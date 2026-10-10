@@ -22,6 +22,13 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1.53.2", features = ["rt", "macros", "net", "time", "process", "sync", "io-util"] }
+tokio-tungstenite = "0.30.0"
+futures-util = "0.3.34"
+gethostname = "1.1.0"
+log = "0.4.34"
+env_logger = "0.11.11"
+zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
@@ -31,3 +38,6 @@ lto = true
 opt-level = 3
 panic = "abort"
 strip = true
+
+[dev-dependencies]
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "test-util", "time"] }

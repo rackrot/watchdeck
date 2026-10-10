@@ -66,6 +66,8 @@ jobs:
         working-directory: app
       - run: cargo clippy --locked -- -D warnings
         working-directory: app/src-tauri
+      - run: cargo test --locked
+        working-directory: app/src-tauri
       - run: pnpm tauri build --debug --no-bundle
         working-directory: app
 

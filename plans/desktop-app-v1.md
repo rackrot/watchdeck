@@ -46,7 +46,7 @@ Nothing here imports `tauri`, so tests run headless.
 | `tls.rs` | rcgen self-signed P-256 cert, rustls `ServerConfig` |
 | `pairing.rs` | Pairing listener (open only while the pairing dialog is open) and the pairing state machine |
 | `server.rs` | wss listener, per-session auth and dispatch, layout push on config change |
-| `mdns.rs` | mdns-sd registration |
+| `mdns.rs` | avahi-daemon registration over D-Bus (zbus) |
 | `actions.rs` | Shell and HTTP runners |
 | `tiles.rs` | Tile pollers |
 | `icons.rs` | Decode, fit, ARGB8888, hash, cache |
@@ -78,7 +78,7 @@ Nothing here imports `tauri`, so tests run headless.
 
 ## 2. Discovery and connection
 
-- **Advertising.** The daemon advertises `_watchdeck._tcp` on port 47820 (wss), with TXT `v=1`, `fp=<16 hex of SHA-256(cert PEM)>` and `pair=47821`. mdns-sd follows IP changes, and docker/virbr interfaces are disabled.
+- **Advertising.** The daemon advertises `_watchdeck._tcp` on port 47820 (wss), with TXT `v=1`, `fp=<16 hex of SHA-256(cert PEM)>` and `pair=47821`. avahi follows IP changes and answers on every interface, including docker and virbr.
 - **Browsing.** The device runs `mdns_query_ptr`, then TXT/A follow-ups for missing fields.
   - Paired: it picks the instance whose `fp` matches NVS, which is how it chooses among several daemons. IPv4 only, own subnet first.
   - Unpaired: it lists the instances, and the user taps one to pair.
@@ -224,7 +224,7 @@ tile = { every_s = 15, json_pointer = "/state",
 | tokio-tungstenite | 0.30 | `WebSocketConfig` size caps |
 | tokio-rustls / rustls | 0.26.6 / 0.23.45 | One crypto provider (aws-lc-rs), installed explicitly at start |
 | rcgen | 0.14 | Self-signed P-256 |
-| mdns-sd | 0.21.5 | `enable_addr_auto`, `disable_interface` |
+| zbus | 5.19 | Feature `tokio`. Registers the service with avahi-daemon |
 | reqwest | 0.13 | Feature `rustls` |
 | serde / serde_json / toml | 1 / 1 / 1.1 | |
 | image | 0.25, `png,jpeg,webp` | |
@@ -282,10 +282,10 @@ Order: S1 → S2 → S3 → S4 → {S5, S6, S8} → S7. S8 can start any time af
 |---|---|
 | mbedTLS 4.1 ↔ rustls handshake fails | The S3a spike runs first. TLS 1.2 ECDHE-ECDSA-AES128-GCM is common ground |
 | Internal heap pressure (TLS + LVGL + Hosted) | mbedTLS allocates in PSRAM. Log the min free internal heap in every slice |
-| avahi-daemon also owns UDP 5353 | Check in S2. Fall back to avahi's D-Bus API |
+| avahi-daemon also owns UDP 5353 | The daemon registers through avahi's D-Bus API, so avahi is the only responder |
 | Desktop firewall blocks 47820/47821 | Document the ports. The tray status shows "no device" |
 | Tray support varies by desktop environment | GNOME needs the AppIndicator extension |
-| Docker/VPN addresses get advertised | `disable_interface`, plus the device's same-subnet preference |
+| Docker/VPN addresses get advertised | The device's same-subnet preference. avahi answers on every interface, so `deny-interfaces` in `avahi-daemon.conf` is the host-side fix |
 | GT911 pins or orientation wrong | S1 verifies, with `#define` knobs |
 | Bug in the custom pairing protocol | Standard commit/reveal shape, a shared test vector, a security audit on S3 |
 | Autostart env lacks PATH or the SSH agent | Document it. stderr shows in results |
