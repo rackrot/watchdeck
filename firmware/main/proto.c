@@ -5,12 +5,29 @@
 
 #include "cJSON.h"
 #include "esp_log.h"
+#include "psa/crypto.h"
 
 static const char *TAG = "proto";
 
 void proto_device_id(char out[PROTO_DEVICE_ID_LEN], const uint8_t mac[6])
 {
     snprintf(out, PROTO_DEVICE_ID_LEN, "wd-%02x%02x%02x%02x%02x%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+esp_err_t proto_fp(const char *pem, char out[PROTO_FP_LEN + 1])
+{
+    uint8_t hash[PSA_HASH_LENGTH(PSA_ALG_SHA_256)];
+    size_t hash_len;
+    psa_status_t status =
+        psa_hash_compute(PSA_ALG_SHA_256, (const uint8_t *)pem, strlen(pem), hash, sizeof(hash), &hash_len);
+    if (status != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "psa_hash_compute: %d", (int)status);
+        return ESP_FAIL;
+    }
+    for (size_t i = 0; i < PROTO_FP_LEN / 2; i++) {
+        snprintf(out + 2 * i, 3, "%02x", hash[i]);
+    }
+    return ESP_OK;
 }
 
 // Print `root` into `buf` and free it. Returns the length, or 0 if it does not fit.

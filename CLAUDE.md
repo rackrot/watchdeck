@@ -27,6 +27,7 @@ Add new tools to `mise.toml`, not to CI or the hooks. The hooks call the mise-pi
 ## Hardware facts
 
 - Chip revision v1.3, so `sdkconfig.defaults` sets `CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y`. ESP-IDF v6.x defaults to v3+ silicon, and a build without this setting won't boot.
+- The ECDSA peripheral also needs v3.0+ silicon, so `sdkconfig.defaults` turns off `CONFIG_MBEDTLS_HARDWARE_ECDSA_VERIFY`. With it on, every TLS handshake logs a `psa_crypto_driver_esp_ecdsa` error and falls back to software anyway.
 - 32 MB PSRAM at 200 MHz, 16 MB flash.
 - The board enumerates as `/dev/ttyUSB0`. Serial access needs the `uucp` group.
 - The board advertises `watchdeck.local` via mDNS (hostname only, no services yet).
@@ -45,7 +46,7 @@ Add new tools to `mise.toml`, not to CI or the hooks. The hooks call the mise-pi
   The SD card and ESP-Hosted share one SDMMC host, and ESP-Hosted probes the C6 before `app_main`.
 - The TF card is GPT-partitioned, so `main/sdcard.c` mounts the first GPT partition read-only through its own diskio driver. Never format the card or write to it.
 - The C6 runs ESP-Hosted slave 2.12.3 and the host is 3.0.9. Hosted logs a "major version mismatch" line, which is only advisory. Don't OTA the C6 without asking.
-- `monitor` needs a real TTY. Without one, read the boot log with pyserial from the IDF Python env (`~/.espressif/python_env/idf6.1_py3.12_env/bin/python`).
+- `monitor` needs a real TTY. Without one, read the boot log with pyserial from the IDF Python env (`~/.espressif/python_env/idf6.1_py3.12_env/bin/python`). Opening the port resets the board, so every capture starts from boot.
 
 ## Conventions
 

@@ -70,12 +70,13 @@ trait EntryGroup {
     fn state_changed(&self, state: i32, error: &str) -> zbus::Result<()>;
 }
 
-/// Keeps `name` advertised on `port` for as long as the future runs.
-pub async fn advertise(name: String, port: u16, status: watch::Sender<MdnsStatus>) {
+/// Keeps `name` advertised on `port` for as long as the future runs. `fp` is the TLS identity's
+/// fingerprint, which devices use to pick their daemon.
+pub async fn advertise(name: String, port: u16, fp: String, status: watch::Sender<MdnsStatus>) {
     loop {
         match Connection::system().await {
             Ok(conn) => {
-                if let Err(e) = supervise(&conn, &name, port, &status).await {
+                if let Err(e) = supervise(&conn, &name, port, &fp, &status).await {
                     set_unavailable(&status, format!("D-Bus error: {e}"));
                 }
             }
@@ -104,6 +105,7 @@ async fn supervise(
     conn: &Connection,
     name: &str,
     port: u16,
+    fp: &str,
     status: &watch::Sender<MdnsStatus>,
 ) -> zbus::Result<()> {
     let dbus = DBusProxy::new(conn).await?;
@@ -112,7 +114,7 @@ async fn supervise(
         .await?;
     loop {
         if dbus.name_has_owner(BusName::try_from(AVAHI)?).await? {
-            match register(conn, name, port, status, &mut owners).await {
+            match register(conn, name, port, fp, status, &mut owners).await {
                 Ok(()) => set_unavailable(status, "avahi-daemon stopped".into()),
                 Err(e) => set_unavailable(status, format!("avahi registration failed: {e}")),
             }
@@ -136,6 +138,7 @@ async fn register(
     conn: &Connection,
     name: &str,
     port: u16,
+    fp: &str,
     status: &watch::Sender<MdnsStatus>,
     owners: &mut zbus::fdo::NameOwnerChangedStream,
 ) -> zbus::Result<()> {
@@ -146,7 +149,7 @@ async fn register(
         .await?;
     let mut states = group.receive_state_changed().await?;
     let mut name = name.to_string();
-    add(&group, &name, port).await?;
+    add(&group, &name, port, fp).await?;
 
     let result = loop {
         tokio::select! {
@@ -161,7 +164,7 @@ async fn register(
                         name = server.get_alternative_service_name(&name).await?;
                         log::warn!("mDNS name collision, retrying as {name:?}");
                         group.reset().await?;
-                        add(&group, &name, port).await?;
+                        add(&group, &name, port, fp).await?;
                     }
                     STATE_FAILURE => break Err(zbus::Error::Failure(args.error.to_string())),
                     _ => {}
@@ -181,8 +184,9 @@ async fn register(
     result
 }
 
-async fn add(group: &EntryGroupProxy<'_>, name: &str, port: u16) -> zbus::Result<()> {
-    let txt = format!("v={VERSION}");
+async fn add(group: &EntryGroupProxy<'_>, name: &str, port: u16, fp: &str) -> zbus::Result<()> {
+    let v = format!("v={VERSION}");
+    let fp = format!("fp={fp}");
     group
         .add_service(
             IF_UNSPEC,
@@ -193,7 +197,7 @@ async fn add(group: &EntryGroupProxy<'_>, name: &str, port: u16) -> zbus::Result
             "",
             "",
             port,
-            &[txt.as_bytes()],
+            &[v.as_bytes(), fp.as_bytes()],
         )
         .await?;
     group.commit().await

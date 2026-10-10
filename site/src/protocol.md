@@ -2,7 +2,7 @@
 
 This page defines how the device and the desktop daemon talk. Both sides implement it, and the daemon's test fixtures use these exact examples.
 
-Status: **protocol v1, S2 subset.** S2 has no authentication and runs over plain WebSocket. S3 adds pairing, the `token` field and TLS. See `plans/desktop-app-v1.md` for the full design.
+Status: **protocol v1, S3a subset.** The link runs over TLS (`wss://`) and the device pins the daemon's certificate. There is still no authentication. Pairing and the `token` field arrive in S3b. See `plans/desktop-app-v1.md` for the full design.
 
 ## Discovery
 
@@ -12,9 +12,19 @@ The daemon advertises itself over mDNS:
 |---|---|
 | Service | `_watchdeck._tcp` |
 | Port | 47820 |
-| TXT | `v=1` |
+| TXT | `v=1`, `fp=<16 hex>` |
 
-The device browses for `_watchdeck._tcp`, takes the first IPv4 address (preferring its own subnet), and connects to `ws://<addr>:47820/`.
+`fp` is the first 16 hex digits of SHA-256 over the daemon's certificate PEM, byte for byte.
+
+The device browses for `_watchdeck._tcp` and keeps the instances whose `fp` matches the certificate it pins. It tries their IPv4 addresses in order, its own subnet first, and moves to the next at once when one fails. It connects to `wss://<addr>:47820/`.
+
+## Transport security
+
+- The daemon serves `wss` on 47820 only. Plain `ws` is refused.
+- The certificate is self-signed P-256, created on the daemon's first run and stored with its key in the daemon's config directory.
+- The device trusts exactly that certificate (a byte-for-byte pin) and checks neither its name nor its dates. Until S3b, the pinned certificate is compiled into the firmware. S3b stores it at pairing.
+- The `fp` in mDNS only selects which instance to try. Any LAN peer can advertise it, so the pin is what authenticates the daemon.
+- The device shows "daemon identity changed" when instances are visible but none carry the pinned `fp`, and "wrong cert from daemon" when an instance with the right `fp` presents another certificate.
 
 ## Connection
 

@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 #include "display.h"
 #include "esp_app_desc.h"
@@ -17,13 +18,18 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "mbedtls/ssl.h"
+#include "mbedtls/x509.h"
 #include "mdns.h"
 
 #define SERVICE "_watchdeck"
 #define SERVICE_PROTO "_tcp"
 #define QUEUE_LEN 16
 #define TASK_STACK 8192
+#define WS_TASK_STACK 6144 // also runs the TLS handshake
 #define DISCOVER_TIMEOUT_MS 3000
+#define DISCOVER_BUDGET_MS 10000 // all per-instance TXT and A queries of one pass
+#define MAX_CANDIDATES 10        // also the PTR result cap
 #define CONNECT_TIMEOUT_MS 15000
 #define SEND_TIMEOUT_MS 2000
 #define PING_INTERVAL_S 10
@@ -34,6 +40,11 @@ static const char *TAG = "link";
 
 // Backoff steps in seconds; the last one is the cap. Each wait gets +/-20% jitter.
 static const uint32_t BACKOFF_S[] = {1, 2, 4, 8, 16, 30};
+
+// S3a seam: the daemon cert the link pins, compiled in from main/daemon_cert.pem.local and empty
+// without it (see main/CMakeLists.txt). S3b replaces it with the cert stored in NVS at pairing,
+// which must stay alive as long as any client points at it.
+extern const char pinned_pem[] asm("_binary_daemon_cert_pem_start");
 
 typedef enum {
     ST_NO_IP,      // waiting for Wi-Fi
@@ -47,8 +58,9 @@ typedef enum {
     EV_WIFI_DOWN,
     EV_WS_UP,
     EV_WS_DOWN,
-    EV_WS_MSG, // data is a PSRAM buffer the link task frees
-    EV_WS_BAD, // oversize or broken frame: close the link
+    EV_WS_MSG,      // data is a PSRAM buffer the link task frees
+    EV_WS_BAD,      // oversize or broken frame: close the link
+    EV_WS_BAD_CERT, // the daemon's cert is not the pinned one
     EV_PRESS,
 } ev_type_t;
 
@@ -67,11 +79,18 @@ typedef struct {
     };
 } link_ev_t;
 
+typedef struct {
+    esp_ip4_addr_t ip;
+    uint16_t port;
+    bool local; // on our own subnet
+} cand_t;
+
 // Everything below except s_rx is touched only by the link task.
 static struct {
     QueueHandle_t queue;
     link_cbs_t cbs;
-    proto_msg_t *msg; // parse target, in PSRAM
+    proto_msg_t *msg;          // parse target, in PSRAM
+    char fp[PROTO_FP_LEN + 1]; // of pinned_pem, matched against mDNS TXT "fp"
     state_t state;
     esp_websocket_client_handle_t client;
     uint32_t gen;
@@ -79,12 +98,20 @@ static struct {
     size_t backoff_idx;
     int64_t retry_at_ms;
     int64_t connect_deadline_ms;
+    const char *retry_reason; // leads the status line while backing off
     int shown_retry_s;
+    cand_t cands[MAX_CANDIDATES]; // this pass's daemons, own subnet first
+    size_t ncand;
+    size_t next_cand; // the next one to try
+    bool wrong_cert;  // a candidate in this pass presented a cert other than the pinned one
 } s;
 
-// Reassembly state, touched only by the websocket task.
+// Reassembly state and connect measurements, touched only by the websocket event handler, which
+// the client runs under its lock.
 static char *s_rx;
 static int s_rx_len;
+static int64_t s_connect_us;
+static bool s_heap_watch;
 
 static int64_t now_ms(void)
 {
@@ -163,24 +190,65 @@ static void on_ws_data(const esp_websocket_event_data_t *d, uint32_t gen)
     }
 }
 
+static void log_heap(const char *when)
+{
+    ESP_LOGI(TAG, "heap %s: internal free %u min %u, PSRAM free %u min %u", when,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM));
+}
+
+static void heap_watch_stop(void)
+{
+    if (s_heap_watch) {
+        s_heap_watch = false;
+        ESP_ERROR_CHECK_WITHOUT_ABORT(heap_caps_monitor_local_minimum_free_size_stop());
+    }
+}
+
+// A connect that failed because the daemon's cert is not the pinned one. esp-tls passes on the
+// mbedTLS error (negated) but not the verify flags, which it reads only after a handshake.
+static bool cert_rejected(const esp_websocket_event_data_t *d)
+{
+    int err = d->error_handle.esp_tls_stack_err;
+    return d->error_handle.error_type == WEBSOCKET_ERROR_TYPE_TCP_TRANSPORT &&
+           (err == -MBEDTLS_ERR_X509_CERT_VERIFY_FAILED || err == -MBEDTLS_ERR_SSL_BAD_CERTIFICATE);
+}
+
 static void ws_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     uint32_t gen = (uint32_t)(uintptr_t)arg;
+    const esp_websocket_event_data_t *d = data;
     link_ev_t ev = {.gen = gen};
     switch (id) {
+    case WEBSOCKET_EVENT_BEFORE_CONNECT:
+        log_heap("before connect");
+        // From here the minimum is this attempt's own, so it shows the handshake's peak.
+        s_heap_watch = heap_caps_monitor_local_minimum_free_size_start() == ESP_OK;
+        s_connect_us = esp_timer_get_time();
+        break;
     case WEBSOCKET_EVENT_CONNECTED:
+        ESP_LOGI(TAG, "TCP + TLS + WebSocket upgrade took %d ms, websocket task stack %u bytes unused",
+                 (int)((esp_timer_get_time() - s_connect_us) / 1000), (unsigned)uxTaskGetStackHighWaterMark(NULL));
+        log_heap("session up");
+        heap_watch_stop();
         ev.type = EV_WS_UP;
         post(&ev);
         break;
     case WEBSOCKET_EVENT_DATA:
-        on_ws_data(data, gen);
+        on_ws_data(d, gen);
         break;
-    case WEBSOCKET_EVENT_ERROR:
+    // ERROR is always followed by DISCONNECTED or CLOSED, and only DISCONNECTED carries the TLS
+    // error, so ERROR is left to the client's own log. FINISH covers a task that ends without
+    // either.
     case WEBSOCKET_EVENT_DISCONNECTED:
     case WEBSOCKET_EVENT_CLOSED:
+    case WEBSOCKET_EVENT_FINISH:
+        heap_watch_stop();
         free(s_rx);
         s_rx = NULL;
-        ev.type = EV_WS_DOWN;
+        ev.type = cert_rejected(d) ? EV_WS_BAD_CERT : EV_WS_DOWN;
         post(&ev);
         break;
     default:
@@ -203,10 +271,52 @@ static bool same_subnet(uint32_t a, uint32_t b, uint32_t mask)
     return (a & mask) == (b & mask);
 }
 
-// Browse for the daemon. Picks an address on our own subnet if any instance has one, else the
-// first IPv4 address found. Instances whose A record is missing get a follow-up query.
-static bool discover(esp_ip4_addr_t *ip, uint16_t *port)
+// Whether an instance advertises the pinned daemon's fp. avahi sends TXT along with the PTR
+// answer, and an instance without it gets a TXT query. *mismatch is set when the TXT was read and
+// its fp is absent or different, as opposed to not being read at all.
+static bool fp_matches(const mdns_result_t *r, uint32_t timeout_ms, bool *mismatch)
 {
+    const char *name = r->instance_name ? r->instance_name : "?";
+    mdns_result_t *queried = NULL;
+    const mdns_result_t *t = r;
+    if (r->txt_count == 0 && r->instance_name &&
+        mdns_query_txt(r->instance_name, SERVICE, SERVICE_PROTO, timeout_ms, &queried) == ESP_OK && queried) {
+        t = queried;
+    }
+    const char *fp = NULL;
+    size_t fp_len = 0;
+    for (size_t i = 0; i < t->txt_count && !fp; i++) {
+        if (t->txt[i].key && strcasecmp(t->txt[i].key, "fp") == 0 && t->txt[i].value) {
+            fp = t->txt[i].value;
+            fp_len = t->txt_value_len[i];
+        }
+    }
+    bool match = fp && fp_len == PROTO_FP_LEN && memcmp(fp, s.fp, PROTO_FP_LEN) == 0;
+    if (!fp) {
+        ESP_LOGI(TAG, "skipping %s: no fp in TXT", name);
+    } else if (!match) {
+        ESP_LOGI(TAG, "skipping %s: fp %.*s is not the pinned %s", name, (int)fp_len, fp, s.fp);
+    }
+    if (t->txt_count > 0 && !match) {
+        *mismatch = true;
+    }
+    if (queried) {
+        mdns_query_results_free(queried);
+    }
+    return match;
+}
+
+// Browse for the pinned daemon and fill s.cands with every address of every instance whose fp
+// matches, own subnet first. Instances whose A record is missing get a follow-up query. The TXT
+// and A follow-ups share DISCOVER_BUDGET_MS, so junk instances cannot hold the link task for
+// long. Sets *mismatch when instances were seen but none matched the pinned fp.
+static void discover(bool *mismatch)
+{
+    s.ncand = 0;
+    s.next_cand = 0;
+    s.wrong_cert = false;
+    *mismatch = false;
+
     esp_netif_ip_info_t ours = {0};
     esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     if (sta) {
@@ -214,39 +324,61 @@ static bool discover(esp_ip4_addr_t *ip, uint16_t *port)
     }
 
     mdns_result_t *results = NULL;
-    esp_err_t err = mdns_query_ptr(SERVICE, SERVICE_PROTO, DISCOVER_TIMEOUT_MS, 10, &results);
+    esp_err_t err = mdns_query_ptr(SERVICE, SERVICE_PROTO, DISCOVER_TIMEOUT_MS, MAX_CANDIDATES, &results);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "mdns_query_ptr: %s", esp_err_to_name(err));
-        return false;
+        return;
     }
 
-    bool found = false;
+    cand_t found[MAX_CANDIDATES];
+    size_t n = 0;
+    bool any_match = false;
+    bool any_mismatch = false;
+    int64_t budget_end_ms = now_ms() + DISCOVER_BUDGET_MS;
     for (const mdns_result_t *r = results; r; r = r->next) {
-        esp_ip4_addr_t cand[4];
-        size_t n = 0;
-        for (const mdns_ip_addr_t *a = r->addr; a && n < 4; a = a->next) {
+        int64_t left_ms = budget_end_ms - now_ms();
+        if (left_ms <= 0) {
+            ESP_LOGW(TAG, "discovery budget of %d ms spent, ignoring the remaining instances", DISCOVER_BUDGET_MS);
+            break;
+        }
+        if (!fp_matches(r, left_ms < DISCOVER_TIMEOUT_MS ? (uint32_t)left_ms : DISCOVER_TIMEOUT_MS, &any_mismatch)) {
+            continue;
+        }
+        any_match = true;
+        esp_ip4_addr_t addrs[4];
+        size_t na = 0;
+        for (const mdns_ip_addr_t *a = r->addr; a && na < 4; a = a->next) {
             if (a->addr.type == ESP_IPADDR_TYPE_V4) {
-                cand[n++] = a->addr.u_addr.ip4;
+                addrs[na++] = a->addr.u_addr.ip4;
             }
         }
-        if (n == 0 && r->hostname) {
+        left_ms = budget_end_ms - now_ms();
+        if (na == 0 && r->hostname && left_ms > 0) {
             ESP_LOGI(TAG, "%s has no address in the PTR answer, querying A", r->hostname);
-            if (mdns_query_a(r->hostname, DISCOVER_TIMEOUT_MS, &cand[0]) == ESP_OK) {
-                n = 1;
+            uint32_t timeout_ms = left_ms < DISCOVER_TIMEOUT_MS ? (uint32_t)left_ms : DISCOVER_TIMEOUT_MS;
+            if (mdns_query_a(r->hostname, timeout_ms, &addrs[0]) == ESP_OK) {
+                na = 1;
             }
         }
-        for (size_t i = 0; i < n; i++) {
-            ESP_LOGI(TAG, "candidate %s at " IPSTR ":%u", r->hostname ? r->hostname : "?", IP2STR(&cand[i]), r->port);
-            bool local = same_subnet(cand[i].addr, ours.ip.addr, ours.netmask.addr);
-            if (!found || (local && !same_subnet(ip->addr, ours.ip.addr, ours.netmask.addr))) {
-                *ip = cand[i];
-                *port = r->port;
-                found = true;
-            }
+        for (size_t i = 0; i < na && n < MAX_CANDIDATES; i++) {
+            found[n].ip = addrs[i];
+            found[n].port = r->port;
+            found[n].local = same_subnet(addrs[i].addr, ours.ip.addr, ours.netmask.addr);
+            ESP_LOGI(TAG, "candidate %s at " IPSTR ":%u%s", r->hostname ? r->hostname : "?", IP2STR(&addrs[i]), r->port,
+                     found[n].local ? " (our subnet)" : "");
+            n++;
         }
     }
     mdns_query_results_free(results);
-    return found;
+
+    for (int want_local = 1; want_local >= 0; want_local--) {
+        for (size_t i = 0; i < n; i++) {
+            if (found[i].local == want_local) {
+                s.cands[s.ncand++] = found[i];
+            }
+        }
+    }
+    *mismatch = any_mismatch && !any_match;
 }
 
 /* ---- Session control (link task only) ---- */
@@ -257,12 +389,14 @@ static void report_retry(void)
     int secs = left > 0 ? (int)((left + 999) / 1000) : 0;
     if (secs != s.shown_retry_s) {
         s.shown_retry_s = secs;
-        set_status("offline, retry in %d s", secs);
+        set_status("%s, retry in %d s", s.retry_reason, secs);
     }
 }
 
-static void schedule_retry(void)
+// Back off before the next attempt, with `reason` leading the status line until then.
+static void schedule_retry(const char *reason)
 {
+    s.retry_reason = reason;
     uint32_t base_ms = BACKOFF_S[s.backoff_idx] * 1000;
     if (s.backoff_idx < sizeof(BACKOFF_S) / sizeof(BACKOFF_S[0]) - 1) {
         s.backoff_idx++;
@@ -287,28 +421,40 @@ static void drop_client(void)
     s.welcomed = false;
 }
 
-static void lost(const char *why)
+// Drop the session and back off, showing `reason` on the status line.
+static void lost_as(const char *why, const char *reason)
 {
     ESP_LOGW(TAG, "link lost: %s", why);
     drop_client();
     if (s.cbs.on_down) {
         s.cbs.on_down();
     }
-    schedule_retry();
+    schedule_retry(reason);
 }
 
-static void start_client(esp_ip4_addr_t ip, uint16_t port)
+static void lost(const char *why)
+{
+    lost_as(why, "offline");
+}
+
+static void candidate_failed(const char *why);
+
+static void start_client(const cand_t *c)
 {
     char uri[48];
-    snprintf(uri, sizeof(uri), "ws://" IPSTR ":%u/", IP2STR(&ip), port);
+    snprintf(uri, sizeof(uri), "wss://" IPSTR ":%u/", IP2STR(&c->ip), c->port);
     s.gen++;
     const esp_websocket_client_config_t cfg = {
         .uri = uri,
+        // The pinned cert is the only trust anchor and the chain check stays on. The daemon's
+        // IP changes, so the name check is off, which also turns off SNI.
+        .cert_pem = pinned_pem,
+        .skip_cert_common_name_check = true,
         .disable_auto_reconnect = true,
         .ping_interval_sec = PING_INTERVAL_S,
         .pingpong_timeout_sec = PINGPONG_TIMEOUT_S,
         .buffer_size = PROTO_MAX_MSG,
-        .task_stack = 6144,
+        .task_stack = WS_TASK_STACK,
         .network_timeout_ms = 5000,
     };
     s.client = esp_websocket_client_init(&cfg);
@@ -320,25 +466,39 @@ static void start_client(esp_ip4_addr_t ip, uint16_t port)
     }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "websocket start: %s", esp_err_to_name(err));
-        lost("websocket start failed");
+        candidate_failed("websocket start failed");
         return;
     }
     s.state = ST_CONNECTING;
     s.connect_deadline_ms = now_ms() + CONNECT_TIMEOUT_MS;
-    set_status("connecting to " IPSTR, IP2STR(&ip));
+    set_status("connecting to " IPSTR, IP2STR(&c->ip));
+}
+
+// A candidate failed before its session came up. Try the next one at once, and back off only
+// after every candidate has failed. Any LAN peer can advertise the public fp, so a cert mismatch
+// from a candidate that matched the fp reads as a wrong cert, not as a changed identity.
+static void candidate_failed(const char *why)
+{
+    if (s.next_cand < s.ncand) {
+        ESP_LOGW(TAG, "candidate failed (%s), trying the next of %u", why, (unsigned)s.ncand);
+        drop_client();
+        start_client(&s.cands[s.next_cand++]);
+        return;
+    }
+    lost_as(why, s.wrong_cert ? "wrong cert from daemon" : "offline");
 }
 
 static void attempt(void)
 {
     set_status("searching");
-    esp_ip4_addr_t ip;
-    uint16_t port;
-    if (!discover(&ip, &port)) {
-        ESP_LOGW(TAG, "no daemon found");
-        schedule_retry();
+    bool mismatch;
+    discover(&mismatch);
+    if (s.ncand == 0) {
+        ESP_LOGW(TAG, "pinned daemon not found%s", mismatch ? ": instances seen, none with the pinned fp" : "");
+        schedule_retry(mismatch ? "daemon identity changed" : "offline");
         return;
     }
-    start_client(ip, port);
+    start_client(&s.cands[s.next_cand++]);
 }
 
 static void send_text(const char *json, size_t len)
@@ -377,7 +537,7 @@ static void handle_msg(const char *json, size_t len)
     ESP_LOGI(TAG, "rx: %.*s", (int)(len > 160 ? 160 : len), json);
     proto_msg_t *m = s.msg;
     if (proto_parse(json, len, m) != ESP_OK) {
-        ESP_LOGW(TAG, "dropped unparseable message");
+        ESP_LOGW(TAG, "dropped unparsable message");
         return;
     }
     switch (m->type) {
@@ -435,12 +595,24 @@ static void handle_event(link_ev_t *ev)
         break;
     case EV_WS_DOWN:
         if (current && s.client) {
-            lost("connection closed");
+            if (s.state == ST_CONNECTING) {
+                candidate_failed("connection closed");
+            } else {
+                lost("connection closed");
+            }
         }
         break;
     case EV_WS_BAD:
         if (current && s.client) {
             lost("bad frame");
+        }
+        break;
+    case EV_WS_BAD_CERT:
+        if (current && s.client) {
+            ESP_LOGE(TAG, "the daemon at candidate %u presented a cert other than the pinned one",
+                     (unsigned)s.next_cand);
+            s.wrong_cert = true;
+            candidate_failed("cert rejected");
         }
         break;
     case EV_WS_MSG:
@@ -482,7 +654,7 @@ static void link_task(void *arg)
                 report_retry();
             }
         } else if (s.state == ST_CONNECTING && now_ms() > s.connect_deadline_ms) {
-            lost("connect timeout");
+            candidate_failed("connect timeout");
         }
     }
 }
@@ -491,6 +663,13 @@ esp_err_t link_start(const link_cbs_t *cbs)
 {
     ESP_RETURN_ON_FALSE(cbs && !s.queue, ESP_ERR_INVALID_STATE, TAG, "bad start");
     s.cbs = *cbs;
+    if (pinned_pem[0] == '\0') {
+        ESP_LOGE(TAG, "no pinned daemon cert; S3b pairing provides it");
+        set_status("no pinned daemon cert, not connecting");
+        return ESP_ERR_NOT_FOUND;
+    }
+    ESP_RETURN_ON_ERROR(proto_fp(pinned_pem, s.fp), TAG, "fp");
+    ESP_LOGI(TAG, "pinned daemon fp %s", s.fp);
     s.msg = heap_caps_malloc(sizeof(*s.msg), MALLOC_CAP_SPIRAM);
     s.queue = xQueueCreate(QUEUE_LEN, sizeof(link_ev_t));
     ESP_RETURN_ON_FALSE(s.msg && s.queue, ESP_ERR_NO_MEM, TAG, "alloc");

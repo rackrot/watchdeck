@@ -1,1 +1,7 @@
-{"t":"hello","v":1,"device":"wd-e8f60ae276ab","fw":"0.2.0","screen":[1024,600]}
+{
+  "t": "hello",
+  "v": 1,
+  "device": "wd-e8f60ae276ab",
+  "fw": "0.2.0",
+  "screen": [1024, 600]
+}

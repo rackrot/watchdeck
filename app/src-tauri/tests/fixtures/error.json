@@ -1,1 +1,1 @@
-{"t":"error","code":"version","msg":"unsupported protocol version 2"}
+{ "t": "error", "code": "version", "msg": "unsupported protocol version 2" }

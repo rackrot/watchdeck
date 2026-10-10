@@ -56,3 +56,16 @@ CONFIG_TINYUSB_DESC_SERIAL_STRING=""
 # cJSON recursion depth. The deepest legitimate message nests 4 levels; the default of 1000
 # would overflow the link task stack on a hostile frame.
 CONFIG_CJSON_NESTING_LIMIT=8
+
+# TLS to the daemon: wss, pinning its self-signed P-256 cert. mbedTLS allocates in PSRAM to
+# spare internal RAM. The daemon's rustls and mbedTLS meet on TLS 1.2 ECDHE-ECDSA with AES-GCM;
+# those are IDF defaults, set here because the link depends on them. TLS 1.3 is off (default).
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+CONFIG_MBEDTLS_SSL_PROTO_TLS1_2=y
+CONFIG_MBEDTLS_KEY_EXCHANGE_ECDHE_ECDSA=y
+CONFIG_MBEDTLS_GCM_C=y
+CONFIG_MBEDTLS_ECP_DP_SECP256R1_ENABLED=y
+# The ECDSA peripheral needs P4 silicon v3.0+. On this v1.3 board its driver logs an error on
+# every handshake and falls back to software, so go straight to software. A v3.x board would
+# drop this line along with CONFIG_ESP32P4_SELECTS_REV_LESS_V3.
+CONFIG_MBEDTLS_HARDWARE_ECDSA_VERIFY=n

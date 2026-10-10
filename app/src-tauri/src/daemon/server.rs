@@ -1,4 +1,4 @@
-//! Plain `ws://` listener: one task per connection, one live session per device id.
+//! `wss://` listener: one task per connection, one live session per device id.
 
 use std::collections::HashMap;
 use std::io;
@@ -10,9 +10,12 @@ use std::time::Duration;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{broadcast, oneshot, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{timeout, timeout_at, Instant};
+use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::server::TlsStream;
+use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message as WsMessage};
 use tokio_tungstenite::{accept_async_with_config, WebSocketStream};
@@ -21,12 +24,15 @@ use super::actions::{self, ActionResult, Runner};
 use super::protocol::{ErrorCode, Message, MAX_MESSAGE_BYTES, VERSION};
 
 pub const PORT: u16 = 47820;
+/// From the TCP accept to the hello, covering the TLS handshake and the WebSocket upgrade.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_BUTTON_ID_BYTES: usize = 64;
+/// Concurrent connections, handshaking or live. Beyond this the listener drops new sockets.
+const MAX_CONNECTIONS: usize = 64;
 
-type Ws = WebSocketStream<TcpStream>;
+type Ws = WebSocketStream<TlsStream<TcpStream>>;
 type WsSink = SplitSink<Ws, WsMessage>;
 type WsRead = SplitStream<Ws>;
 
@@ -43,6 +49,7 @@ pub struct Server {
 
 struct Shared {
     hostname: String,
+    tls: TlsAcceptor,
     runner: Runner,
     events: broadcast::Sender<DaemonEvent>,
     next_id: AtomicU64,
@@ -51,13 +58,18 @@ struct Shared {
 }
 
 impl Server {
-    pub async fn bind(addr: impl ToSocketAddrs, runner: Runner) -> io::Result<Self> {
+    pub async fn bind(
+        addr: impl ToSocketAddrs,
+        tls: Arc<ServerConfig>,
+        runner: Runner,
+    ) -> io::Result<Self> {
         let hostname = gethostname::gethostname().to_string_lossy().into_owned();
         let (events, _) = broadcast::channel(64);
         Ok(Self {
             listener: TcpListener::bind(addr).await?,
             shared: Arc::new(Shared {
                 hostname,
+                tls: TlsAcceptor::from(tls),
                 runner,
                 events,
                 next_id: AtomicU64::new(0),
@@ -81,12 +93,20 @@ impl Server {
     /// Accepts connections until the future is dropped, which also drops every session.
     pub async fn run(self) {
         let mut sessions = JoinSet::new();
+        let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         loop {
             tokio::select! {
                 accepted = self.listener.accept() => match accepted {
-                    Ok((stream, peer)) => {
-                        sessions.spawn(handle(stream, peer, self.shared.clone()));
-                    }
+                    Ok((stream, peer)) => match slots.clone().try_acquire_owned() {
+                        Ok(permit) => {
+                            let shared = self.shared.clone();
+                            sessions.spawn(async move {
+                                handle(stream, peer, &shared).await;
+                                drop(permit);
+                            });
+                        }
+                        Err(_) => log::debug!("{peer}: dropped, {MAX_CONNECTIONS} connections open"),
+                    },
                     Err(e) => {
                         log::error!("accept failed: {e}");
                         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -141,8 +161,8 @@ impl Shared {
     }
 }
 
-async fn handle(stream: TcpStream, peer: SocketAddr, shared: Arc<Shared>) {
-    if let Err(e) = session(stream, &shared).await {
+async fn handle(stream: TcpStream, peer: SocketAddr, shared: &Shared) {
+    if let Err(e) = session(stream, peer, shared).await {
         log::warn!("{peer}: {e}");
     }
 }
@@ -224,14 +244,38 @@ fn valid_device_id(device: &str) -> bool {
     (1..=64).contains(&device.len()) && device.bytes().all(|b| b.is_ascii_graphic())
 }
 
-async fn session(stream: TcpStream, shared: &Shared) -> Result<(), WsError> {
+async fn session(stream: TcpStream, peer: SocketAddr, shared: &Shared) -> Result<(), WsError> {
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_MESSAGE_BYTES))
         .max_frame_size(Some(MAX_MESSAGE_BYTES));
     let deadline = Instant::now() + HELLO_TIMEOUT;
 
-    let Ok(ws) = timeout_at(deadline, accept_async_with_config(stream, Some(config))).await else {
-        log::warn!("handshake did not finish in {HELLO_TIMEOUT:?}");
+    let tls = match timeout_at(deadline, shared.tls.accept(stream)).await {
+        Ok(Ok(tls)) => tls,
+        Ok(Err(e)) => {
+            log::debug!("{peer}: TLS handshake failed: {e}");
+            return Ok(());
+        }
+        Err(_) => {
+            log::debug!("{peer}: TLS handshake did not finish in {HELLO_TIMEOUT:?}");
+            return Ok(());
+        }
+    };
+    let (_, conn) = tls.get_ref();
+    if let (Some(suite), Some(kx)) = (
+        conn.negotiated_cipher_suite(),
+        conn.negotiated_key_exchange_group(),
+    ) {
+        log::debug!(
+            "{peer}: {:?} {:?} {:?}",
+            suite.version().version,
+            suite.suite(),
+            kx.name()
+        );
+    }
+
+    let Ok(ws) = timeout_at(deadline, accept_async_with_config(tls, Some(config))).await else {
+        log::debug!("{peer}: WebSocket upgrade did not finish in {HELLO_TIMEOUT:?}");
         return Ok(());
     };
     let (mut tx, mut rx) = ws?.split();

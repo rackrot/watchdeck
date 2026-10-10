@@ -1,6 +1,6 @@
 # watchdeck v1: daemon, device protocol, screen config
 
-Status: draft plan, 2026-10-10. Nothing here is built yet.
+Status: plan, 2026-10-10. S1 to S3a are built (see the slice table); S3b onward is not.
 
 ## Decisions
 
@@ -147,7 +147,7 @@ H→D tile     {"t":"tile","btn":"nas-load","text":"0.42","state":"ok|bad|unknow
 | | wss with the pinned cert (chosen) | Plain ws with the token |
 |---|---|---|
 | Protects | The token and output from sniffers, sessions from hijack, presses from a rogue daemon | Nothing. Sniffing the Wi-Fi gives the token and every action |
-| Cost | mbedTLS heap (~42 KB, 3.x figure, **UNCONFIRMED** for 4.1), moved to PSRAM. rustls + rcgen on the daemon | None |
+| Cost | mbedTLS heap in PSRAM, measured on 4.1: 4.4 KB internal + 22.9 KB PSRAM steady, 9.8 + 26.4 KB at the handshake peak. rustls + rcgen on the daemon | None |
 
 ### Desktop
 
@@ -240,7 +240,7 @@ Tauri on Linux:
 
 | Firmware component | Version | Note |
 |---|---|---|
-| espressif/esp_websocket_client | 1.8.0 | Its license metadata reads "Custom" (1.7.0 is Apache-2.0). **UNCONFIRMED**. Check `license.txt` or pin `~1.7.0` |
+| espressif/esp_websocket_client | 1.8.0 | Apache-2.0 (the shipped `LICENSE` settles the "Custom" metadata). Settled |
 | espressif/cjson | ^1.7.19 | IDF 6.0 removed the built-in `json` component |
 | espressif/esp_lcd_touch_gt911 | 1.2.1 | Address latching needs RST, INT and `driver_data` |
 | espressif/mdns | 1.14.0 | Already used |
@@ -251,7 +251,7 @@ Tauri on Linux:
 |---|---|---|---|
 | S1 ✅ | Touch: GT911, plus a 5×3 test grid that highlights and logs taps. Done 2026-10-10: answers at 0x5D, pins as assumed, no axis swap or mirror, 0 phantom taps in 5 min | Every cell, corners included, maps correctly. No phantom touches in 5 min. Pins and address confirmed | `fw:build`, serial log on device |
 | S2 ✅ | Thin end-to-end, no auth. Done 2026-10-10: tap → notify-send → toast verified on hardware; board reconnects after a daemon restart (IP change untested). Write `site/src/protocol.md` first. Daemon in Tauri, mDNS, plain ws, hello → one hard-coded button → `notify-send` → result toast. Add `cargo test` to CI | Connects within 10 s. Survives a daemon restart and an IP change. Result shows within 1 s. Heap logged | Fake-device integration test, `avahi-browse`, device |
-| S3 | **Security gate.** S3a: TLS interop spike (rcgen + rustls ↔ mbedTLS). S3b: pairing on both sides, wss-only, Forget pairing | SAS test vector passes. A wrong code stores nothing. A bad or forgotten token gets `unauthorized`. Oversize messages close the link. Device rejects a regenerated cert. tcpdump: TLS only on 47820, no token on 47821 | `cargo test`, device, tcpdump, security review |
+| S3 | **Security gate.** S3a: TLS interop spike (rcgen + rustls ↔ mbedTLS). S3a done 2026-10-10: wss with the pinned cert works on hardware, and 47820 is wss-only (results below). S3b: pairing on both sides, Forget pairing | SAS test vector passes. A wrong code stores nothing. A bad or forgotten token gets `unauthorized`. Oversize messages close the link. Device rejects a regenerated cert. tcpdump: TLS only on 47820, no token on 47821 | `cargo test`, device, tcpdump, security review |
 | S4 | Config and actions: `config.toml`, validation, shell and HTTP runners, secrets, live layout push, result modal | A timeout kills grandchildren. Output caps, exit codes, "already running". HTTP: secret headers, no redirects, caps. Live push needs no reconnect | `cargo test`, device, security review |
 | S5 | Icons: import, render, hash, `icon_get`, PSRAM cache | Exact-bytes render test. An RGB + transparent quadrant icon shows correctly | `cargo test`, device |
 | S6 | Tiles | Paused-clock tests: interval, no overlap, idle stop, poll after press | `cargo test`, device |
@@ -259,6 +259,38 @@ Tauri on Linux:
 | S8 | App shape: tray menu, hidden start, close-to-tray, autostart, single-instance, logging | Tray-only after login. Closing the window keeps the device connected. A second launch focuses the window | `app:build`, manual check |
 
 Order: S1 → S2 → S3 → S4 → {S5, S6, S8} → S7. S8 can start any time after S2, but it shares `lib.rs` with S3 and S4.
+
+### S3a results (2026-10-10)
+
+- **Negotiated:** TLS 1.2 `ECDHE-ECDSA-AES256-GCM-SHA384` over X25519. The device runs mbedTLS 4.1.0 (IDF 6.1, esp_websocket_client 1.8.0). The daemon runs rustls 0.23.45 on aws-lc-rs through tokio-rustls 0.26.6, with an rcgen 0.14.10 cert.
+- **Pinning:** the device trusts only the compiled-in cert (`cert_pem`, name check off) and connects only to instances whose TXT `fp` matches it.
+- **Discovery pass:** `discover()` collects every address of every fp-matching instance (at most 10, the PTR cap), own subnet first, and the link tries them in order. A candidate that rejects the cert, times out or refuses the connection hands over to the next at once. The backoff starts only after all have failed.
+  - The per-instance TXT and A follow-ups share a 10 s budget per pass, so junk instances can't hold the link task for long. The log says when it runs out.
+  - Status when nothing connects: "daemon identity changed" if instances were seen and none had the pinned fp; "wrong cert from daemon" if a candidate matched the fp but presented another cert (any LAN peer can advertise the public fp); "offline" if no instance was seen.
+- **Spoof check on hardware:** a second `_watchdeck._tcp` instance on 47821 advertising the real fp, backed by an `openssl s_server` with another cert, sorted ahead of the real daemon. The device rejected it ("presented a cert other than the pinned one") and connected to the real daemon on 47820 in the same pass.
+- **Daemon hardening:** at most 64 concurrent connections, and the rest are dropped at accept. A TLS handshake failure logs at debug. A socket that sends nothing, or stalls mid-ClientHello, is closed 5 s after the accept. `identity.key` must be 0600 and owned by the config dir's owner, or the daemon refuses to start with a fix command. Identity creation holds an exclusive `identity.lock`, opens its temp files `create_new` (O_EXCL, so a planted symlink fails instead of being followed) and fsyncs the dir.
+- **TLS 1.3** also works (`TLS13_AES_256_GCM_SHA384`, X25519) with `CONFIG_MBEDTLS_SSL_PROTO_TLS1_3=y`. It costs ~3.8 KB more PSRAM, ~0.4 KB more internal heap and ~30 ms. It stays off (the IDF default). Recheck `cert_rejected()` in `link.c` before turning it on.
+- **Device cost,** from `BEFORE_CONNECT` to `CONNECTED` (mbedTLS heap in PSRAM):
+
+  | | Internal | PSRAM |
+  |---|---|---|
+  | Per session | 4.4 KB | 22.9 KB |
+  | Handshake peak | 9.8 KB | 26.4 KB |
+
+- **Timing:** TCP + TLS + WebSocket upgrade takes 330–340 ms. By the end of the handshake the websocket task has used ~2.5 KB of its 6 KB stack.
+- **Negative checks on hardware:**
+  - With a regenerated daemon identity, the device skips every instance on `fp`, never connects, and backs off showing "daemon identity changed". "offline" is for when no instance is seen at all.
+  - An instance advertising the old `fp` fails verification (mbedTLS -0x2700; the daemon logs `UnknownCA`). The device shows "wrong cert from daemon, retry in N s" once every candidate has failed.
+  - Repeated rejections don't leak. After a one-time 1.3 KB on the first attempt, free internal heap held at ~363.5 KB over the next 8 attempts (155 s).
+- **Surprises:**
+  - On a failed first handshake, esp-tls reports no verify flags (`tls_flags=0`). `link.c` detects the rejection from the mbedTLS error instead.
+  - esp_websocket_client dispatches `ERROR` before `DISCONNECTED`, and only `DISCONNECTED` carries the TLS error.
+  - The P4's ECDSA peripheral needs silicon v3.0+. On v1.3 the PSA driver logged an error every handshake before falling back to software, so `sdkconfig.defaults` turns `CONFIG_MBEDTLS_HARDWARE_ECDSA_VERIFY` off.
+  - esp-tls warns on every connect that `skip_common_name` also disables SNI. That's expected with a pinned cert.
+  - The daemon's 5 s hello deadline always started at the TCP accept. What changed is that it now covers the TLS handshake as well.
+  - esp_websocket_client 1.8.0 ships an Apache-2.0 `LICENSE`, which settles the §6 question.
+  - aws-lc-sys builds with `cc` (no cmake or clang). `sha2` 0.11 sits beside a transitive 0.10.
+- **S3a seam:** the pinned cert compiles in from the gitignored `firmware/main/daemon_cert.pem.local`, a copy of the daemon's `identity.pem`. Without it the firmware builds but refuses to connect. Run `idf.py reconfigure` after creating it. S3b replaces it with the cert stored at pairing.
 
 ## 8. Testing
 
@@ -280,7 +312,7 @@ Order: S1 → S2 → S3 → S4 → {S5, S6, S8} → S7. S8 can start any time af
 
 | Risk | Mitigation |
 |---|---|
-| mbedTLS 4.1 ↔ rustls handshake fails | The S3a spike runs first. TLS 1.2 ECDHE-ECDSA-AES128-GCM is common ground |
+| mbedTLS 4.1 ↔ rustls handshake fails | The S3a spike ran first and passed. TLS 1.2 ECDHE-ECDSA-AES256-GCM-SHA384 was negotiated |
 | Internal heap pressure (TLS + LVGL + Hosted) | mbedTLS allocates in PSRAM. Log the min free internal heap in every slice |
 | avahi-daemon also owns UDP 5353 | The daemon registers through avahi's D-Bus API, so avahi is the only responder |
 | Desktop firewall blocks 47820/47821 | Document the ports. The tray status shows "no device" |

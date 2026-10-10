@@ -18,6 +18,7 @@
 #define PROTO_NAME_MAX 48
 #define PROTO_TEXT_MAX 1025    // up to 1 KB of output plus NUL
 #define PROTO_DEVICE_ID_LEN 16 // "wd-" + 12 hex + NUL
+#define PROTO_FP_LEN 16        // hex digits of the daemon cert fingerprint in mDNS TXT "fp"
 
 typedef enum {
     PROTO_MSG_UNKNOWN, // well-formed JSON with a "t" this firmware does not know
@@ -69,6 +70,12 @@ typedef struct {
 
 /** Write "wd-" plus the MAC as 12 lowercase hex digits. `out` must hold PROTO_DEVICE_ID_LEN. */
 void proto_device_id(char out[PROTO_DEVICE_ID_LEN], const uint8_t mac[6]);
+
+/**
+ * Write the daemon cert fingerprint the daemon advertises in mDNS TXT "fp": the first
+ * PROTO_FP_LEN lowercase hex digits of SHA-256 over the cert PEM, NUL excluded.
+ */
+esp_err_t proto_fp(const char *pem, char out[PROTO_FP_LEN + 1]);
 
 /** Build a hello message. Returns the JSON length, or 0 if it does not fit in `buf`. */
 size_t proto_build_hello(char *buf, size_t buf_len, const char *device, const char *fw, int width, int height);
