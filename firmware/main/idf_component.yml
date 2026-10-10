@@ -1,0 +1,8 @@
+dependencies:
+  espressif/esp_lcd_ek79007: "^2.0.2"
+  espressif/esp_lvgl_port: "^2"
+  lvgl/lvgl: "^9"
+  espressif/esp_hosted: "^3.0.3"
+  espressif/esp_wifi_remote: "*"
+  espressif/mdns: "^1.14.0"
+  espressif/esp_tinyusb: "^2.0.0"
