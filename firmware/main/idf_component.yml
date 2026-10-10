@@ -6,3 +6,4 @@ dependencies:
   espressif/esp_wifi_remote: "*"
   espressif/mdns: "^1.14.0"
   espressif/esp_tinyusb: "^2.0.0"
+  espressif/esp_lcd_touch_gt911: "^1.2.1"

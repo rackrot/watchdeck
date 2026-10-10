@@ -19,10 +19,6 @@
 
 static const char *TAG = "display";
 
-static lv_obj_t *s_wifi_label;
-static lv_obj_t *s_sd_label;
-static lv_obj_t *s_usb_label;
-
 static esp_err_t panel_init(esp_lcd_panel_io_handle_t *io, esp_lcd_panel_handle_t *panel)
 {
     esp_lcd_dsi_bus_handle_t bus;
@@ -72,18 +68,7 @@ static esp_err_t panel_init(esp_lcd_panel_io_handle_t *io, esp_lcd_panel_handle_
     return ESP_OK;
 }
 
-static lv_obj_t *add_label(const lv_font_t *font, lv_color_t color, int y)
-{
-    lv_obj_t *label = lv_label_create(lv_screen_active());
-    lv_obj_set_style_text_font(label, font, 0);
-    lv_obj_set_style_text_color(label, color, 0);
-    lv_obj_set_width(label, LCD_H_RES - 80);
-    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
-    lv_obj_align(label, LV_ALIGN_TOP_LEFT, 40, y);
-    return label;
-}
-
-esp_err_t display_init(void)
+esp_err_t display_init(lv_display_t **out_disp)
 {
     esp_lcd_panel_io_handle_t io = NULL;
     esp_lcd_panel_handle_t panel = NULL;
@@ -112,47 +97,11 @@ esp_err_t display_init(void)
     lv_display_t *disp = lvgl_port_add_disp_dsi(&disp_cfg, &dsi_cfg);
     ESP_RETURN_ON_FALSE(disp, ESP_FAIL, TAG, "lvgl_port_add_disp_dsi failed");
 
-    lvgl_port_lock(0);
-    lv_obj_set_style_bg_color(lv_screen_active(), lv_color_black(), 0);
-    lv_obj_t *title = add_label(&lv_font_montserrat_48, lv_color_white(), 60);
-    lv_label_set_text(title, "Hello, watchdeck");
-    s_wifi_label = add_label(&lv_font_montserrat_32, lv_palette_lighten(LV_PALETTE_CYAN, 2), 200);
-    lv_label_set_text(s_wifi_label, "Wi-Fi: starting");
-    s_sd_label = add_label(&lv_font_montserrat_32, lv_palette_lighten(LV_PALETTE_LIGHT_GREEN, 2), 340);
-    lv_label_set_text(s_sd_label, "SD: checking");
-    s_usb_label = add_label(&lv_font_montserrat_32, lv_palette_lighten(LV_PALETTE_AMBER, 2), 480);
-    lv_label_set_text(s_usb_label, "USB: starting");
-    lvgl_port_unlock();
-
     // Backlight on only after the panel is up.
     gpio_config_t bl = {.pin_bit_mask = 1ULL << BACKLIGHT_GPIO, .mode = GPIO_MODE_OUTPUT};
     ESP_RETURN_ON_ERROR(gpio_config(&bl), TAG, "backlight gpio");
     ESP_RETURN_ON_ERROR(gpio_set_level(BACKLIGHT_GPIO, 1), TAG, "backlight on");
-    ESP_LOGI(TAG, "hello screen up");
+    ESP_LOGI(TAG, "display up");
+    *out_disp = disp;
     return ESP_OK;
-}
-
-static void set_text(lv_obj_t *label, const char *text)
-{
-    if (!label) {
-        return;
-    }
-    lvgl_port_lock(0);
-    lv_label_set_text(label, text);
-    lvgl_port_unlock();
-}
-
-void display_set_wifi_text(const char *text)
-{
-    set_text(s_wifi_label, text);
-}
-
-void display_set_sd_text(const char *text)
-{
-    set_text(s_sd_label, text);
-}
-
-void display_set_usb_text(const char *text)
-{
-    set_text(s_usb_label, text);
 }

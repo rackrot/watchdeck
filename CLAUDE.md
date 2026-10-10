@@ -34,7 +34,7 @@ Add new tools to `mise.toml`, not to CI or the hooks. The hooks call the mise-pi
 - USB MSC writes are acked to the host before they reach the card, and card write errors never reach the host (upstream esp_tinyusb behavior, unchanged as of 2026-09), so eject before unplugging.
 - Pin map, from Elecrow's V1.2 schematic and examples:
   - Display: EK79007 over 2-lane MIPI-DSI, backlight on GPIO31 (active high).
-  - Touch: GT911 on I2C GPIO45/46 (not used yet).
+  - Touch: GT911 on I2C0, SDA 45 / SCL 46 at 400 kHz, RST 40, INT 42 (INT has no pull-up, so it runs in polling mode). Verified at address 0x5D, product ID "911". The axes need no swap or mirror (knobs at the top of `main/touch.c`).
   - TF card: SDMMC slot 0, 1-bit only: CLK 43, CMD 44, D0 39.
   - ESP32-C6 Wi-Fi: SDIO slot 1, 4-bit: CLK 18, CMD 19, D0–D3 17/16/15/14, reset GPIO32. Elecrow's lesson configs say 54, which is wrong.
 - Boot order matters:

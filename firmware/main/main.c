@@ -9,6 +9,8 @@
 
 #include "display.h"
 #include "sdcard.h"
+#include "touch.h"
+#include "ui.h"
 #include "usb.h"
 #include "wifi.h"
 
@@ -53,20 +55,34 @@ void app_main(void)
     char sd_text[64];
     sdcard_mount(sd_text, sizeof(sd_text));
 
-    esp_err_t err = display_init();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "display_init: %s", esp_err_to_name(err));
+    lv_display_t *disp = NULL;
+    esp_err_t err = display_init(&disp);
+    if (err == ESP_OK) {
+        err = ui_init(disp);
     }
-    display_set_sd_text(sd_text);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "display/ui init: %s", esp_err_to_name(err));
+    }
+    ui_set_sd_text(sd_text);
 
-    err = wifi_start(display_set_wifi_text);
+    // Touch needs the LVGL display, and its failure must not stop boot.
+    err = disp ? touch_init(disp) : ESP_ERR_INVALID_STATE;
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "touch_init: %s", esp_err_to_name(err));
+    }
+    ui_set_touch_text(err == ESP_OK ? "Touch: ready" : "Touch: FAILED");
+
+    err = wifi_start(ui_set_wifi_text);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "wifi_start: %s", esp_err_to_name(err));
     }
 
     // wifi_start releases the filesystem after reading wifi.txt, even when it fails.
-    err = usb_msc_start(display_set_usb_text);
+    err = usb_msc_start(ui_set_usb_text);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "usb_msc_start: %s", esp_err_to_name(err));
     }
+
+    ESP_LOGI(TAG, "boot done, min free internal heap %u bytes",
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
 }
