@@ -52,3 +52,7 @@ CONFIG_TINYUSB_DESC_PRODUCT_STRING="watchdeck"
 CONFIG_TINYUSB_DESC_MSC_STRING="watchdeck"
 # Empty: esp_tinyusb derives the serial number from the eFuse MAC.
 CONFIG_TINYUSB_DESC_SERIAL_STRING=""
+
+# cJSON recursion depth. The deepest legitimate message nests 4 levels; the default of 1000
+# would overflow the link task stack on a hostile frame.
+CONFIG_CJSON_NESTING_LIMIT=8

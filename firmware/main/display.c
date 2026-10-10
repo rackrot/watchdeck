@@ -11,8 +11,6 @@
 #include "lvgl.h"
 
 #define BACKLIGHT_GPIO 31 // active high into the boost EN (10K pull-down)
-#define LCD_H_RES 1024
-#define LCD_V_RES 600
 // LVGL RGB565 is little-endian in memory, which is what the DPI framebuffer expects.
 // Set to 1 if red and blue or the colors look wrong.
 #define LVGL_SWAP_BYTES 0
@@ -37,8 +35,8 @@ static esp_err_t panel_init(esp_lcd_panel_io_handle_t *io, esp_lcd_panel_handle_
         .num_fbs = 1,
         .video_timing =
             {
-                .h_size = LCD_H_RES,
-                .v_size = LCD_V_RES,
+                .h_size = DISPLAY_H_RES,
+                .v_size = DISPLAY_V_RES,
                 .hsync_pulse_width = 70,
                 .hsync_back_porch = 160,
                 .hsync_front_porch = 160,
@@ -81,10 +79,10 @@ esp_err_t display_init(lv_display_t **out_disp)
     const lvgl_port_display_cfg_t disp_cfg = {
         .io_handle = io,
         .panel_handle = panel,
-        .buffer_size = LCD_H_RES * 50,
+        .buffer_size = DISPLAY_H_RES * 50,
         .double_buffer = true,
-        .hres = LCD_H_RES,
-        .vres = LCD_V_RES,
+        .hres = DISPLAY_H_RES,
+        .vres = DISPLAY_V_RES,
         .color_format = LV_COLOR_FORMAT_RGB565,
         .flags =
             {

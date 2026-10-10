@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "display.h"
 #include "esp_app_desc.h"
 #include "esp_check.h"
 #include "esp_event.h"
@@ -27,8 +28,6 @@
 #define SEND_TIMEOUT_MS 2000
 #define PING_INTERVAL_S 10
 #define PINGPONG_TIMEOUT_S 25
-#define SCREEN_W 1024
-#define SCREEN_H 600
 #define WS_OP_TEXT 0x1
 
 static const char *TAG = "link";
@@ -120,7 +119,9 @@ static bool post(const link_ev_t *ev)
 
 static void on_ws_data(const esp_websocket_event_data_t *d, uint32_t gen)
 {
-    if (d->op_code != WS_OP_TEXT) { // PING and PONG payloads arrive as DATA too
+    // PING and PONG payloads arrive as DATA too. Fragmented text messages (continuation
+    // op_code 0) are dropped on purpose, since the protocol uses single frames.
+    if (d->op_code != WS_OP_TEXT) {
         if (d->op_code == 0x2) {
             ESP_LOGW(TAG, "ignoring binary frame (%d bytes)", d->payload_len);
         }
@@ -128,8 +129,10 @@ static void on_ws_data(const esp_websocket_event_data_t *d, uint32_t gen)
     }
     link_ev_t bad = {.type = EV_WS_BAD, .gen = gen};
     if (d->payload_len > PROTO_MAX_MSG) {
-        ESP_LOGE(TAG, "frame of %d bytes exceeds %d, closing", d->payload_len, PROTO_MAX_MSG);
-        post(&bad);
+        if (d->payload_offset == 0) { // later chunks of the same frame need no second close
+            ESP_LOGE(TAG, "frame of %d bytes exceeds %d, closing", d->payload_len, PROTO_MAX_MSG);
+            post(&bad);
+        }
         return;
     }
     if (d->payload_len == 0) {
@@ -360,7 +363,8 @@ static void send_hello(void)
     char device[PROTO_DEVICE_ID_LEN];
     proto_device_id(device, mac);
     char buf[160];
-    size_t len = proto_build_hello(buf, sizeof(buf), device, esp_app_get_description()->version, SCREEN_W, SCREEN_H);
+    size_t len =
+        proto_build_hello(buf, sizeof(buf), device, esp_app_get_description()->version, DISPLAY_H_RES, DISPLAY_V_RES);
     if (len == 0) {
         lost("hello does not fit");
         return;
