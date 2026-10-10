@@ -6,5 +6,7 @@ if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/sdkconfig.defaults.local")
     list(APPEND SDKCONFIG_DEFAULTS "sdkconfig.defaults.local")
 endif()
 
+set(PROJECT_VER "0.2.0")
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(watchdeck)

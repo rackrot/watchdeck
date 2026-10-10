@@ -8,6 +8,7 @@
 #include "nvs_flash.h"
 
 #include "display.h"
+#include "link.h"
 #include "sdcard.h"
 #include "touch.h"
 #include "ui.h"
@@ -75,6 +76,18 @@ void app_main(void)
     err = wifi_start(ui_set_wifi_text);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "wifi_start: %s", esp_err_to_name(err));
+    }
+
+    // The link waits for an IP itself, so it starts even if wifi_start failed.
+    const link_cbs_t link_cbs = {
+        .on_status = ui_set_daemon_text,
+        .on_layout = ui_apply_layout,
+        .on_down = ui_link_down,
+        .on_result = ui_show_result,
+    };
+    err = link_start(&link_cbs);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "link_start: %s", esp_err_to_name(err));
     }
 
     // wifi_start releases the filesystem after reading wifi.txt, even when it fails.
