@@ -180,6 +180,36 @@ async fn wrong_version_gets_an_error_then_close() {
 }
 
 #[tokio::test]
+async fn any_hello_with_a_wrong_version_gets_a_version_error() {
+    for hello in [
+        r#"{"t":"hello","v":2,"foo":1}"#,
+        r#"{"t":"hello","v":-1}"#,
+        r#"{"t":"hello","v":"1"}"#,
+    ] {
+        let (addr, _events) = start().await;
+        let mut c = connect(addr).await;
+        c.send(Ws::text(hello)).await.unwrap();
+        let Message::Error { code, .. } = recv(&mut c).await else {
+            panic!("expected error for {hello}")
+        };
+        assert_eq!(code, ErrorCode::Version, "{hello}");
+        expect_closed(&mut c).await;
+    }
+}
+
+#[tokio::test]
+async fn a_button_id_over_64_bytes_gets_bad_request_then_close() {
+    let (addr, _events) = start().await;
+    let mut c = handshake(addr, DEVICE).await;
+    c.send(press(&"a".repeat(65), 1)).await.unwrap();
+    let Message::Error { code, .. } = recv(&mut c).await else {
+        panic!("expected error")
+    };
+    assert_eq!(code, ErrorCode::BadRequest);
+    expect_closed(&mut c).await;
+}
+
+#[tokio::test]
 async fn malformed_hello_gets_bad_request_then_close() {
     let (addr, _events) = start().await;
     let mut c = connect(addr).await;

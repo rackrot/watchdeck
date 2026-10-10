@@ -23,6 +23,8 @@ use super::protocol::{ErrorCode, Message, MAX_MESSAGE_BYTES, VERSION};
 pub const PORT: u16 = 47820;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_BUTTON_ID_BYTES: usize = 64;
 
 type Ws = WebSocketStream<TcpStream>;
 type WsSink = SplitSink<Ws, WsMessage>;
@@ -148,6 +150,8 @@ async fn handle(stream: TcpStream, peer: SocketAddr, shared: Arc<Shared>) {
 enum Incoming {
     Msg(Message),
     BadRequest(String),
+    /// A hello with a `v` other than 1 that may not parse as a full [`Message::Hello`].
+    BadVersion(String),
     Closed,
     Idle,
     Failed(WsError),
@@ -167,7 +171,10 @@ async fn next_message(rx: &mut WsRead) -> Incoming {
             WsMessage::Text(text) => {
                 return match serde_json::from_str(text.as_str()) {
                     Ok(msg) => Incoming::Msg(msg),
-                    Err(e) => Incoming::BadRequest(e.to_string()),
+                    Err(e) => match hello_version_mismatch(text.as_str()) {
+                        Some(reason) => Incoming::BadVersion(reason),
+                        None => Incoming::BadRequest(e.to_string()),
+                    },
                 }
             }
             WsMessage::Close(_) => return Incoming::Closed,
@@ -179,9 +186,16 @@ async fn next_message(rx: &mut WsRead) -> Incoming {
     }
 }
 
+/// Sends one message. A peer that stops reading ends the session instead of parking it.
 async fn send(tx: &mut WsSink, msg: &Message) -> Result<(), WsError> {
     let json = serde_json::to_string(msg).expect("protocol messages serialize");
-    tx.send(WsMessage::text(json)).await
+    match timeout(WRITE_TIMEOUT, tx.send(WsMessage::text(json))).await {
+        Ok(sent) => sent,
+        Err(_) => Err(WsError::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("send timed out after {WRITE_TIMEOUT:?}"),
+        ))),
+    }
 }
 
 async fn send_error(tx: &mut WsSink, code: ErrorCode, msg: String) -> Result<(), WsError> {
@@ -189,9 +203,21 @@ async fn send_error(tx: &mut WsSink, code: ErrorCode, msg: String) -> Result<(),
 }
 
 async fn close(tx: &mut WsSink) {
-    if let Err(e) = tx.close().await {
-        log::debug!("close: {e}");
+    match timeout(WRITE_TIMEOUT, tx.close()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log::debug!("close: {e}"),
+        Err(_) => log::warn!("close timed out after {WRITE_TIMEOUT:?}"),
     }
+}
+
+/// `Some(reason)` when `text` is a hello whose `v` is not exactly 1, whatever else is wrong with it.
+fn hello_version_mismatch(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    if value.get("t")? != "hello" {
+        return None;
+    }
+    let v = value.get("v")?;
+    (*v != VERSION).then(|| format!("unsupported protocol version {v}"))
 }
 
 fn valid_device_id(device: &str) -> bool {
@@ -252,6 +278,11 @@ async fn session(stream: TcpStream, shared: &Shared) -> Result<(), WsError> {
             close(&mut tx).await;
             return Ok(());
         }
+        Incoming::BadVersion(msg) => {
+            send_error(&mut tx, ErrorCode::Version, msg).await?;
+            close(&mut tx).await;
+            return Ok(());
+        }
         Incoming::Msg(_) => {
             send_error(&mut tx, ErrorCode::BadRequest, "expected hello".into()).await?;
             close(&mut tx).await;
@@ -301,6 +332,11 @@ async fn serve(
             incoming = next_message(rx) => incoming,
         };
         match incoming {
+            Incoming::Msg(Message::Press { btn, .. }) if btn.len() > MAX_BUTTON_ID_BYTES => {
+                // The result echoes the id, which must keep it under the device's 16 KB cap.
+                send_error(tx, ErrorCode::BadRequest, "button id too long".into()).await?;
+                return Ok(());
+            }
             Incoming::Msg(Message::Press { btn, seq }) => {
                 let result = if buttons.iter().any(|b| b.id == btn) {
                     (shared.runner)(btn.clone(), device.to_string()).await
@@ -329,7 +365,7 @@ async fn serve(
                 log::warn!("{device}: ignoring unknown message type")
             }
             Incoming::Msg(other) => log::warn!("{device}: ignoring unexpected message {other:?}"),
-            Incoming::BadRequest(msg) => {
+            Incoming::BadRequest(msg) | Incoming::BadVersion(msg) => {
                 send_error(tx, ErrorCode::BadRequest, msg).await?;
                 return Ok(());
             }
