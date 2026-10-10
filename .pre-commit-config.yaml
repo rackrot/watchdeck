@@ -1,0 +1,87 @@
+# Local hooks run the mise-pinned binaries; run via `mise run lint` (or with mise activated).
+exclude: ^(app/src-tauri/(gen|icons)/|firmware/(build/|managed_components/|sdkconfig(\.old)?$)|site/book/)
+
+repos:
+  - repo: builtin
+    hooks:
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+
+  - repo: local
+    hooks:
+      - id: gitleaks
+        name: gitleaks
+        language: system
+        entry: gitleaks git --staged --redact --no-banner
+        pass_filenames: false
+        always_run: true
+
+      - id: typos
+        name: typos
+        language: system
+        entry: typos
+        exclude: ^app/pnpm-lock\.yaml$
+
+      - id: biome
+        name: biome check
+        language: system
+        entry: sh -c 'cd app && biome check .'
+        files: ^app/.*\.(ts|tsx|js|jsx|json|css|html)$
+        pass_filenames: false
+
+      - id: cargo-fmt
+        name: cargo fmt
+        language: system
+        entry: cargo fmt --manifest-path app/src-tauri/Cargo.toml --check
+        files: ^app/src-tauri/.*\.rs$
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        language: system
+        entry: cargo clippy --manifest-path app/src-tauri/Cargo.toml -- -D warnings
+        files: ^app/src-tauri/.*\.rs$
+        pass_filenames: false
+
+      - id: clang-format
+        name: clang-format
+        language: system
+        entry: clang-format --dry-run -Werror
+        files: ^firmware/.*\.(c|h)$
+
+      - id: rumdl
+        name: rumdl
+        language: system
+        entry: rumdl check
+        files: \.md$
+
+      - id: taplo
+        name: taplo
+        language: system
+        entry: taplo fmt --check
+        files: \.toml$
+
+      - id: yamllint
+        name: yamllint
+        language: system
+        entry: yamllint --strict
+        files: \.ya?ml$
+
+      - id: actionlint
+        name: actionlint
+        language: system
+        entry: actionlint
+        files: ^\.github/workflows/.*\.ya?ml$
+
+      - id: zizmor
+        name: zizmor
+        language: system
+        entry: zizmor
+        files: ^\.github/(workflows|actions)/.*\.ya?ml$
+
+      - id: shellcheck
+        name: shellcheck
+        language: system
+        entry: shellcheck
+        files: \.sh$

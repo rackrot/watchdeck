@@ -1,0 +1,9 @@
+[book]
+title = "watchdeck"
+authors = ["Buck Brady"]
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/rackrot/watchdeck"
+site-url = "/watchdeck/"

@@ -1,0 +1,11 @@
+extends: default
+ignore: |
+  app/pnpm-lock.yaml
+rules:
+  document-start: disable
+  line-length:
+    max: 120
+  comments:
+    min-spaces-from-content: 1
+  truthy:
+    check-keys: false # GitHub Actions uses `on:`

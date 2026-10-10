@@ -1,0 +1,14 @@
+CONFIG_IDF_TARGET="esp32p4"
+
+# Flash: 16 MB
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# PSRAM: 32 MB on ESP32-P4NRW32
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_SPEED_200M=y
+
+# Chip revision. ESP-IDF v6.x targets P4 silicon v3.x by default, but this
+# CrowPanel reports v1.3 (`esptool chip-id`), so build for <v3. A v3.x board
+# would drop this line (or set CONFIG_ESP32P4_REV_MIN_300=y) and rebuild from
+# a clean sdkconfig.
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y

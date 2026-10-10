@@ -1,0 +1,7 @@
+exclude = [
+  "app/node_modules/**",
+  "app/src-tauri/target/**",
+  "site/book/**",
+  "firmware/build/**",
+  "firmware/managed_components/**",
+]
