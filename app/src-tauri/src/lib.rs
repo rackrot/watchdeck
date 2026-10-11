@@ -1,5 +1,6 @@
 mod commands;
 pub mod daemon;
+mod tray;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -12,19 +13,52 @@ use daemon::secrets::Secrets;
 use daemon::server::{Server, PORT};
 use daemon::store::Store;
 use daemon::tls::Identity;
-use tauri::{Emitter, Manager};
+use tauri::{Emitter, Manager, WindowEvent};
+use tauri_plugin_log::{RotationStrategy, Target, TargetKind};
 use tokio::sync::{broadcast, watch};
 use tokio_rustls::rustls::crypto::aws_lc_rs;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     // The process's one rustls crypto provider, for any TLS user that doesn't name its own.
     aws_lc_rs::default_provider()
         .install_default()
         .expect("nothing installs a crypto provider before run()");
+    // Tauri's `tracing` feature stays off, so IPC bodies never reach the logs. Keep log lines
+    // free of tokens, codes and secret values.
+    let mut targets = vec![Target::new(TargetKind::LogDir { file_name: None })];
+    if cfg!(debug_assertions) {
+        targets.push(Target::new(TargetKind::Stdout));
+    }
     tauri::Builder::default()
+        // A second launch focuses the first one's window. Registered first, as the plugin asks.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            tray::show_window(app)
+        }))
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(log::LevelFilter::Info)
+                .clear_targets()
+                .targets(targets)
+                .max_file_size(1_000_000)
+                .rotation_strategy(RotationStrategy::KeepSome(3))
+                .build(),
+        )
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec![tray::HIDDEN_ARG]),
+        ))
         .plugin(tauri_plugin_opener::init())
+        // Closing the window hides it. The daemon and the device link keep running; Quit is in
+        // the tray menu.
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                if let Err(e) = window.hide() {
+                    log::warn!("hiding the window: {e}");
+                }
+            }
+        })
         .setup(|app| {
             let dir = app.path().app_config_dir()?;
             let identity = Identity::load_or_create(&dir)
@@ -52,6 +86,12 @@ pub fn run() {
             tauri::async_runtime::spawn(configs.clone().watch_files());
 
             let devices = server.devices();
+            // Subscribe before the tray reads its first status, so no device event slips between.
+            let mut events = server.subscribe();
+            let status_item = tray::build(app.handle(), &devices.list())?;
+            if !std::env::args().any(|a| a == tray::HIDDEN_ARG) {
+                tray::show_window(app.handle());
+            }
             let pairing = Pairing::new(
                 SocketAddr::from((Ipv4Addr::UNSPECIFIED, PAIR_PORT)),
                 PAIR_WINDOW,
@@ -76,7 +116,7 @@ pub fn run() {
             // The window refetches the device list on `devices-changed`, and the pairing
             // dialog follows `pairing`.
             let handle = app.handle().clone();
-            let mut events = server.subscribe();
+            let tray_devices = devices.clone();
             tauri::async_runtime::spawn(async move {
                 loop {
                     match events.recv().await {
@@ -88,6 +128,9 @@ pub fn run() {
                     }
                     if let Err(e) = handle.emit("devices-changed", ()) {
                         log::error!("emitting devices-changed: {e}");
+                    }
+                    if let Err(e) = status_item.set_text(tray::status_line(&tray_devices.list())) {
+                        log::error!("updating the tray status: {e}");
                     }
                 }
             });
