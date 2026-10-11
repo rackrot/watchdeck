@@ -224,6 +224,12 @@ static esp_err_t parse_layout(const cJSON *root, proto_layout_t *out)
         if (b->has_icon && !get_hex(item, "icon", b->icon, sizeof(b->icon))) {
             return ESP_ERR_INVALID_ARG;
         }
+        // Absent means false. A key must be a bool.
+        const cJSON *tile = cJSON_GetObjectItemCaseSensitive(item, "tile");
+        if (tile && !cJSON_IsBool(tile)) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        b->tile = cJSON_IsTrue(tile);
         out->n_buttons++;
     }
     return ESP_OK;
@@ -244,6 +250,20 @@ static esp_err_t parse_result(const cJSON *root, proto_result_t *out)
     get_str(root, "btn", out->btn, sizeof(out->btn), false); // optional, names the button on screen
     get_str(root, "summary", out->summary, sizeof(out->summary), false);
     get_str(root, "text", out->text, sizeof(out->text), false);
+    return ESP_OK;
+}
+
+static esp_err_t parse_tile(const cJSON *root, proto_tile_t *out)
+{
+    if (!get_str(root, "btn", out->btn, sizeof(out->btn), true) ||
+        !get_str(root, "text", out->text, sizeof(out->text), false)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    char state[8] = "";
+    get_str(root, "state", state, sizeof(state), false);
+    out->state = strcmp(state, "ok") == 0    ? PROTO_TILE_OK
+                 : strcmp(state, "bad") == 0 ? PROTO_TILE_BAD
+                                             : PROTO_TILE_UNKNOWN;
     return ESP_OK;
 }
 
@@ -324,6 +344,9 @@ esp_err_t proto_parse(const char *json, size_t len, proto_msg_t *out)
     } else if (strcmp(t, "result") == 0) {
         out->type = PROTO_MSG_RESULT;
         err = parse_result(root, &out->result);
+    } else if (strcmp(t, "tile") == 0) {
+        out->type = PROTO_MSG_TILE;
+        err = parse_tile(root, &out->tile);
     } else if (strcmp(t, "pair_offer") == 0) {
         out->type = PROTO_MSG_PAIR_OFFER;
         err = parse_pair_offer(root, &out->pair_offer);

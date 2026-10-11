@@ -13,10 +13,13 @@ use std::time::Instant;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::config::Action;
-use super::secrets::Secrets;
+use super::secrets::{Secret, Secrets};
 
 /// At most this many actions run at once, across all devices.
 pub const MAX_RUNNING: usize = 8;
+/// Tile polls take at most this many of those, so a press always finds two free.
+pub const MAX_TILE_RUNNING: usize = 6;
+const TILE_PREFIX: &str = "tile:";
 /// The result text is the last 1 KB of output.
 const TEXT_BYTES: usize = 1024;
 const SUMMARY_BYTES: usize = 96;
@@ -44,6 +47,50 @@ impl ActionResult {
             text: String::new(),
             ms: 0,
         }
+    }
+}
+
+/// A finished run with what a tile needs beyond the press text: the output as read, up to 64 KB
+/// per stream, which is neither redacted nor made printable, and what it takes to redact a
+/// value derived from it. A tile parses `raw` first and redacts what it picked, because
+/// [`ActionResult::text`] is redacted by literal match and an escaped echo (`\/`, `\u0041`)
+/// would pass that and then decode into the secret.
+pub struct Ran {
+    pub result: ActionResult,
+    raw: String,
+    /// The secrets the request carried.
+    secrets: Vec<Secret>,
+    /// The body was cut at 64 KB, so a secret may start at its very end.
+    cut: bool,
+}
+
+impl Ran {
+    #[cfg(test)]
+    pub(super) fn new(result: ActionResult, raw: &str, secrets: Vec<Secret>, cut: bool) -> Self {
+        Self {
+            result,
+            raw: raw.into(),
+            secrets,
+            cut,
+        }
+    }
+
+    fn of(result: ActionResult) -> Self {
+        Self {
+            result,
+            raw: String::new(),
+            secrets: Vec::new(),
+            cut: false,
+        }
+    }
+
+    pub fn raw(&self) -> &str {
+        &self.raw
+    }
+
+    /// `text` with every copy of a secret this run used blanked.
+    pub fn redact(&self, text: &str) -> String {
+        http::redact(text, &self.secrets, self.cut)
     }
 }
 
@@ -81,10 +128,32 @@ impl Actions {
         })))
     }
 
+    /// Claims the tile of button `id` for a poll. The key has a ':' that no button id can, so a
+    /// press never finds its button "already running" because of a poll, and the other way
+    /// round. At most [`MAX_TILE_RUNNING`] polls run at once, which leaves presses two slots.
+    pub fn start_tile(&self, id: &str) -> Result<Run, ActionResult> {
+        let mut running = self.0.running.lock().expect("running set poisoned");
+        let polling = running
+            .iter()
+            .filter(|k| k.starts_with(TILE_PREFIX))
+            .count();
+        if polling >= MAX_TILE_RUNNING {
+            return Err(ActionResult::failed(format!(
+                "busy: {MAX_TILE_RUNNING} tile polls are running"
+            )));
+        }
+        self.claim(&mut running, &format!("{TILE_PREFIX}{id}"))
+    }
+
     /// Claims `button` for a run, or says why it can't start: it is already running, or
     /// [`MAX_RUNNING`] actions are.
     pub fn start(&self, button: &str) -> Result<Run, ActionResult> {
         let mut running = self.0.running.lock().expect("running set poisoned");
+        self.claim(&mut running, button)
+    }
+
+    /// [`Actions::start`] with the running set already locked.
+    fn claim(&self, running: &mut HashSet<String>, button: &str) -> Result<Run, ActionResult> {
         if running.contains(button) {
             return Err(ActionResult::failed("already running"));
         }
@@ -102,10 +171,19 @@ impl Actions {
 
 impl Run {
     pub async fn run(self, action: &Action) -> ActionResult {
+        self.execute(action).await.result
+    }
+
+    /// Like [`Run::run`], for a tile, which reads its value from the raw output.
+    pub async fn poll(self, action: &Action) -> Ran {
+        self.execute(action).await
+    }
+
+    async fn execute(self, action: &Action) -> Ran {
         let inner = &self.actions.0;
         let started = Instant::now();
-        let mut result = match action {
-            Action::Shell { argv, .. } => shell::run(argv, action.timeout(), &inner.cwd).await,
+        let mut ran = match action {
+            Action::Shell { argv, .. } => shell::ran(argv, action.timeout(), &inner.cwd).await,
             Action::Http {
                 method,
                 url,
@@ -122,11 +200,11 @@ impl Run {
                     secret_headers,
                     timeout: action.timeout(),
                 };
-                http::run(&inner.http, &inner.secrets, request).await
+                http::ran(&inner.http, &inner.secrets, request).await
             }
         };
-        result.ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
-        result
+        ran.result.ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+        ran
     }
 }
 
@@ -142,7 +220,7 @@ impl Drop for Run {
 
 /// `bytes` as text the device font can draw: printable ASCII and newlines. Tabs become spaces,
 /// carriage returns go, and anything else becomes `?`.
-fn printable(bytes: &[u8]) -> String {
+pub(super) fn printable(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes)
         .chars()
         .filter_map(|c| match c {

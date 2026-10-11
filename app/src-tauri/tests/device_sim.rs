@@ -33,7 +33,7 @@ use watchdeck_lib::daemon::actions::Actions;
 use watchdeck_lib::daemon::config::{self, Configs};
 use watchdeck_lib::daemon::pairing::{Pairing, PairingState};
 use watchdeck_lib::daemon::protocol::{
-    decode_hex, encode_hex, pairing_code, ErrorCode, IconFrame, Message, Token,
+    decode_hex, encode_hex, pairing_code, ErrorCode, IconFrame, Message, TileState, Token,
 };
 use watchdeck_lib::daemon::secrets::Secrets;
 use watchdeck_lib::daemon::server::{DaemonEvent, DeviceInfo, Devices, Server};
@@ -861,11 +861,46 @@ async fn wait_for_state(pairing: &Pairing, want: impl Fn(&PairingState) -> bool)
     state
 }
 
-async fn assert_port_closed(addr: SocketAddr) {
-    let err = TcpStream::connect(addr)
+/// `pairing` has no listener: it advertises no port, and nothing at `addr` offers to pair.
+///
+/// This doesn't insist that connecting is refused. The listener's port was ephemeral and is free
+/// once the listener drops, so a test running in parallel can bind it before this looks, and its
+/// connection would be accepted. Whatever holds the port then has to stay silent to a valid
+/// `pair_req`, which no pairing listener does.
+async fn assert_port_closed(pairing: &Pairing, addr: SocketAddr) {
+    assert_eq!(
+        *pairing.advertised().borrow(),
+        None,
+        "the pairing window still advertises a port"
+    );
+    let short = Duration::from_millis(500);
+    let Ok(Ok(tcp)) = tokio::time::timeout(short, TcpStream::connect(addr)).await else {
+        return; // refused, or nobody there
+    };
+    let Ok(Ok((mut ws, _))) =
+        tokio::time::timeout(short, client_async(format!("ws://{addr}/"), tcp)).await
+    else {
+        return; // not a WebSocket server
+    };
+    let commit: [u8; 32] = Sha256::digest([0x42u8; 32]).into();
+    let req = Message::PairReq {
+        v: 1,
+        device: OTHER.into(),
+        commit: encode_hex(&commit),
+    };
+    if ws
+        .send(Ws::text(serde_json::to_string(&req).unwrap()))
         .await
-        .expect_err("the pairing port must be closed");
-    assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+        .is_ok()
+    {
+        if let Ok(Some(Ok(Ws::Text(text)))) = tokio::time::timeout(short, ws.next()).await {
+            let offer = serde_json::from_str::<Message>(text.as_str());
+            assert!(
+                !matches!(offer, Ok(Message::PairOffer { .. })),
+                "a pairing listener is still answering at {addr}"
+            );
+        }
+    }
 }
 
 fn wrong(code: &str) -> String {
@@ -904,7 +939,7 @@ async fn pairing_stores_the_device_and_its_token_then_opens_a_session() {
             device: OTHER.into()
         }
     );
-    assert_port_closed(pair_addr).await;
+    assert_port_closed(&daemon.pairing, pair_addr).await;
 
     let ids: Vec<String> = daemon.devices.list().into_iter().map(|d| d.id).collect();
     assert_eq!(ids, [DEVICE, OTHER]);
@@ -933,7 +968,7 @@ async fn a_wrong_code_stores_nothing_and_ends_the_pairing() {
     })
     .await;
     assert!(matches!(state, PairingState::Failed { reason } if reason.contains("Wrong code")));
-    assert_port_closed(pair_addr).await;
+    assert_port_closed(&daemon.pairing, pair_addr).await;
     assert!(
         daemon.pairing.confirm(&code).is_err(),
         "one guess per window"
@@ -959,7 +994,7 @@ async fn cancel_tells_the_waiting_device_and_closes_the_port() {
     daemon.pairing.cancel().await;
     assert_eq!(recv(&mut ws).await, Message::PairResult { ok: false });
     assert_eq!(*daemon.pairing.subscribe().borrow(), PairingState::Closed);
-    assert_port_closed(pair_addr).await;
+    assert_port_closed(&daemon.pairing, pair_addr).await;
     assert_eq!(daemon.devices.list().len(), 1);
 }
 
@@ -1011,7 +1046,7 @@ async fn a_device_speaking_out_of_turn_at_the_code_ends_the_window() {
         matches!(&state, PairingState::Failed { reason } if reason.contains("unexpected message")),
         "{state:?}"
     );
-    assert_port_closed(pair_addr).await;
+    assert_port_closed(&daemon.pairing, pair_addr).await;
     assert!(daemon.pairing.confirm(&code).is_err());
     assert_eq!(daemon.devices.list().len(), 1);
 }
@@ -1024,7 +1059,7 @@ async fn the_pairing_port_is_open_only_while_the_dialog_is() {
     let daemon = start_with(pair_addr, Duration::from_secs(30), CONFIG).await;
     let mut advertised = daemon.pairing.advertised();
 
-    assert_port_closed(pair_addr).await;
+    assert_port_closed(&daemon.pairing, pair_addr).await;
     assert_eq!(*advertised.borrow_and_update(), None);
     assert!(
         daemon.pairing.confirm("123456").is_err(),
@@ -1036,7 +1071,7 @@ async fn the_pairing_port_is_open_only_while_the_dialog_is() {
     assert_eq!(*advertised.borrow_and_update(), Some(pair_addr.port()));
 
     daemon.pairing.cancel().await;
-    assert_port_closed(pair_addr).await;
+    assert_port_closed(&daemon.pairing, pair_addr).await;
     assert_eq!(*advertised.borrow_and_update(), None);
 }
 
@@ -1059,7 +1094,7 @@ async fn an_unused_pairing_window_closes_when_it_times_out() {
     assert!(waited >= Duration::from_secs(1), "{waited:?}");
     assert!(waited < Duration::from_secs(2), "{waited:?}");
     assert!(matches!(state, PairingState::Failed { reason } if reason.contains("in time")));
-    assert_port_closed(pair_addr).await;
+    assert_port_closed(&daemon.pairing, pair_addr).await;
 }
 
 #[tokio::test]
@@ -1650,4 +1685,274 @@ async fn a_binary_frame_from_the_device_is_a_bad_request() {
     };
     assert_eq!(code, ErrorCode::BadRequest);
     expect_closed(&mut c).await;
+}
+
+// ---- Tiles ----
+
+/// What a tile prints: `state` from the config dir, and a line in `polls` for each poll.
+const SHOW_STATE: &str = "echo poll >> polls; cat state";
+
+/// `up` has a tile that runs `script` every `every_s` seconds, and a press that rewrites `state`.
+/// `plain` has no tile. Shell actions run in the config dir.
+fn tile_config(every_s: u64, script: &str) -> String {
+    format!(
+        r#"
+version = 1
+[layout]
+cols = 5
+rows = 3
+
+[[button]]
+id = "up"
+pos = [0, 0]
+label = "Up"
+action = {{ kind = "shell", argv = ["sh", "-c", "echo pressed > state"] }}
+tile = {{ every_s = {every_s}, source = {{ kind = "shell", argv = ["sh", "-c", {script:?}] }} }}
+
+[[button]]
+id = "plain"
+pos = [1, 0]
+label = "Plain"
+action = {{ kind = "shell", argv = ["true"] }}
+"#
+    )
+}
+
+fn set_state(daemon: &Daemon, text: &str) {
+    fs::write(daemon.dir.path().join("state"), text).unwrap();
+}
+
+/// How many polls the `polls` file has recorded.
+fn polls(daemon: &Daemon) -> usize {
+    fs::read_to_string(daemon.dir.path().join("polls")).map_or(0, |text| text.lines().count())
+}
+
+/// The next message, which must arrive within `secs`.
+async fn recv_within(c: &mut Client, secs: u64) -> Message {
+    tokio::time::timeout(Duration::from_secs(secs), recv(c))
+        .await
+        .expect("no message in time")
+}
+
+async fn recv_tile(c: &mut Client, secs: u64) -> (String, String, TileState) {
+    match recv_within(c, secs).await {
+        Message::Tile { btn, text, state } => (btn, text, state),
+        other => panic!("expected a tile, got {other:?}"),
+    }
+}
+
+/// A device that has `welcome` and the layout, whose first tile is still to come.
+async fn tile_device(daemon: &Daemon) -> Client {
+    let mut c = handshake_without_layout(daemon.addr).await;
+    let Message::Layout { buttons, .. } = recv(&mut c).await else {
+        panic!("expected the layout")
+    };
+    assert_eq!(
+        buttons.iter().map(|b| b.tile).collect::<Vec<_>>(),
+        [true, false],
+        "only `up` has a tile"
+    );
+    c
+}
+
+fn tile(btn: &str, text: &str, state: TileState) -> (String, String, TileState) {
+    (btn.into(), text.into(), state)
+}
+
+#[tokio::test]
+async fn a_tile_value_reaches_the_device_and_only_changes_are_sent() {
+    let daemon = start_configured(&tile_config(2, SHOW_STATE)).await;
+    set_state(&daemon, "one\n");
+    let mut c = tile_device(&daemon).await;
+    assert_eq!(recv_tile(&mut c, 3).await, tile("up", "one", TileState::Ok));
+
+    // A poll that finds "one" again sends nothing: wait for one, then listen.
+    while polls(&daemon) < 2 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let heard = tokio::time::timeout(Duration::from_millis(500), recv(&mut c)).await;
+    assert!(
+        heard.is_err(),
+        "an unchanged value was sent again: {heard:?}"
+    );
+
+    set_state(&daemon, "two\n");
+    assert_eq!(recv_tile(&mut c, 6).await, tile("up", "two", TileState::Ok));
+}
+
+#[tokio::test]
+async fn a_failing_source_shows_bad_and_recovers_to_ok() {
+    let script = "if test -e flag; then echo UP; else echo DOWN; exit 1; fi";
+    let daemon = start_configured(&tile_config(2, script)).await;
+    let mut c = tile_device(&daemon).await;
+    assert_eq!(
+        recv_tile(&mut c, 3).await,
+        tile("up", "DOWN", TileState::Bad)
+    );
+    fs::write(daemon.dir.path().join("flag"), "").unwrap();
+    assert_eq!(recv_tile(&mut c, 6).await, tile("up", "UP", TileState::Ok));
+}
+
+#[tokio::test]
+async fn a_press_polls_its_tile_again_without_waiting_for_the_interval() {
+    // A day between polls, so only the press can explain a second value.
+    let daemon = start_configured(&tile_config(86_400, SHOW_STATE)).await;
+    set_state(&daemon, "one\n");
+    let mut c = tile_device(&daemon).await;
+    assert_eq!(recv_tile(&mut c, 3).await, tile("up", "one", TileState::Ok));
+
+    c.send(press("up", 1)).await.unwrap();
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        seen.push(recv_within(&mut c, 3).await);
+    }
+    assert!(
+        seen.iter().any(|m| matches!(
+            m,
+            Message::Result {
+                seq: 1,
+                ok: true,
+                ..
+            }
+        )),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter().any(|m| matches!(
+            m,
+            Message::Tile { btn, text, state: TileState::Ok } if btn == "up" && text == "pressed"
+        )),
+        "{seen:?}"
+    );
+    assert_eq!(polls(&daemon), 2);
+}
+
+#[tokio::test]
+async fn polling_stops_when_the_device_leaves_and_resumes_when_it_returns() {
+    let mut daemon = start_configured(&tile_config(2, SHOW_STATE)).await;
+    set_state(&daemon, "one\n");
+    let mut c = tile_device(&daemon).await;
+    assert_eq!(recv_tile(&mut c, 3).await, tile("up", "one", TileState::Ok));
+    while polls(&daemon) < 2 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    drop(c);
+    loop {
+        if daemon.events.recv().await.unwrap() == DaemonEvent::DeviceDisconnected(DEVICE.into()) {
+            break;
+        }
+    }
+    // A poll that was under way is cancelled; give it a moment to be gone.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let before = polls(&daemon);
+    tokio::time::sleep(Duration::from_millis(2600)).await;
+    assert_eq!(polls(&daemon), before, "polled with no device connected");
+
+    let mut c = tile_device(&daemon).await;
+    assert_eq!(recv_tile(&mut c, 3).await, tile("up", "one", TileState::Ok));
+    assert!(polls(&daemon) > before);
+}
+
+#[tokio::test]
+async fn a_revoked_session_gets_no_more_tiles() {
+    let daemon = start_configured(&tile_config(2, SHOW_STATE)).await;
+    set_state(&daemon, "one\n");
+    let mut c = tile_device(&daemon).await;
+    assert_eq!(recv_tile(&mut c, 3).await, tile("up", "one", TileState::Ok));
+
+    set_state(&daemon, "two\n");
+    assert!(daemon.devices.forget(DEVICE).unwrap());
+    let Message::Error { code, .. } = recv_within(&mut c, 3).await else {
+        panic!("a revoked session ends with unauthorized, not a tile")
+    };
+    assert_eq!(code, ErrorCode::Unauthorized);
+    expect_closed_unanswered_after_error(&mut c).await;
+
+    let before = polls(&daemon);
+    tokio::time::sleep(Duration::from_millis(2600)).await;
+    assert_eq!(polls(&daemon), before, "polled for a forgotten device");
+}
+
+/// After an `error`, the server may only close.
+async fn expect_closed_unanswered_after_error(c: &mut Client) {
+    loop {
+        match c.next().await {
+            None | Some(Err(_)) | Some(Ok(Ws::Close(_))) => return,
+            Some(Ok(Ws::Ping(_) | Ws::Pong(_))) => {}
+            Some(Ok(frame)) => panic!("expected the connection to end, got {frame:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_new_layout_sends_every_tile_again_and_a_tile_edit_needs_no_layout() {
+    let daemon = start_configured(&tile_config(2, SHOW_STATE)).await;
+    set_state(&daemon, "one\n");
+    let mut c = tile_device(&daemon).await;
+    assert_eq!(recv_tile(&mut c, 3).await, tile("up", "one", TileState::Ok));
+
+    // A new label rebuilds the device's grid, which blanks its tiles, so the value comes again.
+    let edited = tile_config(2, SHOW_STATE).replacen("Up", "Uptime", 1);
+    assert_eq!(daemon.reconfigure(&edited), Ok(true));
+    assert!(matches!(
+        recv_within(&mut c, 3).await,
+        Message::Layout { rev: 2, .. }
+    ));
+    assert_eq!(recv_tile(&mut c, 3).await, tile("up", "one", TileState::Ok));
+
+    // A new source for the same tile changes no layout, and the next message is its value.
+    let edited = tile_config(2, "echo other").replacen("Up", "Uptime", 1);
+    assert_eq!(daemon.reconfigure(&edited), Ok(true));
+    assert_eq!(
+        recv_tile(&mut c, 3).await,
+        tile("up", "other", TileState::Ok)
+    );
+
+    // A new label and a slow new source: the layout rebuilds the device's grid, and the old
+    // source's "other" must not be sent back into it while the new one is still running.
+    let edited = tile_config(2, "sleep 1; echo third").replacen("Up", "Upper", 1);
+    assert_eq!(daemon.reconfigure(&edited), Ok(true));
+    assert!(matches!(
+        recv_within(&mut c, 3).await,
+        Message::Layout { rev: 3, .. }
+    ));
+    assert_eq!(
+        recv_tile(&mut c, 4).await,
+        tile("up", "third", TileState::Ok)
+    );
+}
+
+#[tokio::test]
+async fn only_the_tile_that_changed_is_sent() {
+    let steady = r#"
+[[button]]
+id = "steady"
+pos = [2, 0]
+label = "Steady"
+action = { kind = "shell", argv = ["true"] }
+tile = { every_s = 2, source = { kind = "shell", argv = ["echo", "same"] } }
+"#;
+    let daemon = start_configured(&(tile_config(2, SHOW_STATE) + steady)).await;
+    set_state(&daemon, "one\n");
+    let mut c = handshake_without_layout(daemon.addr).await;
+    assert!(matches!(recv(&mut c).await, Message::Layout { .. }));
+    let mut first = vec![recv_tile(&mut c, 3).await, recv_tile(&mut c, 3).await];
+    first.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        first,
+        [
+            tile("steady", "same", TileState::Ok),
+            tile("up", "one", TileState::Ok)
+        ]
+    );
+
+    // "steady" is polled again too, and finds the same, so one change is one message.
+    set_state(&daemon, "two\n");
+    assert_eq!(recv_tile(&mut c, 6).await, tile("up", "two", TileState::Ok));
+    let heard = tokio::time::timeout(Duration::from_millis(700), recv(&mut c)).await;
+    assert!(
+        heard.is_err(),
+        "an unchanged tile was sent again: {heard:?}"
+    );
 }

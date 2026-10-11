@@ -29,6 +29,9 @@ pub const MAX_ROWS: u32 = 5;
 pub const MAX_ID_BYTES: usize = 63;
 pub const MAX_LABEL_BYTES: usize = 47;
 pub const MAX_TIMEOUT_S: u64 = 600;
+/// A tile polls at most this often, and at least this rarely (a day).
+pub const MIN_EVERY_S: u64 = 2;
+pub const MAX_EVERY_S: u64 = 24 * 60 * 60;
 const DEFAULT_TIMEOUT_S: u64 = 10;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_BODY_BYTES: usize = 64 * 1024;
@@ -90,6 +93,22 @@ pub struct ButtonConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
     pub action: Action,
+    /// Makes the button show a live value, polled from `source`. The tile table goes last
+    /// because TOML wants tables after plain values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tile: Option<TileConfig>,
+}
+
+/// A live value on a button: `source` runs every `every_s` seconds while a device is connected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TileConfig {
+    pub every_s: u64,
+    /// Picks the value out of the JSON the source prints or returns (RFC 6901, e.g. `/state`).
+    /// Without it the value is the first line of output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_pointer: Option<String>,
+    pub source: Action,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +237,7 @@ impl Live {
                 label: b.label.clone(),
                 bg: rgb(&b.bg),
                 fg: rgb(&b.fg),
+                tile: b.tile.is_some(),
                 icon: b.icon.as_ref().map(|name| {
                     let icon = self
                         .icons
@@ -315,7 +335,40 @@ impl Config {
             for problem in b.action.check(secrets) {
                 error(problem);
             }
+            if let Some(tile) = &b.tile {
+                for problem in tile.check(secrets) {
+                    error(problem);
+                }
+            }
         }
+        errors
+    }
+}
+
+impl TileConfig {
+    fn check(&self, secrets: &io::Result<Vec<String>>) -> Vec<String> {
+        let mut errors = Vec::new();
+        if !(MIN_EVERY_S..=MAX_EVERY_S).contains(&self.every_s) {
+            errors.push(format!(
+                "tile.every_s is {}, expected {MIN_EVERY_S} to {MAX_EVERY_S}",
+                self.every_s
+            ));
+        }
+        // "" names the whole document, which is never a short value; RFC 6901 pointers that
+        // select something start with '/'.
+        if self
+            .json_pointer
+            .as_deref()
+            .is_some_and(|p| !p.starts_with('/'))
+        {
+            errors.push("tile.json_pointer must start with '/', like \"/state\"".into());
+        }
+        errors.extend(
+            self.source
+                .check(secrets)
+                .into_iter()
+                .map(|problem| format!("tile.source: {problem}")),
+        );
         errors
     }
 }
@@ -687,7 +740,13 @@ impl Configs {
         self.live.send_if_modified(|live| {
             let changed = **live != next;
             if changed {
-                for b in next.buttons.iter().filter(|b| b.action.secrets_in_clear()) {
+                let sources = |b: &ButtonConfig| {
+                    [Some(&b.action), b.tile.as_ref().map(|t| &t.source)]
+                        .into_iter()
+                        .flatten()
+                        .any(Action::secrets_in_clear)
+                };
+                for b in next.buttons.iter().filter(|b| sources(b)) {
                     log::warn!(
                         "button {:?} sends secret headers over plain http, as insecure_http allows",
                         b.id
@@ -766,7 +825,7 @@ mod tests {
     use super::*;
     use crate::daemon::protocol::MAX_MESSAGE_BYTES;
 
-    /// The plan's example, without the icon and tile that S5 and S6 add.
+    /// The plan's example, without its icon and tile (`TILE` adds the tile).
     const EXAMPLE: &str = r##"
 version = 1
 [layout]
@@ -851,17 +910,135 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
             "unknown field `name`",
         );
         assert_refused(
-            &example_with(
-                "label = \"Plex\"",
-                "label = \"Plex\"\ntile = { every_s = 15 }",
-            ),
-            "tile",
+            &with_tile("every_s = 15, source = SHELL, extra = 1"),
+            "unknown field `extra`",
         );
+        assert_refused(&with_tile("every_s = 15"), "missing field `source`");
+        assert_refused(&with_tile("source = SHELL"), "missing field `every_s`");
         assert_refused(
             &example_with("timeout_s = 30", "timeout_s = 30, shell = true"),
             "shell",
         );
         assert_refused(&example_with("kind = \"shell\"", "kind = \"exec\""), "exec");
+    }
+
+    /// A shell source that prints a number.
+    const SHELL: &str = r#"{ kind = "shell", argv = ["uptime"] }"#;
+
+    /// The example with `tile = { <fields> }` on its first button, `SHELL` standing for the source.
+    fn with_tile(fields: &str) -> String {
+        example_with(
+            "label = \"Plex\"",
+            &format!(
+                "label = \"Plex\"\ntile = {{ {} }}",
+                fields.replace("SHELL", SHELL)
+            ),
+        )
+    }
+
+    #[test]
+    fn a_tile_with_a_shell_or_http_source_passes() {
+        let config = parse(&with_tile("every_s = 15, source = SHELL"), &names()).unwrap();
+        let tile = config.buttons[0].tile.as_ref().unwrap();
+        assert_eq!((tile.every_s, tile.json_pointer.as_deref()), (15, None));
+        assert!(config.buttons[1].tile.is_none());
+
+        let http = with_tile(
+            r#"every_s = 2, json_pointer = "/state",
+               source = { kind = "http", method = "GET", url = "https://ha.lan:8123/api/states/light.office",
+                          secret_headers = { Authorization = "ha" }, timeout_s = 5 }"#,
+        );
+        let config = parse(&http, &names()).unwrap();
+        let tile = config.buttons[0].tile.as_ref().unwrap();
+        assert_eq!(tile.json_pointer.as_deref(), Some("/state"));
+        assert_eq!(tile.source.timeout(), Duration::from_secs(5));
+
+        let layout = live(config).layout();
+        assert_eq!(
+            layout.buttons.iter().map(|b| b.tile).collect::<Vec<_>>(),
+            [true, false]
+        );
+    }
+
+    #[test]
+    fn a_tile_polls_every_2_s_to_a_day() {
+        for (every_s, ok) in [
+            (0, false),
+            (1, false),
+            (2, true),
+            (86_400, true),
+            (86_401, false),
+        ] {
+            let text = with_tile(&format!("every_s = {every_s}, source = SHELL"));
+            match parse(&text, &names()) {
+                Ok(_) => assert!(ok, "every_s = {every_s} must be refused"),
+                Err(errors) => {
+                    assert!(!ok, "every_s = {every_s}: {errors:?}");
+                    assert!(
+                        errors[0]
+                            .contains(&format!("tile.every_s is {every_s}, expected 2 to 86400")),
+                        "{errors:?}"
+                    );
+                }
+            }
+        }
+        assert_refused(&with_tile("every_s = -1, source = SHELL"), "invalid value");
+    }
+
+    #[test]
+    fn a_json_pointer_must_start_with_a_slash() {
+        for pointer in ["state", "", "#/state"] {
+            assert_refused(
+                &with_tile(&format!(
+                    "every_s = 5, json_pointer = {pointer:?}, source = SHELL"
+                )),
+                "tile.json_pointer must start with '/'",
+            );
+        }
+    }
+
+    #[test]
+    fn a_tile_source_obeys_every_action_rule() {
+        let refused = |source: &str, expected: &str| {
+            assert_refused(
+                &with_tile(&format!("every_s = 5, source = {source}")),
+                expected,
+            )
+        };
+        refused(
+            r#"{ kind = "shell", argv = [] }"#,
+            "tile.source: argv is empty",
+        );
+        refused(
+            r#"{ kind = "shell", argv = ["x"], timeout_s = 601 }"#,
+            "tile.source: timeout_s is 601",
+        );
+        refused(
+            r#"{ kind = "http", method = "GET", url = "ftp://h/" }"#,
+            "tile.source: url is not http:// or https://",
+        );
+        refused(
+            r#"{ kind = "http", method = "FETCH", url = "https://h/" }"#,
+            "tile.source: method",
+        );
+        refused(
+            r#"{ kind = "http", method = "GET", url = "https://h/", secret_headers = { Authorization = "nope" } }"#,
+            "tile.source: header \"Authorization\" uses secret \"nope\"",
+        );
+        refused(
+            r#"{ kind = "http", method = "GET", url = "http://nas.lan/", secret_headers = { Authorization = "ha" } }"#,
+            "tile.source: secret_headers would cross the network in the clear",
+        );
+        refused(r#"{ kind = "exec" }"#, "exec");
+        refused(r#"{ kind = "shell", argv = ["x"], shell = true }"#, "shell");
+        // The same rules apply when the daemon checks a config the window saves.
+        let errors = errors(&with_tile(
+            "every_s = 1, json_pointer = \"x\", source = SHELL",
+        ));
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors
+            .iter()
+            .all(|e| e.starts_with("button \"plex\": tile.")));
     }
 
     #[test]
@@ -1177,6 +1354,14 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
                     argv: vec!["true".into()],
                     timeout_s: 1,
                 },
+                tile: Some(TileConfig {
+                    every_s: MIN_EVERY_S,
+                    json_pointer: None,
+                    source: Action::Shell {
+                        argv: vec!["true".into()],
+                        timeout_s: 1,
+                    },
+                }),
             });
         }
         assert!(config.check(&Ok(Vec::new())).is_empty());
@@ -1535,6 +1720,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
             bg: "#000000".into(),
             fg: "#ffffff".into(),
             icon: None,
+            tile: None,
             action: Action::Http {
                 method: "POST".into(),
                 url: url.into(),
@@ -1546,9 +1732,13 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
             },
         };
         let mut config = configs.current().config.clone();
-        config
-            .buttons
-            .push(http("web", 1, "https://ha.lan/api", false));
+        let mut web = http("web", 1, "https://ha.lan/api", false);
+        web.tile = Some(TileConfig {
+            every_s: 30,
+            json_pointer: Some("/state".into()),
+            source: web.action.clone(),
+        });
+        config.buttons.push(web);
         config
             .buttons
             .push(http("lan", 2, "http://ha.lan/api", true));

@@ -33,6 +33,12 @@ void ui_link_down(void);
  */
 void ui_show_result(const proto_result_t *result);
 
+/**
+ * Show a tile's value on its button, in place, without rebuilding the grid: the text on one line and the button
+ * red for a bad state. Ignored for a button the grid doesn't have or that has no tile. Thread-safe.
+ */
+void ui_set_tile(const proto_tile_t *tile);
+
 /* The pairing views below are thread-safe and ignored before ui_init succeeds. */
 
 /** Paired: show the grid area and Forget pairing. Unpaired: show the pairable daemons. */

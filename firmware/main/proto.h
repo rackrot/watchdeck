@@ -18,6 +18,7 @@
 #define PROTO_NAME_MAX 48
 #define PROTO_TEXT_MAX 1025      // up to 1 KB of output plus NUL
 #define PROTO_SUMMARY_MAX 97     // a result's one-line summary, 96 characters plus NUL
+#define PROTO_TILE_MAX 65        // a tile's text, 64 characters plus NUL
 #define PROTO_DEVICE_ID_LEN 16   // "wd-" + 12 hex + NUL
 #define PROTO_FP_LEN 16          // hex digits of the daemon cert fingerprint in mDNS TXT "fp"
 #define PROTO_TOKEN_LEN 32       // bytes in the device token
@@ -35,6 +36,7 @@ typedef enum {
     PROTO_MSG_ERROR,
     PROTO_MSG_LAYOUT,
     PROTO_MSG_RESULT,
+    PROTO_MSG_TILE,
     PROTO_MSG_PAIR_OFFER,
     PROTO_MSG_PAIR_REVEAL,
     PROTO_MSG_PAIR_RESULT,
@@ -49,6 +51,7 @@ typedef struct {
     uint32_t fg;
     bool has_icon;
     uint8_t icon[PROTO_ICON_ID_LEN]; // valid when has_icon
+    bool tile;                       // shows a live value, sent as tile messages
 } proto_button_t;
 
 typedef struct {
@@ -68,6 +71,18 @@ typedef struct {
     char text[PROTO_TEXT_MAX];
     uint32_t ms;
 } proto_result_t;
+
+typedef enum {
+    PROTO_TILE_UNKNOWN, // any "state" but "ok" or "bad", and how a tile looks before its first update
+    PROTO_TILE_OK,
+    PROTO_TILE_BAD,
+} proto_tile_state_t;
+
+typedef struct {
+    char btn[PROTO_ID_MAX];
+    char text[PROTO_TILE_MAX]; // cut to fit; the daemon sends printable ASCII on one line
+    proto_tile_state_t state;
+} proto_tile_t;
 
 typedef struct {
     char name[PROTO_NAME_MAX]; // the daemon's host name, truncated, for display only
@@ -94,6 +109,7 @@ typedef struct {
         } error;
         proto_layout_t layout;
         proto_result_t result;
+        proto_tile_t tile;
         proto_pair_offer_t pair_offer;
         uint8_t n_host[PROTO_NONCE_LEN]; // PROTO_MSG_PAIR_REVEAL
         bool pair_ok;                    // PROTO_MSG_PAIR_RESULT

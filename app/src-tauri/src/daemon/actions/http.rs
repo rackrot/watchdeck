@@ -9,7 +9,7 @@ use std::time::Duration;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{redirect, Client, Method, StatusCode};
 
-use super::{excerpt, ActionResult};
+use super::{excerpt, ActionResult, Ran};
 use crate::daemon::secrets::{Secret, Secrets};
 
 const KEEP_BYTES: usize = 64 * 1024;
@@ -38,10 +38,15 @@ pub(super) fn client() -> reqwest::Result<Client> {
         .build()
 }
 
+#[cfg(test)]
 pub(super) async fn run(client: &Client, secrets: &Secrets, request: Request<'_>) -> ActionResult {
+    ran(client, secrets, request).await.result
+}
+
+pub(super) async fn ran(client: &Client, secrets: &Secrets, request: Request<'_>) -> Ran {
     let (mut headers, used) = match secret_headers(secrets, request.secret_headers) {
         Ok(found) => found,
-        Err(why) => return ActionResult::failed(why),
+        Err(why) => return Ran::of(ActionResult::failed(why)),
     };
     for (name, value) in request.headers {
         let name = HeaderName::from_bytes(name.as_bytes()).expect("header names are checked");
@@ -70,15 +75,22 @@ pub(super) async fn run(client: &Client, secrets: &Secrets, request: Request<'_>
         Ok::<_, reqwest::Error>((status, body, cut))
     };
     match tokio::time::timeout(request.timeout, exchange).await {
-        Err(_) => ActionResult::failed(format!("timed out after {} s", request.timeout.as_secs())),
+        Err(_) => Ran::of(ActionResult::failed(format!(
+            "timed out after {} s",
+            request.timeout.as_secs()
+        ))),
         // The URL stays out, in case it carries a token of its own.
-        Ok(Err(e)) => ActionResult::failed(format!("request failed: {}", causes(&e.without_url()))),
+        Ok(Err(e)) => Ran::of(ActionResult::failed(format!(
+            "request failed: {}",
+            causes(&e.without_url())
+        ))),
         Ok(Ok((status, body, cut))) => answered(status, &body, cut, &used),
     }
 }
 
-fn answered(status: StatusCode, body: &[u8], cut: bool, secrets: &[Secret]) -> ActionResult {
-    let text = redact(&String::from_utf8_lossy(body), secrets, cut);
+fn answered(status: StatusCode, body: &[u8], cut: bool, secrets: &[Secret]) -> Ran {
+    let raw = String::from_utf8_lossy(body).into_owned();
+    let text = redact(&raw, secrets, cut);
     let mut summary = format!("HTTP {}", status.as_u16());
     if status.is_redirection() {
         summary.push_str(", redirect not followed");
@@ -86,19 +98,24 @@ fn answered(status: StatusCode, body: &[u8], cut: bool, secrets: &[Secret]) -> A
     if cut {
         summary.push_str(", body cut at 64 KB");
     }
-    ActionResult {
-        ok: status.is_success(),
-        code: status.as_u16().into(),
-        summary,
-        text: excerpt(text.as_bytes()),
-        ms: 0,
+    Ran {
+        result: ActionResult {
+            ok: status.is_success(),
+            code: status.as_u16().into(),
+            summary,
+            text: excerpt(text.as_bytes()),
+            ms: 0,
+        },
+        raw,
+        secrets: secrets.to_vec(),
+        cut,
     }
 }
 
 /// `text` with each copy of a secret replaced by [`REDACTED`], overlapping copies as one. When the
 /// body was `cut`, a secret's start at the very end goes too, since the rest of it was never
 /// read. Secrets are printable ASCII, so every span starts and ends on a char boundary.
-fn redact(text: &str, secrets: &[Secret], cut: bool) -> String {
+pub(super) fn redact(text: &str, secrets: &[Secret], cut: bool) -> String {
     let mut spans = Vec::new();
     for secret in secrets.iter().map(Secret::expose) {
         let mut from = 0;

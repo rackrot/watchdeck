@@ -211,7 +211,8 @@ The daemon closes the connection after sending it. `code` is one of `version`, `
 ```json
 {"t":"layout","rev":1,"cols":5,"rows":3,"buttons":[
   {"id":"hello","col":0,"row":0,"label":"Hello","bg":2001125,"fg":16777215,"icon":"d95bd7f461bd7bc39755b97d11f8a270"},
-  {"id":"plain","col":1,"row":0,"label":"Plain","bg":0,"fg":16777215}
+  {"id":"plain","col":1,"row":0,"label":"Plain","bg":0,"fg":16777215},
+  {"id":"nas-load","col":2,"row":0,"label":"NAS load","bg":2001125,"fg":16777215,"tile":true}
 ]}
 ```
 
@@ -224,8 +225,9 @@ The daemon closes the connection after sending it. `code` is one of `version`, `
 | `buttons[].label` | string | Printable ASCII, at most 47 bytes |
 | `buttons[].bg`, `fg` | int | Colors as `0xRRGGBB` integers |
 | `buttons[].icon` | string | Optional. The icon's id as 32 lowercase hex digits. Absent for a button without one. A layout with any other value, `null` included, is refused |
+| `buttons[].tile` | bool | Optional, default `false`. `true` for a button that shows a live value, which arrives as [`tile`](#tile-daemon--device) messages. Any other type is refused |
 
-The daemon sends `layout` after `welcome`. When the user's config changes the grid, a button, a label, a color or a position, the daemon pushes a new `layout` on the same session, and the device replaces its grid without reconnecting. An edit that changes only actions sends nothing. Empty cells have no button. S6 adds `tile`.
+The daemon sends `layout` after `welcome`. When the user's config changes the grid, a button, a label, a color or a position, the daemon pushes a new `layout` on the same session, and the device replaces its grid without reconnecting. An edit that changes only actions sends nothing. Empty cells have no button. A layout that turns a tile on or off for a button counts as a change to a button.
 
 The layout carries only icon ids. The device keeps the icons it has, and asks for the rest with `icon_get`. A button without its icon yet shows its label alone and gains the picture when the frame arrives.
 
@@ -307,3 +309,26 @@ The daemon answers every press with exactly one `result`, including when nothing
 | `unknown button`, `already running`, `busy: 8 actions are running` | false | `-1` |
 
 The device shows the result in a modal over the grid: the button's label with OK or Failed, the summary and time, and the text. It closes at a tap, after 4 s when `ok`, or after 10 s when not. A result whose `seq` the device didn't send is ignored. `summary` arrived with S4, so a device that finds none shows the code instead.
+
+### `tile` (daemon → device)
+
+```json
+{"t":"tile","btn":"nas-load","text":"0.42","state":"ok"}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `btn` | string | The id of a button whose layout entry has `tile: true` |
+| `text` | string | The tile's value: one line of printable ASCII, at most 64 characters |
+| `state` | string | `ok` or `bad`. A device shows any other value, or none, as unknown |
+
+The daemon polls each tile only while at least one device has a session, and sends a `tile` when a tile's value or state differs from what it last sent on that session. So:
+
+- A session gets the current value of every tile that has one right after its `layout`, and again after each later `layout`, because a device rebuilds its grid for each layout and the new buttons start blank.
+- A tile that hasn't answered yet has sent nothing. The device shows it as unknown until its first `tile`.
+- A tile whose polls couldn't run (no action slot free, 3 times in a row) sends `bad` with the text `stale`. A device needs nothing special for it.
+- The daemon never sends a value that a tile's source produced before the config edit it has applied.
+- A `tile` for an unknown button, or a button without `tile`, is ignored.
+- A session that the daemon has revoked or replaced gets no more `tile` messages. See [Config](config.md#tiles) for what the value and the state mean.
+
+The device updates the button's text and color in place and doesn't rebuild the grid.

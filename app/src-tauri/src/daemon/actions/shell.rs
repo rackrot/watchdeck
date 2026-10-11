@@ -16,7 +16,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::time::{sleep_until, Instant};
 
-use super::{excerpt, ActionResult};
+use super::{excerpt, ActionResult, Ran};
 
 /// From SIGTERM to SIGKILL.
 const KILL_GRACE: Duration = Duration::from_secs(2);
@@ -64,7 +64,12 @@ impl Phase {
     }
 }
 
+#[cfg(test)]
 pub(super) async fn run(argv: &[String], timeout: Duration, cwd: &Path) -> ActionResult {
+    ran(argv, timeout, cwd).await.result
+}
+
+pub(super) async fn ran(argv: &[String], timeout: Duration, cwd: &Path) -> Ran {
     let (program, args) = argv.split_first().expect("argv is checked to be non-empty");
     let mut child = match Command::new(program)
         .args(args)
@@ -76,7 +81,11 @@ pub(super) async fn run(argv: &[String], timeout: Duration, cwd: &Path) -> Actio
         .spawn()
     {
         Ok(child) => child,
-        Err(e) => return ActionResult::failed(format!("could not start {program}: {e}")),
+        Err(e) => {
+            return Ran::of(ActionResult::failed(format!(
+                "could not start {program}: {e}"
+            )))
+        }
     };
     let pid = child.id().expect("a child not yet waited on has a pid");
     // Declared after the child so it drops first, while the leader is still unreaped.
@@ -111,7 +120,7 @@ pub(super) async fn run(argv: &[String], timeout: Duration, cwd: &Path) -> Actio
                     phase = Phase::Exited { status, until: Instant::now() + DRAIN_GRACE };
                 }
                 // Whether the leader lives is unknown, so `group` kills the group on the way out.
-                Err(e) => return ActionResult::failed(format!("lost track of {program}: {e}")),
+                Err(e) => return Ran::of(ActionResult::failed(format!("lost track of {program}: {e}"))),
             },
             () = sleep_until(phase.deadline()) => match phase {
                 Phase::Running { .. } => {
@@ -147,12 +156,17 @@ pub(super) async fn run(argv: &[String], timeout: Duration, cwd: &Path) -> Actio
             }
         }
     };
-    ActionResult {
-        ok,
-        code,
-        summary,
-        text: excerpt(&output),
-        ms: 0,
+    Ran {
+        result: ActionResult {
+            ok,
+            code,
+            summary,
+            text: excerpt(&output),
+            ms: 0,
+        },
+        raw: String::from_utf8_lossy(&output).into_owned(),
+        secrets: Vec::new(),
+        cut: false,
     }
 }
 

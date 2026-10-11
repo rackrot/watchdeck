@@ -25,6 +25,7 @@ id = "disk"
 pos = [1, 0]
 label = "Disk"
 action = { kind = "shell", argv = ["sh", "-c", "df -h / | tail -n 1"] }
+tile = { every_s = 30, source = { kind = "shell", argv = ["sh", "-c", "df --output=pcent / | tail -n 1"] } }
 
 [[button]]
 id = "office-light"
@@ -38,9 +39,19 @@ url = "https://ha.lan:8123/api/services/light/toggle"
 body = '{"entity_id":"light.office"}'
 headers = { "Content-Type" = "application/json" }
 secret_headers = { Authorization = "ha" }
+
+[button.tile]
+every_s = 15
+json_pointer = "/state"
+
+[button.tile.source]
+kind = "http"
+method = "GET"
+url = "https://ha.lan:8123/api/states/light.office"
+secret_headers = { Authorization = "ha" }
 ```
 
-The last button needs a secret named `ha`; see [Secrets](#secrets).
+The Disk button shows how full `/` is, and the Office button shows whether the light is `on` or `off`; see [Tiles](#tiles). The last button needs a secret named `ha`; see [Secrets](#secrets).
 
 ## Changing the config
 
@@ -76,8 +87,9 @@ Each `[[button]]` table is one cell.
 | `fg` | no | Label color as `#rrggbb`. Default `#ffffff` |
 | `icon` | no | A picture in the `icons/` folder, such as `"3f2a9c1d0e44.png"`; see [Icons](#icons) |
 | `action` | yes | A shell or HTTP action, below |
+| `tile` | no | Makes the button show a live value; see [Tiles](#tiles) |
 
-Unknown keys are errors, so a misspelled key is caught rather than ignored. Live tiles aren't supported yet.
+Unknown keys are errors, so a misspelled key is caught rather than ignored.
 
 ## Icons
 
@@ -144,6 +156,40 @@ To add one, either copy the file into `icons/` yourself (make the folder if it's
 The app refuses a button whose `secret_headers` would go over `http://` to another machine. Over plain http, anyone on the network path can read the header. So can anyone who answers for the host name first, which is easy on a LAN, above all for `.local` names. Use `https://`, or a URL on this machine (`localhost`, `127.0.0.1` or `[::1]`), which needs no setting.
 
 To send them anyway, set `insecure_http = true` on the action. The app then logs a warning whenever a config with that button goes live.
+
+## Tiles
+
+A tile puts a live value on a button, such as a load average, a disk percentage or whether a service is up. Pressing the button still runs its `action`. The tile has its own `source`, which can be any shell or HTTP action:
+
+| Key | Required | Rule |
+|---|---|---|
+| `every_s` | yes | Seconds between polls, 2 to 86400 |
+| `json_pointer` | no | An [RFC 6901](https://www.rfc-editor.org/rfc/rfc6901) pointer such as `/state` or `/attributes/brightness`. It must start with `/` |
+| `source` | yes | A shell or HTTP action, with the keys above. Its `timeout_s` applies to each poll. A source that sends secret headers over plain http needs `insecure_http`, as for any action |
+
+### When it polls
+
+- Only while a device is connected. With no device there are no polls and no traffic. When the first device connects, every tile polls at once. When the last one leaves, polling stops and a poll under way is cancelled.
+- A tile never starts a poll less than 2 s after its previous poll began, whatever asks for one: a press, a device that connects and drops again, or a short `every_s`. The app remembers when each tile last polled across those stops and starts. Editing a tile is the exception and polls at once.
+- Each tile has one poll at a time. The next waits `every_s` seconds after the previous one ends, so a slow source stretches the interval instead of piling up.
+- A press of the button polls its tile again once the press has finished, because the press probably changed what it shows, and once the 2 s above are up. A press that is refused ("already running", "busy") does not.
+- Polls share the 8 action slots with presses, but at most 6 tile polls run at once, so a press always finds 2 slots free. A poll that gets no slot is skipped and tried again after `every_s`. After 3 skipped polls in a row the tile shows `stale` in red, instead of an old value that may no longer be true, until a poll runs. A poll and a press of the same button don't block each other.
+- Editing a tile restarts it with a poll at once, and the first value from the new source replaces what the old one showed. A device never gets a value that the old source produced once the app has applied the edit.
+
+### What it shows
+
+- A good poll (exit 0, or a 2xx reply) shows its value. Without `json_pointer` that is the first line of output that isn't blank. With it, the output is read as JSON and the value is the string, number or boolean at the pointer. The pointer reads the output as it came, so keys with non-ASCII characters match. A missing pointer, a `null`, an object or an array, or output that isn't JSON, is a bad poll. A good poll with no value shows `ok`.
+- A bad poll shows what went wrong: for a shell source its first line of output if it printed one, so a check can print `DOWN` and exit 1, and otherwise the summary (`exit 3`, `HTTP 503`, `timed out after 10 s`). For an HTTP source it is always the summary, never the reply.
+- The text is one line of printable ASCII, cut at 64 characters. Other characters show as `?`. The device shows what fits and ends a longer value in dots.
+- A shell source's output is its stdout followed by its stderr, and the app reads at most the last 64 KB of it. So a `json_pointer` over a command that writes progress to stderr, such as `curl`'s progress meter, finds the output isn't JSON. Use `curl -s`, or `2>/dev/null`. An HTTP reply is read up to 64 KB, and a JSON body longer than that doesn't parse.
+- Secrets in a reply show as `<secret>`, as for any HTTP action. That includes a secret the reply escaped (`\/` or `\u0041`) which the pointer then decodes: the app blanks the picked value against the secrets the request used, before it goes to the device or the log.
+
+### How the device draws it
+
+- The label shrinks to one line and the value goes under it.
+- A tile is grey until its first value arrives, then keeps the button's `bg` while polls are good and turns red while they are bad. If the app goes away, the grid greys out with the rest of the screen.
+- A button with an icon and a tile on a grid of 4 or 5 rows has room for the icon and the value only, so its label is hidden. On 1 to 3 rows it keeps its label.
+- The app logs a line at info level whenever a tile's value changes, and when polling starts and stops.
 
 ## Secrets
 

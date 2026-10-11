@@ -85,6 +85,7 @@ void app_main(void)
         .on_icon = ui_set_icon,
         .on_down = ui_link_down,
         .on_result = ui_show_result,
+        .on_tile = ui_set_tile,
         .on_paired = ui_set_paired,
         .on_daemons = ui_show_daemons,
         .on_pair_code = ui_show_pair_code,

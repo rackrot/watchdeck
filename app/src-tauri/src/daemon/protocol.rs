@@ -50,6 +50,18 @@ pub struct Button {
     /// The icon's id as 32 lowercase hex digits, absent for a button without one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    /// The button shows a live value, which arrives as `tile` messages.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tile: bool,
+}
+
+/// How a tile's last poll went, which the device shows as a color. A device treats any other
+/// string as unknown, which is also how a tile looks before its first update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TileState {
+    Ok,
+    Bad,
 }
 
 /// A device's token as sent in `hello`: 64 lowercase hex digits. Debug never prints it.
@@ -107,6 +119,12 @@ pub enum Message {
         summary: String,
         text: String,
         ms: u64,
+    },
+    /// A tile's current value, for a button whose layout entry has `tile`.
+    Tile {
+        btn: String,
+        text: String,
+        state: TileState,
     },
     PairReq {
         v: u32,
@@ -311,7 +329,7 @@ mod tests {
     use serde_json::Value;
 
     // The fixtures are the JSON examples from site/src/protocol.md.
-    const FIXTURES: [&str; 12] = [
+    const FIXTURES: [&str; 13] = [
         include_str!("../../tests/fixtures/hello.json"),
         include_str!("../../tests/fixtures/welcome.json"),
         include_str!("../../tests/fixtures/error.json"),
@@ -319,6 +337,7 @@ mod tests {
         include_str!("../../tests/fixtures/icon_get.json"),
         include_str!("../../tests/fixtures/press.json"),
         include_str!("../../tests/fixtures/result.json"),
+        include_str!("../../tests/fixtures/tile.json"),
         include_str!("../../tests/fixtures/pair_req.json"),
         include_str!("../../tests/fixtures/pair_offer.json"),
         include_str!("../../tests/fixtures/pair_nonce.json"),
@@ -351,7 +370,7 @@ mod tests {
 
     #[test]
     fn unknown_type_parses_as_unknown() {
-        let msg: Message = serde_json::from_str(r#"{"t":"tile","btn":"a","text":"1"}"#).unwrap();
+        let msg: Message = serde_json::from_str(r#"{"t":"gauge","btn":"a","text":"1"}"#).unwrap();
         assert_eq!(msg, Message::Unknown);
     }
 

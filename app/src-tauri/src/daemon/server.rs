@@ -23,12 +23,13 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message as WsMessage};
 use tokio_tungstenite::{accept_async_with_config, WebSocketStream};
 
 use super::actions::{ActionResult, Actions, MAX_RUNNING};
-use super::config::{Live, MAX_COLS, MAX_ROWS};
+use super::config::{Layout, Live, MAX_COLS, MAX_ROWS};
 use super::protocol::{
     decode_hex, encode_hex, valid_device_id, ErrorCode, Message, Token, ICON_ID_BYTES,
     MAX_MESSAGE_BYTES, TOKEN_BYTES, VERSION,
 };
 use super::store::Store;
+use super::tiles::{self, Sent, Tiles, Values};
 
 pub const PORT: u16 = 47820;
 /// From the TCP accept to the hello, covering the TLS handshake and the WebSocket upgrade.
@@ -88,6 +89,8 @@ struct Shared {
     actions: Actions,
     events: broadcast::Sender<DaemonEvent>,
     next_id: AtomicU64,
+    /// Polls the tiles while a session is open, and holds their latest values.
+    tiles: Tiles,
     /// One lock, so a session is only ever registered under a pairing that still exists.
     registry: Mutex<Registry>,
 }
@@ -96,11 +99,14 @@ struct Registry {
     store: Store,
     /// device id -> (session id, kick that closes the session)
     sessions: HashMap<String, (u64, oneshot::Sender<Kick>)>,
+    /// How many sessions are live. Tile polling follows it.
+    connected: watch::Sender<usize>,
 }
 
 impl Server {
     /// Sessions show the layout of the live config in `config`, and push it again whenever it
-    /// changes. Presses run through `actions`.
+    /// changes. Presses run through `actions`, which also poll the config's tiles for as long as
+    /// a session is open. Must run inside a tokio runtime.
     pub async fn bind(
         addr: impl ToSocketAddrs,
         tls: Arc<ServerConfig>,
@@ -110,8 +116,11 @@ impl Server {
     ) -> io::Result<Self> {
         let hostname = gethostname::gethostname().to_string_lossy().into_owned();
         let (events, _) = broadcast::channel(64);
+        let listener = TcpListener::bind(addr).await?;
+        let (connected, polling) = watch::channel(0);
+        let tiles = tiles::spawn(actions.clone(), config.clone(), polling);
         Ok(Self {
-            listener: TcpListener::bind(addr).await?,
+            listener,
             shared: Arc::new(Shared {
                 hostname,
                 tls: TlsAcceptor::from(tls),
@@ -119,9 +128,11 @@ impl Server {
                 actions,
                 events,
                 next_id: AtomicU64::new(0),
+                tiles,
                 registry: Mutex::new(Registry {
                     store,
                     sessions: HashMap::new(),
+                    connected,
                 }),
             }),
         })
@@ -231,10 +242,15 @@ impl Registry {
             Some((_, kick)) => {
                 // An error only means the session is already ending.
                 let _ = kick.send(Kick::Revoked);
+                self.publish_count();
                 true
             }
             None => false,
         }
+    }
+
+    fn publish_count(&self) {
+        self.connected.send_replace(self.sessions.len());
     }
 }
 
@@ -258,6 +274,7 @@ impl Shared {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (kick_tx, kick_rx) = oneshot::channel();
         let old = registry.sessions.insert(device.to_string(), (id, kick_tx));
+        registry.publish_count();
         drop(registry);
         if let Some((_, old_kick)) = old {
             log::info!("{device} reconnected, replacing its old session");
@@ -278,6 +295,7 @@ impl Shared {
             .is_some_and(|(current, _)| *current == id)
         {
             registry.sessions.remove(device);
+            registry.publish_count();
             drop(registry);
             self.emit(DaemonEvent::DeviceDisconnected(device.to_string()));
         }
@@ -529,9 +547,67 @@ fn result_message(btn: String, seq: u64, result: ActionResult) -> Message {
     }
 }
 
+/// What one session has told its device about tiles. The poller never waits on a session: it
+/// publishes values to a watch channel, and each session reads them at its own pace.
+struct TileFeed {
+    values: watch::Receiver<Values>,
+    /// What the device last got, so only changes are sent.
+    sent: Sent,
+}
+
+impl TileFeed {
+    /// Forget what the device has, as after a new layout, which blanks every tile.
+    fn reset(&mut self) {
+        self.sent.clear();
+    }
+
+    /// Sends each tile of `layout` whose value the device doesn't have, leaving out any reading
+    /// made under a tile definition other than the one in `live`. A kick stops it between
+    /// messages, and the result says how the session ends: `Some(kick)`, where `kick` is `None`
+    /// if the registry just dropped the session.
+    async fn push<S>(
+        &mut self,
+        tx: &mut WsSink<S>,
+        kick: &mut oneshot::Receiver<Kick>,
+        layout: &Layout,
+        live: &Live,
+    ) -> Result<Option<Option<Kick>>, WsError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        // A copy, because a watch guard held across a send would stall the poller's next update.
+        let values = self.values.borrow_and_update().clone();
+        for button in layout.buttons.iter().filter(|b| b.tile) {
+            let Some(reading) = values.get(&button.id) else {
+                continue;
+            };
+            // The poller drops a changed tile's value, but not before a session may look.
+            if live.button(&button.id).and_then(|b| b.tile.as_ref()) != Some(&reading.tile) {
+                continue;
+            }
+            let value = &reading.value;
+            if self.sent.get(&button.id) == Some(value) {
+                continue;
+            }
+            match kick.try_recv() {
+                Err(oneshot::error::TryRecvError::Empty) => {}
+                kicked => return Ok(Some(kicked.ok())),
+            }
+            let msg = Message::Tile {
+                btn: button.id.clone(),
+                text: value.text.clone(),
+                state: value.state,
+            };
+            send(tx, &msg).await?;
+            self.sent.insert(button.id.clone(), value.clone());
+        }
+        Ok(None)
+    }
+}
+
 /// The session after a good hello. Presses run as tasks of their own, so the session keeps
-/// reading (and answering pings) and pushing layouts while actions run. A run whose session has
-/// ended still finishes, and its result is dropped.
+/// reading (and answering pings) and pushing layouts and tiles while actions run. A run whose
+/// session has ended still finishes, and its result is dropped.
 async fn serve<S>(
     tx: &mut WsSink<S>,
     rx: &mut WsRead<S>,
@@ -554,6 +630,14 @@ where
     let mut layout = config.borrow_and_update().layout();
     let mut rev = 1;
     send(tx, &layout.message(rev)).await?;
+    let mut tiles = TileFeed {
+        values: shared.tiles.values(),
+        sent: Sent::new(),
+    };
+    let live = config.borrow().clone();
+    if let Some(kicked) = tiles.push(tx, &mut kick, &layout, &live).await? {
+        return end_kicked(tx, kicked, device).await;
+    }
 
     let (done_tx, mut done_rx) = mpsc::channel::<Done>(MAX_RUNNING);
     let idle = sleep(IDLE_TIMEOUT);
@@ -569,12 +653,24 @@ where
             }
             Ok(()) = config.changed() => {
                 // An edit to actions alone leaves the layout as it was, and sends nothing.
-                let next = config.borrow_and_update().layout();
+                let live = config.borrow_and_update().clone();
+                let next = live.layout();
                 if next != layout {
                     layout = next;
                     rev += 1;
                     log::info!("{device}: pushing layout rev {rev}");
                     send(tx, &layout.message(rev)).await?;
+                    tiles.reset();
+                    if let Some(kicked) = tiles.push(tx, &mut kick, &layout, &live).await? {
+                        return end_kicked(tx, kicked, device).await;
+                    }
+                }
+                continue;
+            }
+            Ok(()) = tiles.values.changed() => {
+                let live = config.borrow().clone();
+                if let Some(kicked) = tiles.push(tx, &mut kick, &layout, &live).await? {
+                    return end_kicked(tx, kicked, device).await;
                 }
                 continue;
             }
@@ -611,10 +707,13 @@ where
                 match started {
                     Ok((run, action)) => {
                         let done = done_tx.clone();
+                        let poker = shared.tiles.poker();
                         let device = device.to_string();
                         tokio::spawn(async move {
                             let result = run.run(&action).await;
                             log::info!("{device}: {btn:?}: {} ({} ms)", result.summary, result.ms);
+                            // The press may have changed what the button's tile shows.
+                            poker.poke(&btn);
                             // An error only means the session has ended.
                             let _ = done.send(Done { btn, seq, result }).await;
                         });

@@ -992,6 +992,7 @@ static void handle_msg(const char *json, size_t len)
         break;
     case PROTO_MSG_LAYOUT:
     case PROTO_MSG_RESULT:
+    case PROTO_MSG_TILE:
         if (!s.welcomed) {
             ESP_LOGW(TAG, "message before welcome, ignored");
         } else if (m->type == PROTO_MSG_LAYOUT) {
@@ -1001,6 +1002,8 @@ static void handle_msg(const char *json, size_t len)
             sync_icons(&m->layout);
         } else if (m->type == PROTO_MSG_RESULT && s.cbs.on_result) {
             s.cbs.on_result(&m->result);
+        } else if (m->type == PROTO_MSG_TILE && s.cbs.on_tile) {
+            s.cbs.on_tile(&m->tile);
         }
         break;
     case PROTO_MSG_UNKNOWN:

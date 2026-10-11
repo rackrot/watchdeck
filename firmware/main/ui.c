@@ -24,7 +24,8 @@
 #define ROW_H 76
 #define ICON_PAD 4 // a button with an icon is a column: the icon, a gap, and a label of fixed height
 #define ICON_GAP 2
-#define ICON_MIN 24 // the label gets two lines unless that leaves the icon less than this
+#define ICON_MIN 24       // the label gets two lines unless that leaves the icon less than this
+#define TILE_BIG_MIN_H 80 // a tile's value uses the 32 pt font in cells at least this tall, else 24 pt
 
 static const char *TAG = "ui";
 
@@ -61,6 +62,8 @@ static lv_obj_t *s_cells[PROTO_MAX_BUTTONS];      // the grid's buttons
 static lv_obj_t *s_cell_icons[PROTO_MAX_BUTTONS]; // their image widgets, NULL until the icon arrives
 static uint8_t s_icon_ids[PROTO_MAX_BUTTONS][PROTO_ICON_ID_LEN];
 static bool s_has_icon[PROTO_MAX_BUTTONS];
+static lv_obj_t *s_cell_values[PROTO_MAX_BUTTONS]; // a tile's value label, NULL for a button without a tile
+static uint32_t s_cell_bgs[PROTO_MAX_BUTTONS];     // the configured color, shown while a tile is ok
 static size_t s_n_buttons;
 static char s_printable[PROTO_TEXT_MAX];
 static bool s_paired;
@@ -68,6 +71,18 @@ static bool s_attempt_shown; // a pairing attempt's code or question is on scree
 static link_daemon_t s_daemons[LINK_MAX_DAEMONS];
 static size_t s_n_daemons;
 static uint32_t s_forget_pressed_at;
+
+static lv_color_t tile_bg(proto_tile_state_t state, uint32_t ok_bg)
+{
+    switch (state) {
+    case PROTO_TILE_OK:
+        return lv_color_hex(ok_bg);
+    case PROTO_TILE_BAD:
+        return lv_palette_darken(LV_PALETTE_RED, 2);
+    default:
+        return lv_palette_darken(LV_PALETTE_GREY, 2);
+    }
+}
 
 static lv_obj_t *add_status(lv_palette_t palette, int y, const char *text)
 {
@@ -336,12 +351,15 @@ static void build_grid(const proto_layout_t *l)
         s_has_icon[i] = b->has_icon;
         memcpy(s_icon_ids[i], b->icon, sizeof(s_icon_ids[i]));
         s_cell_icons[i] = NULL;
+        s_cell_values[i] = NULL;
+        s_cell_bgs[i] = b->bg;
 
         lv_obj_t *btn = lv_button_create(s_grid);
         s_cells[i] = btn;
         lv_obj_set_size(btn, cell_w, cell_h);
         lv_obj_set_pos(btn, GRID_GAP + b->col * (cell_w + GRID_GAP), b->row * (cell_h + GRID_GAP));
-        lv_obj_set_style_bg_color(btn, lv_color_hex(b->bg), 0);
+        // A tile is grey until its first value arrives.
+        lv_obj_set_style_bg_color(btn, b->tile ? tile_bg(PROTO_TILE_UNKNOWN, b->bg) : lv_color_hex(b->bg), 0);
         lv_obj_add_event_cb(btn, cell_event, LV_EVENT_CLICKED, (void *)(intptr_t)i);
         // The icon, once it arrives, goes above the label.
         lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_COLUMN);
@@ -361,6 +379,26 @@ static void build_grid(const proto_layout_t *l)
         lv_obj_set_style_text_font(label, &lv_font_montserrat_32, 0);
         lv_obj_set_style_text_color(label, lv_color_hex(b->fg), 0);
         lv_label_set_text(label, b->label);
+
+        if (b->tile) {
+            // The label shrinks to one line of 24 pt and the value goes under it. With an icon on a grid of
+            // 4 or 5 rows there is room for the icon and the value only, so the label goes.
+            lv_obj_set_style_text_font(label, &lv_font_montserrat_24, 0);
+            lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+            lv_obj_set_height(label, lv_font_get_line_height(&lv_font_montserrat_24));
+            lv_obj_set_hidden(label, b->has_icon && label_lines == 1);
+
+            const lv_font_t *font = cell_h >= TILE_BIG_MIN_H ? &lv_font_montserrat_32 : &lv_font_montserrat_24;
+            lv_obj_t *value = lv_label_create(btn);
+            s_cell_values[i] = value;
+            lv_obj_set_width(value, cell_w - 16);
+            lv_label_set_long_mode(value, LV_LABEL_LONG_DOT);
+            lv_obj_set_height(value, lv_font_get_line_height(font));
+            lv_obj_set_style_text_align(value, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_set_style_text_font(value, font, 0);
+            lv_obj_set_style_text_color(value, lv_color_hex(b->fg), 0);
+            lv_label_set_text(value, "");
+        }
     }
 }
 
@@ -396,6 +434,29 @@ void ui_set_icon(const uint8_t id[PROTO_ICON_ID_LEN], const lv_image_dsc_t *dsc)
             lv_obj_move_to_index(s_cell_icons[i], 0);
         }
         lv_image_set_src(s_cell_icons[i], dsc);
+    }
+    lvgl_port_unlock();
+}
+
+void ui_set_tile(const proto_tile_t *t)
+{
+    lvgl_port_lock(0);
+    size_t i = 0;
+    while (i < s_n_buttons && strcmp(s_ids[i], t->btn) != 0) {
+        i++;
+    }
+    if (i == s_n_buttons || !s_cell_values[i]) {
+        ESP_LOGW(TAG, "tile for %s ignored: no such tile button", t->btn);
+    } else {
+        char text[PROTO_TILE_MAX];
+        copy_printable(text, sizeof(text), t->text);
+        for (char *c = text; *c; c++) {
+            if (*c == '\n') {
+                *c = ' '; // one line
+            }
+        }
+        lv_label_set_text(s_cell_values[i], text);
+        lv_obj_set_style_bg_color(s_cells[i], tile_bg(t->state, s_cell_bgs[i]), 0);
     }
     lvgl_port_unlock();
 }

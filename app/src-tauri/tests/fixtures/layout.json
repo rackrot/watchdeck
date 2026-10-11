@@ -20,6 +20,15 @@
       "label": "Plain",
       "bg": 0,
       "fg": 16777215
+    },
+    {
+      "id": "nas-load",
+      "col": 2,
+      "row": 0,
+      "label": "NAS load",
+      "bg": 2001125,
+      "fg": 16777215,
+      "tile": true
     }
   ]
 }

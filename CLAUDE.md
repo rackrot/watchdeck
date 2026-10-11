@@ -62,6 +62,7 @@ Add new tools to `mise.toml`, not to CI or the hooks. The hooks call the mise-pi
 
 - `firmware/sdkconfig` is generated and gitignored. Persistent config goes in `firmware/sdkconfig.defaults`. Kconfig silently drops unknown names, so check the generated `sdkconfig` after adding one.
 - C follows ESP-IDF style (4 spaces, `.clang-format`). TS/JSON uses Biome, from `app/biome.json`. Run biome from `app/`, because the repo root errors with "nested root configuration".
+- `prek run --all-files` skips untracked files. Run `prek run --files <new files>` for those, or typos and the other hooks never see them.
 - Never commit secrets. Wi-Fi credentials live in the gitignored `firmware/sdkconfig.defaults.local` or in `wifi.txt` on the SD card. Never print device tokens, `identity.key` or `secrets.toml`; both sides redact tokens in their logs.
 
 ## CI

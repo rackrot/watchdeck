@@ -9,4 +9,5 @@ pub mod protocol;
 pub mod secrets;
 pub mod server;
 pub mod store;
+pub mod tiles;
 pub mod tls;
