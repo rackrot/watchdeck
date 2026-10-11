@@ -433,3 +433,10 @@ Rollback: each slice is its own PR. Firmware rolls back by flashing the previous
 | 7 | Non-ASCII labels | Rejected; the built-in fonts lack the glyphs |
 | 8 | Tile polling | Only while a device is connected |
 | 9 | Plain HTTP headers such as `Content-Type` | Settled in S4 by the user: a per-action `headers` table beside `secret_headers`. A name appears once across both, ignoring case |
+
+## Backlog
+
+- **Sentry error reporting.** Research, then plan as its own slice.
+  - Firmware: [getsentry/sentry-micro](https://github.com/getsentry/sentry-micro). First check ESP-IDF v6.1 and ESP32-P4 support, maturity, footprint, and transport (it needs TLS to the Sentry host). If upstream falls short, forking it and adding what watchdeck needs is acceptable.
+  - App: the Sentry SDK for the Rust daemon, and probably the React frontend.
+  - Config: a DSN setting, off by default. On the desktop it goes in `config.toml`. Decide how the device gets its DSN, for example pushed by the daemon over the session or stored in NVS. Keep DSNs and any PII (device ids, IPs, labels) out of events unless the user opts in.
