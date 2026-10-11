@@ -86,6 +86,8 @@ pub fn run() {
             tauri::async_runtime::spawn(configs.clone().watch_files());
 
             let devices = server.devices();
+            // Subscribe before the tray reads its first status, so no device event slips between.
+            let mut events = server.subscribe();
             let status_item = tray::build(app.handle(), &devices.list())?;
             if !std::env::args().any(|a| a == tray::HIDDEN_ARG) {
                 tray::show_window(app.handle());
@@ -114,7 +116,6 @@ pub fn run() {
             // The window refetches the device list on `devices-changed`, and the pairing
             // dialog follows `pairing`.
             let handle = app.handle().clone();
-            let mut events = server.subscribe();
             let tray_devices = devices.clone();
             tauri::async_runtime::spawn(async move {
                 loop {
