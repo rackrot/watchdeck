@@ -2,14 +2,19 @@
 
 use std::sync::Arc;
 
+use serde::Serialize;
 use tauri::State;
 
+use crate::daemon::config::{Config, Configs};
 use crate::daemon::pairing::{Pairing, PairingState};
+use crate::daemon::secrets::Secrets;
 use crate::daemon::server::{DeviceInfo, Devices};
 
 pub struct Daemon {
     pub devices: Devices,
     pub pairing: Arc<Pairing>,
+    pub configs: Arc<Configs>,
+    pub secrets: Arc<Secrets>,
 }
 
 #[tauri::command]
@@ -51,5 +56,51 @@ pub fn confirm_pairing(daemon: State<'_, Daemon>, code: String) -> Result<(), St
 #[tauri::command]
 pub async fn cancel_pairing(daemon: State<'_, Daemon>) -> Result<(), String> {
     daemon.pairing.cancel().await;
+    Ok(())
+}
+
+#[derive(Serialize)]
+pub struct ConfigView {
+    /// The live config.
+    config: Config,
+    /// Pass back to `save_config`. A save from an older revision is refused.
+    revision: String,
+    /// Why `config.toml` on disk is not live, or empty when it is.
+    errors: Vec<String>,
+}
+
+#[tauri::command]
+pub fn get_config(daemon: State<'_, Daemon>) -> ConfigView {
+    let status = daemon.configs.status().borrow().clone();
+    ConfigView {
+        config: (*daemon.configs.current()).clone(),
+        revision: status.revision,
+        errors: status.errors,
+    }
+}
+
+/// Checks and writes the config. Returns the new revision, or every rule it breaks, in which
+/// case nothing is written.
+#[tauri::command]
+pub fn save_config(
+    daemon: State<'_, Daemon>,
+    config: Config,
+    revision: String,
+) -> Result<String, Vec<String>> {
+    daemon.configs.save(config, &revision)
+}
+
+/// Secret names. Values never leave the daemon.
+#[tauri::command]
+pub fn list_secrets(daemon: State<'_, Daemon>) -> Result<Vec<String>, String> {
+    daemon.secrets.names().map_err(|e| e.to_string())
+}
+
+/// Adds or replaces a secret. There is no command that reads one back.
+#[tauri::command]
+pub fn set_secret(daemon: State<'_, Daemon>, name: String, value: String) -> Result<(), String> {
+    daemon.secrets.set(&name, &value)?;
+    // A config held back for want of this secret can go live now. reload logs its own outcome.
+    let _ = daemon.configs.reload();
     Ok(())
 }

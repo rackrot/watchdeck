@@ -12,16 +12,17 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
-use tokio::sync::{broadcast, oneshot, Semaphore};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Semaphore};
 use tokio::task::JoinSet;
-use tokio::time::{timeout, timeout_at, Instant};
+use tokio::time::{sleep, timeout, timeout_at, Instant};
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message as WsMessage};
 use tokio_tungstenite::{accept_async_with_config, WebSocketStream};
 
-use super::actions::{self, ActionResult, Runner};
+use super::actions::{ActionResult, Actions, MAX_RUNNING};
+use super::config::Config;
 use super::protocol::{
     decode_hex, valid_device_id, ErrorCode, Message, Token, MAX_MESSAGE_BYTES, TOKEN_BYTES, VERSION,
 };
@@ -79,7 +80,8 @@ pub struct Devices(Arc<Shared>);
 struct Shared {
     hostname: String,
     tls: TlsAcceptor,
-    runner: Runner,
+    config: watch::Receiver<Arc<Config>>,
+    actions: Actions,
     events: broadcast::Sender<DaemonEvent>,
     next_id: AtomicU64,
     /// One lock, so a session is only ever registered under a pairing that still exists.
@@ -93,11 +95,14 @@ struct Registry {
 }
 
 impl Server {
+    /// Sessions show the layout of the live config in `config`, and push it again whenever it
+    /// changes. Presses run through `actions`.
     pub async fn bind(
         addr: impl ToSocketAddrs,
         tls: Arc<ServerConfig>,
-        runner: Runner,
         store: Store,
+        config: watch::Receiver<Arc<Config>>,
+        actions: Actions,
     ) -> io::Result<Self> {
         let hostname = gethostname::gethostname().to_string_lossy().into_owned();
         let (events, _) = broadcast::channel(64);
@@ -106,7 +111,8 @@ impl Server {
             shared: Arc::new(Shared {
                 hostname,
                 tls: TlsAcceptor::from(tls),
-                runner,
+                config,
+                actions,
                 events,
                 next_id: AtomicU64::new(0),
                 registry: Mutex::new(Registry {
@@ -302,28 +308,34 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     loop {
-        let frame = match timeout(IDLE_TIMEOUT, rx.next()).await {
+        match timeout(IDLE_TIMEOUT, rx.next()).await {
             Err(_) => return Incoming::Idle,
             Ok(None) => return Incoming::Closed,
             Ok(Some(Err(e))) => return Incoming::Failed(e),
-            Ok(Some(Ok(frame))) => frame,
-        };
-        match frame {
-            WsMessage::Text(text) => {
-                return match serde_json::from_str(text.as_str()) {
-                    Ok(msg) => Incoming::Msg(msg),
-                    Err(e) => match hello_version_mismatch(text.as_str()) {
-                        Some(reason) => Incoming::BadVersion(reason),
-                        None => Incoming::BadRequest(e.to_string()),
-                    },
+            Ok(Some(Ok(frame))) => {
+                if let Some(incoming) = incoming(frame) {
+                    return incoming;
                 }
             }
-            WsMessage::Close(_) => return Incoming::Closed,
-            WsMessage::Binary(_) => {
-                return Incoming::BadRequest("binary frames are not supported".into())
-            }
-            _ => {}
         }
+    }
+}
+
+/// What a frame means to a session, or `None` for a control frame.
+fn incoming(frame: WsMessage) -> Option<Incoming> {
+    match frame {
+        WsMessage::Text(text) => Some(match serde_json::from_str(text.as_str()) {
+            Ok(msg) => Incoming::Msg(msg),
+            Err(e) => match hello_version_mismatch(text.as_str()) {
+                Some(reason) => Incoming::BadVersion(reason),
+                None => Incoming::BadRequest(e.to_string()),
+            },
+        }),
+        WsMessage::Close(_) => Some(Incoming::Closed),
+        WsMessage::Binary(_) => Some(Incoming::BadRequest(
+            "binary frames are not supported".into(),
+        )),
+        _ => None,
     }
 }
 
@@ -487,6 +499,28 @@ where
     outcome
 }
 
+/// A finished run, on its way back to the session whose press started it.
+struct Done {
+    btn: String,
+    seq: u64,
+    result: ActionResult,
+}
+
+fn result_message(btn: String, seq: u64, result: ActionResult) -> Message {
+    Message::Result {
+        btn,
+        seq,
+        ok: result.ok,
+        code: result.code,
+        summary: result.summary,
+        text: result.text,
+        ms: result.ms,
+    }
+}
+
+/// The session after a good hello. Presses run as tasks of their own, so the session keeps
+/// reading (and answering pings) and pushing layouts while actions run. A run whose session has
+/// ended still finishes, and its result is dropped.
 async fn serve<S>(
     tx: &mut WsSink<S>,
     rx: &mut WsRead<S>,
@@ -497,7 +531,7 @@ async fn serve<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let buttons = actions::buttons();
+    let mut config = shared.config.clone();
     send(
         tx,
         &Message::Welcome {
@@ -506,23 +540,45 @@ where
         },
     )
     .await?;
-    send(
-        tx,
-        &Message::Layout {
-            rev: 1,
-            cols: actions::COLS,
-            rows: actions::ROWS,
-            buttons: buttons.clone(),
-        },
-    )
-    .await?;
+    let mut layout = config.borrow_and_update().layout();
+    let mut rev = 1;
+    send(tx, &layout.message(rev)).await?;
 
+    let (done_tx, mut done_rx) = mpsc::channel::<Done>(MAX_RUNNING);
+    let idle = sleep(IDLE_TIMEOUT);
+    tokio::pin!(idle);
     loop {
         let incoming = tokio::select! {
             // The kick goes first, so presses queued behind a revocation never run.
             biased;
             kicked = &mut kick => return end_kicked(tx, kicked.ok(), device).await,
-            incoming = next_message(rx) => incoming,
+            Some(done) = done_rx.recv() => {
+                send(tx, &result_message(done.btn, done.seq, done.result)).await?;
+                continue;
+            }
+            Ok(()) = config.changed() => {
+                // An edit to actions alone leaves the layout as it was, and sends nothing.
+                let next = config.borrow_and_update().layout();
+                if next != layout {
+                    layout = next;
+                    rev += 1;
+                    log::info!("{device}: pushing layout rev {rev}");
+                    send(tx, &layout.message(rev)).await?;
+                }
+                continue;
+            }
+            frame = rx.next() => {
+                idle.as_mut().reset(Instant::now() + IDLE_TIMEOUT);
+                match frame {
+                    None => Incoming::Closed,
+                    Some(Err(e)) => Incoming::Failed(e),
+                    Some(Ok(frame)) => match incoming(frame) {
+                        Some(incoming) => incoming,
+                        None => continue,
+                    },
+                }
+            }
+            () = &mut idle => Incoming::Idle,
         };
         match incoming {
             Incoming::Msg(Message::Press { btn, .. }) if btn.len() > MAX_BUTTON_ID_BYTES => {
@@ -536,28 +592,28 @@ where
                     Err(oneshot::error::TryRecvError::Empty) => {}
                     kicked => return end_kicked(tx, kicked.ok(), device).await,
                 }
-                let result = if buttons.iter().any(|b| b.id == btn) {
-                    (shared.runner)(btn.clone(), device.to_string()).await
-                } else {
-                    ActionResult {
-                        ok: false,
-                        code: -1,
-                        text: "unknown button".into(),
-                        ms: 0,
-                    }
+                let action = config.borrow().button(&btn).map(|b| b.action.clone());
+                let started = match action {
+                    Some(action) => shared.actions.start(&btn).map(|run| (run, action)),
+                    None => Err(ActionResult::failed("unknown button")),
                 };
-                send(
-                    tx,
-                    &Message::Result {
-                        btn,
-                        seq,
-                        ok: result.ok,
-                        code: result.code,
-                        text: result.text,
-                        ms: result.ms,
-                    },
-                )
-                .await?;
+                match started {
+                    Ok((run, action)) => {
+                        let done = done_tx.clone();
+                        let device = device.to_string();
+                        tokio::spawn(async move {
+                            let result = run.run(&action).await;
+                            log::info!("{device}: {btn:?}: {} ({} ms)", result.summary, result.ms);
+                            // An error only means the session has ended.
+                            let _ = done.send(Done { btn, seq, result }).await;
+                        });
+                    }
+                    Err(refused) => {
+                        // Debug escapes what an unknown id may carry, such as newlines or ANSI.
+                        log::info!("{device}: {btn:?}: {}", refused.summary);
+                        send(tx, &result_message(btn, seq, refused)).await?;
+                    }
+                }
             }
             Incoming::Msg(Message::Unknown) => {
                 log::warn!("{device}: ignoring unknown message type")

@@ -1,0 +1,1323 @@
+//! `config.toml`: the grid and what each button does. Rust is the authority on what is valid. A
+//! config that breaks any rule is never applied or pushed, and the last good one stays live. The
+//! daemon polls the file, and `secrets.toml` whose names the rules check, and reloads on a change.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::{self, File};
+use std::io::{self, Read};
+use std::net::IpAddr;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, SystemTime};
+
+use reqwest::header::HeaderName;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::sync::watch;
+
+use super::protocol::{encode_hex, Button, Message};
+use super::secrets::Secrets;
+use super::store::write_private;
+
+pub const FILE: &str = "config.toml";
+pub const MAX_COLS: u32 = 8;
+pub const MAX_ROWS: u32 = 5;
+/// The device keeps an id in 64 bytes and a label in 48, each with its NUL.
+pub const MAX_ID_BYTES: usize = 63;
+pub const MAX_LABEL_BYTES: usize = 47;
+pub const MAX_TIMEOUT_S: u64 = 600;
+const DEFAULT_TIMEOUT_S: u64 = 10;
+const MAX_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_BODY_BYTES: usize = 64 * 1024;
+const METHODS: [&str; 6] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"];
+/// How often the files are checked for changes.
+const POLL: Duration = Duration::from_millis(500);
+
+/// Written on first run, when there is no `config.toml`.
+pub const DEFAULT: &str = r##"# watchdeck: the button grid and what each button does.
+# The app reloads this file when it changes. A version that breaks a rule is
+# not applied, and the app logs why. Reference:
+# https://rackrot.github.io/watchdeck/config.html
+version = 1
+
+[layout]
+cols = 5 # 1 to 8
+rows = 3 # 1 to 5
+
+# One [[button]] per cell. pos = [column, row], counted from 0 at the top left.
+# Labels are printable ASCII, at most 47 characters.
+[[button]]
+id = "hello"
+pos = [0, 0]
+label = "Hello"
+bg = "#1e88e5"
+fg = "#ffffff"
+# argv runs without a shell, in your home directory. timeout_s is 1 to 600.
+action = { kind = "shell", argv = ["notify-send", "watchdeck", "Hello from watchdeck"], timeout_s = 10 }
+"##;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    pub version: u32,
+    pub layout: Grid,
+    #[serde(default, rename = "button")]
+    pub buttons: Vec<ButtonConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Grid {
+    pub cols: u32,
+    pub rows: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ButtonConfig {
+    pub id: String,
+    /// `[column, row]`, from 0.
+    pub pos: [u32; 2],
+    pub label: String,
+    #[serde(default = "default_bg")]
+    pub bg: String,
+    #[serde(default = "default_fg")]
+    pub fg: String,
+    pub action: Action,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Action {
+    Shell {
+        argv: Vec<String>,
+        #[serde(default = "default_timeout")]
+        timeout_s: u64,
+    },
+    Http {
+        method: String,
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body: Option<String>,
+        /// Header name -> value, sent as written. Not secret.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        headers: BTreeMap<String, String>,
+        /// Header name -> the name of a secret in `secrets.toml`.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        secret_headers: BTreeMap<String, String>,
+        /// Lets `secret_headers` cross the network over plain http.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        insecure_http: bool,
+        #[serde(default = "default_timeout")]
+        timeout_s: u64,
+    },
+}
+
+fn default_bg() -> String {
+    "#1e88e5".into()
+}
+
+fn default_fg() -> String {
+    "#ffffff".into()
+}
+
+fn default_timeout() -> u64 {
+    DEFAULT_TIMEOUT_S
+}
+
+/// What a device draws, which is all of a config except the actions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layout {
+    pub cols: u32,
+    pub rows: u32,
+    pub buttons: Vec<Button>,
+}
+
+impl Layout {
+    pub fn message(&self, rev: u32) -> Message {
+        Message::Layout {
+            rev,
+            cols: self.cols,
+            rows: self.rows,
+            buttons: self.buttons.clone(),
+        }
+    }
+}
+
+/// `#rrggbb` as `0xRRGGBB`.
+fn color(text: &str) -> Option<u32> {
+    let hex = text.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(hex, 16).ok()
+}
+
+fn printable_ascii(text: &str) -> bool {
+    text.bytes().all(|b| (b' '..=b'~').contains(&b))
+}
+
+/// Whether `url` names this machine: a loopback address, or `localhost`.
+fn loopback(url: &reqwest::Url) -> bool {
+    match url.host_str() {
+        Some("localhost") => true,
+        Some(host) => host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback()),
+        None => false,
+    }
+}
+
+impl Config {
+    /// No buttons, which is what runs until a valid file loads.
+    pub fn empty() -> Self {
+        Self {
+            version: 1,
+            layout: Grid { cols: 5, rows: 3 },
+            buttons: Vec::new(),
+        }
+    }
+
+    pub fn button(&self, id: &str) -> Option<&ButtonConfig> {
+        self.buttons.iter().find(|b| b.id == id)
+    }
+
+    /// The layout message's content. Only call it on a config that passed [`Config::check`].
+    pub fn layout(&self) -> Layout {
+        let rgb = |text: &str| color(text).expect("colors are checked before a config goes live");
+        Layout {
+            cols: self.layout.cols,
+            rows: self.layout.rows,
+            buttons: self
+                .buttons
+                .iter()
+                .map(|b| Button {
+                    id: b.id.clone(),
+                    col: b.pos[0],
+                    row: b.pos[1],
+                    label: b.label.clone(),
+                    bg: rgb(&b.bg),
+                    fg: rgb(&b.fg),
+                })
+                .collect(),
+        }
+    }
+
+    /// Every rule this config breaks. `secrets` holds the names in `secrets.toml`, and is
+    /// consulted only for buttons that use a secret.
+    pub fn check(&self, secrets: &io::Result<Vec<String>>) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.version != 1 {
+            errors.push(format!("version is {}, expected 1", self.version));
+        }
+        let Grid { cols, rows } = self.layout;
+        let grid_ok = (1..=MAX_COLS).contains(&cols) && (1..=MAX_ROWS).contains(&rows);
+        if !(1..=MAX_COLS).contains(&cols) {
+            errors.push(format!("layout.cols is {cols}, expected 1 to {MAX_COLS}"));
+        }
+        if !(1..=MAX_ROWS).contains(&rows) {
+            errors.push(format!("layout.rows is {rows}, expected 1 to {MAX_ROWS}"));
+        }
+
+        let mut ids = HashSet::new();
+        let mut cells = HashMap::new();
+        for b in &self.buttons {
+            let mut error = |problem: String| errors.push(format!("button {:?}: {problem}", b.id));
+            if b.id.is_empty()
+                || b.id.len() > MAX_ID_BYTES
+                || !b
+                    .id
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
+            {
+                error(format!(
+                    "id must be 1 to {MAX_ID_BYTES} letters, digits, '_', '-' or '.'"
+                ));
+            }
+            if !ids.insert(b.id.as_str()) {
+                error("another button has this id".into());
+            }
+            let [col, row] = b.pos;
+            if grid_ok && (col >= cols || row >= rows) {
+                error(format!(
+                    "pos [{col}, {row}] is outside the {cols}x{rows} grid"
+                ));
+            } else if let Some(other) = cells.insert((col, row), b.id.as_str()) {
+                error(format!("pos [{col}, {row}] is taken by button {other:?}"));
+            }
+            if b.label.len() > MAX_LABEL_BYTES {
+                error(format!(
+                    "label is {} bytes, at most {MAX_LABEL_BYTES}",
+                    b.label.len()
+                ));
+            }
+            if !printable_ascii(&b.label) {
+                error(
+                    "label must be printable ASCII, the only characters the device can draw".into(),
+                );
+            }
+            for (field, value) in [("bg", &b.bg), ("fg", &b.fg)] {
+                if color(value).is_none() {
+                    error(format!("{field} {value:?} is not a #rrggbb color"));
+                }
+            }
+            for problem in b.action.check(secrets) {
+                error(problem);
+            }
+        }
+        errors
+    }
+}
+
+impl Action {
+    pub fn timeout(&self) -> Duration {
+        match self {
+            Action::Shell { timeout_s, .. } | Action::Http { timeout_s, .. } => {
+                Duration::from_secs(*timeout_s)
+            }
+        }
+    }
+
+    /// Whether this sends secret headers over plain http to another machine, where anyone on the
+    /// way, or anyone who answers for the host name, can read them.
+    pub fn secrets_in_clear(&self) -> bool {
+        let Action::Http {
+            url,
+            secret_headers,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        !secret_headers.is_empty()
+            && reqwest::Url::parse(url).is_ok_and(|u| u.scheme() == "http" && !loopback(&u))
+    }
+
+    fn check(&self, secrets: &io::Result<Vec<String>>) -> Vec<String> {
+        let mut errors = Vec::new();
+        let timeout_s = self.timeout().as_secs();
+        if !(1..=MAX_TIMEOUT_S).contains(&timeout_s) {
+            errors.push(format!(
+                "timeout_s is {timeout_s}, expected 1 to {MAX_TIMEOUT_S}"
+            ));
+        }
+        match self {
+            Action::Shell { argv, .. } => {
+                match argv.first() {
+                    None => errors.push("argv is empty".into()),
+                    Some(program) if program.is_empty() => {
+                        errors.push("argv[0], the program, is empty".into())
+                    }
+                    Some(_) => {}
+                }
+                for (i, arg) in argv.iter().enumerate() {
+                    if arg.contains('\0') {
+                        errors.push(format!("argv[{i}] contains a NUL character"));
+                    }
+                }
+            }
+            Action::Http {
+                method,
+                url,
+                body,
+                headers,
+                secret_headers,
+                insecure_http,
+                ..
+            } => {
+                if !METHODS.contains(&method.as_str()) {
+                    errors.push(format!(
+                        "method {method:?} is not one of {}",
+                        METHODS.join(", ")
+                    ));
+                }
+                // The URL stays out of errors, in case it carries a token of its own.
+                match reqwest::Url::parse(url) {
+                    Err(e) => errors.push(format!("url does not parse: {e}")),
+                    Ok(u) if !matches!(u.scheme(), "http" | "https") => {
+                        errors.push("url is not http:// or https://".into())
+                    }
+                    Ok(u) if u.host_str().is_none_or(str::is_empty) => {
+                        errors.push("url has no host".into())
+                    }
+                    Ok(_) => {}
+                }
+                if self.secrets_in_clear() && !insecure_http {
+                    errors.push(
+                        "secret_headers would cross the network in the clear over http://; \
+                         use https://, or set insecure_http = true"
+                            .into(),
+                    );
+                }
+                if body.as_ref().is_some_and(|b| b.len() > MAX_BODY_BYTES) {
+                    errors.push(format!("body is over {} KB", MAX_BODY_BYTES / 1024));
+                }
+                let mut names = HashSet::new();
+                for header in headers.keys().chain(secret_headers.keys()) {
+                    if HeaderName::from_bytes(header.as_bytes()).is_err() {
+                        errors.push(format!("{header:?} is not a valid header name"));
+                    } else if !names.insert(header.to_ascii_lowercase()) {
+                        errors.push(format!("header {header:?} is set twice; names ignore case"));
+                    }
+                }
+                for (header, value) in headers {
+                    if !printable_ascii(value) {
+                        errors.push(format!(
+                            "header {header:?} must have a value of printable ASCII on one line"
+                        ));
+                    }
+                }
+                for (header, secret) in secret_headers {
+                    match secrets {
+                        Ok(names) if names.contains(secret) => {}
+                        Ok(_) => errors.push(format!(
+                            "header {header:?} uses secret {secret:?}, which is not in secrets.toml"
+                        )),
+                        Err(e) => errors.push(format!(
+                            "header {header:?} uses secret {secret:?}, but secrets.toml can't be read: {e}"
+                        )),
+                    }
+                }
+            }
+        }
+        errors
+    }
+}
+
+/// Parses `text` and checks it against every rule.
+pub fn parse(text: &str, secrets: &io::Result<Vec<String>>) -> Result<Config, Vec<String>> {
+    let config: Config = toml::from_str(text).map_err(|e| vec![toml_error(text, &e)])?;
+    let errors = config.check(secrets);
+    if errors.is_empty() {
+        Ok(config)
+    } else {
+        Err(errors)
+    }
+}
+
+/// Where the TOML went wrong and why, without toml's copy of the line, which may hold a URL. The
+/// message itself can still quote a value of the wrong type.
+fn toml_error(text: &str, e: &toml::de::Error) -> String {
+    let message = e.message().trim_end();
+    let Some(span) = e.span() else {
+        return message.to_string();
+    };
+    let before = text.get(..span.start).unwrap_or(text);
+    let line = before.matches('\n').count() + 1;
+    let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+    format!("line {line}, column {column}: {message}")
+}
+
+/// What the window needs to know about the file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConfigStatus {
+    /// SHA-256 of the file text the live config came from. A save must name it.
+    pub revision: String,
+    /// Why the file on disk is not live, or empty when it is.
+    pub errors: Vec<String>,
+}
+
+/// The live config, and the file it comes from.
+pub struct Configs {
+    path: PathBuf,
+    secrets: Arc<Secrets>,
+    live: watch::Sender<Arc<Config>>,
+    status: watch::Sender<ConfigStatus>,
+    /// The files as the last reload read them. Holding it serializes reloads and saves, so a
+    /// save's check and its write see the same file.
+    read: Mutex<Stamps>,
+}
+
+impl Configs {
+    /// Loads `config.toml` from `dir`, writing [`DEFAULT`] there first if there is none. If the
+    /// file can't be read or breaks a rule, an empty grid goes live and `status` says why.
+    pub fn open(dir: &Path, secrets: Arc<Secrets>) -> io::Result<Arc<Self>> {
+        let path = dir.join(FILE);
+        if !path.try_exists()? {
+            write_private(&path, DEFAULT.as_bytes())?;
+            log::info!("wrote the default {}", path.display());
+        }
+        let configs = Arc::new(Self {
+            path,
+            secrets,
+            live: watch::channel(Arc::new(Config::empty())).0,
+            status: watch::channel(ConfigStatus {
+                revision: String::new(),
+                errors: Vec::new(),
+            })
+            .0,
+            // Nothing read yet, which differs from any file that exists.
+            read: Mutex::new((None, None)),
+        });
+        // reload logs its own outcome.
+        let _ = configs.reload();
+        Ok(configs)
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<Arc<Config>> {
+        self.live.subscribe()
+    }
+
+    pub fn status(&self) -> watch::Receiver<ConfigStatus> {
+        self.status.subscribe()
+    }
+
+    pub fn current(&self) -> Arc<Config> {
+        self.live.borrow().clone()
+    }
+
+    fn locked(&self) -> MutexGuard<'_, Stamps> {
+        self.read.lock().expect("config lock poisoned")
+    }
+
+    /// Reads and checks the file. If it passes, it goes live (devices get its layout if that
+    /// changed) and `Ok` says whether anything changed. If not, the live config stays. A file
+    /// that changes while it is read counts as not read, and the poller reads it again.
+    pub fn reload(&self) -> Result<bool, Vec<String>> {
+        let mut read = self.locked();
+        let before = self.stamp();
+        let loaded = read_capped(&self.path).and_then(|bytes| {
+            let text = String::from_utf8(bytes).map_err(|_| vec!["not UTF-8".to_string()])?;
+            let config = parse(&text, &self.secrets.names())?;
+            Ok((sha256_hex(text.as_bytes()), config))
+        });
+        if self.stamp() != before {
+            log::debug!("{} changed while being read", self.path.display());
+            return Ok(false);
+        }
+        *read = before;
+        let (revision, config) = match loaded {
+            Ok(loaded) => loaded,
+            Err(errors) => {
+                log::error!(
+                    "{} not applied, keeping the live config: {}",
+                    self.path.display(),
+                    errors.join("; ")
+                );
+                self.status.send_if_modified(|status| {
+                    let changed = status.errors != errors;
+                    status.errors = errors.clone();
+                    changed
+                });
+                return Err(errors);
+            }
+        };
+        let changed = self.go_live(config);
+        if changed {
+            log::info!("applied {}", self.path.display());
+        }
+        self.set_status(revision);
+        Ok(changed)
+    }
+
+    /// Checks `config` and writes it in place of the file, which must still be the one the
+    /// window loaded at `revision`, with no edits on disk that aren't live. Returns the new
+    /// revision. Nothing is written unless every check passes.
+    pub fn save(&self, config: Config, revision: &str) -> Result<String, Vec<String>> {
+        let errors = config.check(&self.secrets.names());
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        let _read = self.locked();
+        let live = self.status.borrow().revision.clone();
+        if revision != live {
+            return Err(vec![format!(
+                "{FILE} changed since it was loaded; load it again before saving"
+            )]);
+        }
+        if read_capped(&self.path).map(|bytes| sha256_hex(&bytes)) != Ok(live) {
+            return Err(vec![format!(
+                "{FILE} has edits on disk that are not live; fix or revert them first"
+            )]);
+        }
+        let text = format!(
+            "# Written by the watchdeck app, which does not keep comments.\n{}",
+            toml::to_string(&config).expect("a config serializes")
+        );
+        write_private(&self.path, text.as_bytes())
+            .map_err(|e| vec![format!("Could not save {FILE}: {e}")])?;
+        let revision = sha256_hex(text.as_bytes());
+        if self.go_live(config) {
+            log::info!("saved and applied {}", self.path.display());
+        }
+        self.set_status(revision.clone());
+        Ok(revision)
+    }
+
+    /// Reloads whenever `config.toml` or `secrets.toml` differ from what the last reload read,
+    /// until the future is dropped. A change counts once the files look the same on two polls in
+    /// a row, so a write in progress is not read half done.
+    pub async fn watch_files(self: Arc<Self>) {
+        let mut last = self.stamp();
+        loop {
+            tokio::time::sleep(POLL).await;
+            let now = self.stamp();
+            let read = *self.locked();
+            if now == last && now != read {
+                // reload logs its own outcome.
+                let _ = self.reload();
+            }
+            last = now;
+        }
+    }
+
+    fn stamp(&self) -> Stamps {
+        (stamp(&self.path), stamp(&self.secrets.path()))
+    }
+
+    /// Callers hold the lock.
+    fn go_live(&self, config: Config) -> bool {
+        self.live.send_if_modified(|live| {
+            let changed = **live != config;
+            if changed {
+                for b in config
+                    .buttons
+                    .iter()
+                    .filter(|b| b.action.secrets_in_clear())
+                {
+                    log::warn!(
+                        "button {:?} sends secret headers over plain http, as insecure_http allows",
+                        b.id
+                    );
+                }
+                *live = Arc::new(config);
+            }
+            changed
+        })
+    }
+
+    fn set_status(&self, revision: String) {
+        let next = ConfigStatus {
+            revision,
+            errors: Vec::new(),
+        };
+        self.status.send_if_modified(|status| {
+            let changed = *status != next;
+            *status = next;
+            changed
+        });
+    }
+}
+
+/// When a file last changed, as far as polling can tell: mtime, size and inode, since editors
+/// often save by renaming a new file into place, then mode and owner, so the chmod or chown that
+/// makes `secrets.toml` readable takes effect at once.
+type Stamp = (SystemTime, u64, u64, u32, u32);
+/// `config.toml`, then `secrets.toml`.
+type Stamps = (Option<Stamp>, Option<Stamp>);
+
+fn stamp(path: &Path) -> Option<Stamp> {
+    let meta = fs::metadata(path).ok()?;
+    Some((
+        meta.modified().ok()?,
+        meta.len(),
+        meta.ino(),
+        meta.mode(),
+        meta.uid(),
+    ))
+}
+
+fn read_capped(path: &Path) -> Result<Vec<u8>, Vec<String>> {
+    let fail = |e: io::Error| vec![format!("{}: {e}", path.display())];
+    let mut bytes = Vec::new();
+    File::open(path)
+        .and_then(|file| file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes))
+        .map_err(fail)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(vec![format!(
+            "{} is over {} KB",
+            path.display(),
+            MAX_FILE_BYTES / 1024
+        )]);
+    }
+    Ok(bytes)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    encode_hex(&Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::Permissions;
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+    use crate::daemon::protocol::MAX_MESSAGE_BYTES;
+
+    /// The plan's example, without the icon and tile that S5 and S6 add.
+    const EXAMPLE: &str = r##"
+version = 1
+[layout]
+cols = 5
+rows = 3
+
+[[button]]
+id = "plex"
+pos = [0, 0]
+label = "Plex"
+bg = "#1e88e5"
+fg = "#ffffff"
+action = { kind = "shell", argv = ["ssh", "nas", "docker", "restart", "plex"], timeout_s = 30 }
+
+[[button]]
+id = "office-light"
+pos = [1, 0]
+label = "Office"
+action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/services/light/toggle",
+           body = '{"entity_id":"light.office"}', secret_headers = { Authorization = "ha" } }
+"##;
+
+    const EXAMPLE_URL: &str = "url = \"https://ha.lan:8123/api/services/light/toggle\"";
+
+    fn names() -> io::Result<Vec<String>> {
+        Ok(vec!["ha".into()])
+    }
+
+    /// The errors from `text`, which must parse as TOML and as a config.
+    fn errors(text: &str) -> Vec<String> {
+        parse(text, &names()).expect_err("the config must be refused")
+    }
+
+    /// The example with its first button's `from` replaced by `to`.
+    fn example_with(from: &str, to: &str) -> String {
+        assert!(EXAMPLE.contains(from), "{from}");
+        EXAMPLE.replacen(from, to, 1)
+    }
+
+    fn assert_refused(text: &str, expected: &str) {
+        let errors = errors(text);
+        assert!(
+            errors.iter().any(|e| e.contains(expected)),
+            "expected an error containing {expected:?}, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn the_example_and_the_default_pass() {
+        let config = parse(EXAMPLE, &names()).unwrap();
+        assert_eq!(config.buttons.len(), 2);
+        let office = config.button("office-light").unwrap();
+        assert_eq!(
+            (office.bg.as_str(), office.fg.as_str()),
+            ("#1e88e5", "#ffffff")
+        );
+        assert_eq!(office.action.timeout(), Duration::from_secs(10));
+        let layout = config.layout();
+        assert_eq!((layout.cols, layout.rows), (5, 3));
+        assert_eq!(
+            (layout.buttons[0].bg, layout.buttons[0].fg),
+            (0x1e88e5, 0xffffff)
+        );
+
+        let default = parse(DEFAULT, &Ok(Vec::new())).unwrap();
+        assert_eq!(default.buttons[0].id, "hello");
+        assert!(matches!(
+            &default.buttons[0].action,
+            Action::Shell { argv, .. } if argv[0] == "notify-send"
+        ));
+    }
+
+    #[test]
+    fn a_toml_error_names_its_line() {
+        assert_refused("version = 1\n[layout]\ncols = x\n", "line 3");
+    }
+
+    #[test]
+    fn unknown_fields_are_refused_icons_and_tiles_included() {
+        assert_refused(
+            &example_with("label = \"Plex\"", "name = \"Plex\""),
+            "unknown field `name`",
+        );
+        assert_refused(
+            &example_with("label = \"Plex\"", "label = \"Plex\"\nicon = \"a.png\""),
+            "icon",
+        );
+        assert_refused(
+            &example_with(
+                "label = \"Plex\"",
+                "label = \"Plex\"\ntile = { every_s = 15 }",
+            ),
+            "tile",
+        );
+        assert_refused(
+            &example_with("timeout_s = 30", "timeout_s = 30, shell = true"),
+            "shell",
+        );
+        assert_refused(&example_with("kind = \"shell\"", "kind = \"exec\""), "exec");
+    }
+
+    #[test]
+    fn the_version_must_be_1() {
+        assert_refused(
+            &EXAMPLE.replacen("version = 1", "version = 2", 1),
+            "version is 2",
+        );
+    }
+
+    #[test]
+    fn the_grid_is_1_to_8_columns_by_1_to_5_rows() {
+        for (from, to, expected) in [
+            ("cols = 5", "cols = 0", "layout.cols is 0"),
+            ("cols = 5", "cols = 9", "layout.cols is 9"),
+            ("rows = 3", "rows = 0", "layout.rows is 0"),
+            ("rows = 3", "rows = 6", "layout.rows is 6"),
+        ] {
+            assert_refused(&EXAMPLE.replacen(from, to, 1), expected);
+        }
+        let big = EXAMPLE
+            .replacen("cols = 5", "cols = 8", 1)
+            .replacen("rows = 3", "rows = 5", 1);
+        parse(&big, &names()).unwrap();
+    }
+
+    #[test]
+    fn ids_are_unique_short_and_plain() {
+        assert_refused(
+            &example_with("id = \"plex\"", "id = \"office-light\""),
+            "another button has this id",
+        );
+        for bad in ["", "has space", "x\u{e9}y", &"a".repeat(64)] {
+            assert_refused(
+                &example_with("id = \"plex\"", &format!("id = {bad:?}")),
+                "id must be",
+            );
+        }
+        let longest = example_with("id = \"plex\"", &format!("id = {:?}", "a".repeat(63)));
+        parse(&longest, &names()).unwrap();
+    }
+
+    #[test]
+    fn buttons_sit_inside_the_grid_one_per_cell() {
+        assert_refused(
+            &example_with("pos = [0, 0]", "pos = [5, 0]"),
+            "outside the 5x3 grid",
+        );
+        assert_refused(
+            &example_with("pos = [0, 0]", "pos = [0, 3]"),
+            "outside the 5x3 grid",
+        );
+        assert_refused(
+            &example_with("pos = [0, 0]", "pos = [1, 0]"),
+            "taken by button",
+        );
+    }
+
+    #[test]
+    fn labels_are_printable_ascii_up_to_47_bytes() {
+        assert_refused(
+            &example_with("label = \"Plex\"", "label = \"Pl\u{e9}x\""),
+            "printable ASCII",
+        );
+        assert_refused(
+            &example_with("label = \"Plex\"", "label = \"a\\tb\""),
+            "printable ASCII",
+        );
+        let long = format!("label = {:?}", "a".repeat(48));
+        assert_refused(&example_with("label = \"Plex\"", &long), "at most 47");
+        let longest = format!("label = {:?}", "~".repeat(47));
+        parse(&example_with("label = \"Plex\"", &longest), &names()).unwrap();
+    }
+
+    #[test]
+    fn colors_are_hash_and_six_hex_digits() {
+        for bad in ["red", "#12345", "#1234567", "#gggggg", "1e88e5"] {
+            assert_refused(
+                &example_with("bg = \"#1e88e5\"", &format!("bg = {bad:?}")),
+                "is not a #rrggbb color",
+            );
+        }
+        assert_refused(
+            &example_with("fg = \"#ffffff\"", "fg = \"white\""),
+            "fg \"white\"",
+        );
+        parse(
+            &example_with("bg = \"#1e88e5\"", "bg = \"#ABCdef\""),
+            &names(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn shell_argv_is_non_empty_with_a_program_and_no_nul() {
+        let argv = "argv = [\"ssh\", \"nas\", \"docker\", \"restart\", \"plex\"]";
+        assert_refused(&example_with(argv, "argv = []"), "argv is empty");
+        assert_refused(
+            &example_with(argv, "argv = [\"\", \"x\"]"),
+            "argv[0], the program, is empty",
+        );
+        assert_refused(
+            &example_with(argv, "argv = [\"echo\", \"a\\u0000b\"]"),
+            "argv[1] contains a NUL",
+        );
+        assert_refused(&example_with(argv, "argv = \"ssh nas\""), "invalid type");
+    }
+
+    #[test]
+    fn timeouts_are_1_to_600_seconds() {
+        assert_refused(
+            &example_with("timeout_s = 30", "timeout_s = 0"),
+            "timeout_s is 0",
+        );
+        assert_refused(
+            &example_with("timeout_s = 30", "timeout_s = 601"),
+            "timeout_s is 601",
+        );
+        assert_refused(
+            &example_with("timeout_s = 30", "timeout_s = -1"),
+            "invalid value",
+        );
+        let http = EXAMPLE.replacen(
+            "Authorization = \"ha\" }",
+            "Authorization = \"ha\" }, timeout_s = 0",
+            1,
+        );
+        assert_refused(&http, "timeout_s is 0");
+        parse(&example_with("timeout_s = 30", "timeout_s = 600"), &names()).unwrap();
+    }
+
+    #[test]
+    fn http_urls_are_http_or_https_with_a_host_and_stay_out_of_errors() {
+        for (bad, expected) in [
+            ("ftp://ha.lan/x?token=abc", "is not http:// or https://"),
+            ("file:///etc/passwd?token=abc", "is not http:// or https://"),
+            ("ha.lan/x?token=abc", "does not parse"),
+            ("http://?token=abc", "does not parse"),
+        ] {
+            let errors = errors(&EXAMPLE.replacen(EXAMPLE_URL, &format!("url = {bad:?}"), 1));
+            assert!(errors.iter().any(|e| e.contains(expected)), "{errors:?}");
+            assert!(
+                errors.iter().all(|e| !e.contains("token=abc")),
+                "{errors:?}"
+            );
+        }
+        parse(
+            &EXAMPLE.replacen(EXAMPLE_URL, "url = \"https://ha.lan/x\"", 1),
+            &names(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn secret_headers_need_https_unless_the_host_is_this_machine() {
+        let plain = EXAMPLE.replacen(EXAMPLE_URL, "url = \"http://ha.lan:8123/x\"", 1);
+        assert_refused(&plain, "in the clear");
+        for here in [
+            "http://127.0.0.1:8123/x",
+            "http://127.9.9.9/x",
+            "http://[::1]:8123/x",
+            "http://localhost:8123/x",
+            "http://LOCALHOST/x",
+        ] {
+            let text = EXAMPLE.replacen(EXAMPLE_URL, &format!("url = {here:?}"), 1);
+            let config = parse(&text, &names()).unwrap();
+            assert!(!config.buttons[1].action.secrets_in_clear(), "{here}");
+        }
+        let opted_in = plain.replacen(
+            "secret_headers = {",
+            "insecure_http = true, secret_headers = {",
+            1,
+        );
+        let config = parse(&opted_in, &names()).unwrap();
+        assert!(config.buttons[1].action.secrets_in_clear());
+        let without_secrets =
+            plain.replacen(", secret_headers = { Authorization = \"ha\" }", "", 1);
+        parse(&without_secrets, &names()).unwrap();
+    }
+
+    #[test]
+    fn plain_headers_are_checked_and_no_name_repeats_ignoring_case() {
+        let secret = "secret_headers = { Authorization = \"ha\" }";
+        let with = |headers: &str| EXAMPLE.replacen(secret, &format!("{headers}, {secret}"), 1);
+        let config = parse(
+            &with("headers = { \"Content-Type\" = \"application/json\" }"),
+            &names(),
+        )
+        .unwrap();
+        let Action::Http { headers, .. } = &config.buttons[1].action else {
+            panic!("expected an http action");
+        };
+        assert_eq!(headers["Content-Type"], "application/json");
+
+        for (headers, expected) in [
+            (
+                "headers = { \"X-A\" = \"1\\r\\nX-Injected: 1\" }",
+                "printable ASCII",
+            ),
+            ("headers = { \"X-A\" = \"tab\\there\" }", "printable ASCII"),
+            (
+                "headers = { \"Bad Header\" = \"1\" }",
+                "not a valid header name",
+            ),
+            (
+                "headers = { authorization = \"Basic x\" }",
+                "\"Authorization\" is set twice",
+            ),
+        ] {
+            assert_refused(&with(headers), expected);
+        }
+        assert_refused(
+            &EXAMPLE.replacen(
+                secret,
+                "secret_headers = { Authorization = \"ha\", authorization = \"ha\" }",
+                1,
+            ),
+            "is set twice",
+        );
+    }
+
+    #[test]
+    fn a_toml_error_keeps_its_place_but_not_the_line() {
+        let errors = errors("version = 1\nurl = \"http://x/?token=abc\n");
+        assert!(errors[0].starts_with("line 2, column "), "{errors:?}");
+        assert!(!errors[0].contains("token=abc"), "{errors:?}");
+    }
+
+    #[test]
+    fn http_methods_bodies_and_headers_are_checked() {
+        assert_refused(
+            &EXAMPLE.replacen("method = \"POST\"", "method = \"post\"", 1),
+            "is not one of",
+        );
+        assert_refused(
+            &EXAMPLE.replacen("method = \"POST\"", "method = \"TRACE\"", 1),
+            "is not one of",
+        );
+        let body = format!("body = '{}'", "a".repeat(MAX_BODY_BYTES + 1));
+        assert_refused(
+            &EXAMPLE.replacen("body = '{\"entity_id\":\"light.office\"}'", &body, 1),
+            "body is over",
+        );
+        let header = "secret_headers = { Authorization = \"ha\" }";
+        assert_refused(
+            &EXAMPLE.replacen(header, "secret_headers = { \"Bad Header\" = \"ha\" }", 1),
+            "not a valid header name",
+        );
+    }
+
+    #[test]
+    fn secret_headers_name_secrets_that_exist() {
+        let errors = parse(EXAMPLE, &Ok(vec!["other".into()])).unwrap_err();
+        assert!(
+            errors[0].contains("secret \"ha\", which is not in secrets.toml"),
+            "{errors:?}"
+        );
+        let unreadable = Err(io::Error::new(io::ErrorKind::PermissionDenied, "mode 0644"));
+        let errors = parse(EXAMPLE, &unreadable).unwrap_err();
+        assert!(errors[0].contains("can't be read: mode 0644"), "{errors:?}");
+        // A config without secrets doesn't care whether secrets.toml reads.
+        let shell_only = EXAMPLE
+            .split("[[button]]")
+            .take(2)
+            .collect::<Vec<_>>()
+            .join("[[button]]");
+        parse(&shell_only, &Err(io::Error::other("unreadable"))).unwrap();
+    }
+
+    #[test]
+    fn every_problem_is_reported_at_once() {
+        let text = example_with("pos = [0, 0]", "pos = [9, 9]").replacen(
+            "bg = \"#1e88e5\"",
+            "bg = \"blue\"",
+            1,
+        );
+        let errors = parse(&text, &Ok(Vec::new())).unwrap_err();
+        assert_eq!(errors.len(), 3, "{errors:?}");
+    }
+
+    #[test]
+    fn the_fullest_layout_fits_in_one_message() {
+        let mut config = Config::empty();
+        config.layout = Grid {
+            cols: MAX_COLS,
+            rows: MAX_ROWS,
+        };
+        for i in 0..MAX_COLS * MAX_ROWS {
+            config.buttons.push(ButtonConfig {
+                id: format!("{i:0>63}"),
+                pos: [i % MAX_COLS, i / MAX_COLS],
+                label: "\"\\".repeat(MAX_LABEL_BYTES / 2) + "\"",
+                bg: "#ffffff".into(),
+                fg: "#ffffff".into(),
+                action: Action::Shell {
+                    argv: vec!["true".into()],
+                    timeout_s: 1,
+                },
+            });
+        }
+        assert!(config.check(&Ok(Vec::new())).is_empty());
+        let json = serde_json::to_string(&config.layout().message(u32::MAX)).unwrap();
+        assert!(json.len() <= MAX_MESSAGE_BYTES, "{} bytes", json.len());
+    }
+
+    // ---- The file ----
+
+    fn open(dir: &Path) -> Arc<Configs> {
+        Configs::open(dir, Arc::new(Secrets::new(dir))).unwrap()
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn a_missing_file_gets_the_default_written_0600_and_loaded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let configs = open(tmp.path());
+        let path = tmp.path().join(FILE);
+        assert_eq!(fs::read_to_string(&path).unwrap(), DEFAULT);
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(configs.current().buttons[0].id, "hello");
+        let status = configs.status().borrow().clone();
+        assert!(status.errors.is_empty());
+        assert_eq!(status.revision, sha256_hex(DEFAULT.as_bytes()));
+    }
+
+    #[test]
+    fn an_invalid_file_at_start_runs_an_empty_grid_and_says_why() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join(FILE),
+            "version = 2\n[layout]\ncols = 5\nrows = 3\n",
+        )
+        .unwrap();
+        let configs = open(tmp.path());
+        assert_eq!(*configs.current(), Config::empty());
+        let status = configs.status().borrow().clone();
+        assert!(status.errors[0].contains("version is 2"), "{status:?}");
+        assert_eq!(status.revision, "");
+    }
+
+    #[test]
+    fn a_bad_reload_keeps_the_live_config_and_a_good_one_replaces_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(FILE);
+        let configs = open(tmp.path());
+        let mut live = configs.subscribe();
+        live.mark_unchanged();
+
+        fs::write(
+            &path,
+            DEFAULT.replacen("label = \"Hello\"", "label = \"H\u{e9}llo\"", 1),
+        )
+        .unwrap();
+        let errors = configs.reload().unwrap_err();
+        assert!(errors[0].contains("printable ASCII"), "{errors:?}");
+        assert!(
+            !live.has_changed().unwrap(),
+            "an invalid config must not go live"
+        );
+        assert_eq!(configs.current().buttons[0].label, "Hello");
+        assert_eq!(configs.status().borrow().errors, errors);
+
+        fs::write(
+            &path,
+            DEFAULT.replacen("label = \"Hello\"", "label = \"Hi\"", 1),
+        )
+        .unwrap();
+        assert_eq!(configs.reload(), Ok(true));
+        assert!(live.has_changed().unwrap());
+        assert_eq!(configs.current().buttons[0].label, "Hi");
+        assert!(configs.status().borrow().errors.is_empty());
+
+        // A comment-only edit is a new revision of the same config, so nothing is pushed.
+        live.mark_unchanged();
+        fs::write(
+            &path,
+            format!("# note\n{}", fs::read_to_string(&path).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(configs.reload(), Ok(false));
+        assert!(!live.has_changed().unwrap());
+    }
+
+    #[test]
+    fn a_missing_secret_holds_the_config_back_until_it_is_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join(FILE), EXAMPLE).unwrap();
+        let secrets = Arc::new(Secrets::new(tmp.path()));
+        let configs = Configs::open(tmp.path(), secrets.clone()).unwrap();
+        assert!(configs.current().buttons.is_empty());
+        secrets.set("ha", "Bearer x").unwrap();
+        assert_eq!(configs.reload(), Ok(true));
+        assert_eq!(configs.current().buttons.len(), 2);
+    }
+
+    #[test]
+    fn save_writes_0600_and_goes_live_but_only_from_the_live_revision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(FILE);
+        let configs = open(tmp.path());
+        let loaded = configs.status().borrow().revision.clone();
+        let mut config = (*configs.current()).clone();
+        config.buttons[0].label = "Saved".into();
+
+        let stale = configs.save(config.clone(), "0123").unwrap_err();
+        assert!(
+            stale[0].contains("changed since it was loaded"),
+            "{stale:?}"
+        );
+        let revision = configs.save(config.clone(), &loaded).unwrap();
+        assert_ne!(revision, loaded);
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(configs.current().buttons[0].label, "Saved");
+        assert_eq!(
+            parse(&fs::read_to_string(&path).unwrap(), &Ok(Vec::new())).unwrap(),
+            config
+        );
+        assert_eq!(
+            configs.reload(),
+            Ok(false),
+            "the poller finds nothing new after a save"
+        );
+
+        // A hand edit that isn't live yet is never overwritten.
+        fs::write(&path, "version = 1\n").unwrap();
+        let held = configs.save(config, &revision).unwrap_err();
+        assert!(held[0].contains("edits on disk"), "{held:?}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "version = 1\n");
+    }
+
+    #[test]
+    fn an_invalid_save_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(FILE);
+        let configs = open(tmp.path());
+        let revision = configs.status().borrow().revision.clone();
+        let mut config = (*configs.current()).clone();
+        config.buttons[0].pos = [7, 0];
+        let errors = configs.save(config, &revision).unwrap_err();
+        assert!(errors[0].contains("outside"), "{errors:?}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), DEFAULT);
+    }
+
+    #[test]
+    fn an_unreadable_or_huge_file_is_an_error_not_a_crash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(FILE);
+        let configs = open(tmp.path());
+        fs::write(&path, vec![b'#'; MAX_FILE_BYTES as usize + 1]).unwrap();
+        assert!(configs.reload().unwrap_err()[0].contains("is over"));
+        fs::write(&path, b"version = 1\xff").unwrap();
+        assert_eq!(configs.reload().unwrap_err(), ["not UTF-8"]);
+        fs::set_permissions(&path, Permissions::from_mode(0o000)).unwrap();
+        // Root reads anything, so only check that a failure, if any, is reported.
+        if fs::read(&path).is_err() {
+            assert!(configs.reload().is_err());
+        }
+        fs::remove_file(&path).unwrap();
+        assert!(configs.reload().is_err());
+        assert_eq!(configs.current().buttons[0].id, "hello");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_poller_applies_an_edit_once_it_settles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(FILE);
+        let configs = open(tmp.path());
+        let mut live = configs.subscribe();
+        live.mark_unchanged();
+        tokio::spawn(configs.clone().watch_files());
+        tokio::time::sleep(POLL / 2).await;
+
+        fs::write(
+            &path,
+            DEFAULT.replacen("label = \"Hello\"", "label = \"Polled\"", 1),
+        )
+        .unwrap();
+        tokio::time::sleep(POLL).await;
+        assert!(
+            !live.has_changed().unwrap(),
+            "applied before the file settled"
+        );
+        tokio::time::timeout(3 * POLL, live.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(configs.current().buttons[0].label, "Polled");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_chmod_that_makes_secrets_readable_applies_the_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join(FILE), EXAMPLE).unwrap();
+        let secrets_path = tmp.path().join(crate::daemon::secrets::FILE);
+        fs::write(&secrets_path, "ha = \"Bearer x\"\n").unwrap();
+        fs::set_permissions(&secrets_path, Permissions::from_mode(0o644)).unwrap();
+        let configs = open(tmp.path());
+        let errors = configs.status().borrow().errors.clone();
+        assert!(errors[0].contains("can't be read"), "{errors:?}");
+        let mut live = configs.subscribe();
+        live.mark_unchanged();
+        tokio::spawn(configs.clone().watch_files());
+        tokio::time::sleep(POLL / 2).await;
+
+        // Only the mode changes, not the content, size or inode.
+        fs::set_permissions(&secrets_path, Permissions::from_mode(0o600)).unwrap();
+        tokio::time::timeout(4 * POLL, live.changed())
+            .await
+            .expect("the chmod was not picked up")
+            .unwrap();
+        assert_eq!(configs.current().buttons.len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_edit_made_before_the_poller_starts_still_applies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let configs = open(tmp.path());
+        let mut live = configs.subscribe();
+        live.mark_unchanged();
+        fs::write(
+            tmp.path().join(FILE),
+            DEFAULT.replacen("label = \"Hello\"", "label = \"Early\"", 1),
+        )
+        .unwrap();
+
+        tokio::spawn(configs.clone().watch_files());
+        tokio::time::timeout(4 * POLL, live.changed())
+            .await
+            .expect("the edit was lost")
+            .unwrap();
+        assert_eq!(configs.current().buttons[0].label, "Early");
+    }
+
+    #[test]
+    fn a_save_round_trips_http_actions_with_every_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let secrets = Arc::new(Secrets::new(tmp.path()));
+        secrets.set("ha", "Bearer x").unwrap();
+        let configs = Configs::open(tmp.path(), secrets).unwrap();
+        let revision = configs.status().borrow().revision.clone();
+        let http = |id: &str, col, url: &str, insecure_http| ButtonConfig {
+            id: id.into(),
+            pos: [col, 0],
+            label: id.into(),
+            bg: "#000000".into(),
+            fg: "#ffffff".into(),
+            action: Action::Http {
+                method: "POST".into(),
+                url: url.into(),
+                body: Some("{\"a\": \"b\\nc\"}\n'quoted'".into()),
+                headers: BTreeMap::from([("Content-Type".into(), "application/json".into())]),
+                secret_headers: BTreeMap::from([("Authorization".into(), "ha".into())]),
+                insecure_http,
+                timeout_s: 5,
+            },
+        };
+        let mut config = (*configs.current()).clone();
+        config
+            .buttons
+            .push(http("web", 1, "https://ha.lan/api", false));
+        config
+            .buttons
+            .push(http("lan", 2, "http://ha.lan/api", true));
+
+        configs.save(config.clone(), &revision).unwrap();
+        let text = fs::read_to_string(tmp.path().join(FILE)).unwrap();
+        assert_eq!(text.matches("insecure_http").count(), 1, "{text}");
+        assert_eq!(parse(&text, &names()).unwrap(), config);
+    }
+}

@@ -1,6 +1,7 @@
 //! A fake device driving the daemon over a real socket, without mDNS. It pins the daemon's cert
 //! the way the device does: the exact cert bytes, with no name or date checks.
 
+use std::fs;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,7 +12,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use futures_util::{SinkExt, StreamExt};
 use sha2::{Digest, Sha256};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::client::danger::{
@@ -28,11 +29,13 @@ use tokio_rustls::rustls::{
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::Message as Ws;
 use tokio_tungstenite::{client_async, connect_async, WebSocketStream};
-use watchdeck_lib::daemon::actions::{ActionResult, Runner};
+use watchdeck_lib::daemon::actions::Actions;
+use watchdeck_lib::daemon::config::{self, Configs};
 use watchdeck_lib::daemon::pairing::{Pairing, PairingState};
 use watchdeck_lib::daemon::protocol::{
     decode_hex, encode_hex, pairing_code, ErrorCode, Message, Token,
 };
+use watchdeck_lib::daemon::secrets::Secrets;
 use watchdeck_lib::daemon::server::{DaemonEvent, DeviceInfo, Devices, Server};
 use watchdeck_lib::daemon::store::Store;
 use watchdeck_lib::daemon::tls::Identity;
@@ -102,34 +105,54 @@ fn identity() -> &'static Identity {
     })
 }
 
-fn stub_runner() -> Runner {
-    Arc::new(|btn, device| {
-        Box::pin(async move {
-            ActionResult {
-                ok: true,
-                code: 0,
-                text: format!("ran {btn} for {device}"),
-                ms: 1,
-            }
-        })
-    })
-}
+/// One button, `hello` at the top left in the default colors, that prints "ran hello".
+const CONFIG: &str = r#"
+version = 1
+[layout]
+cols = 5
+rows = 3
+
+[[button]]
+id = "hello"
+pos = [0, 0]
+label = "Hello"
+action = { kind = "shell", argv = ["echo", "ran hello"] }
+"#;
 
 struct Daemon {
     addr: SocketAddr,
     events: broadcast::Receiver<DaemonEvent>,
     devices: Devices,
     pairing: Arc<Pairing>,
-    _state: tempfile::TempDir,
+    configs: Arc<Configs>,
+    secrets: Arc<Secrets>,
+    /// The config dir, which is also where shell actions run.
+    dir: tempfile::TempDir,
 }
 
-/// A daemon on an ephemeral port with `DEVICE` paired, whose pairing listener binds `pair_addr`
-/// for at most `window` once started, and whose actions `runner` runs.
-async fn start_with(pair_addr: SocketAddr, window: Duration, runner: Runner) -> Daemon {
-    let state = tempfile::tempdir().unwrap();
+impl Daemon {
+    /// Replaces `config.toml` and reloads it, returning what the reload said.
+    fn reconfigure(&self, text: &str) -> Result<bool, Vec<String>> {
+        fs::write(self.dir.path().join(config::FILE), text).unwrap();
+        self.configs.reload()
+    }
+}
+
+/// A daemon on an ephemeral port with `DEVICE` paired and `config` as its `config.toml`, whose
+/// pairing listener binds `pair_addr` for at most `window` once started.
+async fn start_with(pair_addr: SocketAddr, window: Duration, config: &str) -> Daemon {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join(config::FILE), config).unwrap();
+    let secrets = Arc::new(Secrets::new(dir.path()));
+    let configs = Configs::open(dir.path(), secrets.clone()).unwrap();
+    assert!(
+        configs.status().borrow().errors.is_empty(),
+        "the test config must be valid"
+    );
+    let actions = Actions::new(secrets.clone(), dir.path().to_path_buf()).unwrap();
     let tls = identity().server_config().unwrap();
-    let store = Store::load(state.path()).unwrap();
-    let server = Server::bind("127.0.0.1:0", tls, runner, store)
+    let store = Store::load(dir.path()).unwrap();
+    let server = Server::bind("127.0.0.1:0", tls, store, configs.subscribe(), actions)
         .await
         .unwrap();
     let devices = server.devices();
@@ -146,7 +169,9 @@ async fn start_with(pair_addr: SocketAddr, window: Duration, runner: Runner) -> 
         events: server.subscribe(),
         devices,
         pairing,
-        _state: state,
+        configs,
+        secrets,
+        dir,
     };
     tokio::spawn(server.run());
     daemon
@@ -156,7 +181,16 @@ async fn start() -> Daemon {
     start_with(
         "127.0.0.1:0".parse().unwrap(),
         Duration::from_secs(30),
-        stub_runner(),
+        CONFIG,
+    )
+    .await
+}
+
+async fn start_configured(config: &str) -> Daemon {
+    start_with(
+        "127.0.0.1:0".parse().unwrap(),
+        Duration::from_secs(30),
+        config,
     )
     .await
 }
@@ -373,26 +407,32 @@ async fn hello_gets_welcome_then_the_layout() {
     assert_eq!(buttons.len(), 1);
     let b = &buttons[0];
     assert_eq!((b.id.as_str(), b.col, b.row), ("hello", 0, 0));
-    assert_eq!((b.label.as_str(), b.bg, b.fg), ("Hello", 1959605, 16777215));
+    assert_eq!(
+        (b.label.as_str(), b.bg, b.fg),
+        ("Hello", 0x1e88e5, 0xffffff)
+    );
 }
 
 #[tokio::test]
-async fn press_hello_gets_one_ok_result() {
+async fn press_hello_runs_its_command_and_gets_one_ok_result() {
     let daemon = start().await;
     let addr = daemon.addr;
     let mut c = handshake(addr, DEVICE, &TOKEN).await;
     c.send(press("hello", 17)).await.unwrap();
-    assert_eq!(
-        recv(&mut c).await,
-        Message::Result {
-            btn: "hello".into(),
-            seq: 17,
-            ok: true,
-            code: 0,
-            text: format!("ran hello for {DEVICE}"),
-            ms: 1,
-        }
-    );
+    let Message::Result {
+        btn,
+        seq,
+        ok,
+        code,
+        summary,
+        text,
+        ..
+    } = recv(&mut c).await
+    else {
+        panic!("expected result")
+    };
+    assert_eq!((btn.as_str(), seq, ok, code), ("hello", 17, true, 0));
+    assert_eq!((summary.as_str(), text.as_str()), ("exit 0", "ran hello"));
 }
 
 #[tokio::test]
@@ -408,7 +448,8 @@ async fn press_unknown_button_fails_without_running_anything() {
             seq: 3,
             ok: false,
             code: -1,
-            text: "unknown button".into(),
+            summary: "unknown button".into(),
+            text: String::new(),
             ms: 0,
         }
     );
@@ -695,50 +736,57 @@ async fn forget_closes_the_live_session_with_unauthorized_and_voids_the_token() 
     );
 }
 
-#[tokio::test]
-async fn presses_queued_behind_a_forget_never_run() {
-    let runs = Arc::new(AtomicUsize::new(0));
-    let counter = runs.clone();
-    let slow: Runner = Arc::new(move |_btn, _device| {
-        let runs = counter.clone();
-        Box::pin(async move {
-            runs.fetch_add(1, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            ActionResult {
-                ok: true,
-                code: 0,
-                text: String::new(),
-                ms: 200,
-            }
-        })
-    });
-    let daemon = start_with(
-        "127.0.0.1:0".parse().unwrap(),
-        Duration::from_secs(30),
-        slow,
-    )
-    .await;
-    let mut c = handshake(daemon.addr, DEVICE, &TOKEN).await;
-    for seq in 1..=4 {
-        c.send(press("hello", seq)).await.unwrap();
-    }
+/// Two buttons whose commands each add a line to `runs` in the config dir. `slow` then takes 300 ms.
+const COUNTING: &str = r#"
+version = 1
+[layout]
+cols = 5
+rows = 3
 
-    // Forget while the first press runs, with the other three queued behind it.
+[[button]]
+id = "slow"
+pos = [0, 0]
+label = "Slow"
+action = { kind = "shell", argv = ["sh", "-c", "echo slow >> runs; sleep 0.3"] }
+
+[[button]]
+id = "count"
+pos = [1, 0]
+label = "Count"
+action = { kind = "shell", argv = ["sh", "-c", "echo count >> runs"] }
+"#;
+
+fn runs(daemon: &Daemon) -> Vec<String> {
+    match fs::read_to_string(daemon.dir.path().join("runs")) {
+        Ok(text) => text.lines().map(String::from).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+// Presses run concurrently, so none waits behind another. What a revocation must stop is any
+// press that arrives after it, even while an earlier run is still going.
+#[tokio::test]
+async fn no_press_runs_after_a_forget_even_with_a_run_in_flight() {
+    let daemon = start_configured(COUNTING).await;
+    let mut c = handshake(daemon.addr, DEVICE, &TOKEN).await;
+    c.send(press("slow", 1)).await.unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
-    while runs.load(Ordering::SeqCst) == 0 {
+    while runs(&daemon).is_empty() {
         assert!(Instant::now() < deadline, "the first press never ran");
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    assert!(daemon.devices.forget(DEVICE).unwrap());
-    let started = runs.load(Ordering::SeqCst);
 
-    assert!(matches!(recv(&mut c).await, Message::Result { seq: 1, .. }));
+    assert!(daemon.devices.forget(DEVICE).unwrap());
+    // The session may not have seen the kick yet, but this press must not run either way.
+    c.send(press("count", 2)).await.unwrap();
     assert_eq!(recv(&mut c).await, unauthorized());
     expect_closed(&mut c).await;
-    assert_eq!(started, 1);
+
+    // Long enough for both commands to finish, had both started.
+    tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
-        runs.load(Ordering::SeqCst),
-        started,
+        runs(&daemon),
+        ["slow"],
         "a press started after forget returned"
     );
 }
@@ -958,7 +1006,7 @@ async fn the_pairing_port_is_open_only_while_the_dialog_is() {
     let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let pair_addr = free.local_addr().unwrap();
     drop(free);
-    let daemon = start_with(pair_addr, Duration::from_secs(30), stub_runner()).await;
+    let daemon = start_with(pair_addr, Duration::from_secs(30), CONFIG).await;
     let mut advertised = daemon.pairing.advertised();
 
     assert_port_closed(pair_addr).await;
@@ -983,7 +1031,7 @@ async fn an_unused_pairing_window_closes_when_it_times_out() {
     let daemon = start_with(
         "127.0.0.1:0".parse().unwrap(),
         Duration::from_secs(1),
-        stub_runner(),
+        CONFIG,
     )
     .await;
     let started = Instant::now();
@@ -1004,7 +1052,7 @@ async fn a_device_waiting_on_the_code_is_told_when_the_window_times_out() {
     let daemon = start_with(
         "127.0.0.1:0".parse().unwrap(),
         Duration::from_secs(1),
-        stub_runner(),
+        CONFIG,
     )
     .await;
     let pair_addr = daemon.pairing.start().await.unwrap();
@@ -1069,4 +1117,310 @@ async fn a_bad_or_oversize_attempt_is_refused_and_the_window_stays_open() {
     .await;
     daemon.pairing.confirm(&code).unwrap();
     assert_eq!(recv(&mut ws).await, Message::PairResult { ok: true });
+}
+
+// ---- Config and actions ----
+
+/// `CONFIG` with `from` replaced by `to`.
+fn config_with(from: &str, to: &str) -> String {
+    assert!(CONFIG.contains(from), "{from}");
+    CONFIG.replacen(from, to, 1)
+}
+
+const SECOND: &str = r##"
+[[button]]
+id = "second"
+pos = [4, 2]
+label = "Second"
+bg = "#000000"
+action = { kind = "shell", argv = ["true"] }
+"##;
+
+#[tokio::test]
+async fn a_config_edit_reaches_a_connected_device_without_a_reconnect() {
+    let mut daemon = start().await;
+    let mut c = handshake(daemon.addr, DEVICE, &TOKEN).await;
+    assert_eq!(
+        daemon.events.recv().await.unwrap(),
+        DaemonEvent::DeviceConnected(DEVICE.into())
+    );
+
+    let edited = config_with("label = \"Hello\"", "label = \"Hi\"") + SECOND;
+    assert_eq!(daemon.reconfigure(&edited), Ok(true));
+    let Message::Layout { rev, buttons, .. } = recv(&mut c).await else {
+        panic!("expected the new layout")
+    };
+    assert_eq!(rev, 2);
+    let shown: Vec<_> = buttons
+        .iter()
+        .map(|b| (b.id.as_str(), b.col, b.row, b.label.as_str(), b.bg))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            ("hello", 0, 0, "Hi", 0x1e88e5),
+            ("second", 4, 2, "Second", 0)
+        ]
+    );
+
+    // The same session runs the new button, and nothing reconnected.
+    c.send(press("second", 1)).await.unwrap();
+    assert!(matches!(
+        recv(&mut c).await,
+        Message::Result {
+            seq: 1,
+            ok: true,
+            ..
+        }
+    ));
+    assert!(
+        daemon.events.try_recv().is_err(),
+        "the session was replaced"
+    );
+}
+
+#[tokio::test]
+async fn an_invalid_config_is_never_pushed_and_the_last_good_one_keeps_working() {
+    let daemon = start().await;
+    let mut c = handshake(daemon.addr, DEVICE, &TOKEN).await;
+    for bad in [
+        config_with("cols = 5", "cols = 9"),
+        config_with("label = \"Hello\"", "label = \"H\u{e9}llo\""),
+        config_with("pos = [0, 0]", "pos = [5, 0]"),
+        "not toml at all".to_string(),
+    ] {
+        let errors = daemon.reconfigure(&bad).unwrap_err();
+        assert!(!errors.is_empty());
+        assert_eq!(daemon.configs.status().borrow().errors, errors);
+    }
+
+    // A pushed layout would come before this press's result.
+    c.send(press("hello", 1)).await.unwrap();
+    let Message::Result { seq, text, .. } = recv(&mut c).await else {
+        panic!("expected the press's result, not a layout")
+    };
+    assert_eq!((seq, text.as_str()), (1, "ran hello"));
+
+    // A fresh session gets the last good layout too.
+    let mut fresh = connect(daemon.addr).await;
+    fresh.send(hello(1, DEVICE, Some(&TOKEN))).await.unwrap();
+    assert!(matches!(recv(&mut fresh).await, Message::Welcome { .. }));
+    let Message::Layout { cols, buttons, .. } = recv(&mut fresh).await else {
+        panic!("expected layout")
+    };
+    assert_eq!((cols, buttons[0].label.as_str()), (5, "Hello"));
+}
+
+#[tokio::test]
+async fn an_edit_to_actions_alone_pushes_no_layout_and_applies_at_once() {
+    let daemon = start().await;
+    let mut c = handshake(daemon.addr, DEVICE, &TOKEN).await;
+    let edited = config_with("\"ran hello\"", "\"ran the new action\"");
+    assert_eq!(daemon.reconfigure(&edited), Ok(true));
+    c.send(press("hello", 1)).await.unwrap();
+    let Message::Result { text, .. } = recv(&mut c).await else {
+        panic!("expected the press's result, not a layout")
+    };
+    assert_eq!(text, "ran the new action");
+}
+
+#[tokio::test]
+async fn a_second_press_while_a_button_runs_gets_already_running() {
+    let daemon = start_configured(
+        &(config_with("[\"echo\", \"ran hello\"]", "[\"sleep\", \"1\"]") + SECOND),
+    )
+    .await;
+    let mut c = handshake(daemon.addr, DEVICE, &TOKEN).await;
+    c.send(press("hello", 1)).await.unwrap();
+    c.send(press("hello", 2)).await.unwrap();
+    c.send(press("second", 3)).await.unwrap();
+
+    let Message::Result {
+        seq,
+        ok,
+        code,
+        summary,
+        ms,
+        ..
+    } = recv(&mut c).await
+    else {
+        panic!("expected result")
+    };
+    assert_eq!(
+        (seq, ok, code, summary.as_str(), ms),
+        (2, false, -1, "already running", 0)
+    );
+    // Another button runs meanwhile, and finishes first.
+    assert!(matches!(
+        recv(&mut c).await,
+        Message::Result {
+            seq: 3,
+            ok: true,
+            ..
+        }
+    ));
+    let Message::Result { seq, ok, ms, .. } = recv(&mut c).await else {
+        panic!("expected result")
+    };
+    assert!(seq == 1 && ok && ms >= 1000, "seq {seq}, ok {ok}, {ms} ms");
+
+    // Once the run ends the button is free again.
+    c.send(press("hello", 4)).await.unwrap();
+    assert!(matches!(
+        recv(&mut c).await,
+        Message::Result {
+            seq: 4,
+            ok: true,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn a_session_answers_pings_while_an_action_runs() {
+    let daemon = start_configured(&config_with(
+        "[\"echo\", \"ran hello\"]",
+        "[\"sleep\", \"1\"]",
+    ))
+    .await;
+    let mut c = handshake(daemon.addr, DEVICE, &TOKEN).await;
+    c.send(press("hello", 1)).await.unwrap();
+    c.send(Ws::Ping(vec![9].into())).await.unwrap();
+    let frame = c.next().await.unwrap().unwrap();
+    assert!(
+        matches!(&frame, Ws::Pong(p) if p.as_ref() == [9]),
+        "{frame:?}"
+    );
+    assert!(matches!(
+        recv(&mut c).await,
+        Message::Result {
+            seq: 1,
+            ok: true,
+            ..
+        }
+    ));
+}
+
+/// The value the daemon must never log or send to the device.
+const SECRET: &str = "Bearer device-sim-s3cret";
+
+static LOG_RECORDS: AtomicUsize = AtomicUsize::new(0);
+static LOG_LEAKS: AtomicUsize = AtomicUsize::new(0);
+static LOG_INSECURE: AtomicUsize = AtomicUsize::new(0);
+
+/// Counts every log record at every level, those that contain [`SECRET`], and the warnings
+/// about secrets sent over plain http.
+struct LeakCheck;
+
+impl log::Log for LeakCheck {
+    fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        LOG_RECORDS.fetch_add(1, Ordering::SeqCst);
+        let text = record.args().to_string();
+        if text.contains(SECRET) {
+            LOG_LEAKS.fetch_add(1, Ordering::SeqCst);
+        }
+        if record.level() == log::Level::Warn && text.contains("as insecure_http allows") {
+            LOG_INSECURE.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+/// An HTTP/1.1 server that answers each request with its own head, which holds the headers.
+async fn echo_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if socket.read(&mut byte).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    head.push(byte[0]);
+                }
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    head.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.write_all(&head).await;
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn a_secret_header_reaches_the_server_but_never_the_device_or_the_logs() {
+    log::set_logger(&LeakCheck).expect("only this test sets a logger");
+    log::set_max_level(log::LevelFilter::Trace);
+
+    let server = echo_server().await;
+    let daemon = start().await;
+    daemon.secrets.set("tok", SECRET).unwrap();
+    let edited = CONFIG.to_string()
+        + &format!(
+            r#"
+[[button]]
+id = "web"
+pos = [1, 0]
+label = "Web"
+action = {{ kind = "http", method = "GET", url = "http://{server}/state", secret_headers = {{ Authorization = "tok" }} }}
+"#
+        );
+    assert_eq!(daemon.reconfigure(&edited), Ok(true));
+    let mut c = handshake(daemon.addr, DEVICE, &TOKEN).await;
+    c.send(press("web", 1)).await.unwrap();
+    let result = recv(&mut c).await;
+    let Message::Result {
+        ok, summary, text, ..
+    } = &result
+    else {
+        panic!("expected result")
+    };
+    assert!(*ok, "{summary}");
+    // The echo proves the header went out. The device gets it blanked.
+    assert!(
+        text.to_ascii_lowercase()
+            .contains("authorization: <secret>"),
+        "{text}"
+    );
+    assert!(!format!("{result:?}").contains(SECRET));
+
+    // A secret that is missing is named, never shown.
+    let gone = edited.replace("\"tok\"", "\"missing\"");
+    let errors = daemon.reconfigure(&gone).unwrap_err();
+    assert!(errors.iter().all(|e| !e.contains(SECRET)), "{errors:?}");
+
+    // Plain http to another machine needs the opt-in, and going live with it warns.
+    let lan = edited.replace(
+        &format!("url = \"http://{server}/state\","),
+        "url = \"http://ha.lan/state\",",
+    );
+    assert_ne!(lan, edited);
+    let errors = daemon.reconfigure(&lan).unwrap_err();
+    assert!(errors[0].contains("in the clear"), "{errors:?}");
+    assert_eq!(LOG_INSECURE.load(Ordering::SeqCst), 0);
+    let opted_in = lan.replace("secret_headers =", "insecure_http = true, secret_headers =");
+    assert_eq!(daemon.reconfigure(&opted_in), Ok(true));
+    assert_eq!(LOG_INSECURE.load(Ordering::SeqCst), 1);
+
+    assert!(
+        LOG_RECORDS.load(Ordering::SeqCst) > 0,
+        "the logger saw nothing"
+    );
+    assert_eq!(
+        LOG_LEAKS.load(Ordering::SeqCst),
+        0,
+        "a log record held the secret"
+    );
 }

@@ -160,7 +160,7 @@ pub(super) fn check_private(path: &Path, uid: u32) -> io::Result<()> {
 /// partial file behind. The temp file is opened `create_new`, which (O_EXCL) fails on a planted
 /// symlink instead of following it, so it needs no separate O_NOFOLLOW. A temp file left by a
 /// crash is removed first, which is safe because the caller is the only writer: it holds the
-/// identity lock, or port 47820 for `state.json`.
+/// identity lock, or port 47820 for `state.json`, `config.toml` and `secrets.toml`.
 pub(super) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_added_extension("tmp");
     match fs::remove_file(&tmp) {

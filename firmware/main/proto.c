@@ -216,7 +216,8 @@ static esp_err_t parse_result(const cJSON *root, proto_result_t *out)
     out->seq = (uint32_t)seq;
     out->code = (int)code;
     out->ms = (uint32_t)ms;
-    get_str(root, "btn", out->btn, sizeof(out->btn), false); // optional, only logged
+    get_str(root, "btn", out->btn, sizeof(out->btn), false); // optional, names the button on screen
+    get_str(root, "summary", out->summary, sizeof(out->summary), false);
     get_str(root, "text", out->text, sizeof(out->text), false);
     return ESP_OK;
 }

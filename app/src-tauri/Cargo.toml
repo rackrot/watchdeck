@@ -46,6 +46,13 @@ rcgen = { version = "0.14.10", default-features = false, features = [
   "aws_lc_rs",
   "pem",
 ] }
+# `rustls` is rustls on aws-lc-rs. reqwest takes the process's installed provider when there is
+# one. No http2, charset or system-proxy: actions speak HTTP/1.1 straight to their URL.
+reqwest = { version = "0.13.5", default-features = false, features = [
+  "rustls",
+] }
+nix = { version = "0.31.3", features = ["signal"] }
+toml = "1.1.8"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

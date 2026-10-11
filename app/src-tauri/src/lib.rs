@@ -2,9 +2,13 @@ mod commands;
 pub mod daemon;
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 
+use daemon::actions::Actions;
+use daemon::config::Configs;
 use daemon::mdns::{self, MdnsStatus};
 use daemon::pairing::{Pairing, PAIR_PORT, PAIR_WINDOW};
+use daemon::secrets::Secrets;
 use daemon::server::{Server, PORT};
 use daemon::store::Store;
 use daemon::tls::Identity;
@@ -28,15 +32,24 @@ pub fn run() {
             log::info!("TLS identity in {}, fp={}", dir.display(), identity.fp());
             let store =
                 Store::load(&dir).map_err(|e| format!("device state in {}: {e}", dir.display()))?;
+            let secrets = Arc::new(Secrets::new(&dir));
+            let configs = Configs::open(&dir, secrets.clone())
+                .map_err(|e| format!("config in {}: {e}", dir.display()))?;
+            // Shell actions run in the home directory, wherever the app was started from.
+            let home = std::env::home_dir().ok_or("HOME is not set")?;
+            let actions = Actions::new(secrets.clone(), home)
+                .map_err(|e| format!("HTTP client for actions: {e}"))?;
 
             // A daemon that can't listen is useless, so a bind failure aborts startup.
             let server = tauri::async_runtime::block_on(Server::bind(
                 ("0.0.0.0", PORT),
                 identity.server_config()?,
-                daemon::actions::default_runner(),
                 store,
+                configs.subscribe(),
+                actions,
             ))?;
             log::info!("listening on {} (wss)", server.local_addr()?);
+            tauri::async_runtime::spawn(configs.clone().watch_files());
 
             let devices = server.devices();
             let pairing = Pairing::new(
@@ -89,7 +102,24 @@ pub fn run() {
                 }
             });
 
-            app.manage(commands::Daemon { devices, pairing });
+            // The window follows `config-status` to show why config.toml isn't live.
+            let handle = app.handle().clone();
+            let mut config_status = configs.status();
+            tauri::async_runtime::spawn(async move {
+                while config_status.changed().await.is_ok() {
+                    let status = config_status.borrow_and_update().clone();
+                    if let Err(e) = handle.emit("config-status", status) {
+                        log::error!("emitting config-status: {e}");
+                    }
+                }
+            });
+
+            app.manage(commands::Daemon {
+                devices,
+                pairing,
+                configs,
+                secrets,
+            });
             tauri::async_runtime::spawn(server.run());
             Ok(())
         })
@@ -100,6 +130,10 @@ pub fn run() {
             commands::pairing_state,
             commands::confirm_pairing,
             commands::cancel_pairing,
+            commands::get_config,
+            commands::save_config,
+            commands::list_secrets,
+            commands::set_secret,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

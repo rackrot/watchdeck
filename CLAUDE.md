@@ -47,18 +47,20 @@ Add new tools to `mise.toml`, not to CI or the hooks. The hooks call the mise-pi
   The SD card and ESP-Hosted share one SDMMC host, and ESP-Hosted probes the C6 before `app_main`.
 - The TF card is GPT-partitioned, so `main/sdcard.c` mounts the first GPT partition read-only through its own diskio driver. Never format the card or write to it.
 - The C6 runs ESP-Hosted slave 2.12.3 and the host is 3.0.9. Hosted logs a "major version mismatch" line, which is only advisory. Don't OTA the C6 without asking.
-- `monitor` needs a real TTY. Without one, read the boot log with pyserial from the IDF Python env (`~/.espressif/python_env/idf6.1_py3.12_env/bin/python`). Opening the port resets the board, so every capture starts from boot.
+- `monitor` needs a real TTY. Without one, read the boot log with pyserial from the IDF Python env (`~/.espressif/python_env/idf6.1_py3.12_env/bin/python`). Opening the port doesn't reliably reset the board. To capture a boot, pulse RTS as esptool's hard reset does: DTR off, RTS on for 100 ms, then RTS off.
 
 ## Daemon facts
 
 - The daemon serves `wss` on 47820 and opens plain `ws` on 47821 only while the pairing dialog is open. `site/src/protocol.md` is the wire spec.
 - Its TLS identity and `state.json` (device id → SHA-256 of its token) live in `~/.config/dev.rackrot.watchdeck/`. A new identity makes every paired device pair again, so tests use temp dirs.
+- `config.toml` (the grid and actions) and `secrets.toml` (0600, header values for HTTP actions) live there too. The daemon polls both every 500 ms, and an invalid edit is refused while the last good config stays live. `site/src/config.md` documents the format.
+- `mise run app:dev` rebuilds and restarts the daemon on any change under `app/src-tauri/`, test fixtures included, and the board then reconnects. Don't edit there during a check that needs an unbroken session.
 
 ## Conventions
 
 - `firmware/sdkconfig` is generated and gitignored. Persistent config goes in `firmware/sdkconfig.defaults`. Kconfig silently drops unknown names, so check the generated `sdkconfig` after adding one.
 - C follows ESP-IDF style (4 spaces, `.clang-format`). TS/JSON uses Biome, from `app/biome.json`. Run biome from `app/`, because the repo root errors with "nested root configuration".
-- Never commit secrets. Wi-Fi credentials live in the gitignored `firmware/sdkconfig.defaults.local` or in `wifi.txt` on the SD card. Never print device tokens or `identity.key`; both sides redact tokens in their logs.
+- Never commit secrets. Wi-Fi credentials live in the gitignored `firmware/sdkconfig.defaults.local` or in `wifi.txt` on the SD card. Never print device tokens, `identity.key` or `secrets.toml`; both sides redact tokens in their logs.
 
 ## CI
 

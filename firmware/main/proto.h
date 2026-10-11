@@ -17,6 +17,7 @@
 #define PROTO_LABEL_MAX 48
 #define PROTO_NAME_MAX 48
 #define PROTO_TEXT_MAX 1025    // up to 1 KB of output plus NUL
+#define PROTO_SUMMARY_MAX 97   // a result's one-line summary, 96 characters plus NUL
 #define PROTO_DEVICE_ID_LEN 16 // "wd-" + 12 hex + NUL
 #define PROTO_FP_LEN 16        // hex digits of the daemon cert fingerprint in mDNS TXT "fp"
 #define PROTO_TOKEN_LEN 32     // bytes in the device token
@@ -57,6 +58,7 @@ typedef struct {
     uint32_t seq;
     bool ok;
     int code;
+    char summary[PROTO_SUMMARY_MAX]; // "exit 0", "timed out after 10 s"; empty if the daemon sent none
     char text[PROTO_TEXT_MAX];
     uint32_t ms;
 } proto_result_t;

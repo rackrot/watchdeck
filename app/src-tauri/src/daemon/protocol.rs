@@ -84,6 +84,7 @@ pub enum Message {
         seq: u64,
         ok: bool,
         code: i32,
+        summary: String,
         text: String,
         ms: u64,
     },

@@ -38,7 +38,7 @@ The daemon advertises itself over mDNS:
 
 Pairing runs over plain `ws` on 47821, so anyone on the LAN can read it. Nothing secret crosses it. The device makes a random 32-byte token and sends only its SHA-256 (`commit`). A commit/reveal exchange then gives both sides the same 6-digit code. The device shows the code, the user types it into the desktop app, and then the user confirms on the device that the app shows the pairing.
 
-The daemon commits to its nonce before it sees the device's, and reveals it only after. Neither side can steer the code, so a man in the middle gets a 1 in 10^6 chance per attempt that the desktop accepts the typed code, and one wrong guess closes the window. That check protects the desktop only. The device can't see whether the code matched, and `pair_result` is unauthenticated, so anyone on the pairing socket can send `ok:true`. The device therefore saves nothing until the user confirms on it that the desktop app says "Paired <device>". The device's side relies on the user checking the desktop before tapping Yes.
+The daemon commits to its nonce before it sees the device's, and reveals it only after. Neither side can steer the code, so a man in the middle gets a 1 in 10^6 chance per attempt that the desktop accepts the typed code, and one wrong guess closes the window. That check protects the desktop only. The device can't see whether the code matched, and `pair_result` is unauthenticated, so anyone on the pairing socket can send `ok:true`. The device therefore saves nothing until the user confirms on it that the desktop app says "Paired `<device>`". The device's side relies on the user checking the desktop before tapping Yes.
 
 ```text
 device                          daemon (dialog open)
@@ -124,7 +124,7 @@ Test vector, matching the examples above:
 
 `ok` is true only when the typed code matched and the daemon stored SHA-256(token) for `device`. The daemon closes after sending it.
 
-On `ok:true` the device keeps its token, the daemon's name and the certificate in RAM, and asks the user whether the desktop app says "Paired <device>". Yes stores them in NVS and connects over `wss`. No, or no answer within 60 s, wipes them and shows "pairing cancelled".
+On `ok:true` the device keeps its token, the daemon's name and the certificate in RAM, and asks the user whether the desktop app says "Paired `<device>`". Yes stores them in NVS and connects over `wss`. No, or no answer within 60 s, wipes them and shows "pairing cancelled".
 
 The daemon stores its side before the user answers, so a No leaves a token hash on the desktop that nobody can use, since only the device ever held the token. The device's question screen tells the user to Forget the device on the desktop after a No. Nothing syncs this automatically.
 
@@ -155,11 +155,12 @@ The daemon stores its side before the user answers, so a No leaves a token hash 
 device                      daemon
   |--- hello ---------------->|   within 5 s of connecting
   |<-- welcome ---------------|   or error, then close
-  |<-- layout ----------------|
+  |<-- layout ----------------|   and again whenever the grid changes
   |--- press ---------------->|
   |<-- result ----------------|   exactly one per press
 ```
 
+- Presses run concurrently. Results arrive in the order the actions finish, and pings, presses and layouts keep flowing while an action runs.
 - A device that authenticates with the same `device` id replaces its old session. A `hello` that fails authentication never touches the live session, so a copied id can't push the real device off.
 - Forgetting a device on the desktop deletes its token hash, sends its live session `error` with `unauthorized`, and closes it.
 - Forget pairing on the device erases only the device's copy. The desktop keeps listing the device until it's forgotten there too.
@@ -206,20 +207,20 @@ The daemon closes the connection after sending it. `code` is one of `version`, `
 
 ```json
 {"t":"layout","rev":1,"cols":5,"rows":3,"buttons":[
-  {"id":"hello","col":0,"row":0,"label":"Hello","bg":1959605,"fg":16777215}
+  {"id":"hello","col":0,"row":0,"label":"Hello","bg":2001125,"fg":16777215}
 ]}
 ```
 
 | Field | Type | Meaning |
 |---|---|---|
-| `rev` | int | Increases each time the layout changes |
-| `cols`, `rows` | int | Grid size |
-| `buttons[].id` | string | Stable button id, used in `press` |
+| `rev` | int | 1 for the session's first layout, then one more for each layout pushed on it |
+| `cols`, `rows` | int | Grid size, 1 to 8 columns by 1 to 5 rows |
+| `buttons[].id` | string | Stable button id, used in `press`. At most 63 bytes |
 | `buttons[].col`, `row` | int | Zero-based cell |
-| `buttons[].label` | string | Printable ASCII |
+| `buttons[].label` | string | Printable ASCII, at most 47 bytes |
 | `buttons[].bg`, `fg` | int | Colors as `0xRRGGBB` integers |
 
-The daemon sends `layout` after `welcome`, then again only when the layout changes. Empty cells have no button. S5 adds `icon`, and S6 adds `tile`.
+The daemon sends `layout` after `welcome`. When the user's config changes the grid, a button, a label, a color or a position, the daemon pushes a new `layout` on the same session, and the device replaces its grid without reconnecting. An edit that changes only actions sends nothing. Empty cells have no button. S5 adds `icon`, and S6 adds `tile`.
 
 ### `press` (device → daemon)
 
@@ -232,19 +233,28 @@ The daemon sends `layout` after `welcome`, then again only when the layout chang
 ### `result` (daemon → device)
 
 ```json
-{"t":"result","btn":"hello","seq":17,"ok":true,"code":0,"text":"","ms":12}
+{"t":"result","btn":"hello","seq":17,"ok":true,"code":0,"summary":"exit 0","text":"","ms":12}
 ```
 
 | Field | Type | Meaning |
 |---|---|---|
-| `ok` | bool | Whether the action succeeded |
-| `code` | int | Exit code, or `-1` when there is no exit code (unknown button, already running, timeout) |
-| `text` | string | Up to the last 1 KB of output, or an error message |
-| `ms` | int | How long the action took to run |
+| `btn` | string | The button id from the `press` |
+| `ok` | bool | Exit 0 for a shell action, a 2xx status for an HTTP action |
+| `code` | int | The exit code or HTTP status, or `-1` when there is neither |
+| `summary` | string | One line, at most 96 bytes, on what happened |
+| `text` | string | The last 1 KB of output: stdout then stderr, or the HTTP body. Printable ASCII and `\n` only. Often empty |
+| `ms` | int | How long the action ran. `0` when nothing ran |
 
-The daemon answers every press with exactly one `result`, including failures. The device shows it as a short toast.
+The daemon answers every press with exactly one `result`, including when nothing runs. Typical summaries:
 
-## S2 behavior
+| `summary` | `ok` | `code` |
+|---|---|---|
+| `exit 0`, `exit 3` | exit 0 only | The exit code |
+| `killed by signal 9` | false | `-1` |
+| `timed out after 30 s` | false | `-1` |
+| `could not start ssh: …` | false | `-1` |
+| `HTTP 200`, `HTTP 503`, `HTTP 302, redirect not followed` | 2xx only | The status |
+| `request failed: …` | false | `-1` |
+| `unknown button`, `already running`, `busy: 8 actions are running` | false | `-1` |
 
-- The daemon serves one hard-coded button, `hello`, which runs `notify-send watchdeck "Hello from <device>"` on the desktop. Configured actions arrive in S4.
-- A press on an unknown button id gets `ok:false`, `code:-1`, `text:"unknown button"`.
+The device shows the result in a modal over the grid: the button's label with OK or Failed, the summary and time, and the text. It closes at a tap, after 4 s when `ok`, or after 10 s when not. A result whose `seq` the device didn't send is ignored. `summary` arrived with S4, so a device that finds none shows the code instead.

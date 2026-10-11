@@ -1,6 +1,6 @@
 # watchdeck v1: daemon, device protocol, screen config
 
-Status: plan, 2026-10-10. S1 to S3 are done (see the slice table); S4 onward is not built.
+Status: plan, 2026-10-10. S1 to S4 are done (see the slice table); S5 onward is not built.
 
 ## Decisions
 
@@ -41,13 +41,14 @@ Nothing here imports `tauri`, so tests run headless.
 | Module | Owns |
 |---|---|
 | `protocol.rs` | Message types (serde, tag `t`), size limits, icon-frame codec, SAS function |
-| `config.rs` | TOML schema, validation, atomic save (tmp + rename, 0600), refusal on a stale mtime |
-| `store.rs` | `state.json` (device id → SHA-256(token)), `secrets.toml`, identity cert and key. Files 0600, dir 0700 |
+| `config.rs` | TOML schema, validation, atomic save (tmp + rename, 0600), refusal on a stale revision, polling `config.toml` and `secrets.toml` |
+| `secrets.rs` | `secrets.toml`: names out, values only into request headers |
+| `store.rs` | `state.json` (device id → SHA-256(token)), identity cert and key, the 0600 write and check helpers. Files 0600, dir 0700 |
 | `tls.rs` | rcgen self-signed P-256 cert, rustls `ServerConfig` |
 | `pairing.rs` | Pairing listener (open only while the pairing dialog is open) and the pairing state machine |
 | `server.rs` | wss listener, per-session auth and dispatch, layout push on config change |
 | `mdns.rs` | avahi-daemon registration over D-Bus (zbus) |
-| `actions.rs` | Shell and HTTP runners |
+| `actions.rs`, `actions/` | One run per button, the global limit, result text; the shell and HTTP runners |
 | `tiles.rs` | Tile pollers |
 | `icons.rs` | Decode, fit, ARGB8888, hash, cache |
 
@@ -67,7 +68,7 @@ Nothing here imports `tauri`, so tests run headless.
 | `main.c` | Boot order unchanged, then touch, ui, link |
 | `display.c` | Panel and LVGL port. The hello labels move to `ui.c` |
 | `touch.c` | GT911 via `esp_lcd_touch_gt911` + `lvgl_port_add_touch`, swap/mirror `#define` knobs |
-| `ui.c` | Status screen, daemon list, pairing code and question, grid, result toast, tiles, Forget pairing |
+| `ui.c` | Status screen, daemon list, pairing code and question, grid, result modal, tiles, Forget pairing |
 | `proto.c` | cJSON parse/build, icon-frame parse. Pure functions |
 | `pairing.c` | Pairing session, SAS, NVS blob |
 | `link.c` | Discovery, backoff, websocket lifecycle, dispatch, icon cache |
@@ -99,12 +100,12 @@ D→H hello    {"t":"hello","v":1,"device":"wd-a1b2c3","token":"<64 hex>","fw":"
 H→D welcome  {"t":"welcome","v":1,"name":"buck-desktop"}
 H→D error    {"t":"error","code":"unauthorized|version|bad_request","msg":"…"}   then close
 H→D layout   {"t":"layout","rev":7,"cols":5,"rows":3,"buttons":[
-               {"id":"plex","col":0,"row":0,"label":"Plex","bg":1959605,"fg":16777215,
+               {"id":"plex","col":0,"row":0,"label":"Plex","bg":2001125,"fg":16777215,
                 "icon":"9f86d081884c7d659a2feaa0c55ad015","tile":false}]}
 D→H icon_get {"t":"icon_get","ids":["9f86d081884c7d659a2feaa0c55ad015"]}
 H→D <binary> "WDI1"(4) | id(16) | w u16le | h u16le | w*h*4 bytes ARGB8888 (LVGL order B,G,R,A)
 D→H press    {"t":"press","btn":"plex","seq":17}
-H→D result   {"t":"result","btn":"plex","seq":17,"ok":false,"code":3,"text":"<≤1 KB output tail>","ms":412}
+H→D result   {"t":"result","btn":"plex","seq":17,"ok":false,"code":3,"summary":"exit 3","text":"<≤1 KB output tail>","ms":412}
 H→D tile     {"t":"tile","btn":"nas-load","text":"0.42","state":"ok|bad|unknown"}
 ```
 
@@ -156,7 +157,7 @@ H→D tile     {"t":"tile","btn":"nas-load","text":"0.42","state":"ok|bad|unknow
 ### Desktop
 
 - The TLS key, `state.json` and `secrets.toml` are 0600 in a 0700 config dir. No keyring: Secret Service doesn't protect against same-user processes and may be locked at login.
-- Set a strict webview CSP. Today it's `null`, and the webview can call `save_config` and `test_action`.
+- Set a strict webview CSP. Today it's `null`, and the webview can call `save_config` and `set_secret`.
 
 ### Shell runner
 
@@ -169,8 +170,10 @@ H→D tile     {"t":"tile","btn":"nas-load","text":"0.42","state":"ok|bad|unknow
 
 ### HTTP runner
 
-- reqwest with redirects off, a timeout and a 64 KB body cap.
-- `secret_headers` pull values from `secrets.toml`. Secret values never reach the UI, the device or the logs.
+- reqwest with redirects off, no proxy, a timeout and a 64 KB body cap.
+- `headers` go out as written. `secret_headers` pull values from `secrets.toml`, and a header name appears once across both, ignoring case.
+- Secret values never reach the UI or the logs. In the reply the device sees, exact copies are blanked.
+- Secret headers need `https://` or a loopback host. Plain http to another machine needs `insecure_http = true` on the action, and going live with it logs a warning.
 
 ### Security gate
 
@@ -199,10 +202,10 @@ action = { kind = "shell", argv = ["ssh", "nas", "docker", "restart", "plex"], t
 id = "office-light"
 pos = [1, 0]
 label = "Office"
-action = { kind = "http", method = "POST", url = "http://ha.lan:8123/api/services/light/toggle",
+action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/services/light/toggle",
            body = '{"entity_id":"light.office"}', secret_headers = { Authorization = "ha" } }
 tile = { every_s = 15, json_pointer = "/state",
-         source = { kind = "http", method = "GET", url = "http://ha.lan:8123/api/states/light.office",
+         source = { kind = "http", method = "GET", url = "https://ha.lan:8123/api/states/light.office",
                     secret_headers = { Authorization = "ha" } } }
 ```
 
@@ -213,9 +216,9 @@ tile = { every_s = 15, json_pointer = "/state",
 - **Validation** happens in Rust: unique ids, inside the grid, no overlaps, non-empty argv, sane timeouts, http(s) URLs, valid colors, ASCII labels, decodable icons, and secret names that exist. An invalid config is never saved or pushed.
 - **Saving:**
   1. The UI edits a copy, then the user presses Save.
-  2. Rust validates it and refuses if the file's mtime changed since load.
+  2. Rust validates it and refuses if the file changed since load. The revision is the SHA-256 of the file text.
   3. Rust writes atomically, the watch channel fires, and the layout pushes.
-  4. For hand edits, the tray has "Reload config". There is no file watcher.
+  4. Hand edits apply on their own. The daemon polls the mtime, size and inode of `config.toml` and `secrets.toml` every 500 ms and reloads once a change holds for two polls. No watcher crate.
 - **Icons.** The daemon renders each icon into a box of min(cell) × 0.55, at most 256 px, as ARGB8888. The id is the first 16 bytes of SHA-256(w, h, pixels). Rejected: on-device PNG decode, which costs more CPU and code for no RAM saving.
 - **Device storage.** The layout and icons stream into PSRAM on every connect. NVS holds only the pairing blob. Rejected: a flash cache, because actions need the daemon anyway, cached tiles would mislead, and it needs a partition change.
 - **Offline.** The device shows a status screen: Wi-Fi state, "searching" or "daemon offline, retry in N s", and Forget pairing. If the link drops mid-session, the grid greys out under a banner and presses are blocked.
@@ -256,10 +259,10 @@ Tauri on Linux:
 | S1 ✅ | Touch: GT911, plus a 5×3 test grid that highlights and logs taps. Done 2026-10-10: answers at 0x5D, pins as assumed, no axis swap or mirror, 0 phantom taps in 5 min | Every cell, corners included, maps correctly. No phantom touches in 5 min. Pins and address confirmed | `fw:build`, serial log on device |
 | S2 ✅ | Thin end-to-end, no auth. Done 2026-10-10: tap → notify-send → toast verified on hardware; board reconnects after a daemon restart (IP change untested). Write `site/src/protocol.md` first. Daemon in Tauri, mDNS, plain ws, hello → one hard-coded button → `notify-send` → result toast. Add `cargo test` to CI | Connects within 10 s. Survives a daemon restart and an IP change. Result shows within 1 s. Heap logged | Fake-device integration test, `avahi-browse`, device |
 | S3 | **Security gate.** S3a: TLS interop spike (rcgen + rustls ↔ mbedTLS). S3a done 2026-10-10: wss with the pinned cert works on hardware, and 47820 is wss-only (results below). S3b: pairing on both sides, Forget pairing. S3b built 2026-10-10: paired on hardware, and every hello needs its token (results below). Security review done 2026-10-10 and its fixes applied (review fixes below). tcpdump passed. On hardware, a run covered Forget from both sides, Yes, a wrong code, right-then-No, the 60 s timeout and re-pair, and all passed. **S3 ✅ 2026-10-10** | SAS test vector passes. A wrong code stores nothing. The device pins nothing without the person's Yes. A bad or forgotten token gets `unauthorized`. Oversize messages close the link. Device rejects a regenerated cert. tcpdump: TLS only on 47820, no token on 47821 | `cargo test`, device, tcpdump, security review |
-| S4 | Config and actions: `config.toml`, validation, shell and HTTP runners, secrets, live layout push, result modal | A timeout kills grandchildren. Output caps, exit codes, "already running". HTTP: secret headers, no redirects, caps. Live push needs no reconnect | `cargo test`, device, security review |
+| S4 ✅ | Config and actions: `config.toml`, validation, shell and HTTP runners, secrets, live layout push, result modal. S4 built 2026-10-10: `cargo test` covers the acceptance list, and on hardware a live edit pushed with no reconnect while invalid edits pushed nothing. The user's tap check passed all six steps. Review and security audit done 2026-10-10 and their fixes applied (results below). **S4 ✅ 2026-10-10** | A timeout kills grandchildren. Output caps, exit codes, "already running". HTTP: secret headers, no redirects, caps. Live push needs no reconnect | `cargo test`, device, security review |
 | S5 | Icons: import, render, hash, `icon_get`, PSRAM cache | Exact-bytes render test. An RGB + transparent quadrant icon shows correctly | `cargo test`, device |
 | S6 | Tiles | Paused-clock tests: interval, no overlap, idle stop, poll after press | `cargo test`, device |
-| S7 | Config UI (needs design direction first) | A save reaches the device within 2 s. Field errors write nothing. Secrets are never returned. Strict CSP | `pnpm build`, `app:dev` |
+| S7 | Config UI (needs design direction first). Design note from the S4 review: with an invalid `config.toml` at startup the revision is empty, so `save_config` can never repair the file from the UI. S7 must handle that case | A save reaches the device within 2 s. Field errors write nothing. Secrets are never returned. Strict CSP | `pnpm build`, `app:dev` |
 | S8 | App shape: tray menu, hidden start, close-to-tray, autostart, single-instance, logging | Tray-only after login. Closing the window keeps the device connected. A second launch focuses the window | `app:build`, manual check |
 
 Order: S1 → S2 → S3 → S4 → {S5, S6, S8} → S7. S8 can start any time after S2, but it shares `lib.rs` with S3 and S4.
@@ -332,7 +335,58 @@ Order: S1 → S2 → S3 → S4 → {S5, S6, S8} → S7. S8 can start any time af
   - The code prompt shows the device's IP.
   - A Forget on the device that can't erase NVS keeps the pairing and shows the error.
 - **New tests:** in `device_sim`, pipelined presses then a forget, a valid message padded past 16 KB on each port, a re-pair cutting a live session with `unauthorized`, and a device speaking while the code is shown. A store unit test covers the fsync contract.
-- **Not yet run on hardware:** the question screen, Yes, No and the 60 s timeout. The board kept its earlier pairing, so the user can run them after a Forget.
+- **Run on hardware 2026-10-10, 01:20–01:25 UTC, all passed:** Forget from both sides, Yes, a wrong code, the right code then No, the 60 s timeout, and a re-pair.
+
+### S4 results (2026-10-10)
+
+- **Live push on hardware,** in UTC, against the dev daemon:
+  - 02:14:25.86: `config.toml` saved with a changed label and a second button.
+  - 02:14:26: the daemon logs `applied` and `pushing layout rev 2`.
+  - By 02:14:27.10: the device logs `layout rev 2 applied: 5x3, 2 buttons`. Neither side logs a link change between rev 1 and rev 2.
+- **Invalid edits on hardware:** a button moved outside the grid (02:14:49) and an unterminated string (02:15:04) each logged `not applied, keeping the live config` with the reason. The device logged nothing.
+- **Restart:** a `tauri dev` rebuild restarted the daemon at 02:19:53. The device logged `link lost`, reconnected and applied the layout by 02:19:58.
+- **Tap check on hardware, passed 2026-10-10:** the user ran all six steps with the test buttons: Print, Fail, Slow once (the timeout), Slow twice (already running, then the timeout), Hello, and closing a result by tap and by timer.
+- **Tests:** 85 unit and 38 `device_sim` after the fixes below. They cover every validation rule with a negative case, a timeout killing a grandchild, a SIGTERM-ignoring group killed by SIGKILL, output caps, exit codes, already running, and HTTP against a local responder (secret header sent, redirect not followed, 64 KB cap, timeout). They also cover a live push with no reconnect, invalid configs never pushed, and a trace-level logger that never sees the secret value.
+- **Dependencies:** reqwest 0.13.5 (`rustls` only), nix 0.31.3, toml 1.1.8. `cargo tree --target all` shows no ring, openssl or native-tls. reqwest uses the process's aws-lc-rs provider.
+- **Device cost:** firmware 0x197570 bytes, 60% of the app partition free. The minimum free internal heap after the first layout was 310.4 KB (S3b: 312.8 KB).
+- **Choices made in S4:**
+  - The daemon polls the files. That avoids a watcher crate, and a change applies within about 1 s.
+  - `secrets.rs` is its own module. Values leave it only as request headers. Errors name a secret or a line, never a value.
+  - A config's revision is the SHA-256 of its file text, not its mtime. A save refuses a stale revision, and also refuses when the file on disk has edits that aren't live.
+  - Shell actions run in `$HOME` with the daemon's environment. The autostart `PATH` caveat is in `site/src/config.md`.
+  - HTTP actions use HTTP/1.1, ignore proxy settings, and check HTTPS against the system's roots.
+  - A press beyond 8 running actions fails at once with `busy` rather than queueing.
+  - `icon`, `tile`, and any other unknown key are rejected until S5 and S6 add them.
+  - Sessions no longer wait on actions. A run outlives its session, and a result for a closed session is dropped.
+  - `set_secret` reloads the config, so a config held back by a missing secret applies at once.
+  - A save rewrites `config.toml` without comments and replaces a symlink with a regular file.
+  - Deleting `config.toml` while the daemon runs keeps the last good config. An invalid file at startup serves an empty grid.
+  - `test_action`, `import_icon` and the TS wrappers wait for S7 and S5. Action runs aren't on the event broadcast yet; they log at info.
+  - `result` gained `summary`, and the toast became a modal that closes at a tap, after 4 s (ok) or after 10 s (failed).
+- **Surprises:**
+  - S2's `bg` of 1959605 was `#1de6b5`, not `#1e88e5`. The layout now carries 2001125, so the Hello button changes from teal to blue.
+  - Opening the serial port didn't reset the board this time. An RTS pulse, as esptool sends, did.
+
+### S4 review and audit fixes (2026-10-10)
+
+The review and the security audit found no blockers. These fixes followed:
+
+- **Plain headers (the user's decision):** a per-action `headers` table beside `secret_headers`. Names must be valid and values printable ASCII, so CR and LF are refused. A name appears once across both tables, ignoring case, which also catches `Authorization` and `authorization` together in `secret_headers`. `get_config` shows plain values.
+- **Secret headers over plain http (audit, major):** refused unless the host is `localhost`, 127.0.0.0/8 or `::1`, or the action sets `insecure_http = true`. Going live with the opt-in logs a warning. The docs' example moved to `https://`.
+- **Redaction:** every copy of every used secret becomes a span, and overlapping spans merge. A secret inside a longer one, or two that overlap, leaks nothing whatever their order. When the body is cut at 64 KB, a secret's start at the very end is blanked too. Secrets must be printable ASCII, so spans fall on byte boundaries. `set_secret` refuses any other value, and loading `secrets.toml` refuses a hand-edited one by name, so the config check catches it before any press. Encoded echoes still pass, and `config.md` says so.
+- **Logs:** a press's button id prints through Debug, so an unknown id can't inject a newline or ANSI codes.
+- **Errors:** config errors name `url` instead of quoting it. A TOML error gives its line, column and message without toml's copy of the line. serde's message can still quote a value of the wrong type.
+- **Tauri IPC (checked, no change):** in tauri 2.12.2 and wry 0.57.0, IPC bodies, `set_secret`'s included, are recorded only into `tracing` spans behind tauri's `tracing` feature. That feature is off, no subscriber is installed, and the `tracing` crate lacks its `log` feature, so env_logger sees none at any level. Debug builds do open the webview inspector, which shows IPC traffic to someone at the keyboard. S8 must not turn on tauri's `tracing` feature, or `tauri-plugin-log` at trace for IPC, without filtering it.
+- **Polling:** the stamp adds mode and owner, so the chmod that the `secrets.toml` error asks for applies without a restart. `reload` records the stamps it read under its lock, and treats a file that changed mid-read as unread. The poller compares against that record, so an edit made before the poller starts is no longer lost.
+- **Shell:** a leader still alive 5 s after SIGKILL, such as one stuck in the kernel, is given up on with a warning and "timed out after N s". That frees its button and slot, and tokio reaps it later. A failed wait now kills the group before letting it go.
+- **Busy:** a finished run frees its slot before its button, under the same lock, so a press can no longer get a spurious "busy".
+- **New tests:**
+  - every header rule, the http and loopback cases, and errors that keep out a planted `?token=`
+  - a chmod-only change, an edit before the poller starts, and a save round-trip of HTTP actions with every field
+  - redaction of overlaps and of a cut-off start, a secret straddling byte 65536 end to end, and a hand-edited secret that can't be a header
+  - plain headers on the wire, a two-thread "busy" stress test, and the go-live warning in `device_sim`
+  - Each was checked to fail on the old code. The SIGKILL deadline has no test, since a unit test can't make a process outlive SIGKILL.
+- **CSP:** still `null` until S7, as tracked. `save_config` and `set_secret` raise its priority: a script injected into the webview could write shell actions into `config.toml`, which run as the user.
 
 ## 8. Testing
 
@@ -378,3 +432,4 @@ Rollback: each slice is its own PR. Firmware rolls back by flashing the previous
 | 6 | SVG icons | PNG, JPEG and WebP only. SVG via resvg later |
 | 7 | Non-ASCII labels | Rejected; the built-in fonts lack the glyphs |
 | 8 | Tile polling | Only while a device is connected |
+| 9 | Plain HTTP headers such as `Content-Type` | Settled in S4 by the user: a per-action `headers` table beside `secret_headers`. A name appears once across both, ignoring case |

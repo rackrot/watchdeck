@@ -13,7 +13,8 @@
 #define GRID_TOP 204
 #define GRID_GAP 8
 #define TOAST_MS 2000
-#define TOAST_TEXT_MAX 120
+#define RESULT_OK_MS 4000 // a result closes itself after this, or at a tap
+#define RESULT_FAIL_MS 10000
 #define MAX_PENDING 8
 #define PENDING_TTL_MS (11 * 60 * 1000) // longest action timeout (10 min) plus margin
 #define FORGET_W 300                    // "Forget pairing", right of the touch status line
@@ -35,6 +36,12 @@ static lv_obj_t *s_pair_view; // unpaired: the daemon list, the pairing code, or
 static lv_obj_t *s_forget;    // shown while paired
 static lv_obj_t *s_toast;
 static lv_timer_t *s_toast_timer;
+static lv_obj_t *s_result;      // a press's result, on the top layer: a backdrop over the grid
+static lv_obj_t *s_result_card; // the scrollable panel on the backdrop
+static lv_obj_t *s_result_title;
+static lv_obj_t *s_result_summary;
+static lv_obj_t *s_result_text;
+static lv_timer_t *s_result_timer;
 
 // Written and read under the LVGL lock, which also covers the tap callbacks.
 static bool s_online;
@@ -46,6 +53,9 @@ static struct {
 } s_pending[MAX_PENDING];
 static size_t s_n_pending;
 static char s_ids[PROTO_MAX_BUTTONS][PROTO_ID_MAX];
+static char s_labels[PROTO_MAX_BUTTONS][PROTO_LABEL_MAX];
+static size_t s_n_buttons;
+static char s_printable[PROTO_TEXT_MAX];
 static bool s_paired;
 static bool s_attempt_shown; // a pairing attempt's code or question is on screen
 static link_daemon_t s_daemons[LINK_MAX_DAEMONS];
@@ -94,6 +104,118 @@ static void show_toast(lv_color_t bg, const char *text)
     lv_obj_set_hidden(s_toast, false);
     lv_timer_reset(s_toast_timer);
     lv_timer_resume(s_toast_timer);
+}
+
+/* ---- Result modal, all under the LVGL lock ---- */
+
+static void result_hide(void)
+{
+    lv_obj_set_hidden(s_result, true);
+    lv_timer_pause(s_result_timer);
+}
+
+static void result_timed_out(lv_timer_t *timer)
+{
+    result_hide();
+}
+
+// A tap anywhere closes it. A drag on the card scrolls the output instead.
+static void result_tapped(lv_event_t *e)
+{
+    result_hide();
+}
+
+static lv_obj_t *add_result_label(const lv_font_t *font)
+{
+    lv_obj_t *label = lv_label_create(s_result_card);
+    lv_obj_set_width(label, LV_PCT(100));
+    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(label, font, 0);
+    lv_obj_set_style_text_color(label, lv_color_white(), 0);
+    return label;
+}
+
+static void create_result(void)
+{
+    s_result = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(s_result);
+    lv_obj_set_size(s_result, DISPLAY_H_RES, DISPLAY_V_RES);
+    lv_obj_set_style_bg_color(s_result, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_result, LV_OPA_70, 0);
+    lv_obj_set_clickable(s_result, true); // and so keeps taps off the grid below
+    lv_obj_add_event_cb(s_result, result_tapped, LV_EVENT_CLICKED, NULL);
+
+    s_result_card = lv_obj_create(s_result);
+    lv_obj_set_size(s_result_card, DISPLAY_H_RES - 80, DISPLAY_V_RES - 60);
+    lv_obj_center(s_result_card);
+    lv_obj_set_style_bg_color(s_result_card, lv_palette_darken(LV_PALETTE_GREY, 4), 0);
+    lv_obj_set_style_border_width(s_result_card, 0, 0);
+    lv_obj_set_style_radius(s_result_card, 16, 0);
+    lv_obj_set_style_pad_all(s_result_card, 24, 0);
+    lv_obj_set_style_pad_row(s_result_card, 12, 0);
+    lv_obj_set_flex_flow(s_result_card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_event_bubble(s_result_card, true);
+
+    s_result_title = add_result_label(&lv_font_montserrat_48);
+    s_result_summary = add_result_label(&lv_font_montserrat_32);
+    s_result_text = add_result_label(&lv_font_montserrat_24);
+    lv_obj_set_hidden(s_result, true);
+    s_result_timer = lv_timer_create(result_timed_out, RESULT_OK_MS, NULL);
+    lv_timer_pause(s_result_timer);
+}
+
+// Copy `src`, turning anything but printable ASCII and newlines into '?', since the font has no
+// other glyphs. The daemon sends only those, so this only guards against a buggy one.
+static void copy_printable(char *dst, size_t dst_len, const char *src)
+{
+    size_t i = 0;
+    for (; src[i] && i + 1 < dst_len; i++) {
+        char c = src[i];
+        dst[i] = c == '\n' || (c >= ' ' && c <= '~') ? c : '?';
+    }
+    dst[i] = '\0';
+}
+
+// The label of button `id` in the grid, or `id` itself if the grid no longer has it.
+static const char *button_name(const char *id)
+{
+    for (size_t i = 0; i < s_n_buttons; i++) {
+        if (strcmp(s_ids[i], id) == 0 && s_labels[i][0]) {
+            return s_labels[i];
+        }
+    }
+    return id;
+}
+
+static void show_result(const proto_result_t *r)
+{
+    const char *verdict = r->ok ? "OK" : "Failed";
+    const char *name = button_name(r->btn);
+    if (name[0]) {
+        lv_label_set_text_fmt(s_result_title, "%s: %s", name, verdict);
+    } else {
+        lv_label_set_text(s_result_title, verdict);
+    }
+    lv_palette_t palette = r->ok ? LV_PALETTE_GREEN : LV_PALETTE_RED;
+    lv_obj_set_style_text_color(s_result_title, lv_palette_lighten(palette, 2), 0);
+
+    copy_printable(s_printable, PROTO_SUMMARY_MAX, r->summary);
+    if (!s_printable[0]) {
+        lv_label_set_text_fmt(s_result_summary, "code %d, %u ms", r->code, (unsigned)r->ms);
+    } else if (r->ms > 0) {
+        lv_label_set_text_fmt(s_result_summary, "%s, %u ms", s_printable, (unsigned)r->ms);
+    } else {
+        lv_label_set_text(s_result_summary, s_printable);
+    }
+    copy_printable(s_printable, sizeof(s_printable), r->text);
+    lv_label_set_text(s_result_text, s_printable);
+    lv_obj_set_hidden(s_result_text, !s_printable[0]);
+
+    lv_obj_scroll_to_y(s_result_card, 0, LV_ANIM_OFF);
+    lv_obj_set_hidden(s_result, false);
+    lv_timer_set_period(s_result_timer, r->ok ? RESULT_OK_MS : RESULT_FAIL_MS);
+    lv_timer_reset(s_result_timer);
+    lv_timer_resume(s_result_timer);
 }
 
 // A short tap only explains itself, so a stray touch can't wipe the pairing.
@@ -169,6 +291,7 @@ esp_err_t ui_init(lv_display_t *disp)
     s_daemon_label = add_status(LV_PALETTE_PURPLE, 156, "Daemon: waiting for Wi-Fi");
     create_forget();
     create_toast();
+    create_result();
     lvgl_port_unlock();
     return ESP_OK;
 }
@@ -185,9 +308,11 @@ static void build_grid(const proto_layout_t *l)
 
     const int cell_w = (DISPLAY_H_RES - (l->cols + 1) * GRID_GAP) / l->cols;
     const int cell_h = (DISPLAY_V_RES - GRID_TOP - l->rows * GRID_GAP) / l->rows;
+    s_n_buttons = l->n_buttons;
     for (size_t i = 0; i < l->n_buttons; i++) {
         const proto_button_t *b = &l->buttons[i];
         strlcpy(s_ids[i], b->id, sizeof(s_ids[i]));
+        strlcpy(s_labels[i], b->label, sizeof(s_labels[i]));
 
         lv_obj_t *btn = lv_button_create(s_grid);
         lv_obj_set_size(btn, cell_w, cell_h);
@@ -243,12 +368,9 @@ void ui_show_result(const proto_result_t *r)
         ESP_LOGW(TAG, "result for unknown seq %u ignored", (unsigned)r->seq);
     } else {
         s_pending[i] = s_pending[--s_n_pending];
-        char text[TOAST_TEXT_MAX + 16];
-        snprintf(text, sizeof(text), "%s%s%.*s", r->ok ? "OK" : "FAILED", r->text[0] ? ": " : "", TOAST_TEXT_MAX,
-                 r->text);
-        show_toast(r->ok ? lv_palette_darken(LV_PALETTE_GREEN, 3) : lv_palette_darken(LV_PALETTE_RED, 3), text);
-        ESP_LOGI(TAG, "result seq %u %s code %d in %u ms", (unsigned)r->seq, r->ok ? "ok" : "fail", r->code,
-                 (unsigned)r->ms);
+        show_result(r);
+        ESP_LOGI(TAG, "result seq %u %s code %d in %u ms: %s", (unsigned)r->seq, r->ok ? "ok" : "fail", r->code,
+                 (unsigned)r->ms, r->summary);
     }
     lvgl_port_unlock();
 }
@@ -378,8 +500,10 @@ void ui_set_paired(bool paired)
             lv_obj_delete(s_grid);
             s_grid = NULL;
         }
+        result_hide();
         s_online = false;
         s_n_pending = 0;
+        s_n_buttons = 0;
         s_n_daemons = 0;
         show_daemon_list();
     }

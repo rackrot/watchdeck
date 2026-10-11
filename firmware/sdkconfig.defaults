@@ -20,7 +20,8 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # FATFS long filenames (wifi.txt and user files on the TF card).
 CONFIG_FATFS_LFN_HEAP=y
 
-# LVGL: 14 px default is unreadable on a 10" panel.
+# LVGL: 14 px default is unreadable on a 10" panel. 24 px is for command output in a result.
+CONFIG_LV_FONT_MONTSERRAT_24=y
 CONFIG_LV_FONT_MONTSERRAT_32=y
 CONFIG_LV_FONT_MONTSERRAT_48=y
 
