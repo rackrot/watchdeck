@@ -5,6 +5,7 @@
 
 #include "esp_err.h"
 #include "esp_netif_ip_addr.h"
+#include "lvgl.h"
 #include "proto.h"
 
 #define LINK_MAX_DAEMONS 4 // daemons open for pairing that the unpaired screen lists
@@ -21,8 +22,10 @@ typedef struct {
  * LVGL lock) but must not call back into link_*. Any may be NULL.
  */
 typedef struct {
-    void (*on_status)(const char *text);                           // "searching", "connected to <name>", ...
-    void (*on_layout)(const proto_layout_t *layout);               // valid only during the call
+    void (*on_status)(const char *text);             // "searching", "connected to <name>", ...
+    void (*on_layout)(const proto_layout_t *layout); // valid only during the call
+    void (*on_icon)(const uint8_t id[PROTO_ICON_ID_LEN],
+                    const lv_image_dsc_t *dsc);                    // show it on every button with `id`
     void (*on_down)(void);                                         // session lost, grid must stop taking presses
     void (*on_result)(const proto_result_t *result);               // valid only during the call
     void (*on_paired)(bool paired);                                // at start and on every change

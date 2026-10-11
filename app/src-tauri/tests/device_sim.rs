@@ -33,7 +33,7 @@ use watchdeck_lib::daemon::actions::Actions;
 use watchdeck_lib::daemon::config::{self, Configs};
 use watchdeck_lib::daemon::pairing::{Pairing, PairingState};
 use watchdeck_lib::daemon::protocol::{
-    decode_hex, encode_hex, pairing_code, ErrorCode, Message, Token,
+    decode_hex, encode_hex, pairing_code, ErrorCode, IconFrame, Message, Token,
 };
 use watchdeck_lib::daemon::secrets::Secrets;
 use watchdeck_lib::daemon::server::{DaemonEvent, DeviceInfo, Devices, Server};
@@ -254,6 +254,21 @@ async fn recv<S: AsyncRead + AsyncWrite + Unpin>(c: &mut WebSocketStream<S>) -> 
             other => panic!("unexpected frame {other:?}"),
         }
     }
+}
+
+/// The next binary frame, decoded the way the device checks it.
+async fn recv_icon<S: AsyncRead + AsyncWrite + Unpin>(c: &mut WebSocketStream<S>) -> IconFrame {
+    loop {
+        match c.next().await.expect("stream ended").unwrap() {
+            Ws::Binary(frame) => return IconFrame::decode(&frame).unwrap(),
+            Ws::Ping(_) | Ws::Pong(_) => {}
+            other => panic!("expected an icon frame, got {other:?}"),
+        }
+    }
+}
+
+fn icon_get(ids: &[&str]) -> Ws {
+    Ws::text(serde_json::to_string(&serde_json::json!({"t": "icon_get", "ids": ids})).unwrap())
 }
 
 /// Reads until the server ends the connection, however it chooses to (close frame, EOF or reset).
@@ -1423,4 +1438,216 @@ action = {{ kind = "http", method = "GET", url = "http://{server}/state", secret
         0,
         "a log record held the secret"
     );
+}
+
+// ---- Icons ----
+
+const ICON_CONFIG: &str = r##"
+version = 1
+[layout]
+cols = 5
+rows = 3
+
+[[button]]
+id = "pic"
+pos = [0, 0]
+label = "Pic"
+icon = "a.png"
+action = { kind = "shell", argv = ["echo", "ran pic"] }
+
+[[button]]
+id = "twin"
+pos = [1, 0]
+label = "Twin"
+icon = "a.png"
+action = { kind = "shell", argv = ["true"] }
+
+[[button]]
+id = "plain"
+pos = [2, 0]
+label = "Plain"
+action = { kind = "shell", argv = ["true"] }
+"##;
+
+/// Red, green and blue quadrants and a transparent one, `side` pixels square, as PNG bytes.
+fn quadrants_png(side: u32) -> Vec<u8> {
+    let picture =
+        image::RgbaImage::from_fn(side, side, |x, y| match (x < side / 2, y < side / 2) {
+            (true, true) => image::Rgba([255, 0, 0, 255]),
+            (false, true) => image::Rgba([0, 255, 0, 255]),
+            (true, false) => image::Rgba([0, 0, 255, 255]),
+            (false, false) => image::Rgba([0, 0, 0, 0]),
+        });
+    let mut out = std::io::Cursor::new(Vec::new());
+    picture.write_to(&mut out, image::ImageFormat::Png).unwrap();
+    out.into_inner()
+}
+
+fn put_icon(daemon: &Daemon, name: &str, bytes: &[u8]) {
+    let dir = daemon.dir.path().join("icons");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(name), bytes).unwrap();
+}
+
+/// Starts a daemon whose config names `a.png`, then connects a device that has the first layout.
+async fn start_with_icon() -> (Daemon, Client, String) {
+    let daemon = start().await;
+    put_icon(&daemon, "a.png", &quadrants_png(200));
+    daemon.reconfigure(ICON_CONFIG).unwrap();
+    let mut c = handshake_without_layout(daemon.addr).await;
+    let Message::Layout { buttons, .. } = recv(&mut c).await else {
+        panic!("expected layout")
+    };
+    let icon = buttons[0]
+        .icon
+        .clone()
+        .expect("the first button has an icon");
+    assert_eq!(
+        buttons[1].icon.as_deref(),
+        Some(icon.as_str()),
+        "one file, one id"
+    );
+    assert_eq!(buttons[2].icon, None);
+    (daemon, c, icon)
+}
+
+async fn handshake_without_layout(addr: SocketAddr) -> Client {
+    let mut c = connect(addr).await;
+    c.send(hello(1, DEVICE, Some(&TOKEN))).await.unwrap();
+    assert!(matches!(recv(&mut c).await, Message::Welcome { .. }));
+    c
+}
+
+#[tokio::test]
+async fn icon_get_answers_with_the_frame_the_layout_named() {
+    let (_daemon, mut c, id) = start_with_icon().await;
+    c.send(icon_get(&[&id])).await.unwrap();
+    let icon = recv_icon(&mut c).await;
+    assert_eq!(encode_hex(&icon.id), id);
+    // 5x3 buttons leave 116 px inside the padding, less a two-line label and a gap: 44.
+    assert_eq!((icon.w, icon.h), (44, 44));
+    let pixel = |x: usize, y: usize| {
+        let at = (y * 44 + x) * 4;
+        icon.pixels[at..at + 4].to_vec()
+    };
+    assert_eq!(pixel(8, 8), [0, 0, 255, 255], "red, as B, G, R, A");
+    assert_eq!(pixel(35, 8), [0, 255, 0, 255]);
+    assert_eq!(pixel(8, 35), [255, 0, 0, 255]);
+    assert_eq!(pixel(35, 35), [0, 0, 0, 0], "the transparent quadrant");
+
+    // A repeated id gets one frame, and asking again later gets it again.
+    c.send(icon_get(&[&id, &id])).await.unwrap();
+    assert_eq!(recv_icon(&mut c).await, icon);
+    c.send(press("pic", 1)).await.unwrap();
+    assert!(matches!(
+        recv(&mut c).await,
+        Message::Result {
+            seq: 1,
+            ok: true,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn icon_get_skips_ids_the_layout_does_not_name() {
+    let (_daemon, mut c, id) = start_with_icon().await;
+    let unknown = "0".repeat(32);
+    c.send(icon_get(&[&unknown, &id])).await.unwrap();
+    assert_eq!(encode_hex(&recv_icon(&mut c).await.id), id);
+    c.send(icon_get(&[&unknown])).await.unwrap();
+    c.send(press("pic", 2)).await.unwrap();
+    // Nothing came for the unknown id, so the next message is the press's result.
+    assert!(matches!(recv(&mut c).await, Message::Result { seq: 2, .. }));
+}
+
+#[tokio::test]
+async fn a_malformed_or_oversize_icon_get_gets_bad_request_then_close() {
+    let (_daemon, _c, id) = start_with_icon().await;
+    let too_many = vec![id.as_str(); 41];
+    let forty = vec![id.as_str(); 40];
+    for bad in [
+        vec!["xyz"],
+        vec![&id[..31]],
+        vec!["ABCDEF0123456789ABCDEF0123456789"],
+        vec![""],
+        too_many,
+    ] {
+        let (daemon, _, _) = (&_daemon, 0, 0);
+        let mut c = handshake(daemon.addr, DEVICE, &TOKEN).await;
+        c.send(icon_get(&bad)).await.unwrap();
+        let Message::Error { code, .. } = recv(&mut c).await else {
+            panic!("expected error for {bad:?}")
+        };
+        assert_eq!(code, ErrorCode::BadRequest, "{bad:?}");
+        expect_closed(&mut c).await;
+    }
+    // Forty ids is the most a layout can name, and is fine. Forty copies of one get one frame.
+    let mut c = handshake(_daemon.addr, DEVICE, &TOKEN).await;
+    c.send(icon_get(&forty)).await.unwrap();
+    assert_eq!(encode_hex(&recv_icon(&mut c).await.id), id);
+    c.send(press("pic", 9)).await.unwrap();
+    assert!(matches!(recv(&mut c).await, Message::Result { seq: 9, .. }));
+}
+
+#[tokio::test]
+async fn an_icon_edit_pushes_a_new_layout_and_a_bad_one_pushes_nothing() {
+    let (daemon, mut c, old) = start_with_icon().await;
+
+    // A new picture under the same name changes the id, so devices get a layout and fetch it.
+    let mut other = quadrants_png(200);
+    let last = other.len() - 20;
+    other[last] ^= 0xff; // inside the IDAT stream or its checksum
+    put_icon(&daemon, "a.png", &other);
+    assert!(
+        daemon.reconfigure(ICON_CONFIG).is_err(),
+        "a corrupt PNG is refused"
+    );
+    put_icon(&daemon, "a.png", &{
+        let picture = image::RgbaImage::from_pixel(8, 8, image::Rgba([1, 2, 3, 255]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        picture.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    });
+    assert_eq!(daemon.reconfigure(ICON_CONFIG), Ok(true));
+    let Message::Layout { rev, buttons, .. } = recv(&mut c).await else {
+        panic!("expected the new layout, not a layout for the bad file")
+    };
+    assert_eq!(rev, 2, "the refused file pushed nothing");
+    let new = buttons[0].icon.clone().unwrap();
+    assert_ne!(new, old);
+    c.send(icon_get(&[&old, &new])).await.unwrap();
+    let icon = recv_icon(&mut c).await;
+    assert_eq!((encode_hex(&icon.id), icon.w, icon.h), (new, 8, 8));
+
+    // A config naming a missing file is refused whole.
+    let errors = daemon
+        .reconfigure(&ICON_CONFIG.replacen("a.png", "gone.png", 1))
+        .unwrap_err();
+    assert!(errors[0].contains("\"gone.png\": not found"), "{errors:?}");
+    c.send(press("pic", 3)).await.unwrap();
+    assert!(matches!(recv(&mut c).await, Message::Result { seq: 3, .. }));
+}
+
+#[tokio::test]
+async fn a_new_session_gets_the_same_icon_ids() {
+    let (daemon, _c, id) = start_with_icon().await;
+    let mut fresh = handshake_without_layout(daemon.addr).await;
+    let Message::Layout { buttons, .. } = recv(&mut fresh).await else {
+        panic!("expected layout")
+    };
+    assert_eq!(buttons[0].icon.as_deref(), Some(id.as_str()));
+    fresh.send(icon_get(&[&id])).await.unwrap();
+    assert_eq!(encode_hex(&recv_icon(&mut fresh).await.id), id);
+}
+
+#[tokio::test]
+async fn a_binary_frame_from_the_device_is_a_bad_request() {
+    let (_daemon, mut c, _) = start_with_icon().await;
+    c.send(Ws::binary(vec![1, 2, 3])).await.unwrap();
+    let Message::Error { code, .. } = recv(&mut c).await else {
+        panic!("expected error")
+    };
+    assert_eq!(code, ErrorCode::BadRequest);
+    expect_closed(&mut c).await;
 }

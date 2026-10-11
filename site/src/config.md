@@ -74,9 +74,36 @@ Each `[[button]]` table is one cell.
 | `label` | yes | Printable ASCII, at most 47 characters. The device's fonts have no other characters |
 | `bg` | no | Background as `#rrggbb`. Default `#1e88e5` |
 | `fg` | no | Label color as `#rrggbb`. Default `#ffffff` |
+| `icon` | no | A picture in the `icons/` folder, such as `"3f2a9c1d0e44.png"`; see [Icons](#icons) |
 | `action` | yes | A shell or HTTP action, below |
 
-Unknown keys are errors, so a misspelled key is caught rather than ignored. Icons and live tiles aren't supported yet.
+Unknown keys are errors, so a misspelled key is caught rather than ignored. Live tiles aren't supported yet.
+
+## Icons
+
+A button can show a picture above its label. The picture is a PNG, JPEG or WebP file in `~/.config/dev.rackrot.watchdeck/icons/`, and `icon` names the file:
+
+```toml
+[[button]]
+id = "plex"
+pos = [0, 0]
+label = "Plex"
+icon = "plex.png"
+action = { kind = "shell", argv = ["ssh", "nas", "docker", "restart", "plex"] }
+```
+
+To add one, either copy the file into `icons/` yourself (make the folder if it's missing) and name it in `config.toml`, or import it, which copies it there under a name made from its content, such as `3f2a9c1d0e44.png`. The app's `import_icon` command does the import; the config editor will offer it.
+
+- `icon` is a plain file name: 1 to 63 letters, digits, `_`, `-` or `.`, not starting with a dot. It can't point outside `icons/`.
+- Only PNG, JPEG and WebP are read. The kind comes from the file's contents, not its name. SVG isn't supported.
+- A file must be a regular file of at most 2 MB, and the picture at most 4096 × 4096 pixels. Bigger ones are refused, not scaled.
+- Transparency is kept, so a PNG or WebP with a see-through background shows the button's color behind it.
+- The app shrinks a picture that is bigger than its box, keeping its shape, and leaves a smaller one as it is. It never scales a picture up. A JPEG is turned upright by its EXIF orientation first.
+- The box is a square above the label. Its side is what the button has left after 4 px of padding on each side, a 2 px gap and the label, and it never exceeds 256 px or the button's width less the padding. The label gets 2 lines (35 px each), or 1 line where 2 lines would leave the icon under 24 px. A longer label ends in dots. So the box is 256 px on 1 row, 110 on 2 rows, 44 on 3 rows (the default 5×3 grid, labels up to 2 lines), 46 on 4 rows and 26 on 5 rows (8×5, labels of 1 line). On a single row of 4 or more columns the button's width limits it instead, for example 238 px on 4 columns.
+- A WebP's declared sizes are checked before it is decoded, because the decoder would trust them. The app reads the headers (the canvas, each animation frame and the picture data) and refuses a picture over 4096 pixels on a side, one whose headers disagree, or one that breaks off.
+- Buttons that name the same file share one picture on the device.
+- A missing, unreadable or invalid file holds back the whole config, like any other broken rule, and the app logs which button and file.
+- Adding or removing a file in `icons/`, or changing one a button names (its modified time or size), reloads the config once the change has held for two polls. That covers replacing a picture in place, and a file that is still being copied is read again when it finishes. A different picture gets a new id, so the device fetches it and drops the old one.
 
 ## Shell actions
 

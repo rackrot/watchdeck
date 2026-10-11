@@ -1,5 +1,6 @@
 //! Tauri commands for the window. They only forward to the daemon, which owns the rules.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -73,7 +74,7 @@ pub struct ConfigView {
 pub fn get_config(daemon: State<'_, Daemon>) -> ConfigView {
     let status = daemon.configs.status().borrow().clone();
     ConfigView {
-        config: (*daemon.configs.current()).clone(),
+        config: daemon.configs.current().config.clone(),
         revision: status.revision,
         errors: status.errors,
     }
@@ -82,12 +83,15 @@ pub fn get_config(daemon: State<'_, Daemon>) -> ConfigView {
 /// Checks and writes the config. Returns the new revision, or every rule it breaks, in which
 /// case nothing is written.
 #[tauri::command]
-pub fn save_config(
+pub async fn save_config(
     daemon: State<'_, Daemon>,
     config: Config,
     revision: String,
 ) -> Result<String, Vec<String>> {
-    daemon.configs.save(config, &revision)
+    let configs = daemon.configs.clone();
+    blocking(move || configs.save(config, &revision))
+        .await
+        .map_err(|e| vec![e])?
 }
 
 /// Secret names. Values never leave the daemon.
@@ -98,9 +102,34 @@ pub fn list_secrets(daemon: State<'_, Daemon>) -> Result<Vec<String>, String> {
 
 /// Adds or replaces a secret. There is no command that reads one back.
 #[tauri::command]
-pub fn set_secret(daemon: State<'_, Daemon>, name: String, value: String) -> Result<(), String> {
-    daemon.secrets.set(&name, &value)?;
-    // A config held back for want of this secret can go live now. reload logs its own outcome.
-    let _ = daemon.configs.reload();
-    Ok(())
+pub async fn set_secret(
+    daemon: State<'_, Daemon>,
+    name: String,
+    value: String,
+) -> Result<(), String> {
+    let (configs, secrets) = (daemon.configs.clone(), daemon.secrets.clone());
+    blocking(move || {
+        secrets.set(&name, &value)?;
+        // A config held back for want of this secret can go live now. reload logs its own outcome.
+        let _ = configs.reload();
+        Ok(())
+    })
+    .await?
+}
+
+/// Copies a PNG, JPEG or WebP into the icons directory and returns the file name for a button's
+/// `icon`. The file must pass the same size and decoding checks as a configured icon.
+#[tauri::command]
+pub async fn import_icon(daemon: State<'_, Daemon>, path: String) -> Result<String, String> {
+    let configs = daemon.configs.clone();
+    blocking(move || configs.import_icon(Path::new(&path))).await?
+}
+
+/// Runs `work` on the blocking pool, since it may decode images or wait on the config lock.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|e| format!("background task failed: {e}"))
 }

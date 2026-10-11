@@ -18,13 +18,15 @@ use tokio::time::{sleep, timeout, timeout_at, Instant};
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::Bytes;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message as WsMessage};
 use tokio_tungstenite::{accept_async_with_config, WebSocketStream};
 
 use super::actions::{ActionResult, Actions, MAX_RUNNING};
-use super::config::Config;
+use super::config::{Live, MAX_COLS, MAX_ROWS};
 use super::protocol::{
-    decode_hex, valid_device_id, ErrorCode, Message, Token, MAX_MESSAGE_BYTES, TOKEN_BYTES, VERSION,
+    decode_hex, encode_hex, valid_device_id, ErrorCode, Message, Token, ICON_ID_BYTES,
+    MAX_MESSAGE_BYTES, TOKEN_BYTES, VERSION,
 };
 use super::store::Store;
 
@@ -36,6 +38,8 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a closing session waits for the device to close too.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_BUTTON_ID_BYTES: usize = 64;
+/// Ids in one `icon_get`: a layout never names more icons than it has cells.
+const MAX_ICON_IDS: usize = (MAX_COLS * MAX_ROWS) as usize;
 /// Concurrent connections, handshaking or live. Beyond this the listener drops new sockets.
 const MAX_CONNECTIONS: usize = 64;
 /// The one reply to every failed authentication, so a client can't tell an unknown device from
@@ -80,7 +84,7 @@ pub struct Devices(Arc<Shared>);
 struct Shared {
     hostname: String,
     tls: TlsAcceptor,
-    config: watch::Receiver<Arc<Config>>,
+    config: watch::Receiver<Arc<Live>>,
     actions: Actions,
     events: broadcast::Sender<DaemonEvent>,
     next_id: AtomicU64,
@@ -101,7 +105,7 @@ impl Server {
         addr: impl ToSocketAddrs,
         tls: Arc<ServerConfig>,
         store: Store,
-        config: watch::Receiver<Arc<Config>>,
+        config: watch::Receiver<Arc<Live>>,
         actions: Actions,
     ) -> io::Result<Self> {
         let hostname = gethostname::gethostname().to_string_lossy().into_owned();
@@ -345,7 +349,14 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let json = serde_json::to_string(msg).expect("protocol messages serialize");
-    match timeout(WRITE_TIMEOUT, tx.send(WsMessage::text(json))).await {
+    send_frame(tx, WsMessage::text(json)).await
+}
+
+async fn send_frame<S>(tx: &mut WsSink<S>, frame: WsMessage) -> Result<(), WsError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match timeout(WRITE_TIMEOUT, tx.send(frame)).await {
         Ok(sent) => sent,
         Err(_) => Err(WsError::Io(io::Error::new(
             io::ErrorKind::TimedOut,
@@ -615,6 +626,38 @@ where
                     }
                 }
             }
+            Incoming::Msg(Message::IconGet { ids }) => {
+                let Some(wanted) = icon_ids(&ids) else {
+                    let why = format!(
+                        "icon_get takes at most {MAX_ICON_IDS} ids of {} lowercase hex digits",
+                        2 * ICON_ID_BYTES
+                    );
+                    send_error(tx, ErrorCode::BadRequest, why).await?;
+                    return Ok(());
+                };
+                let mut sent = Vec::new();
+                for id in wanted {
+                    if sent.contains(&id) {
+                        continue;
+                    }
+                    sent.push(id);
+                    // A revoke ends the session before the next frame, not after the last.
+                    match kick.try_recv() {
+                        Err(oneshot::error::TryRecvError::Empty) => {}
+                        kicked => return end_kicked(tx, kicked.ok(), device).await,
+                    }
+                    // An icon the layout dropped since the device asked is no longer wanted.
+                    match layout.icons.iter().find(|icon| icon.id == id) {
+                        Some(icon) => {
+                            let frame = WsMessage::Binary(Bytes::from_owner(icon.wire()));
+                            send_frame(tx, frame).await?
+                        }
+                        None => {
+                            log::info!("{device}: icon {} is not in the layout", encode_hex(&id))
+                        }
+                    }
+                }
+            }
             Incoming::Msg(Message::Unknown) => {
                 log::warn!("{device}: ignoring unknown message type")
             }
@@ -634,6 +677,14 @@ where
             Incoming::Failed(e) => return Err(e),
         }
     }
+}
+
+/// The ids of an `icon_get`, or `None` if it has too many or one is malformed.
+fn icon_ids(ids: &[String]) -> Option<Vec<[u8; ICON_ID_BYTES]>> {
+    if ids.len() > MAX_ICON_IDS {
+        return None;
+    }
+    ids.iter().map(|id| decode_hex(id)).collect()
 }
 
 /// Ends a session whose kick fired. A revoked device is told `unauthorized` first, so it drops

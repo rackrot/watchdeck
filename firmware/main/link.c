@@ -21,6 +21,7 @@
 #include "mbedtls/ssl.h"
 #include "mbedtls/x509.h"
 #include "mdns.h"
+#include "icons.h"
 #include "pairing.h"
 
 #define SERVICE "_watchdeck"
@@ -38,7 +39,10 @@
 #define BROWSE_INTERVAL_MS 4000  // unpaired: pause between looks for daemons open for pairing
 #define PAIR_TIMEOUT_MS 130000   // one attempt, tap to verdict; the daemon's own window is 120 s
 #define CONFIRM_TIMEOUT_MS 60000 // then the person's Yes or No on the device
+#define RX_POST_WAIT_MS                                                                                                \
+    500 // a full queue holds the websocket task this long before a frame is dropped; under SEND_TIMEOUT_MS
 #define WS_OP_TEXT 0x1
+#define WS_OP_BINARY 0x2
 
 static const char *TAG = "link";
 
@@ -77,6 +81,7 @@ typedef struct {
         struct {
             char *data;
             size_t len;
+            bool binary; // an icon frame, else a JSON text message
         } msg;
         struct {
             char btn[PROTO_ID_MAX];
@@ -117,16 +122,19 @@ static struct {
     int64_t browse_at_ms;
     link_daemon_t daemons[LINK_MAX_DAEMONS]; // the pairable list the UI shows
     size_t ndaemons;
-    bool listed;              // the UI has been given a list, even an empty one
-    link_daemon_t pair_with;  // the daemon of the attempt
-    bool pair_up;             // that attempt's socket is connected
-    int64_t pair_deadline_ms; // the attempt, or its question in ST_CONFIRM, ends after this
+    bool listed;                                        // the UI has been given a list, even an empty one
+    link_daemon_t pair_with;                            // the daemon of the attempt
+    bool pair_up;                                       // that attempt's socket is connected
+    int64_t pair_deadline_ms;                           // the attempt, or its question in ST_CONFIRM, ends after this
+    uint8_t want[PROTO_MAX_BUTTONS][PROTO_ICON_ID_LEN]; // icons asked for and not yet received
+    size_t n_want;
 } s;
 
 // Reassembly state and connect measurements, touched only by the websocket event handler, which
 // the client runs under its lock.
 static char *s_rx;
 static int s_rx_len;
+static volatile bool s_binary_ok; // set before a client starts: icon frames are taken only from a pinned wss peer
 static int64_t s_connect_us;
 static bool s_heap_watch;
 
@@ -150,31 +158,42 @@ static void set_status(const char *fmt, ...)
     }
 }
 
-static bool post(const link_ev_t *ev)
+static bool post_wait(const link_ev_t *ev, TickType_t wait)
 {
-    if (xQueueSend(s.queue, ev, 0) != pdTRUE) {
+    if (xQueueSend(s.queue, ev, wait) != pdTRUE) {
         ESP_LOGE(TAG, "event queue full, dropped event %d", ev->type);
         return false;
     }
     return true;
 }
 
+static bool post(const link_ev_t *ev)
+{
+    return post_wait(ev, 0);
+}
+
 /* ---- Websocket event handler: runs on the client's task, so it only posts. ---- */
 
 static void on_ws_data(const esp_websocket_event_data_t *d, uint32_t gen)
 {
-    // PING and PONG payloads arrive as DATA too. Fragmented text messages (continuation
-    // op_code 0) are dropped on purpose, since the protocol uses single frames.
-    if (d->op_code != WS_OP_TEXT) {
-        if (d->op_code == 0x2) {
-            ESP_LOGW(TAG, "ignoring binary frame (%d bytes)", d->payload_len);
+    // PING and PONG payloads arrive as DATA too. Fragmented messages (continuation op_code 0) are
+    // dropped on purpose, since the protocol uses single frames.
+    bool binary = d->op_code == WS_OP_BINARY;
+    if (d->op_code != WS_OP_TEXT && !binary) {
+        return;
+    }
+    if (binary && !s_binary_ok) {
+        // The plain pairing socket has no authentication, so it gets no big allocation.
+        if (d->payload_offset == 0) {
+            ESP_LOGW(TAG, "binary frame of %d bytes refused, this client takes text only", d->payload_len);
         }
         return;
     }
+    const int max_len = binary ? PROTO_MAX_ICON_FRAME : PROTO_MAX_MSG;
     link_ev_t bad = {.type = EV_WS_BAD, .gen = gen};
-    if (d->payload_len > PROTO_MAX_MSG) {
+    if (d->payload_len > max_len) {
         if (d->payload_offset == 0) { // later chunks of the same frame need no second close
-            ESP_LOGE(TAG, "frame of %d bytes exceeds %d, closing", d->payload_len, PROTO_MAX_MSG);
+            ESP_LOGE(TAG, "frame of %d bytes exceeds %d, closing", d->payload_len, max_len);
             post(&bad);
         }
         return;
@@ -199,8 +218,10 @@ static void on_ws_data(const esp_websocket_event_data_t *d, uint32_t gen)
     s_rx_len += d->data_len;
     if (s_rx_len == d->payload_len) {
         s_rx[s_rx_len] = '\0';
-        link_ev_t ev = {.type = EV_WS_MSG, .gen = gen, .msg = {.data = s_rx, .len = (size_t)s_rx_len}};
-        if (!post(&ev)) {
+        link_ev_t ev = {
+            .type = EV_WS_MSG, .gen = gen, .msg = {.data = s_rx, .len = (size_t)s_rx_len, .binary = binary}};
+        // Wait for room, so a burst of icon frames slows the daemon down instead of losing icons.
+        if (!post_wait(&ev, pdMS_TO_TICKS(RX_POST_WAIT_MS))) {
             free(s_rx);
         }
         s_rx = NULL;
@@ -542,6 +563,7 @@ static void drop_client(void)
         s.client = NULL;
     }
     s.welcomed = false;
+    s.n_want = 0;
 }
 
 // Drop the session and back off, showing `reason` on the status line.
@@ -566,6 +588,7 @@ static void lost(const char *why)
 static esp_err_t open_client(const char *uri, const char *cert_pem)
 {
     s.gen++;
+    s_binary_ok = cert_pem != NULL;
     const esp_websocket_client_config_t cfg = {
         .uri = uri,
         .cert_pem = cert_pem,
@@ -696,6 +719,9 @@ static void set_paired(bool paired)
     }
     if (s.cbs.on_paired) {
         s.cbs.on_paired(paired);
+    }
+    if (!paired) {
+        icons_clear(); // the UI has dropped the grid that showed them
     }
 }
 
@@ -850,6 +876,94 @@ static void handle_pair_msg(const char *json, size_t len)
 
 /* ---- Paired session ---- */
 
+#define ID4(id) (id)[0], (id)[1], (id)[2], (id)[3] // enough of an icon id for the log
+
+static bool has_id(const uint8_t ids[][PROTO_ICON_ID_LEN], size_t n, const uint8_t id[PROTO_ICON_ID_LEN])
+{
+    for (size_t i = 0; i < n; i++) {
+        if (memcmp(ids[i], id, PROTO_ICON_ID_LEN) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// A layout arrived and the UI has rebuilt the grid from it. Free the icons it no longer names, give
+// the UI those already cached, and ask the daemon for the rest in one icon_get.
+static void sync_icons(const proto_layout_t *layout)
+{
+    size_t dropped = icons_retain(layout);
+    uint8_t seen[PROTO_MAX_BUTTONS][PROTO_ICON_ID_LEN];
+    size_t n_seen = 0;
+    size_t cached = 0;
+    s.n_want = 0;
+    for (size_t i = 0; i < layout->n_buttons; i++) {
+        const uint8_t *id = layout->buttons[i].icon;
+        if (!layout->buttons[i].has_icon || has_id(seen, n_seen, id)) {
+            continue;
+        }
+        memcpy(seen[n_seen++], id, PROTO_ICON_ID_LEN);
+        const lv_image_dsc_t *dsc = icons_find(id);
+        if (dsc) {
+            cached++;
+            ESP_LOGI(TAG, "icon %02x%02x%02x%02x from cache", ID4(id));
+            if (s.cbs.on_icon) {
+                s.cbs.on_icon(id, dsc);
+            }
+        } else {
+            memcpy(s.want[s.n_want++], id, PROTO_ICON_ID_LEN);
+        }
+    }
+    ESP_LOGI(TAG, "layout names %u icon(s): %u cached, %u to request, %u dropped", (unsigned)n_seen, (unsigned)cached,
+             (unsigned)s.n_want, (unsigned)dropped);
+    if (s.n_want == 0) {
+        return;
+    }
+    char buf[2048]; // 40 ids of 32 digits fit with room to spare
+    size_t len = proto_build_icon_get(buf, sizeof(buf), s.want, s.n_want);
+    if (len == 0) {
+        ESP_LOGE(TAG, "icon_get does not fit");
+        return;
+    }
+    ESP_LOGI(TAG, "requesting %u icon(s)", (unsigned)s.n_want);
+    send_text(buf, len, NULL);
+}
+
+// One binary frame. Returns true if the cache took the buffer, else the caller frees it.
+static bool handle_icon_frame(uint8_t *frame, size_t len)
+{
+    proto_icon_t icon;
+    if (!s.welcomed) {
+        ESP_LOGW(TAG, "icon before welcome, ignored");
+        return false;
+    }
+    if (proto_parse_icon(frame, len, &icon) != ESP_OK) {
+        return false; // proto_parse_icon says why
+    }
+    if (icons_find(icon.id)) {
+        ESP_LOGI(TAG, "icon %02x%02x%02x%02x already cached, ignored", ID4(icon.id));
+        return false;
+    }
+    size_t i = 0;
+    while (i < s.n_want && memcmp(s.want[i], icon.id, PROTO_ICON_ID_LEN) != 0) {
+        i++;
+    }
+    if (i == s.n_want) {
+        ESP_LOGW(TAG, "icon %02x%02x%02x%02x was not requested, dropped", ID4(icon.id));
+        return false;
+    }
+    if (icons_add(&icon, frame) != ESP_OK) {
+        return false; // icons_add says why
+    }
+    memcpy(s.want[i], s.want[--s.n_want], PROTO_ICON_ID_LEN);
+    ESP_LOGI(TAG, "icon %02x%02x%02x%02x %ux%u received, validated and cached, %u still wanted", ID4(icon.id), icon.w,
+             icon.h, (unsigned)s.n_want);
+    if (s.cbs.on_icon) {
+        s.cbs.on_icon(icon.id, icons_find(icon.id));
+    }
+    return true;
+}
+
 static void handle_msg(const char *json, size_t len)
 {
     ESP_LOGI(TAG, "rx: %.*s", (int)(len > 160 ? 160 : len), json);
@@ -880,8 +994,11 @@ static void handle_msg(const char *json, size_t len)
     case PROTO_MSG_RESULT:
         if (!s.welcomed) {
             ESP_LOGW(TAG, "message before welcome, ignored");
-        } else if (m->type == PROTO_MSG_LAYOUT && s.cbs.on_layout) {
-            s.cbs.on_layout(&m->layout);
+        } else if (m->type == PROTO_MSG_LAYOUT) {
+            if (s.cbs.on_layout) {
+                s.cbs.on_layout(&m->layout);
+            }
+            sync_icons(&m->layout);
         } else if (m->type == PROTO_MSG_RESULT && s.cbs.on_result) {
             s.cbs.on_result(&m->result);
         }
@@ -959,14 +1076,22 @@ static void handle_event(link_ev_t *ev)
             candidate_failed("cert rejected");
         }
         break;
-    case EV_WS_MSG:
+    case EV_WS_MSG: {
+        bool kept = false;
         if (current && s.state == ST_UP) {
-            handle_msg(ev->msg.data, ev->msg.len);
-        } else if (current && s.state == ST_PAIRING) {
+            if (ev->msg.binary) {
+                kept = handle_icon_frame((uint8_t *)ev->msg.data, ev->msg.len);
+            } else {
+                handle_msg(ev->msg.data, ev->msg.len);
+            }
+        } else if (current && s.state == ST_PAIRING && !ev->msg.binary) {
             handle_pair_msg(ev->msg.data, ev->msg.len);
         }
-        free(ev->msg.data);
+        if (!kept) {
+            free(ev->msg.data);
+        }
         break;
+    }
     case EV_PRESS:
         if (s.state == ST_UP && s.welcomed) {
             char buf[PROTO_ID_MAX + 64];

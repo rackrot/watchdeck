@@ -1,6 +1,6 @@
 # watchdeck v1: daemon, device protocol, screen config
 
-Status: plan, 2026-10-10. S1 to S4 are done (see the slice table); S5 onward is not built.
+Status: plan, 2026-10-10. S1 to S5 are done (see the slice table). S8 is built and waits on a manual check. S6 and S7 are not built.
 
 ## Decisions
 
@@ -50,7 +50,7 @@ Nothing here imports `tauri`, so tests run headless.
 | `mdns.rs` | avahi-daemon registration over D-Bus (zbus) |
 | `actions.rs`, `actions/` | One run per button, the global limit, result text; the shell and HTTP runners |
 | `tiles.rs` | Tile pollers |
-| `icons.rs` | Decode, fit, ARGB8888, hash, cache |
+| `icons.rs` | Decode, fit, ARGB8888, hash, import. The live config carries the rendered icons |
 
 - A `watch<Arc<Config>>` carries live config. A `broadcast<DaemonEvent>` carries connects, pairing requests and action runs.
 - `lib.rs` builds Tauri, plugins and the tray, starts the daemon and mDNS, and forwards events to the UI and the tray status line.
@@ -71,7 +71,8 @@ Nothing here imports `tauri`, so tests run headless.
 | `ui.c` | Status screen, daemon list, pairing code and question, grid, result modal, tiles, Forget pairing |
 | `proto.c` | cJSON parse/build, icon-frame parse. Pure functions |
 | `pairing.c` | Pairing session, SAS, NVS blob |
-| `link.c` | Discovery, backoff, websocket lifecycle, dispatch, icon cache |
+| `link.c` | Discovery, backoff, websocket lifecycle, dispatch, icon requests |
+| `icons.c` | The PSRAM icon cache, by id, bounded. Link task only |
 
 - All LVGL calls run under `lvgl_port_lock`.
 - The touch callback and the websocket event handler only post to the link task's queue. The link task does every send and every stop/destroy.
@@ -219,7 +220,7 @@ tile = { every_s = 15, json_pointer = "/state",
   2. Rust validates it and refuses if the file changed since load. The revision is the SHA-256 of the file text.
   3. Rust writes atomically, the watch channel fires, and the layout pushes.
   4. Hand edits apply on their own. The daemon polls the mtime, size and inode of `config.toml` and `secrets.toml` every 500 ms and reloads once a change holds for two polls. No watcher crate.
-- **Icons.** The daemon renders each icon into a box of min(cell) × 0.55, at most 256 px, as ARGB8888. The id is the first 16 bytes of SHA-256(w, h, pixels). Rejected: on-device PNG decode, which costs more CPU and code for no RAM saving.
+- **Icons.** The daemon shrinks each icon to fit a box of min(cell) × 0.55, at most 256 px, and never scales one up. It converts the result to ARGB8888. The id is the first 16 bytes of SHA-256(w, h, pixels). Rejected: on-device PNG decode, which costs more CPU and code for no RAM saving.
 - **Device storage.** The layout and icons stream into PSRAM on every connect. NVS holds only the pairing blob. Rejected: a flash cache, because actions need the daemon anyway, cached tiles would mislead, and it needs a partition change.
 - **Offline.** The device shows a status screen: Wi-Fi state, "searching" or "daemon offline, retry in N s", and Forget pairing. If the link drops mid-session, the grid greys out under a banner and presses are blocked.
 
@@ -260,7 +261,7 @@ Tauri on Linux:
 | S2 ✅ | Thin end-to-end, no auth. Done 2026-10-10: tap → notify-send → toast verified on hardware; board reconnects after a daemon restart (IP change untested). Write `site/src/protocol.md` first. Daemon in Tauri, mDNS, plain ws, hello → one hard-coded button → `notify-send` → result toast. Add `cargo test` to CI | Connects within 10 s. Survives a daemon restart and an IP change. Result shows within 1 s. Heap logged | Fake-device integration test, `avahi-browse`, device |
 | S3 | **Security gate.** S3a: TLS interop spike (rcgen + rustls ↔ mbedTLS). S3a done 2026-10-10: wss with the pinned cert works on hardware, and 47820 is wss-only (results below). S3b: pairing on both sides, Forget pairing. S3b built 2026-10-10: paired on hardware, and every hello needs its token (results below). Security review done 2026-10-10 and its fixes applied (review fixes below). tcpdump passed. On hardware, a run covered Forget from both sides, Yes, a wrong code, right-then-No, the 60 s timeout and re-pair, and all passed. **S3 ✅ 2026-10-10** | SAS test vector passes. A wrong code stores nothing. The device pins nothing without the person's Yes. A bad or forgotten token gets `unauthorized`. Oversize messages close the link. Device rejects a regenerated cert. tcpdump: TLS only on 47820, no token on 47821 | `cargo test`, device, tcpdump, security review |
 | S4 ✅ | Config and actions: `config.toml`, validation, shell and HTTP runners, secrets, live layout push, result modal. S4 built 2026-10-10: `cargo test` covers the acceptance list, and on hardware a live edit pushed with no reconnect while invalid edits pushed nothing. The user's tap check passed all six steps. Review and security audit done 2026-10-10 and their fixes applied (results below). **S4 ✅ 2026-10-10** | A timeout kills grandchildren. Output caps, exit codes, "already running". HTTP: secret headers, no redirects, caps. Live push needs no reconnect | `cargo test`, device, security review |
-| S5 | Icons: import, render, hash, `icon_get`, PSRAM cache | Exact-bytes render test. An RGB + transparent quadrant icon shows correctly | `cargo test`, device |
+| S5 | Icons: import, render, hash, `icon_get`, PSRAM cache. S5 built 2026-10-10: `cargo test` covers the acceptance list, and on hardware the icons were requested, received, validated, cached and hit again after a reconnect. The visual check and the recheck after the review fixes both passed (results below). **S5 ✅ 2026-10-10** | Exact-bytes render test. An RGB + transparent quadrant icon shows correctly | `cargo test`, device |
 | S6 | Tiles | Paused-clock tests: interval, no overlap, idle stop, poll after press | `cargo test`, device |
 | S7 | Config UI (needs design direction first). Design note from the S4 review: with an invalid `config.toml` at startup the revision is empty, so `save_config` can never repair the file from the UI. S7 must handle that case | A save reaches the device within 2 s. Field errors write nothing. Secrets are never returned. Strict CSP | `pnpm build`, `app:dev` |
 | S8 | App shape: tray menu, hidden start, close-to-tray, autostart, single-instance, logging | Tray-only after login. Closing the window keeps the device connected. A second launch focuses the window | `app:build`, manual check |
@@ -387,6 +388,47 @@ The review and the security audit found no blockers. These fixes followed:
   - plain headers on the wire, a two-thread "busy" stress test, and the go-live warning in `device_sim`
   - Each was checked to fail on the old code. The SIGKILL deadline has no test, since a unit test can't make a process outlive SIGKILL.
 - **CSP:** still `null` until S7, as tracked. `save_config` and `set_secret` raise its priority: a script injected into the webview could write shell actions into `config.toml`, which run as the user.
+
+### S5 results (2026-10-10)
+
+- **On hardware,** with the dev daemon and the board that S4 used, against a config where four buttons show three distinct images, two of the buttons sharing one. The log is from the board's serial port, with ticks in ms since boot. The first run used the build from before `clang-format` (a layout-only change), and the final build repeated the first connect and the restart:
+  - First connect, final build: `layout names 3 icon(s): 0 cached, 3 to request` at 9.81 s, one `icon_get` with the three ids, then each icon logged `received, validated and cached` at 9.96, 9.98 and 10.01 s. That is 200 ms from the layout to all three held.
+  - Daemon restart with the board left running, final build: `link lost`, then `welcome` at 55.67 s, `icon 2f6a6b05 from cache` and two more, and `3 cached, 0 to request`. The board sent no `icon_get`.
+  - Live edits, with no reconnect (first build): a changed icon set pushed rev 2, 3 and 4. Rev 3 logged `1 cached, 1 to request, 1 dropped` and fetched only the new id. Rev 4 re-fetched the id that rev 3 had dropped.
+  - Min free internal heap after the first layout: 307.4 KB (S4: 310.4 KB). The firmware is 0x198520 bytes, 60% of the app partition free.
+- **Tests:** 103 unit and 44 `device_sim`.
+  - protocol.rs: an icon frame matches a vector computed with Python's hashlib, the largest frame round-trips at the cap, and `decode` refuses a short frame, a bad magic, a zero, oversize or 65535-wide side, a length off by one either way, a wrong id, a flipped pixel, and the same pixels read as another shape.
+  - icons.rs: the exact-bytes render test (red, green, blue and a transparent quadrant give B, G, R, A bytes, a hashed id and the frame layout), shrinking that keeps the shape and never scales up, no color bleeding from transparent pixels, PNG, JPEG and WebP accepted and GIF, SVG and text refused, a truncated file, a picture over 4096 pixels, the file name rule, a missing, junk, directory and oversize file, and `import`.
+  - config.rs: a config waiting on its icon until the poller sees the file, and a save that names an icon that exists.
+  - `device_sim`: the layout carries the hash, `icon_get` returns frames that decode with the device's checks, unknown ids get nothing, malformed and 41-id lists close the session, an icon edit pushes a layout and a corrupt file pushes nothing, and a binary frame from the device is refused.
+  - The firmware has no test harness in the repo. Its icon parser, `icon_get` builder and layout parser were compiled on the host against 16 frames built by an independent Python writer (the Rust vector among them) under AddressSanitizer: all pass. That harness isn't committed.
+- **Not run on hardware:** the device's refusal of a bad frame, since the daemon only sends good ones. The host run covers `proto_parse_icon`, but not the link's request matching or the cache cap.
+- **Dependencies:** image 0.25.10 with `png`, `jpeg` and `webp` only (zune-jpeg, image-webp, png, moxcms). `cargo tree --target all` shows no ring, openssl, native-tls or rayon.
+- **Choices made in S5:**
+  - The live config now carries its rendered icons (`Live`, a `Config` plus an icon set), so the layout and the frames it names always come from one load. `Config::layout()` became `Live::layout()`.
+  - `icons::load` runs after `Config::check` in `reload` and `save`, so only the file name rule is in `check`. A file that is missing or won't decode holds back the whole config.
+  - A picture is shrunk to fit, never scaled up. The shrink runs through premultiplied alpha, because `image`'s resize assumes it and otherwise the color of transparent pixels bleeds into the edge.
+  - The daemon takes the grid geometry from constants that mirror `ui.c` and `display.h` (1024×600, top 204, gap 8), not from the device's `hello`, because one layout serves every device.
+  - Limits, picked here since the plan named none: a file of at most 2 MB, a picture of at most 4096×4096, and 128 MB of decoder memory.
+  - `icon_get` answers from the session's own layout. An id it doesn't name gets nothing, and a malformed or 41-id list closes the session.
+  - The device sends one `icon_get` per layout. It frees icons the new layout doesn't name, and keeps the rest across a reconnect. Frames are accepted only for ids it asked for, and the cache holds at most 40 icons and 8 MB.
+  - The websocket handler waits up to 500 ms for queue room before it drops a frame, so a burst of icons slows the daemon instead of losing icons. Dropped icons stay missing until the next layout.
+  - The poller also watches the `icons/` directory's stamp, so adding a file applies a config that was waiting for it. Overwriting a file in place doesn't change the directory, so that needs a save of `config.toml`.
+  - `import_icon` copies an image into `icons/` under the first 12 hex digits of its SHA-256 and the extension of its format. The TS wrapper waits for S7.
+  - The firmware cache lives in `icons.c`, not `link.c` as §1 first said, because `link.c` was already over 1100 lines.
+- **Surprises:**
+  - An RTS reset empties the cache, since PSRAM is cleared. The reconnect check restarts the daemon instead.
+  - `tauri dev` restarts the daemon on any file change under `app/src-tauri/`, so the Rust edits stopped before the hardware run.
+  - The `image` crate has no GIF encoder with these features, so the GIF refusal test uses a hand-written header.
+- **Visual check:** the user passed all 4 items on 2026-10-10. Review and the security audit then found two majors and nine minors, fixed in the same tree (below). On the same day the user rechecked the label layout fix. Two-line labels on icon buttons fit on 5×3, and the long label ends in "..." without overflowing.
+- **Fixes after review (2026-10-10):**
+  - Icon plus a two-line label clipped on 5×3, and a one-line label on 8×5. The box is now what the cell has left after padding (4 px each side), the 2 px gap and the label: 2 lines of 35 px, or 1 where 2 would leave under 24 px. Boxes: 256, 110, 44, 46, 26 px for 1 to 5 rows. `ui.c` fixes the label's height and ends long labels in dots. `box_px` and `ui.c` mirror each other, and a test pins every grid.
+  - WebP decode ignored the 128 MiB cap. `check_webp` walks the RIFF chunks (bounded) and reads the VP8, VP8L and ANMF headers before decoding. A crafted file that claims 16383² is refused.
+  - The unauthenticated pairing socket refuses binary frames without allocating (`s_binary_ok`, true only for pinned wss).
+  - Decode moved to the blocking pool, renders are cached by file stamp and box size, and the config lock is not held across a decode. The sync commands are async.
+  - The poll stamp includes each watched icon file's mtime and size, so in-place overwrites reload and a half-copied file is retried.
+  - `icon_get` dedupes ids, checks for a kick between frames and encodes each frame once.
+  - The import log uses `{:?}`. `"icon": null` is refused by the firmware, as the doc says. JPEG EXIF orientation is applied. `icons.c` drops the LVGL image cache entry on free. The firmware logs the LVGL heap after each layout.
 
 ## 8. Testing
 

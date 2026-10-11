@@ -18,6 +18,12 @@ void ui_set_daemon_text(const char *text);
 /** Replace the grid with `layout` and accept presses. Every layout the daemon pushes lands here. Thread-safe. */
 void ui_apply_layout(const proto_layout_t *layout);
 
+/**
+ * Show `dsc` above the label of every button whose layout icon id is `id`. `dsc` must outlive those buttons:
+ * the link drops an icon only after ui_apply_layout has replaced the grid that showed it. Thread-safe.
+ */
+void ui_set_icon(const uint8_t id[PROTO_ICON_ID_LEN], const lv_image_dsc_t *dsc);
+
 /** Grey out the grid and block presses until the next ui_apply_layout. Thread-safe. */
 void ui_link_down(void);
 

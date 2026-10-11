@@ -1,4 +1,4 @@
-idf_component_register(SRCS "main.c" "display.c" "touch.c" "ui.c" "proto.c" "pairing.c" "link.c" "sdcard.c" "wifi.c"
+idf_component_register(SRCS "main.c" "display.c" "touch.c" "ui.c" "proto.c" "icons.c" "pairing.c" "link.c" "sdcard.c" "wifi.c"
                             "usb.c"
                        INCLUDE_DIRS "."
                        PRIV_REQUIRES esp_lcd esp_hw_support esp_driver_gpio fatfs sdmmc

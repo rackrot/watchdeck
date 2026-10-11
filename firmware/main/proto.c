@@ -114,6 +114,25 @@ size_t proto_build_pair_nonce(char *buf, size_t buf_len, const uint8_t n_dev[PRO
     return print_into(root, buf, buf_len);
 }
 
+size_t proto_build_icon_get(char *buf, size_t buf_len, const uint8_t ids[][PROTO_ICON_ID_LEN], size_t n)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON *list = cJSON_CreateArray();
+    if (!root || !list) {
+        cJSON_Delete(list);
+        cJSON_Delete(root);
+        return 0;
+    }
+    for (size_t i = 0; i < n; i++) {
+        char hex[2 * PROTO_ICON_ID_LEN + 1];
+        to_hex(ids[i], PROTO_ICON_ID_LEN, hex);
+        cJSON_AddItemToArray(list, cJSON_CreateString(hex));
+    }
+    cJSON_AddStringToObject(root, "t", "icon_get");
+    cJSON_AddItemToObject(root, "ids", list);
+    return print_into(root, buf, buf_len);
+}
+
 size_t proto_build_press(char *buf, size_t buf_len, const char *btn, uint32_t seq)
 {
     cJSON *root = cJSON_CreateObject();
@@ -189,6 +208,7 @@ static esp_err_t parse_layout(const cJSON *root, proto_layout_t *out)
     {
         proto_button_t *b = &out->buttons[out->n_buttons];
         double col, row, bg, fg;
+        const cJSON *icon = cJSON_GetObjectItemCaseSensitive(item, "icon");
         if (!cJSON_IsObject(item) || !get_str(item, "id", b->id, sizeof(b->id), true) || b->id[0] == '\0' ||
             !get_str(item, "label", b->label, sizeof(b->label), false) || !get_int(item, "col", 0, cols - 1, &col) ||
             !get_int(item, "row", 0, rows - 1, &row) || !get_int(item, "bg", 0, 0xFFFFFF, &bg) ||
@@ -199,6 +219,11 @@ static esp_err_t parse_layout(const cJSON *root, proto_layout_t *out)
         b->row = (uint8_t)row;
         b->bg = (uint32_t)bg;
         b->fg = (uint32_t)fg;
+        // No icon key leaves the button plain. A key must hold a well-formed id, so null is refused.
+        b->has_icon = icon != NULL;
+        if (b->has_icon && !get_hex(item, "icon", b->icon, sizeof(b->icon))) {
+            return ESP_ERR_INVALID_ARG;
+        }
         out->n_buttons++;
     }
     return ESP_OK;
@@ -229,6 +254,45 @@ static esp_err_t parse_pair_offer(const cJSON *root, proto_pair_offer_t *out)
         !get_hex(root, "c_host", out->c_host, sizeof(out->c_host))) {
         return ESP_ERR_INVALID_ARG;
     }
+    return ESP_OK;
+}
+
+esp_err_t proto_parse_icon(const uint8_t *frame, size_t len, proto_icon_t *out)
+{
+    if (len < PROTO_ICON_HEADER_LEN) {
+        ESP_LOGW(TAG, "icon frame of %u bytes is shorter than its header", (unsigned)len);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (memcmp(frame, "WDI1", 4) != 0) {
+        ESP_LOGW(TAG, "binary frame is not an icon");
+        return ESP_ERR_INVALID_ARG;
+    }
+    size_t w = frame[20] | (size_t)frame[21] << 8;
+    size_t h = frame[22] | (size_t)frame[23] << 8;
+    if (w < 1 || w > PROTO_ICON_MAX_SIDE || h < 1 || h > PROTO_ICON_MAX_SIDE) {
+        ESP_LOGW(TAG, "icon of %ux%u is outside 1..%d", (unsigned)w, (unsigned)h, PROTO_ICON_MAX_SIDE);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (len != PROTO_ICON_HEADER_LEN + w * h * 4) {
+        ESP_LOGW(TAG, "icon of %ux%u should be %u bytes, got %u", (unsigned)w, (unsigned)h,
+                 (unsigned)(PROTO_ICON_HEADER_LEN + w * h * 4), (unsigned)len);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    uint8_t hash[PSA_HASH_LENGTH(PSA_ALG_SHA_256)];
+    size_t hash_len;
+    psa_status_t status = psa_hash_compute(PSA_ALG_SHA_256, frame + 20, len - 20, hash, sizeof(hash), &hash_len);
+    if (status != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "psa_hash_compute: %d", (int)status);
+        return ESP_FAIL;
+    }
+    if (memcmp(hash, frame + 4, PROTO_ICON_ID_LEN) != 0) {
+        ESP_LOGW(TAG, "icon id does not match its pixels");
+        return ESP_ERR_INVALID_CRC;
+    }
+    memcpy(out->id, frame + 4, PROTO_ICON_ID_LEN);
+    out->w = (uint16_t)w;
+    out->h = (uint16_t)h;
+    out->pixels = frame + PROTO_ICON_HEADER_LEN;
     return ESP_OK;
 }
 

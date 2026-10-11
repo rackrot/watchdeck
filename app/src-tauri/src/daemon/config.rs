@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::net::IpAddr;
+use std::ops::Deref;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -16,7 +17,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 
-use super::protocol::{encode_hex, Button, Message};
+use super::icons::{self, IconSet, Icons};
+use super::protocol::{encode_hex, Button, IconFrame, Message};
 use super::secrets::Secrets;
 use super::store::write_private;
 
@@ -84,6 +86,9 @@ pub struct ButtonConfig {
     pub bg: String,
     #[serde(default = "default_fg")]
     pub fg: String,
+    /// A file in `icons/`, shown above the label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
     pub action: Action,
 }
 
@@ -132,6 +137,8 @@ pub struct Layout {
     pub cols: u32,
     pub rows: u32,
     pub buttons: Vec<Button>,
+    /// The pictures the buttons name, for answering `icon_get`.
+    pub icons: Vec<Arc<IconFrame>>,
 }
 
 impl Layout {
@@ -171,6 +178,65 @@ fn loopback(url: &reqwest::Url) -> bool {
     }
 }
 
+/// A config that passed every check, with the icons it names rendered. This is what goes live,
+/// so a layout and the icons it names always come from the same load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Live {
+    pub config: Config,
+    /// One entry for each icon file `config` names.
+    pub icons: IconSet,
+}
+
+impl Deref for Live {
+    type Target = Config;
+
+    fn deref(&self) -> &Config {
+        &self.config
+    }
+}
+
+impl Live {
+    /// No buttons, which is what runs until a valid file loads.
+    pub fn empty() -> Self {
+        Self {
+            config: Config::empty(),
+            icons: IconSet::new(),
+        }
+    }
+
+    pub fn layout(&self) -> Layout {
+        let rgb = |text: &str| color(text).expect("colors are checked before a config goes live");
+        let mut icons = Vec::new();
+        let buttons = self
+            .config
+            .buttons
+            .iter()
+            .map(|b| Button {
+                id: b.id.clone(),
+                col: b.pos[0],
+                row: b.pos[1],
+                label: b.label.clone(),
+                bg: rgb(&b.bg),
+                fg: rgb(&b.fg),
+                icon: b.icon.as_ref().map(|name| {
+                    let icon = self
+                        .icons
+                        .get(name)
+                        .expect("icons are rendered before a config goes live");
+                    icons.push(icon.clone());
+                    encode_hex(&icon.id)
+                }),
+            })
+            .collect();
+        Layout {
+            cols: self.config.layout.cols,
+            rows: self.config.layout.rows,
+            buttons,
+            icons,
+        }
+    }
+}
+
 impl Config {
     /// No buttons, which is what runs until a valid file loads.
     pub fn empty() -> Self {
@@ -183,27 +249,6 @@ impl Config {
 
     pub fn button(&self, id: &str) -> Option<&ButtonConfig> {
         self.buttons.iter().find(|b| b.id == id)
-    }
-
-    /// The layout message's content. Only call it on a config that passed [`Config::check`].
-    pub fn layout(&self) -> Layout {
-        let rgb = |text: &str| color(text).expect("colors are checked before a config goes live");
-        Layout {
-            cols: self.layout.cols,
-            rows: self.layout.rows,
-            buttons: self
-                .buttons
-                .iter()
-                .map(|b| Button {
-                    id: b.id.clone(),
-                    col: b.pos[0],
-                    row: b.pos[1],
-                    label: b.label.clone(),
-                    bg: rgb(&b.bg),
-                    fg: rgb(&b.fg),
-                })
-                .collect(),
-        }
     }
 
     /// Every rule this config breaks. `secrets` holds the names in `secrets.toml`, and is
@@ -258,6 +303,9 @@ impl Config {
                 error(
                     "label must be printable ASCII, the only characters the device can draw".into(),
                 );
+            }
+            if let Some(problem) = b.icon.as_deref().and_then(icons::name_error) {
+                error(problem);
             }
             for (field, value) in [("bg", &b.bg), ("fg", &b.fg)] {
                 if color(value).is_none() {
@@ -424,8 +472,13 @@ pub struct ConfigStatus {
 pub struct Configs {
     path: PathBuf,
     secrets: Arc<Secrets>,
-    live: watch::Sender<Arc<Config>>,
+    live: watch::Sender<Arc<Live>>,
     status: watch::Sender<ConfigStatus>,
+    icons_dir: PathBuf,
+    icons: Icons,
+    /// The icon files the file on disk names, for the poller to stamp. Kept even when the config
+    /// is refused, so a file that is still being copied in is read again once it settles.
+    watched: Mutex<Vec<String>>,
     /// The files as the last reload read them. Holding it serializes reloads and saves, so a
     /// save's check and its write see the same file.
     read: Mutex<Stamps>,
@@ -436,6 +489,7 @@ impl Configs {
     /// file can't be read or breaks a rule, an empty grid goes live and `status` says why.
     pub fn open(dir: &Path, secrets: Arc<Secrets>) -> io::Result<Arc<Self>> {
         let path = dir.join(FILE);
+        let icons_dir = dir.join(icons::DIR);
         if !path.try_exists()? {
             write_private(&path, DEFAULT.as_bytes())?;
             log::info!("wrote the default {}", path.display());
@@ -443,21 +497,24 @@ impl Configs {
         let configs = Arc::new(Self {
             path,
             secrets,
-            live: watch::channel(Arc::new(Config::empty())).0,
+            live: watch::channel(Arc::new(Live::empty())).0,
             status: watch::channel(ConfigStatus {
                 revision: String::new(),
                 errors: Vec::new(),
             })
             .0,
+            icons: Icons::new(icons_dir.clone()),
+            icons_dir,
+            watched: Mutex::default(),
             // Nothing read yet, which differs from any file that exists.
-            read: Mutex::new((None, None)),
+            read: Mutex::new(Stamps::default()),
         });
         // reload logs its own outcome.
         let _ = configs.reload();
         Ok(configs)
     }
 
-    pub fn subscribe(&self) -> watch::Receiver<Arc<Config>> {
+    pub fn subscribe(&self) -> watch::Receiver<Arc<Live>> {
         self.live.subscribe()
     }
 
@@ -465,7 +522,7 @@ impl Configs {
         self.status.subscribe()
     }
 
-    pub fn current(&self) -> Arc<Config> {
+    pub fn current(&self) -> Arc<Live> {
         self.live.borrow().clone()
     }
 
@@ -477,19 +534,25 @@ impl Configs {
     /// changed) and `Ok` says whether anything changed. If not, the live config stays. A file
     /// that changes while it is read counts as not read, and the poller reads it again.
     pub fn reload(&self) -> Result<bool, Vec<String>> {
+        self.prewarm();
         let mut read = self.locked();
         let before = self.stamp();
+        let mut icons_before = None;
         let loaded = read_capped(&self.path).and_then(|bytes| {
             let text = String::from_utf8(bytes).map_err(|_| vec!["not UTF-8".to_string()])?;
             let config = parse(&text, &self.secrets.names())?;
-            Ok((sha256_hex(text.as_bytes()), config))
+            self.watch(&config);
+            icons_before = Some(self.stamp().icons);
+            let icons = self.icons.load(&config)?;
+            Ok((sha256_hex(text.as_bytes()), Live { config, icons }))
         });
-        if self.stamp() != before {
+        let now = self.stamp();
+        if now.files != before.files || icons_before.is_some_and(|icons| icons != now.icons) {
             log::debug!("{} changed while being read", self.path.display());
             return Ok(false);
         }
-        *read = before;
-        let (revision, config) = match loaded {
+        *read = now;
+        let (revision, live) = match loaded {
             Ok(loaded) => loaded,
             Err(errors) => {
                 log::error!(
@@ -505,7 +568,7 @@ impl Configs {
                 return Err(errors);
             }
         };
-        let changed = self.go_live(config);
+        let changed = self.go_live(live);
         if changed {
             log::info!("applied {}", self.path.display());
         }
@@ -521,7 +584,11 @@ impl Configs {
         if !errors.is_empty() {
             return Err(errors);
         }
+        // Render before the lock, so a slow decode doesn't hold it, then again under the lock.
+        // That pass is a cache hit unless a file changed in between, as in `reload`.
+        self.icons.load(&config)?;
         let _read = self.locked();
+        let icons = self.icons.load(&config)?;
         let live = self.status.borrow().revision.clone();
         if revision != live {
             return Err(vec![format!(
@@ -540,50 +607,93 @@ impl Configs {
         write_private(&self.path, text.as_bytes())
             .map_err(|e| vec![format!("Could not save {FILE}: {e}")])?;
         let revision = sha256_hex(text.as_bytes());
-        if self.go_live(config) {
+        if self.go_live(Live { config, icons }) {
             log::info!("saved and applied {}", self.path.display());
         }
         self.set_status(revision.clone());
         Ok(revision)
     }
 
-    /// Reloads whenever `config.toml` or `secrets.toml` differ from what the last reload read,
-    /// until the future is dropped. A change counts once the files look the same on two polls in
-    /// a row, so a write in progress is not read half done.
+    /// Copies the image at `src` into `icons/` and returns the file name for a button's `icon`.
+    pub fn import_icon(&self, src: &Path) -> Result<String, String> {
+        self.icons.import(src)
+    }
+
+    /// Renders the icons that the file on disk names, before `reload` takes the lock, so that
+    /// decoding mostly stays out of it. The locked pass then finds them cached, and decodes only
+    /// what changed since, which can briefly hold up a save or another reload.
+    /// Whatever is wrong with the file, the locked pass reports it, so errors are dropped here.
+    fn prewarm(&self) {
+        let Ok(bytes) = read_capped(&self.path) else {
+            return;
+        };
+        let Ok(text) = String::from_utf8(bytes) else {
+            return;
+        };
+        if let Ok(config) = parse(&text, &self.secrets.names()) {
+            let _ = self.icons.load(&config);
+        }
+    }
+
+    fn watch(&self, config: &Config) {
+        let mut names: Vec<String> = config
+            .buttons
+            .iter()
+            .filter_map(|b| b.icon.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        *self.watched.lock().expect("watched icons poisoned") = names;
+    }
+
+    /// Reloads whenever `config.toml`, `secrets.toml` or the `icons/` directory differ from what
+    /// the last reload read, until the future is dropped. A change counts once they look the same
+    /// on two polls in a row, so a write in progress is not read half done.
     pub async fn watch_files(self: Arc<Self>) {
         let mut last = self.stamp();
         loop {
             tokio::time::sleep(POLL).await;
             let now = self.stamp();
-            let read = *self.locked();
+            let read = self.locked().clone();
             if now == last && now != read {
-                // reload logs its own outcome.
-                let _ = self.reload();
+                // Decoding icons would stall a worker, so it runs on the blocking pool. reload
+                // logs its own outcome.
+                let this = self.clone();
+                if let Err(e) = tokio::task::spawn_blocking(move || this.reload()).await {
+                    log::error!("config reload failed: {e}");
+                }
             }
             last = now;
         }
     }
 
     fn stamp(&self) -> Stamps {
-        (stamp(&self.path), stamp(&self.secrets.path()))
+        let watched = self.watched.lock().expect("watched icons poisoned");
+        Stamps {
+            files: (
+                stamp(&self.path),
+                stamp(&self.secrets.path()),
+                stamp(&self.icons_dir),
+            ),
+            icons: watched
+                .iter()
+                .map(|name| stamp(&self.icons_dir.join(name)))
+                .collect(),
+        }
     }
 
     /// Callers hold the lock.
-    fn go_live(&self, config: Config) -> bool {
+    fn go_live(&self, next: Live) -> bool {
         self.live.send_if_modified(|live| {
-            let changed = **live != config;
+            let changed = **live != next;
             if changed {
-                for b in config
-                    .buttons
-                    .iter()
-                    .filter(|b| b.action.secrets_in_clear())
-                {
+                for b in next.buttons.iter().filter(|b| b.action.secrets_in_clear()) {
                     log::warn!(
                         "button {:?} sends secret headers over plain http, as insecure_http allows",
                         b.id
                     );
                 }
-                *live = Arc::new(config);
+                *live = Arc::new(next);
             }
             changed
         })
@@ -606,8 +716,16 @@ impl Configs {
 /// often save by renaming a new file into place, then mode and owner, so the chmod or chown that
 /// makes `secrets.toml` readable takes effect at once.
 type Stamp = (SystemTime, u64, u64, u32, u32);
-/// `config.toml`, then `secrets.toml`.
-type Stamps = (Option<Stamp>, Option<Stamp>);
+/// What the poller watches.
+#[derive(Clone, Default, PartialEq)]
+struct Stamps {
+    /// `config.toml`, `secrets.toml`, then the `icons/` directory, whose stamp changes when a
+    /// file is added, renamed or removed.
+    files: (Option<Stamp>, Option<Stamp>, Option<Stamp>),
+    /// The icon files `config.toml` names, which also change when one is overwritten in place or
+    /// is still being written.
+    icons: Vec<Option<Stamp>>,
+}
 
 fn stamp(path: &Path) -> Option<Stamp> {
     let meta = fs::metadata(path).ok()?;
@@ -706,7 +824,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
             ("#1e88e5", "#ffffff")
         );
         assert_eq!(office.action.timeout(), Duration::from_secs(10));
-        let layout = config.layout();
+        let layout = live(config).layout();
         assert_eq!((layout.cols, layout.rows), (5, 3));
         assert_eq!(
             (layout.buttons[0].bg, layout.buttons[0].fg),
@@ -727,14 +845,10 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
     }
 
     #[test]
-    fn unknown_fields_are_refused_icons_and_tiles_included() {
+    fn unknown_fields_are_refused_tiles_included() {
         assert_refused(
             &example_with("label = \"Plex\"", "name = \"Plex\""),
             "unknown field `name`",
-        );
-        assert_refused(
-            &example_with("label = \"Plex\"", "label = \"Plex\"\nicon = \"a.png\""),
-            "icon",
         );
         assert_refused(
             &example_with(
@@ -748,6 +862,22 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
             "shell",
         );
         assert_refused(&example_with("kind = \"shell\"", "kind = \"exec\""), "exec");
+    }
+
+    #[test]
+    fn an_icon_must_be_a_plain_file_name() {
+        let with_icon = |icon: &str| {
+            example_with(
+                "label = \"Plex\"",
+                &format!("label = \"Plex\"\nicon = {icon:?}"),
+            )
+        };
+        let config = parse(&with_icon("3f2a9c.png"), &names()).unwrap();
+        assert_eq!(config.buttons[0].icon.as_deref(), Some("3f2a9c.png"));
+        assert_eq!(config.buttons[1].icon, None);
+        for bad in ["", "../a.png", "a/b.png", ".hidden.png", "a b.png"] {
+            assert_refused(&with_icon(bad), "icon must be a file name");
+        }
     }
 
     #[test]
@@ -1042,6 +1172,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
                 label: "\"\\".repeat(MAX_LABEL_BYTES / 2) + "\"",
                 bg: "#ffffff".into(),
                 fg: "#ffffff".into(),
+                icon: Some("i.png".into()),
                 action: Action::Shell {
                     argv: vec!["true".into()],
                     timeout_s: 1,
@@ -1049,8 +1180,19 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
             });
         }
         assert!(config.check(&Ok(Vec::new())).is_empty());
-        let json = serde_json::to_string(&config.layout().message(u32::MAX)).unwrap();
+        let mut live = live(config);
+        live.icons
+            .insert("i.png".into(), Arc::new(IconFrame::new(1, 1, vec![0; 4])));
+        let json = serde_json::to_string(&live.layout().message(u32::MAX)).unwrap();
         assert!(json.len() <= MAX_MESSAGE_BYTES, "{} bytes", json.len());
+    }
+
+    /// `config` as it goes live when it names no icons.
+    fn live(config: Config) -> Live {
+        Live {
+            config,
+            icons: IconSet::new(),
+        }
     }
 
     // ---- The file ----
@@ -1085,7 +1227,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
         )
         .unwrap();
         let configs = open(tmp.path());
-        assert_eq!(*configs.current(), Config::empty());
+        assert_eq!(configs.current().config, Config::empty());
         let status = configs.status().borrow().clone();
         assert!(status.errors[0].contains("version is 2"), "{status:?}");
         assert_eq!(status.revision, "");
@@ -1152,7 +1294,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
         let path = tmp.path().join(FILE);
         let configs = open(tmp.path());
         let loaded = configs.status().borrow().revision.clone();
-        let mut config = (*configs.current()).clone();
+        let mut config = configs.current().config.clone();
         config.buttons[0].label = "Saved".into();
 
         let stale = configs.save(config.clone(), "0123").unwrap_err();
@@ -1187,7 +1329,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
         let path = tmp.path().join(FILE);
         let configs = open(tmp.path());
         let revision = configs.status().borrow().revision.clone();
-        let mut config = (*configs.current()).clone();
+        let mut config = configs.current().config.clone();
         config.buttons[0].pos = [7, 0];
         let errors = configs.save(config, &revision).unwrap_err();
         assert!(errors[0].contains("outside"), "{errors:?}");
@@ -1284,6 +1426,101 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
         assert_eq!(configs.current().buttons[0].label, "Early");
     }
 
+    /// A 4x4 PNG, drawn as is on any grid.
+    fn tiny_png() -> Vec<u8> {
+        let picture = image::RgbaImage::from_pixel(4, 4, image::Rgba([9, 9, 9, 255]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        picture.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_config_waits_for_its_icon_and_the_poller_notices_the_file_arriving() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join(FILE),
+            DEFAULT.replacen(
+                "label = \"Hello\"",
+                "label = \"Hello\"\nicon = \"a.png\"",
+                1,
+            ),
+        )
+        .unwrap();
+        let configs = open(tmp.path());
+        let errors = configs.status().borrow().errors.clone();
+        assert!(errors[0].contains("\"a.png\": not found"), "{errors:?}");
+        assert!(configs.current().buttons.is_empty());
+        let mut live = configs.subscribe();
+        live.mark_unchanged();
+        tokio::spawn(configs.clone().watch_files());
+        tokio::time::sleep(POLL / 2).await;
+
+        fs::create_dir(tmp.path().join(icons::DIR)).unwrap();
+        fs::write(tmp.path().join(icons::DIR).join("a.png"), tiny_png()).unwrap();
+        tokio::time::timeout(4 * POLL, live.changed())
+            .await
+            .expect("the new icon was not picked up")
+            .unwrap();
+        let layout = configs.current().layout();
+        assert_eq!(layout.buttons[0].icon.as_ref().map(String::len), Some(32));
+        assert_eq!((layout.icons[0].w, layout.icons[0].h), (4, 4));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_half_copied_icon_is_read_again_once_the_file_is_finished_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join(FILE),
+            DEFAULT.replacen(
+                "label = \"Hello\"",
+                "label = \"Hello\"\nicon = \"a.png\"",
+                1,
+            ),
+        )
+        .unwrap();
+        let png = tiny_png();
+        fs::create_dir(tmp.path().join(icons::DIR)).unwrap();
+        let file = tmp.path().join(icons::DIR).join("a.png");
+        fs::write(&file, &png[..png.len() / 2]).unwrap();
+        let configs = open(tmp.path());
+        assert!(!configs.status().borrow().errors.is_empty());
+        let mut live = configs.subscribe();
+        live.mark_unchanged();
+        tokio::spawn(configs.clone().watch_files());
+        tokio::time::sleep(POLL / 2).await;
+
+        // The rest arrives in the same file, so the directory's stamp doesn't change.
+        fs::write(&file, &png).unwrap();
+        tokio::time::timeout(4 * POLL, live.changed())
+            .await
+            .expect("the finished icon was not picked up")
+            .unwrap();
+        assert_eq!(configs.current().buttons.len(), 1);
+    }
+
+    #[test]
+    fn a_save_names_icons_that_exist_and_an_import_makes_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let configs = open(tmp.path());
+        let revision = configs.status().borrow().revision.clone();
+        let mut config = configs.current().config.clone();
+        config.buttons[0].icon = Some("a.png".into());
+
+        let errors = configs.save(config.clone(), &revision).unwrap_err();
+        assert!(errors[0].contains("\"a.png\": not found"), "{errors:?}");
+        assert_eq!(fs::read_to_string(tmp.path().join(FILE)).unwrap(), DEFAULT);
+
+        let src = tmp.path().join("source.png");
+        fs::write(&src, tiny_png()).unwrap();
+        let name = configs.import_icon(&src).unwrap();
+        config.buttons[0].icon = Some(name.clone());
+        let revision = configs.save(config.clone(), &revision).unwrap();
+        assert_eq!(configs.current().buttons[0].icon, Some(name));
+        let text = fs::read_to_string(tmp.path().join(FILE)).unwrap();
+        assert_eq!(parse(&text, &names()).unwrap(), config);
+        assert_eq!(configs.reload(), Ok(false), "{revision}");
+    }
+
     #[test]
     fn a_save_round_trips_http_actions_with_every_field() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1297,6 +1534,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
             label: id.into(),
             bg: "#000000".into(),
             fg: "#ffffff".into(),
+            icon: None,
             action: Action::Http {
                 method: "POST".into(),
                 url: url.into(),
@@ -1307,7 +1545,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
                 timeout_s: 5,
             },
         };
-        let mut config = (*configs.current()).clone();
+        let mut config = configs.current().config.clone();
         config
             .buttons
             .push(http("web", 1, "https://ha.lan/api", false));

@@ -1,6 +1,7 @@
 //! Device protocol v1. The wire format is documented in `site/src/protocol.md`.
 
 use std::fmt;
+use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -9,6 +10,18 @@ pub const VERSION: u32 = 1;
 
 /// Largest message, and largest frame, in either direction.
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
+
+/// An icon frame's header: `WDI1`, the 16-byte id, then width and height as u16 LE.
+pub const ICON_HEADER_BYTES: usize = 24;
+/// Bytes in an icon id, which is also what `icon` in a layout spells as 32 hex digits.
+pub const ICON_ID_BYTES: usize = 16;
+/// Largest icon side, in pixels. The device refuses anything bigger.
+pub const ICON_MAX_SIDE: usize = 256;
+/// Largest icon frame, which the device allows for binary frames while text stays at 16 KB.
+pub const MAX_ICON_FRAME_BYTES: usize = ICON_HEADER_BYTES + ICON_MAX_SIDE * ICON_MAX_SIDE * 4;
+const ICON_MAGIC: &[u8; 4] = b"WDI1";
+/// The id and dimensions end here: the id's hash covers the frame from this offset on.
+const ICON_HASHED_FROM: usize = 4 + ICON_ID_BYTES;
 
 /// Bytes in a device token, and in SHA-256 digests (`commit`, `c_host`).
 pub const TOKEN_BYTES: usize = 32;
@@ -34,6 +47,9 @@ pub struct Button {
     pub label: String,
     pub bg: u32,
     pub fg: u32,
+    /// The icon's id as 32 lowercase hex digits, absent for a button without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
 }
 
 /// A device's token as sent in `hello`: 64 lowercase hex digits. Debug never prints it.
@@ -75,6 +91,10 @@ pub enum Message {
         rows: u32,
         buttons: Vec<Button>,
     },
+    /// The icons the device is missing. The daemon answers each known id with a binary frame.
+    IconGet {
+        ids: Vec<String>,
+    },
     Press {
         btn: String,
         seq: u64,
@@ -109,6 +129,121 @@ pub enum Message {
     },
     #[serde(other)]
     Unknown,
+}
+
+/// A button icon in the device's pixel format: ARGB8888 as LVGL stores it, which is the bytes
+/// B, G, R, A per pixel with straight alpha. Its id is the first 16 bytes of SHA-256 over the
+/// width and height as u16 LE and then the pixels, so equal pictures share an id.
+#[derive(Clone, PartialEq, Eq)]
+pub struct IconFrame {
+    pub id: [u8; ICON_ID_BYTES],
+    pub w: u16,
+    pub h: u16,
+    pub pixels: Vec<u8>,
+    /// The frame as sent, built on first use and shared by every session.
+    wire: OnceLock<Arc<[u8]>>,
+}
+
+impl fmt::Debug for IconFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "IconFrame({} {}x{})",
+            encode_hex(&self.id),
+            self.w,
+            self.h
+        )
+    }
+}
+
+/// Why a binary frame is not an icon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IconFrameError {
+    TooShort,
+    BadMagic,
+    BadSize,
+    BadLength,
+    BadHash,
+}
+
+impl fmt::Display for IconFrameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::TooShort => "shorter than the header",
+            Self::BadMagic => "not an icon frame",
+            Self::BadSize => "width or height outside 1 to 256",
+            Self::BadLength => "length does not match the width and height",
+            Self::BadHash => "id does not match the pixels",
+        })
+    }
+}
+
+fn icon_id(dims_and_pixels: &[u8]) -> [u8; ICON_ID_BYTES] {
+    let digest = Sha256::digest(dims_and_pixels);
+    std::array::from_fn(|i| digest[i])
+}
+
+impl IconFrame {
+    /// `pixels` is `w * h * 4` bytes of B, G, R, A.
+    pub fn new(w: u16, h: u16, pixels: Vec<u8>) -> Self {
+        assert_eq!(pixels.len(), usize::from(w) * usize::from(h) * 4);
+        let mut hashed = Vec::with_capacity(4 + pixels.len());
+        hashed.extend_from_slice(&w.to_le_bytes());
+        hashed.extend_from_slice(&h.to_le_bytes());
+        hashed.extend_from_slice(&pixels);
+        Self {
+            id: icon_id(&hashed),
+            w,
+            h,
+            pixels,
+            wire: OnceLock::new(),
+        }
+    }
+
+    /// The encoded frame, built once.
+    pub fn wire(&self) -> Arc<[u8]> {
+        self.wire.get_or_init(|| self.encode().into()).clone()
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(ICON_HEADER_BYTES + self.pixels.len());
+        frame.extend_from_slice(ICON_MAGIC);
+        frame.extend_from_slice(&self.id);
+        frame.extend_from_slice(&self.w.to_le_bytes());
+        frame.extend_from_slice(&self.h.to_le_bytes());
+        frame.extend_from_slice(&self.pixels);
+        frame
+    }
+
+    /// Checks a frame the way the device does: header, size limits, exact length, then the hash.
+    pub fn decode(frame: &[u8]) -> Result<Self, IconFrameError> {
+        if frame.len() < ICON_HEADER_BYTES {
+            return Err(IconFrameError::TooShort);
+        }
+        if &frame[..4] != ICON_MAGIC {
+            return Err(IconFrameError::BadMagic);
+        }
+        let w = u16::from_le_bytes([frame[20], frame[21]]);
+        let h = u16::from_le_bytes([frame[22], frame[23]]);
+        let side = 1..=ICON_MAX_SIDE;
+        if !side.contains(&usize::from(w)) || !side.contains(&usize::from(h)) {
+            return Err(IconFrameError::BadSize);
+        }
+        if frame.len() != ICON_HEADER_BYTES + usize::from(w) * usize::from(h) * 4 {
+            return Err(IconFrameError::BadLength);
+        }
+        let id: [u8; ICON_ID_BYTES] = std::array::from_fn(|i| frame[4 + i]);
+        if icon_id(&frame[ICON_HASHED_FROM..]) != id {
+            return Err(IconFrameError::BadHash);
+        }
+        Ok(Self {
+            id,
+            w,
+            h,
+            pixels: frame[ICON_HEADER_BYTES..].to_vec(),
+            wire: OnceLock::new(),
+        })
+    }
 }
 
 /// `wd-` plus the device's Wi-Fi MAC as 12 lowercase hex digits, exactly as the firmware writes it.
@@ -176,11 +311,12 @@ mod tests {
     use serde_json::Value;
 
     // The fixtures are the JSON examples from site/src/protocol.md.
-    const FIXTURES: [&str; 11] = [
+    const FIXTURES: [&str; 12] = [
         include_str!("../../tests/fixtures/hello.json"),
         include_str!("../../tests/fixtures/welcome.json"),
         include_str!("../../tests/fixtures/error.json"),
         include_str!("../../tests/fixtures/layout.json"),
+        include_str!("../../tests/fixtures/icon_get.json"),
         include_str!("../../tests/fixtures/press.json"),
         include_str!("../../tests/fixtures/result.json"),
         include_str!("../../tests/fixtures/pair_req.json"),
@@ -309,5 +445,72 @@ mod tests {
         for (i, variant) in variants.iter().enumerate() {
             assert_ne!(*variant, base, "input {i}");
         }
+    }
+
+    // ---- Icon frames ----
+
+    /// A 2x1 icon: opaque red, then fully transparent.
+    fn two_pixels() -> IconFrame {
+        IconFrame::new(2, 1, vec![0, 0, 255, 255, 0, 0, 0, 0])
+    }
+
+    /// The frame in site/src/protocol.md, with the id computed independently with Python's hashlib.
+    #[test]
+    fn an_icon_frame_matches_the_published_vector() {
+        let icon = two_pixels();
+        assert_eq!(encode_hex(&icon.id), "d95bd7f461bd7bc39755b97d11f8a270");
+        let frame = icon.encode();
+        assert_eq!(&frame[..4], b"WDI1");
+        assert_eq!(&frame[20..24], [2, 0, 1, 0]);
+        assert_eq!(frame.len(), 24 + 8);
+        assert_eq!(IconFrame::decode(&frame).unwrap(), icon);
+    }
+
+    #[test]
+    fn a_largest_icon_round_trips_at_the_frame_cap() {
+        let icon = IconFrame::new(256, 256, vec![7; 256 * 256 * 4]);
+        let frame = icon.encode();
+        assert_eq!(frame.len(), MAX_ICON_FRAME_BYTES);
+        assert_eq!(IconFrame::decode(&frame).unwrap(), icon);
+    }
+
+    #[test]
+    fn a_frame_that_breaks_any_rule_is_refused() {
+        let good = two_pixels().encode();
+        let with = |edit: &dyn Fn(&mut Vec<u8>)| {
+            let mut frame = good.clone();
+            edit(&mut frame);
+            IconFrame::decode(&frame)
+        };
+        assert_eq!(
+            IconFrame::decode(&good[..23]),
+            Err(IconFrameError::TooShort)
+        );
+        assert_eq!(IconFrame::decode(&[]), Err(IconFrameError::TooShort));
+        assert_eq!(with(&|f| f[0] = b'X'), Err(IconFrameError::BadMagic));
+        assert_eq!(with(&|f| f[20] = 0), Err(IconFrameError::BadSize)); // w = 0
+        assert_eq!(with(&|f| f[22] = 0), Err(IconFrameError::BadSize)); // h = 0
+        assert_eq!(with(&|f| f[21] = 2), Err(IconFrameError::BadSize)); // w = 514
+        assert_eq!(with(&|f| f.push(0)), Err(IconFrameError::BadLength));
+        assert_eq!(
+            with(&|f| {
+                f.pop();
+            }),
+            Err(IconFrameError::BadLength)
+        );
+        assert_eq!(with(&|f| f[4] ^= 1), Err(IconFrameError::BadHash)); // id
+        assert_eq!(with(&|f| f[24] ^= 1), Err(IconFrameError::BadHash)); // pixel
+                                                                         // The same pixels read as another shape have another id.
+        assert_eq!(
+            with(&|f| f.splice(20..24, [1, 0, 2, 0]).for_each(drop)),
+            Err(IconFrameError::BadHash)
+        );
+    }
+
+    #[test]
+    fn an_oversize_icon_header_is_refused_before_its_length_is_computed() {
+        let mut frame = two_pixels().encode();
+        frame[20..24].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+        assert_eq!(IconFrame::decode(&frame), Err(IconFrameError::BadSize));
     }
 }

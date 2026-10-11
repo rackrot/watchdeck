@@ -82,6 +82,7 @@ void app_main(void)
     const link_cbs_t link_cbs = {
         .on_status = ui_set_daemon_text,
         .on_layout = ui_apply_layout,
+        .on_icon = ui_set_icon,
         .on_down = ui_link_down,
         .on_result = ui_show_result,
         .on_paired = ui_set_paired,

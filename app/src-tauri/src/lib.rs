@@ -134,6 +134,7 @@ pub fn run() {
             commands::save_config,
             commands::list_secrets,
             commands::set_secret,
+            commands::import_icon,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

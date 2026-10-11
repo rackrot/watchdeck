@@ -47,6 +47,7 @@ Add new tools to `mise.toml`, not to CI or the hooks. The hooks call the mise-pi
   The SD card and ESP-Hosted share one SDMMC host, and ESP-Hosted probes the C6 before `app_main`.
 - The TF card is GPT-partitioned, so `main/sdcard.c` mounts the first GPT partition read-only through its own diskio driver. Never format the card or write to it.
 - The C6 runs ESP-Hosted slave 2.12.3 and the host is 3.0.9. Hosted logs a "major version mismatch" line, which is only advisory. Don't OTA the C6 without asking.
+- The icon cache lives in PSRAM, so a reset (an RTS pulse included) empties it. To check that a reconnect hits the cache, restart the daemon and leave the board running.
 - `monitor` needs a real TTY. Without one, read the boot log with pyserial from the IDF Python env (`~/.espressif/python_env/idf6.1_py3.12_env/bin/python`). Opening the port doesn't reliably reset the board. To capture a boot, pulse RTS as esptool's hard reset does: DTR off, RTS on for 100 ms, then RTS off.
 
 ## Daemon facts
@@ -54,6 +55,7 @@ Add new tools to `mise.toml`, not to CI or the hooks. The hooks call the mise-pi
 - The daemon serves `wss` on 47820 and opens plain `ws` on 47821 only while the pairing dialog is open. `site/src/protocol.md` is the wire spec.
 - Its TLS identity and `state.json` (device id → SHA-256 of its token) live in `~/.config/dev.rackrot.watchdeck/`. A new identity makes every paired device pair again, so tests use temp dirs.
 - `config.toml` (the grid and actions) and `secrets.toml` (0600, header values for HTTP actions) live there too. The daemon polls both every 500 ms, and an invalid edit is refused while the last good config stays live. `site/src/config.md` documents the format.
+- Button icons are PNG, JPEG or WebP files in `icons/` beside `config.toml`, named by a button's `icon`. The daemon shrinks each to fit its button, converts it to B, G, R, A pixels, and names it by a hash. The device fetches the ones it lacks with `icon_get` and keeps them in PSRAM while its layout names them. `site/src/protocol.md` has the frame, and `site/src/config.md` has the limits.
 - `mise run app:dev` rebuilds and restarts the daemon on any change under `app/src-tauri/`, test fixtures included, and the board then reconnects. Don't edit there during a check that needs an unbroken session.
 
 ## Conventions

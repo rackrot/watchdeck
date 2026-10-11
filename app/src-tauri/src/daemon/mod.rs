@@ -2,6 +2,7 @@
 
 pub mod actions;
 pub mod config;
+pub mod icons;
 pub mod mdns;
 pub mod pairing;
 pub mod protocol;

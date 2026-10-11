@@ -22,6 +22,9 @@
 #define FORGET_HOLD_MS 2000
 #define ROW_W (DISPLAY_H_RES - 80) // labels and buttons of the pairing views
 #define ROW_H 76
+#define ICON_PAD 4 // a button with an icon is a column: the icon, a gap, and a label of fixed height
+#define ICON_GAP 2
+#define ICON_MIN 24 // the label gets two lines unless that leaves the icon less than this
 
 static const char *TAG = "ui";
 
@@ -54,6 +57,10 @@ static struct {
 static size_t s_n_pending;
 static char s_ids[PROTO_MAX_BUTTONS][PROTO_ID_MAX];
 static char s_labels[PROTO_MAX_BUTTONS][PROTO_LABEL_MAX];
+static lv_obj_t *s_cells[PROTO_MAX_BUTTONS];      // the grid's buttons
+static lv_obj_t *s_cell_icons[PROTO_MAX_BUTTONS]; // their image widgets, NULL until the icon arrives
+static uint8_t s_icon_ids[PROTO_MAX_BUTTONS][PROTO_ICON_ID_LEN];
+static bool s_has_icon[PROTO_MAX_BUTTONS];
 static size_t s_n_buttons;
 static char s_printable[PROTO_TEXT_MAX];
 static bool s_paired;
@@ -308,26 +315,52 @@ static void build_grid(const proto_layout_t *l)
 
     const int cell_w = (DISPLAY_H_RES - (l->cols + 1) * GRID_GAP) / l->cols;
     const int cell_h = (DISPLAY_V_RES - GRID_TOP - l->rows * GRID_GAP) / l->rows;
+    // The daemon sizes icons to what is left (icons.rs box_px), so both sides use these numbers.
+    const int line_h = lv_font_get_line_height(&lv_font_montserrat_32);
+    const int room = cell_h - 2 * ICON_PAD;
+    const int label_lines = room >= 2 * line_h + ICON_GAP + ICON_MIN ? 2 : 1;
+    int icon_side = room - label_lines * line_h - ICON_GAP;
+    if (icon_side > cell_w - 2 * ICON_PAD) {
+        icon_side = cell_w - 2 * ICON_PAD;
+    }
+    if (icon_side > PROTO_ICON_MAX_SIDE) {
+        icon_side = PROTO_ICON_MAX_SIDE;
+    }
+    ESP_LOGI(TAG, "cells %dx%d, icon box %d px, labels %d line(s)", cell_w, cell_h, icon_side, label_lines);
     s_n_buttons = l->n_buttons;
     for (size_t i = 0; i < l->n_buttons; i++) {
         const proto_button_t *b = &l->buttons[i];
         strlcpy(s_ids[i], b->id, sizeof(s_ids[i]));
         strlcpy(s_labels[i], b->label, sizeof(s_labels[i]));
 
+        s_has_icon[i] = b->has_icon;
+        memcpy(s_icon_ids[i], b->icon, sizeof(s_icon_ids[i]));
+        s_cell_icons[i] = NULL;
+
         lv_obj_t *btn = lv_button_create(s_grid);
+        s_cells[i] = btn;
         lv_obj_set_size(btn, cell_w, cell_h);
         lv_obj_set_pos(btn, GRID_GAP + b->col * (cell_w + GRID_GAP), b->row * (cell_h + GRID_GAP));
         lv_obj_set_style_bg_color(btn, lv_color_hex(b->bg), 0);
         lv_obj_add_event_cb(btn, cell_event, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        // The icon, once it arrives, goes above the label.
+        lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_all(btn, ICON_PAD, 0);
+        lv_obj_set_style_pad_row(btn, ICON_GAP, 0);
 
         lv_obj_t *label = lv_label_create(btn);
         lv_obj_set_width(label, cell_w - 16);
         lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+        if (b->has_icon) {
+            // Fixed height, so a long label ends in dots instead of pushing the icon out of the button.
+            lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+            lv_obj_set_height(label, label_lines * line_h);
+        }
         lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_font(label, &lv_font_montserrat_32, 0);
         lv_obj_set_style_text_color(label, lv_color_hex(b->fg), 0);
         lv_label_set_text(label, b->label);
-        lv_obj_center(label);
     }
 }
 
@@ -336,7 +369,12 @@ void ui_apply_layout(const proto_layout_t *layout)
     lvgl_port_lock(0);
     build_grid(layout);
     s_online = true;
+    lv_mem_monitor_t mem;
+    lv_mem_monitor(&mem);
     lvgl_port_unlock();
+    ESP_LOGI(TAG, "LVGL heap: %u of %u bytes used now, %u at most, %u%% fragmented",
+             (unsigned)(mem.total_size - mem.free_size), (unsigned)mem.total_size, (unsigned)mem.max_used,
+             (unsigned)mem.frag_pct);
     ESP_LOGI(TAG, "layout rev %u applied: %ux%u, %u buttons", (unsigned)layout->rev, layout->cols, layout->rows,
              (unsigned)layout->n_buttons);
     if (!s_heap_logged) {
@@ -344,6 +382,22 @@ void ui_apply_layout(const proto_layout_t *layout)
         ESP_LOGI(TAG, "first layout applied, min free internal heap %u bytes",
                  (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
     }
+}
+
+void ui_set_icon(const uint8_t id[PROTO_ICON_ID_LEN], const lv_image_dsc_t *dsc)
+{
+    lvgl_port_lock(0);
+    for (size_t i = 0; i < s_n_buttons; i++) {
+        if (!s_has_icon[i] || memcmp(s_icon_ids[i], id, PROTO_ICON_ID_LEN) != 0) {
+            continue;
+        }
+        if (!s_cell_icons[i]) {
+            s_cell_icons[i] = lv_image_create(s_cells[i]);
+            lv_obj_move_to_index(s_cell_icons[i], 0);
+        }
+        lv_image_set_src(s_cell_icons[i], dsc);
+    }
+    lvgl_port_unlock();
 }
 
 void ui_link_down(void)

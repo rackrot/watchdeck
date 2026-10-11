@@ -142,6 +142,7 @@ The daemon stores its side before the user answers, so a No leaves a token hash 
 - The daemon is the WebSocket server, and the device is the client.
 - Messages are JSON in text frames. Every message has a string field `t` that names its type.
 - Each message is a single frame of at most 16 KB in either direction, on both ports. The receiver closes the connection on anything larger.
+- The one exception is an [icon frame](#icon-frames), a binary frame from the daemon to the device of at most 262,168 bytes. The device never sends binary frames, and the daemon answers one with `error` `bad_request` and a close.
 - Both sides ignore unknown fields. An unknown `t` is logged and ignored.
 - Liveness uses WebSocket ping frames. The device pings every 10 s and drops the link after 25 s without a pong. The daemon drops a session that has been silent for over 30 s.
 - If the link drops, the device reconnects:
@@ -156,6 +157,8 @@ device                      daemon
   |--- hello ---------------->|   within 5 s of connecting
   |<-- welcome ---------------|   or error, then close
   |<-- layout ----------------|   and again whenever the grid changes
+  |--- icon_get ------------->|   for icons the device doesn't have
+  |<-- icon frame (binary) ---|   one per icon
   |--- press ---------------->|
   |<-- result ----------------|   exactly one per press
 ```
@@ -207,7 +210,8 @@ The daemon closes the connection after sending it. `code` is one of `version`, `
 
 ```json
 {"t":"layout","rev":1,"cols":5,"rows":3,"buttons":[
-  {"id":"hello","col":0,"row":0,"label":"Hello","bg":2001125,"fg":16777215}
+  {"id":"hello","col":0,"row":0,"label":"Hello","bg":2001125,"fg":16777215,"icon":"d95bd7f461bd7bc39755b97d11f8a270"},
+  {"id":"plain","col":1,"row":0,"label":"Plain","bg":0,"fg":16777215}
 ]}
 ```
 
@@ -219,8 +223,53 @@ The daemon closes the connection after sending it. `code` is one of `version`, `
 | `buttons[].col`, `row` | int | Zero-based cell |
 | `buttons[].label` | string | Printable ASCII, at most 47 bytes |
 | `buttons[].bg`, `fg` | int | Colors as `0xRRGGBB` integers |
+| `buttons[].icon` | string | Optional. The icon's id as 32 lowercase hex digits. Absent for a button without one. A layout with any other value, `null` included, is refused |
 
-The daemon sends `layout` after `welcome`. When the user's config changes the grid, a button, a label, a color or a position, the daemon pushes a new `layout` on the same session, and the device replaces its grid without reconnecting. An edit that changes only actions sends nothing. Empty cells have no button. S5 adds `icon`, and S6 adds `tile`.
+The daemon sends `layout` after `welcome`. When the user's config changes the grid, a button, a label, a color or a position, the daemon pushes a new `layout` on the same session, and the device replaces its grid without reconnecting. An edit that changes only actions sends nothing. Empty cells have no button. S6 adds `tile`.
+
+The layout carries only icon ids. The device keeps the icons it has, and asks for the rest with `icon_get`. A button without its icon yet shows its label alone and gains the picture when the frame arrives.
+
+### `icon_get` (device → daemon)
+
+```json
+{"t":"icon_get","ids":["9f86d081884c7d659a2feaa0c55ad015","d95bd7f461bd7bc39755b97d11f8a270"]}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `ids` | [string] | Icon ids from the current layout that the device lacks. At most 40, each exactly 32 lowercase hex digits |
+
+The daemon answers each id that the session's current layout names with one [icon frame](#icon-frames), in the order asked, and sends nothing for any other id. A repeated id gets one frame, since the daemon drops duplicates. A list that is too long or has a malformed id gets `error` `bad_request` and a close.
+
+The device sends one `icon_get` per layout, listing every distinct id it doesn't hold, and sends none when it holds them all. It keeps the icons of the layout on screen only. A layout that drops an icon frees it, and a link that drops and returns keeps the rest, so a reconnect to an unchanged layout fetches nothing.
+
+### Icon frames
+
+An icon is a binary WebSocket frame from the daemon:
+
+```text
+offset  size    field
+0       4       "WDI1"
+4       16      id
+20      2       width, u16 LE
+22      2       height, u16 LE
+24      w*h*4   pixels, row by row, from the top left
+```
+
+- Pixels are LVGL's ARGB8888: the bytes **B, G, R, A** for each pixel, with straight (not premultiplied) alpha.
+- The `id` is the first 16 bytes of SHA-256 over the frame from byte 20 on: width, height and pixels. Equal pictures share an id.
+- Width and height are each 1 to 256, and the frame is exactly 24 + w·h·4 bytes, so a frame is at most 262,168 bytes.
+- The device checks, in this order, that the frame has a header, that it starts with `WDI1`, that width and height are in range, that its length is exactly right, and that the hash matches `id`. It also checks that it asked for that `id`. A frame that fails any check is dropped and logged, and the session goes on. The device never reads a pixel before the length check passes.
+
+Test vector, a 2×1 icon of one opaque red pixel and one fully transparent pixel:
+
+| Field | Value |
+|---|---|
+| pixels | `00 00 ff ff` `00 00 00 00` |
+| `id` | `d95bd7f461bd7bc39755b97d11f8a270` |
+| frame | `57 44 49 31`, the 16 id bytes, `02 00 01 00`, then the 8 pixel bytes: 32 bytes in all |
+
+The daemon sizes every icon to fit its button, with room left for the label. See [Icons](config.md#icons) for the box and how pictures are scaled.
 
 ### `press` (device → daemon)
 

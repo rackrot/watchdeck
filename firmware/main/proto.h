@@ -16,14 +16,18 @@
 #define PROTO_ID_MAX 64
 #define PROTO_LABEL_MAX 48
 #define PROTO_NAME_MAX 48
-#define PROTO_TEXT_MAX 1025    // up to 1 KB of output plus NUL
-#define PROTO_SUMMARY_MAX 97   // a result's one-line summary, 96 characters plus NUL
-#define PROTO_DEVICE_ID_LEN 16 // "wd-" + 12 hex + NUL
-#define PROTO_FP_LEN 16        // hex digits of the daemon cert fingerprint in mDNS TXT "fp"
-#define PROTO_TOKEN_LEN 32     // bytes in the device token
-#define PROTO_HASH_LEN 32      // bytes in a SHA-256 digest (commit, c_host)
-#define PROTO_NONCE_LEN 16     // bytes in each pairing nonce (n_dev, n_host)
-#define PROTO_CERT_MAX 2048    // the daemon cert PEM plus NUL
+#define PROTO_TEXT_MAX 1025      // up to 1 KB of output plus NUL
+#define PROTO_SUMMARY_MAX 97     // a result's one-line summary, 96 characters plus NUL
+#define PROTO_DEVICE_ID_LEN 16   // "wd-" + 12 hex + NUL
+#define PROTO_FP_LEN 16          // hex digits of the daemon cert fingerprint in mDNS TXT "fp"
+#define PROTO_TOKEN_LEN 32       // bytes in the device token
+#define PROTO_HASH_LEN 32        // bytes in a SHA-256 digest (commit, c_host)
+#define PROTO_NONCE_LEN 16       // bytes in each pairing nonce (n_dev, n_host)
+#define PROTO_CERT_MAX 2048      // the daemon cert PEM plus NUL
+#define PROTO_ICON_ID_LEN 16     // bytes in an icon id, shown as 32 hex digits in a layout
+#define PROTO_ICON_HEADER_LEN 24 // "WDI1", the id, then width and height as u16 LE
+#define PROTO_ICON_MAX_SIDE 256
+#define PROTO_MAX_ICON_FRAME (PROTO_ICON_HEADER_LEN + PROTO_ICON_MAX_SIDE * PROTO_ICON_MAX_SIDE * 4) // one binary frame
 
 typedef enum {
     PROTO_MSG_UNKNOWN, // well-formed JSON with a "t" this firmware does not know
@@ -43,6 +47,8 @@ typedef struct {
     uint8_t row;
     uint32_t bg; // 0xRRGGBB
     uint32_t fg;
+    bool has_icon;
+    uint8_t icon[PROTO_ICON_ID_LEN]; // valid when has_icon
 } proto_button_t;
 
 typedef struct {
@@ -68,6 +74,14 @@ typedef struct {
     char cert[PROTO_CERT_MAX]; // the daemon cert PEM, exactly as sent
     uint8_t c_host[PROTO_HASH_LEN];
 } proto_pair_offer_t;
+
+// A validated icon frame. `pixels` points into the frame, which the caller still owns.
+typedef struct {
+    uint8_t id[PROTO_ICON_ID_LEN];
+    uint16_t w;
+    uint16_t h;
+    const uint8_t *pixels; // w * h * 4 bytes of B, G, R, A (LVGL's ARGB8888), straight alpha
+} proto_icon_t;
 
 typedef struct {
     proto_type_t type;
@@ -105,6 +119,9 @@ size_t proto_build_pair_req(char *buf, size_t buf_len, const char *device, const
 /** Build pair_nonce. Returns the JSON length, or 0 if it does not fit in `buf`. */
 size_t proto_build_pair_nonce(char *buf, size_t buf_len, const uint8_t n_dev[PROTO_NONCE_LEN]);
 
+/** Build icon_get for `n` ids. Returns the JSON length, or 0 if it does not fit in `buf`. */
+size_t proto_build_icon_get(char *buf, size_t buf_len, const uint8_t ids[][PROTO_ICON_ID_LEN], size_t n);
+
 /** Build a press message. Returns the JSON length, or 0 if it does not fit in `buf`. */
 size_t proto_build_press(char *buf, size_t buf_len, const char *btn, uint32_t seq);
 
@@ -115,3 +132,11 @@ size_t proto_build_press(char *buf, size_t buf_len, const char *btn, uint32_t se
  * be lowercase hex of exactly their length, and a cert that does not fit is refused, never cut.
  */
 esp_err_t proto_parse(const char *json, size_t len, proto_msg_t *out);
+
+/**
+ * Check one binary frame from the daemon, in this order: at least a header, the "WDI1" magic, width and height
+ * each in 1..PROTO_ICON_MAX_SIDE, a length of exactly header + w * h * 4, and the id equal to the first 16 bytes of
+ * SHA-256 over the frame from byte 20 on (width, height, pixels). Nothing is read past `len`. Any failure returns
+ * a non-ESP_OK code, logs why, and leaves `out` unspecified.
+ */
+esp_err_t proto_parse_icon(const uint8_t *frame, size_t len, proto_icon_t *out);
