@@ -4714,6 +4714,7 @@ dependencies = [
 name = "watchdeck"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "env_logger",
  "futures-util",
  "gethostname",

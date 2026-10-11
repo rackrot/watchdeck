@@ -30,6 +30,28 @@ esp_err_t proto_fp(const char *pem, char out[PROTO_FP_LEN + 1])
     return ESP_OK;
 }
 
+// Write n bytes as 2n lowercase hex digits plus NUL.
+static void to_hex(const uint8_t *in, size_t n, char *out)
+{
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < n; i++) {
+        out[2 * i] = digits[in[i] >> 4];
+        out[2 * i + 1] = digits[in[i] & 0xf];
+    }
+    out[2 * n] = '\0';
+}
+
+static int hex_digit(char c)
+{
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    return -1;
+}
+
 // Print `root` into `buf` and free it. Returns the length, or 0 if it does not fit.
 static size_t print_into(cJSON *root, char *buf, size_t buf_len)
 {
@@ -41,8 +63,11 @@ static size_t print_into(cJSON *root, char *buf, size_t buf_len)
     return len;
 }
 
-size_t proto_build_hello(char *buf, size_t buf_len, const char *device, const char *fw, int width, int height)
+size_t proto_build_hello(char *buf, size_t buf_len, const char *device, const uint8_t token[PROTO_TOKEN_LEN],
+                         const char *fw, int width, int height)
 {
+    char token_hex[2 * PROTO_TOKEN_LEN + 1];
+    to_hex(token, PROTO_TOKEN_LEN, token_hex);
     cJSON *root = cJSON_CreateObject();
     cJSON *screen = cJSON_CreateArray();
     if (!root || !screen) {
@@ -55,8 +80,37 @@ size_t proto_build_hello(char *buf, size_t buf_len, const char *device, const ch
     cJSON_AddStringToObject(root, "t", "hello");
     cJSON_AddNumberToObject(root, "v", PROTO_VERSION);
     cJSON_AddStringToObject(root, "device", device);
+    cJSON_AddStringToObject(root, "token", token_hex);
     cJSON_AddStringToObject(root, "fw", fw);
     cJSON_AddItemToObject(root, "screen", screen);
+    return print_into(root, buf, buf_len);
+}
+
+size_t proto_build_pair_req(char *buf, size_t buf_len, const char *device, const uint8_t commit[PROTO_HASH_LEN])
+{
+    char commit_hex[2 * PROTO_HASH_LEN + 1];
+    to_hex(commit, PROTO_HASH_LEN, commit_hex);
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return 0;
+    }
+    cJSON_AddStringToObject(root, "t", "pair_req");
+    cJSON_AddNumberToObject(root, "v", PROTO_VERSION);
+    cJSON_AddStringToObject(root, "device", device);
+    cJSON_AddStringToObject(root, "commit", commit_hex);
+    return print_into(root, buf, buf_len);
+}
+
+size_t proto_build_pair_nonce(char *buf, size_t buf_len, const uint8_t n_dev[PROTO_NONCE_LEN])
+{
+    char n_dev_hex[2 * PROTO_NONCE_LEN + 1];
+    to_hex(n_dev, PROTO_NONCE_LEN, n_dev_hex);
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return 0;
+    }
+    cJSON_AddStringToObject(root, "t", "pair_nonce");
+    cJSON_AddStringToObject(root, "n_dev", n_dev_hex);
     return print_into(root, buf, buf_len);
 }
 
@@ -84,6 +138,24 @@ static bool get_str(const cJSON *obj, const char *key, char *dst, size_t dst_len
         return false;
     }
     strlcpy(dst, item->valuestring, dst_len);
+    return true;
+}
+
+// Decode a string field of exactly 2n lowercase hex digits into n bytes.
+static bool get_hex(const cJSON *obj, const char *key, uint8_t *dst, size_t n)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (!cJSON_IsString(item) || !item->valuestring || strlen(item->valuestring) != 2 * n) {
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        int hi = hex_digit(item->valuestring[2 * i]);
+        int lo = hex_digit(item->valuestring[2 * i + 1]);
+        if (hi < 0 || lo < 0) {
+            return false;
+        }
+        dst[i] = (uint8_t)(hi << 4 | lo);
+    }
     return true;
 }
 
@@ -149,6 +221,16 @@ static esp_err_t parse_result(const cJSON *root, proto_result_t *out)
     return ESP_OK;
 }
 
+static esp_err_t parse_pair_offer(const cJSON *root, proto_pair_offer_t *out)
+{
+    if (!get_str(root, "name", out->name, sizeof(out->name), false) ||
+        !get_str(root, "cert", out->cert, sizeof(out->cert), true) ||
+        !get_hex(root, "c_host", out->c_host, sizeof(out->c_host))) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return ESP_OK;
+}
+
 esp_err_t proto_parse(const char *json, size_t len, proto_msg_t *out)
 {
     memset(out, 0, sizeof(*out));
@@ -177,6 +259,17 @@ esp_err_t proto_parse(const char *json, size_t len, proto_msg_t *out)
     } else if (strcmp(t, "result") == 0) {
         out->type = PROTO_MSG_RESULT;
         err = parse_result(root, &out->result);
+    } else if (strcmp(t, "pair_offer") == 0) {
+        out->type = PROTO_MSG_PAIR_OFFER;
+        err = parse_pair_offer(root, &out->pair_offer);
+    } else if (strcmp(t, "pair_reveal") == 0) {
+        out->type = PROTO_MSG_PAIR_REVEAL;
+        err = get_hex(root, "n_host", out->n_host, sizeof(out->n_host)) ? ESP_OK : ESP_ERR_INVALID_ARG;
+    } else if (strcmp(t, "pair_result") == 0) {
+        out->type = PROTO_MSG_PAIR_RESULT;
+        const cJSON *ok = cJSON_GetObjectItemCaseSensitive(root, "ok");
+        err = cJSON_IsBool(ok) ? ESP_OK : ESP_ERR_INVALID_ARG;
+        out->pair_ok = cJSON_IsTrue(ok);
     } else {
         out->type = PROTO_MSG_UNKNOWN;
         strlcpy(out->unknown_t, t, sizeof(out->unknown_t));

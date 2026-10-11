@@ -19,6 +19,10 @@
 #define PROTO_TEXT_MAX 1025    // up to 1 KB of output plus NUL
 #define PROTO_DEVICE_ID_LEN 16 // "wd-" + 12 hex + NUL
 #define PROTO_FP_LEN 16        // hex digits of the daemon cert fingerprint in mDNS TXT "fp"
+#define PROTO_TOKEN_LEN 32     // bytes in the device token
+#define PROTO_HASH_LEN 32      // bytes in a SHA-256 digest (commit, c_host)
+#define PROTO_NONCE_LEN 16     // bytes in each pairing nonce (n_dev, n_host)
+#define PROTO_CERT_MAX 2048    // the daemon cert PEM plus NUL
 
 typedef enum {
     PROTO_MSG_UNKNOWN, // well-formed JSON with a "t" this firmware does not know
@@ -26,6 +30,9 @@ typedef enum {
     PROTO_MSG_ERROR,
     PROTO_MSG_LAYOUT,
     PROTO_MSG_RESULT,
+    PROTO_MSG_PAIR_OFFER,
+    PROTO_MSG_PAIR_REVEAL,
+    PROTO_MSG_PAIR_RESULT,
 } proto_type_t;
 
 typedef struct {
@@ -55,6 +62,12 @@ typedef struct {
 } proto_result_t;
 
 typedef struct {
+    char name[PROTO_NAME_MAX]; // the daemon's host name, truncated, for display only
+    char cert[PROTO_CERT_MAX]; // the daemon cert PEM, exactly as sent
+    uint8_t c_host[PROTO_HASH_LEN];
+} proto_pair_offer_t;
+
+typedef struct {
     proto_type_t type;
     char unknown_t[16]; // PROTO_MSG_UNKNOWN: the "t" value, truncated, for logging
     union {
@@ -65,6 +78,9 @@ typedef struct {
         } error;
         proto_layout_t layout;
         proto_result_t result;
+        proto_pair_offer_t pair_offer;
+        uint8_t n_host[PROTO_NONCE_LEN]; // PROTO_MSG_PAIR_REVEAL
+        bool pair_ok;                    // PROTO_MSG_PAIR_RESULT
     };
 } proto_msg_t;
 
@@ -77,8 +93,15 @@ void proto_device_id(char out[PROTO_DEVICE_ID_LEN], const uint8_t mac[6]);
  */
 esp_err_t proto_fp(const char *pem, char out[PROTO_FP_LEN + 1]);
 
-/** Build a hello message. Returns the JSON length, or 0 if it does not fit in `buf`. */
-size_t proto_build_hello(char *buf, size_t buf_len, const char *device, const char *fw, int width, int height);
+/** Build a hello message carrying `token`. Returns the JSON length, or 0 if it does not fit in `buf`. */
+size_t proto_build_hello(char *buf, size_t buf_len, const char *device, const uint8_t token[PROTO_TOKEN_LEN],
+                         const char *fw, int width, int height);
+
+/** Build pair_req. Returns the JSON length, or 0 if it does not fit in `buf`. */
+size_t proto_build_pair_req(char *buf, size_t buf_len, const char *device, const uint8_t commit[PROTO_HASH_LEN]);
+
+/** Build pair_nonce. Returns the JSON length, or 0 if it does not fit in `buf`. */
+size_t proto_build_pair_nonce(char *buf, size_t buf_len, const uint8_t n_dev[PROTO_NONCE_LEN]);
 
 /** Build a press message. Returns the JSON length, or 0 if it does not fit in `buf`. */
 size_t proto_build_press(char *buf, size_t buf_len, const char *btn, uint32_t seq);
@@ -86,6 +109,7 @@ size_t proto_build_press(char *buf, size_t buf_len, const char *btn, uint32_t se
 /**
  * Parse one daemon message. Unknown fields are ignored. An unknown "t" returns ESP_OK with
  * PROTO_MSG_UNKNOWN. Malformed JSON, a missing "t", or a missing or out-of-range required
- * field returns ESP_ERR_INVALID_ARG, and `out` is then unspecified.
+ * field returns ESP_ERR_INVALID_ARG, and `out` is then unspecified. Binary pairing fields must
+ * be lowercase hex of exactly their length, and a cert that does not fit is refused, never cut.
  */
 esp_err_t proto_parse(const char *json, size_t len, proto_msg_t *out);

@@ -1,7 +1,8 @@
 //! Advertises `_watchdeck._tcp` through avahi-daemon's D-Bus API, so the host has one mDNS responder.
 //!
 //! A supervisor keeps the registration alive. It re-registers when avahi restarts, picks a new
-//! instance name on a collision, and reports its state on a watch channel.
+//! instance name on a collision, and reports its state on a watch channel. TXT `pair` appears
+//! only while a pairing window is open, so unpaired devices list only daemons ready to pair.
 
 use std::time::Duration;
 
@@ -62,6 +63,17 @@ trait EntryGroup {
         port: u16,
         txt: &[&[u8]],
     ) -> zbus::Result<()>;
+    #[allow(clippy::too_many_arguments)]
+    fn update_service_txt(
+        &self,
+        interface: i32,
+        protocol: i32,
+        flags: u32,
+        name: &str,
+        service_type: &str,
+        domain: &str,
+        txt: &[&[u8]],
+    ) -> zbus::Result<()>;
     fn commit(&self) -> zbus::Result<()>;
     fn reset(&self) -> zbus::Result<()>;
     fn free(&self) -> zbus::Result<()>;
@@ -71,12 +83,19 @@ trait EntryGroup {
 }
 
 /// Keeps `name` advertised on `port` for as long as the future runs. `fp` is the TLS identity's
-/// fingerprint, which devices use to pick their daemon.
-pub async fn advertise(name: String, port: u16, fp: String, status: watch::Sender<MdnsStatus>) {
+/// fingerprint, which devices use to pick their daemon. `pairing` holds the pairing port while
+/// a pairing window is open.
+pub async fn advertise(
+    name: String,
+    port: u16,
+    fp: String,
+    mut pairing: watch::Receiver<Option<u16>>,
+    status: watch::Sender<MdnsStatus>,
+) {
     loop {
         match Connection::system().await {
             Ok(conn) => {
-                if let Err(e) = supervise(&conn, &name, port, &fp, &status).await {
+                if let Err(e) = supervise(&conn, &name, port, &fp, &mut pairing, &status).await {
                     set_unavailable(&status, format!("D-Bus error: {e}"));
                 }
             }
@@ -106,6 +125,7 @@ async fn supervise(
     name: &str,
     port: u16,
     fp: &str,
+    pairing: &mut watch::Receiver<Option<u16>>,
     status: &watch::Sender<MdnsStatus>,
 ) -> zbus::Result<()> {
     let dbus = DBusProxy::new(conn).await?;
@@ -114,7 +134,7 @@ async fn supervise(
         .await?;
     loop {
         if dbus.name_has_owner(BusName::try_from(AVAHI)?).await? {
-            match register(conn, name, port, fp, status, &mut owners).await {
+            match register(conn, name, port, fp, pairing, status, &mut owners).await {
                 Ok(()) => set_unavailable(status, "avahi-daemon stopped".into()),
                 Err(e) => set_unavailable(status, format!("avahi registration failed: {e}")),
             }
@@ -139,6 +159,7 @@ async fn register(
     name: &str,
     port: u16,
     fp: &str,
+    pairing: &mut watch::Receiver<Option<u16>>,
     status: &watch::Sender<MdnsStatus>,
     owners: &mut zbus::fdo::NameOwnerChangedStream,
 ) -> zbus::Result<()> {
@@ -149,7 +170,10 @@ async fn register(
         .await?;
     let mut states = group.receive_state_changed().await?;
     let mut name = name.to_string();
-    add(&group, &name, port, fp).await?;
+    let mut txt = txt(fp, *pairing.borrow_and_update());
+    // Stops watching if the pairing side goes away, instead of waking on every poll.
+    let mut watching = true;
+    add(&group, &name, port, &txt).await?;
 
     let result = loop {
         tokio::select! {
@@ -164,7 +188,7 @@ async fn register(
                         name = server.get_alternative_service_name(&name).await?;
                         log::warn!("mDNS name collision, retrying as {name:?}");
                         group.reset().await?;
-                        add(&group, &name, port, fp).await?;
+                        add(&group, &name, port, &txt).await?;
                     }
                     STATE_FAILURE => break Err(zbus::Error::Failure(args.error.to_string())),
                     _ => {}
@@ -175,6 +199,18 @@ async fn register(
                     break Ok(());
                 }
             }
+            changed = pairing.changed(), if watching => {
+                if changed.is_err() {
+                    watching = false;
+                    continue;
+                }
+                txt = self::txt(fp, *pairing.borrow_and_update());
+                let fields: Vec<&[u8]> = txt.iter().map(|f| f.as_bytes()).collect();
+                group
+                    .update_service_txt(IF_UNSPEC, PROTO_INET, 0, &name, SERVICE_TYPE, "", &fields)
+                    .await?;
+                log::info!("mDNS TXT now {txt:?}");
+            }
             else => break Err(zbus::Error::Failure("D-Bus signal stream closed".into())),
         }
     };
@@ -184,9 +220,20 @@ async fn register(
     result
 }
 
-async fn add(group: &EntryGroupProxy<'_>, name: &str, port: u16, fp: &str) -> zbus::Result<()> {
-    let v = format!("v={VERSION}");
-    let fp = format!("fp={fp}");
+/// TXT `v` and `fp`, plus `pair` while a pairing window is open.
+fn txt(fp: &str, pair: Option<u16>) -> Vec<String> {
+    let mut txt = vec![format!("v={VERSION}"), format!("fp={fp}")];
+    txt.extend(pair.map(|port| format!("pair={port}")));
+    txt
+}
+
+async fn add(
+    group: &EntryGroupProxy<'_>,
+    name: &str,
+    port: u16,
+    txt: &[String],
+) -> zbus::Result<()> {
+    let fields: Vec<&[u8]> = txt.iter().map(|f| f.as_bytes()).collect();
     group
         .add_service(
             IF_UNSPEC,
@@ -197,8 +244,25 @@ async fn add(group: &EntryGroupProxy<'_>, name: &str, port: u16, fp: &str) -> zb
             "",
             "",
             port,
-            &[v.as_bytes(), fp.as_bytes()],
+            &fields,
         )
         .await?;
     group.commit().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn txt_carries_pair_only_while_pairing_is_open() {
+        assert_eq!(
+            txt("0123456789abcdef", None),
+            ["v=1", "fp=0123456789abcdef"]
+        );
+        assert_eq!(
+            txt("0123456789abcdef", Some(47821)),
+            ["v=1", "fp=0123456789abcdef", "pair=47821"]
+        );
+    }
 }

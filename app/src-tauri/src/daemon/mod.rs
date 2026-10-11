@@ -2,6 +2,8 @@
 
 pub mod actions;
 pub mod mdns;
+pub mod pairing;
 pub mod protocol;
 pub mod server;
+pub mod store;
 pub mod tls;

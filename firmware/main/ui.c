@@ -1,5 +1,6 @@
 #include "ui.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_check.h"
@@ -15,6 +16,11 @@
 #define TOAST_TEXT_MAX 120
 #define MAX_PENDING 8
 #define PENDING_TTL_MS (11 * 60 * 1000) // longest action timeout (10 min) plus margin
+#define FORGET_W 300                    // "Forget pairing", right of the touch status line
+#define FORGET_H 40
+#define FORGET_HOLD_MS 2000
+#define ROW_W (DISPLAY_H_RES - 80) // labels and buttons of the pairing views
+#define ROW_H 76
 
 static const char *TAG = "ui";
 
@@ -24,11 +30,13 @@ static lv_obj_t *s_usb_label;
 static lv_obj_t *s_touch_label;
 static lv_obj_t *s_daemon_label;
 
-static lv_obj_t *s_grid; // NULL until the first layout
+static lv_obj_t *s_grid;      // NULL until the first layout
+static lv_obj_t *s_pair_view; // unpaired: the daemon list, the pairing code, or its question
+static lv_obj_t *s_forget;    // shown while paired
 static lv_obj_t *s_toast;
 static lv_timer_t *s_toast_timer;
 
-// Written and read under the LVGL lock, which also covers the tap callback.
+// Written and read under the LVGL lock, which also covers the tap callbacks.
 static bool s_online;
 static bool s_heap_logged;
 static uint32_t s_seq;
@@ -38,6 +46,11 @@ static struct {
 } s_pending[MAX_PENDING];
 static size_t s_n_pending;
 static char s_ids[PROTO_MAX_BUTTONS][PROTO_ID_MAX];
+static bool s_paired;
+static bool s_attempt_shown; // a pairing attempt's code or question is on screen
+static link_daemon_t s_daemons[LINK_MAX_DAEMONS];
+static size_t s_n_daemons;
+static uint32_t s_forget_pressed_at;
 
 static lv_obj_t *add_status(lv_palette_t palette, int y, const char *text)
 {
@@ -71,6 +84,44 @@ static void create_toast(void)
     lv_obj_set_hidden(s_toast, true);
     s_toast_timer = lv_timer_create(toast_hide, TOAST_MS, NULL);
     lv_timer_pause(s_toast_timer);
+}
+
+// Under the LVGL lock.
+static void show_toast(lv_color_t bg, const char *text)
+{
+    lv_obj_set_style_bg_color(s_toast, bg, 0);
+    lv_label_set_text(s_toast, text);
+    lv_obj_set_hidden(s_toast, false);
+    lv_timer_reset(s_toast_timer);
+    lv_timer_resume(s_toast_timer);
+}
+
+// A short tap only explains itself, so a stray touch can't wipe the pairing.
+static void forget_event(lv_event_t *e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_PRESSED) {
+        s_forget_pressed_at = lv_tick_get();
+    } else if (lv_tick_elaps(s_forget_pressed_at) >= FORGET_HOLD_MS) {
+        ESP_LOGI(TAG, "forget pairing");
+        link_forget();
+    } else {
+        show_toast(lv_palette_darken(LV_PALETTE_GREY, 3), "Hold Forget pairing for 2 s to unpair this device.");
+    }
+}
+
+static void create_forget(void)
+{
+    s_forget = lv_button_create(lv_screen_active());
+    lv_obj_set_size(s_forget, FORGET_W, FORGET_H);
+    lv_obj_align(s_forget, LV_ALIGN_TOP_RIGHT, -20, 114);
+    lv_obj_set_style_bg_color(s_forget, lv_palette_darken(LV_PALETTE_RED, 2), 0);
+    lv_obj_add_event_cb(s_forget, forget_event, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(s_forget, forget_event, LV_EVENT_RELEASED, NULL);
+    lv_obj_t *label = lv_label_create(s_forget);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_32, 0);
+    lv_label_set_text(label, "Forget pairing");
+    lv_obj_center(label);
+    lv_obj_set_hidden(s_forget, true);
 }
 
 // Drop presses whose result never came, so they cannot fill the table forever.
@@ -114,7 +165,9 @@ esp_err_t ui_init(lv_display_t *disp)
     s_sd_label = add_status(LV_PALETTE_LIGHT_GREEN, 42, "SD: checking");
     s_usb_label = add_status(LV_PALETTE_AMBER, 80, "USB: starting");
     s_touch_label = add_status(LV_PALETTE_PINK, 118, "Touch: starting");
+    lv_obj_set_width(s_touch_label, DISPLAY_H_RES - 60 - FORGET_W); // the touch text is short
     s_daemon_label = add_status(LV_PALETTE_PURPLE, 156, "Daemon: waiting for Wi-Fi");
+    create_forget();
     create_toast();
     lvgl_port_unlock();
     return ESP_OK;
@@ -190,16 +243,186 @@ void ui_show_result(const proto_result_t *r)
         ESP_LOGW(TAG, "result for unknown seq %u ignored", (unsigned)r->seq);
     } else {
         s_pending[i] = s_pending[--s_n_pending];
-        lv_obj_set_style_bg_color(
-            s_toast, r->ok ? lv_palette_darken(LV_PALETTE_GREEN, 3) : lv_palette_darken(LV_PALETTE_RED, 3), 0);
-        lv_label_set_text_fmt(s_toast, "%s%s%.*s", r->ok ? "OK" : "FAILED", r->text[0] ? ": " : "", TOAST_TEXT_MAX,
-                              r->text);
-        lv_obj_set_hidden(s_toast, false);
-        lv_timer_reset(s_toast_timer);
-        lv_timer_resume(s_toast_timer);
+        char text[TOAST_TEXT_MAX + 16];
+        snprintf(text, sizeof(text), "%s%s%.*s", r->ok ? "OK" : "FAILED", r->text[0] ? ": " : "", TOAST_TEXT_MAX,
+                 r->text);
+        show_toast(r->ok ? lv_palette_darken(LV_PALETTE_GREEN, 3) : lv_palette_darken(LV_PALETTE_RED, 3), text);
         ESP_LOGI(TAG, "result seq %u %s code %d in %u ms", (unsigned)r->seq, r->ok ? "ok" : "fail", r->code,
                  (unsigned)r->ms);
     }
+    lvgl_port_unlock();
+}
+
+/* ---- Pairing views, all under the LVGL lock ---- */
+
+static void clear_pair_view(void)
+{
+    if (s_pair_view) {
+        lv_obj_delete(s_pair_view);
+        s_pair_view = NULL;
+    }
+}
+
+// A centered column below the status lines.
+static lv_obj_t *new_pair_view(void)
+{
+    clear_pair_view();
+    lv_obj_t *view = lv_obj_create(lv_screen_active());
+    lv_obj_remove_style_all(view);
+    lv_obj_set_size(view, DISPLAY_H_RES, DISPLAY_V_RES - GRID_TOP);
+    lv_obj_set_pos(view, 0, GRID_TOP);
+    lv_obj_set_flex_flow(view, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(view, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(view, GRID_GAP, 0);
+    s_pair_view = view;
+    return view;
+}
+
+static lv_obj_t *add_text(lv_obj_t *parent, const lv_font_t *font, const char *text)
+{
+    lv_obj_t *label = lv_label_create(parent);
+    lv_obj_set_style_text_font(label, font, 0);
+    lv_obj_set_style_text_color(label, lv_color_white(), 0);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(label, ROW_W);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(label, text);
+    return label;
+}
+
+static void add_button(lv_obj_t *parent, const char *text, lv_event_cb_t cb, void *user_data)
+{
+    lv_obj_t *btn = lv_button_create(parent);
+    lv_obj_set_size(btn, ROW_W, ROW_H);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, user_data);
+    lv_obj_t *label = lv_label_create(btn);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_32, 0);
+    lv_obj_set_width(label, ROW_W - 32);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(label, text);
+    lv_obj_center(label);
+}
+
+static void daemon_tapped(lv_event_t *e)
+{
+    size_t i = (size_t)(intptr_t)lv_event_get_user_data(e);
+    if (i < s_n_daemons) {
+        ESP_LOGI(TAG, "pair with %s", s_daemons[i].name);
+        link_pair(&s_daemons[i]);
+    }
+}
+
+static void cancel_tapped(lv_event_t *e)
+{
+    link_pair_cancel();
+}
+
+static void show_daemon_list(void)
+{
+    lv_obj_t *view = new_pair_view();
+    if (s_n_daemons == 0) {
+        add_text(view, &lv_font_montserrat_32,
+                 "No desktop is ready to pair.\nIn the watchdeck app, click Pair a device.");
+        return;
+    }
+    add_text(view, &lv_font_montserrat_32, "Tap your desktop to pair:");
+    for (size_t i = 0; i < s_n_daemons; i++) {
+        char text[PROTO_NAME_MAX + 24];
+        snprintf(text, sizeof(text), "%s  (" IPSTR ")", s_daemons[i].name, IP2STR(&s_daemons[i].ip));
+        add_button(view, text, daemon_tapped, (void *)(intptr_t)i);
+    }
+}
+
+static void show_code(const char *code, const char *name)
+{
+    lv_obj_t *view = new_pair_view();
+    add_text(view, &lv_font_montserrat_32, "Pairing code");
+    char spaced[8]; // "123 456"
+    snprintf(spaced, sizeof(spaced), "%.3s %.3s", code, code + 3);
+    add_text(view, &lv_font_montserrat_48, spaced);
+    lv_label_set_text_fmt(add_text(view, &lv_font_montserrat_32, ""), "Type it into the watchdeck app on %s.", name);
+    add_button(view, "Cancel", cancel_tapped, NULL);
+}
+
+static void yes_tapped(lv_event_t *e)
+{
+    link_pair_confirm();
+}
+
+static void show_confirm(const char *device, const char *name)
+{
+    lv_obj_t *view = new_pair_view();
+    lv_label_set_text_fmt(add_text(view, &lv_font_montserrat_32, ""), "Does the watchdeck app on %s say \"Paired %s\"?",
+                          name, device);
+    add_button(view, "Yes", yes_tapped, NULL);
+    add_button(view, "No", cancel_tapped, NULL);
+    add_text(view, &lv_font_montserrat_32,
+             "Nothing is saved here until you tap Yes. If you tap No and the desktop lists this device, click "
+             "Forget there.");
+}
+
+void ui_set_paired(bool paired)
+{
+    if (!s_forget) {
+        return;
+    }
+    lvgl_port_lock(0);
+    s_paired = paired;
+    s_attempt_shown = false;
+    lv_obj_set_hidden(s_forget, !paired);
+    if (paired) {
+        clear_pair_view();
+    } else {
+        if (s_grid) {
+            lv_obj_delete(s_grid);
+            s_grid = NULL;
+        }
+        s_online = false;
+        s_n_pending = 0;
+        s_n_daemons = 0;
+        show_daemon_list();
+    }
+    lvgl_port_unlock();
+}
+
+void ui_show_daemons(const link_daemon_t *daemons, size_t n)
+{
+    if (!s_forget) {
+        return;
+    }
+    lvgl_port_lock(0);
+    s_n_daemons = n < LINK_MAX_DAEMONS ? n : LINK_MAX_DAEMONS;
+    memcpy(s_daemons, daemons, s_n_daemons * sizeof(daemons[0]));
+    if (!s_paired && !s_attempt_shown) {
+        show_daemon_list();
+    }
+    lvgl_port_unlock();
+}
+
+void ui_show_pair_code(const char *code, const char *name)
+{
+    if (!s_forget) {
+        return;
+    }
+    lvgl_port_lock(0);
+    s_attempt_shown = code != NULL;
+    if (code) {
+        show_code(code, name);
+    } else if (!s_paired) {
+        show_daemon_list();
+    }
+    lvgl_port_unlock();
+}
+
+void ui_show_pair_confirm(const char *device, const char *name)
+{
+    if (!s_forget) {
+        return;
+    }
+    lvgl_port_lock(0);
+    s_attempt_shown = true;
+    show_confirm(device, name);
     lvgl_port_unlock();
 }
 

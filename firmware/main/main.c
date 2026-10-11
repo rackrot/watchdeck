@@ -84,6 +84,10 @@ void app_main(void)
         .on_layout = ui_apply_layout,
         .on_down = ui_link_down,
         .on_result = ui_show_result,
+        .on_paired = ui_set_paired,
+        .on_daemons = ui_show_daemons,
+        .on_pair_code = ui_show_pair_code,
+        .on_pair_confirm = ui_show_pair_confirm,
     };
     err = link_start(&link_cbs);
     if (err != ESP_OK) {

@@ -1,6 +1,6 @@
 # watchdeck v1: daemon, device protocol, screen config
 
-Status: plan, 2026-10-10. S1 to S3a are built (see the slice table); S3b onward is not.
+Status: plan, 2026-10-10. S1 to S3 are done (see the slice table); S4 onward is not built.
 
 ## Decisions
 
@@ -55,7 +55,7 @@ Nothing here imports `tauri`, so tests run headless.
 - `lib.rs` builds Tauri, plugins and the tray, starts the daemon and mDNS, and forwards events to the UI and the tray status line.
 - `commands.rs` exposes the Tauri commands:
   - config: `get_config`, `save_config`
-  - devices and pairing: `list_devices`, `forget_device` (closes the live session too), `start_pairing`, `cancel_pairing`, `submit_pair_code`
+  - devices and pairing: `list_devices`, `forget_device` (closes the live session too), `start_pairing`, `cancel_pairing`, `confirm_pairing`
   - secrets: `list_secrets`, `set_secret` (write-only)
   - tools: `test_action`, `import_icon`
 - React UI in `app/src`: GridEditor, ButtonForm, PairDialog, Devices, Secrets, plus `api.ts` (typed invoke wrappers) and `config.ts` (types). Rust validation is the authority.
@@ -67,7 +67,7 @@ Nothing here imports `tauri`, so tests run headless.
 | `main.c` | Boot order unchanged, then touch, ui, link |
 | `display.c` | Panel and LVGL port. The hello labels move to `ui.c` |
 | `touch.c` | GT911 via `esp_lcd_touch_gt911` + `lvgl_port_add_touch`, swap/mirror `#define` knobs |
-| `ui.c` | Status screen, daemon list, pairing code, grid, result toast, tiles, Forget pairing |
+| `ui.c` | Status screen, daemon list, pairing code and question, grid, result toast, tiles, Forget pairing |
 | `proto.c` | cJSON parse/build, icon-frame parse. Pure functions |
 | `pairing.c` | Pairing session, SAS, NVS blob |
 | `link.c` | Discovery, backoff, websocket lifecycle, dispatch, icon cache |
@@ -78,7 +78,7 @@ Nothing here imports `tauri`, so tests run headless.
 
 ## 2. Discovery and connection
 
-- **Advertising.** The daemon advertises `_watchdeck._tcp` on port 47820 (wss), with TXT `v=1`, `fp=<16 hex of SHA-256(cert PEM)>` and `pair=47821`. avahi follows IP changes and answers on every interface, including docker and virbr.
+- **Advertising.** The daemon advertises `_watchdeck._tcp` on port 47820 (wss), with TXT `v=1`, `fp=<16 hex of SHA-256(cert PEM)>`, and `pair=47821` only while the pairing dialog is open. avahi follows IP changes and answers on every interface, including docker and virbr.
 - **Browsing.** The device runs `mdns_query_ptr`, then TXT/A follow-ups for missing fields.
   - Paired: it picks the instance whose `fp` matches NVS, which is how it chooses among several daemons. IPv4 only, own subnet first.
   - Unpaired: it lists the instances, and the user taps one to pair.
@@ -95,7 +95,7 @@ Nothing here imports `tauri`, so tests run headless.
 Main port 47820 (wss):
 
 ```text
-D→H hello    {"t":"hello","v":1,"device":"wd-a1b2c3","token":"<b64 32B>","fw":"0.2.0","screen":[1024,600]}
+D→H hello    {"t":"hello","v":1,"device":"wd-a1b2c3","token":"<64 hex>","fw":"0.2.0","screen":[1024,600]}
 H→D welcome  {"t":"welcome","v":1,"name":"buck-desktop"}
 H→D error    {"t":"error","code":"unauthorized|version|bad_request","msg":"…"}   then close
 H→D layout   {"t":"layout","rev":7,"cols":5,"rows":3,"buttons":[
@@ -134,13 +134,17 @@ H→D tile     {"t":"tile","btn":"nas-load","text":"0.42","state":"ok|bad|unknow
 | 4 | H→D | `pair_reveal {n_host}` | The device aborts unless SHA-256(n_host) = c_host |
 | 5 | both | code = `BE_u32(SHA-256(enc)[0..4]) mod 10^6`, 6 digits | enc is each field as u16-BE length + bytes, in order: `"watchdeck-pair-v1"`, device, commit, cert PEM, n_dev, n_host. The device shows the code; the user types it into the app |
 | 6 | H→D | `pair_result {ok}` | On a match the daemon stores device → commit. A mismatch or the 120 s timeout aborts. One pending request at a time |
+| 7 | device | the person confirms | On `ok` the device asks whether the app says "Paired <device>". Yes saves and connects; No or 60 s saves nothing |
 
-- **Why commit-then-reveal.** A man-in-the-middle sees the nonce only after committing its own inputs, so its best odds are 1 in 10^6. A single-round 6-digit code could be ground offline in milliseconds.
+- **Why commit-then-reveal.** A man-in-the-middle sees the nonce only after committing its own inputs, so its best odds of getting the desktop to accept the typed code are 1 in 10^6. A single-round 6-digit code could be ground offline in milliseconds.
+- **Why the device asks.** The code protects only the desktop. The device can't see whether the code matched, and `pair_result` is unauthenticated, so anyone on the pairing socket can send `ok:true`. The device pins nothing until the person confirms on it that the app shows the pairing, so its side relies on that person checking the desktop.
+- **Encoding.** Binary fields travel as lowercase hex: `commit` and `c_host` are 64 digits, `n_dev` and `n_host` 32.
 - **On the device,** after `ok`:
-  - It writes one atomic NVS blob `{ver, fp, token, cert PEM}`.
+  - It keeps the token, cert and name in RAM and asks the question. No, or 60 s without an answer, wipes them.
+  - On Yes it writes one atomic NVS blob `{ver, token, daemon name, cert PEM}` and derives `fp` from the cert at boot.
   - It connects with wss, with the cert pinned via `cert_pem` and the common-name check skipped because the IP changes. Chain verification stays on.
-- **On the daemon:** it stores only SHA-256(token), so a leaked `state.json` gives no session.
-- **Device reactions:** `error{unauthorized}` wipes the blob. A TLS verify failure shows "daemon identity changed". The status screen always offers Forget pairing.
+- **On the daemon:** it stores only SHA-256(token), so a leaked `state.json` gives no session. It stores on the code match, before the person answers on the device, so a No leaves an unusable hash until Forget on the desktop removes it.
+- **Device reactions:** `error{unauthorized}` wipes the blob and goes back to the daemon list. A TLS verify failure shows "wrong cert from daemon". The status screen always offers Forget pairing, behind a 2 s hold. If the blob won't erase, the device stays paired and shows the error.
 
 ### TLS: use it
 
@@ -251,7 +255,7 @@ Tauri on Linux:
 |---|---|---|---|
 | S1 ✅ | Touch: GT911, plus a 5×3 test grid that highlights and logs taps. Done 2026-10-10: answers at 0x5D, pins as assumed, no axis swap or mirror, 0 phantom taps in 5 min | Every cell, corners included, maps correctly. No phantom touches in 5 min. Pins and address confirmed | `fw:build`, serial log on device |
 | S2 ✅ | Thin end-to-end, no auth. Done 2026-10-10: tap → notify-send → toast verified on hardware; board reconnects after a daemon restart (IP change untested). Write `site/src/protocol.md` first. Daemon in Tauri, mDNS, plain ws, hello → one hard-coded button → `notify-send` → result toast. Add `cargo test` to CI | Connects within 10 s. Survives a daemon restart and an IP change. Result shows within 1 s. Heap logged | Fake-device integration test, `avahi-browse`, device |
-| S3 | **Security gate.** S3a: TLS interop spike (rcgen + rustls ↔ mbedTLS). S3a done 2026-10-10: wss with the pinned cert works on hardware, and 47820 is wss-only (results below). S3b: pairing on both sides, Forget pairing | SAS test vector passes. A wrong code stores nothing. A bad or forgotten token gets `unauthorized`. Oversize messages close the link. Device rejects a regenerated cert. tcpdump: TLS only on 47820, no token on 47821 | `cargo test`, device, tcpdump, security review |
+| S3 | **Security gate.** S3a: TLS interop spike (rcgen + rustls ↔ mbedTLS). S3a done 2026-10-10: wss with the pinned cert works on hardware, and 47820 is wss-only (results below). S3b: pairing on both sides, Forget pairing. S3b built 2026-10-10: paired on hardware, and every hello needs its token (results below). Security review done 2026-10-10 and its fixes applied (review fixes below). tcpdump passed. On hardware, a run covered Forget from both sides, Yes, a wrong code, right-then-No, the 60 s timeout and re-pair, and all passed. **S3 ✅ 2026-10-10** | SAS test vector passes. A wrong code stores nothing. The device pins nothing without the person's Yes. A bad or forgotten token gets `unauthorized`. Oversize messages close the link. Device rejects a regenerated cert. tcpdump: TLS only on 47820, no token on 47821 | `cargo test`, device, tcpdump, security review |
 | S4 | Config and actions: `config.toml`, validation, shell and HTTP runners, secrets, live layout push, result modal | A timeout kills grandchildren. Output caps, exit codes, "already running". HTTP: secret headers, no redirects, caps. Live push needs no reconnect | `cargo test`, device, security review |
 | S5 | Icons: import, render, hash, `icon_get`, PSRAM cache | Exact-bytes render test. An RGB + transparent quadrant icon shows correctly | `cargo test`, device |
 | S6 | Tiles | Paused-clock tests: interval, no overlap, idle stop, poll after press | `cargo test`, device |
@@ -290,7 +294,45 @@ Order: S1 → S2 → S3 → S4 → {S5, S6, S8} → S7. S8 can start any time af
   - The daemon's 5 s hello deadline always started at the TCP accept. What changed is that it now covers the TLS handshake as well.
   - esp_websocket_client 1.8.0 ships an Apache-2.0 `LICENSE`, which settles the §6 question.
   - aws-lc-sys builds with `cc` (no cmake or clang). `sha2` 0.11 sits beside a transitive 0.10.
-- **S3a seam:** the pinned cert compiles in from the gitignored `firmware/main/daemon_cert.pem.local`, a copy of the daemon's `identity.pem`. Without it the firmware builds but refuses to connect. Run `idf.py reconfigure` after creating it. S3b replaces it with the cert stored at pairing.
+
+### S3b results (2026-10-10)
+
+- **Paired on hardware.** The daemon log shows one full pairing, which needs a person to read the code off the board and type it into the dialog. Nobody captured serial or watched the screens during it. Daemon log, in UTC:
+  - 00:00:32: window open, TXT gains `pair=47821`
+  - 00:00:42: `pair_req` from `wd-a0f26283602c`
+  - 00:00:48: code matched, `state.json` written, TXT drops `pair`
+  - 00:00:52: first authenticated `hello`
+- **Persistence.** After a reset the board reloads the blob ("paired with devbox, pinned daemon fp e2004f4d7b1747f2") and reaches `welcome` 9.1 s after power-on, 316 ms of it TCP + TLS + WebSocket. It logs `tx: hello (token redacted)`.
+- **Impostors on hardware.** Four `hello`s over wss each got `error{unauthorized}` and a close: the paired id with no token, a random token and a malformed one, and an unknown id. The paired session stayed up through all four.
+- **Pairing port.** 47821 refuses connections while the dialog is closed, and `avahi-browse` shows only `v` and `fp`.
+- **Seam removed.** The firmware no longer compiles a cert in. The pin comes only from the pairing blob.
+- **Covered by `device_sim` only:** a wrong code, cancel, both timeouts, a bad or oversize attempt, one device's token opening another, Forget closing the live session, and an impostor failing to kick a live session. A regenerated cert against the stored pin wasn't retried on hardware; S3a ran the same pin path with the compiled-in cert.
+- **tcpdump, passed 2026-10-10 18:23** (`sudo tcpdump -i enp11s0 -A 'host 192.168.0.56 and (port 47820 or port 47821)'`, run during a re-pair). The capture was taken before the device-side confirm step was added, which changes no wire message.
+  - 47821 carried only `pair_offer` (cert, `c_host`), `pair_reveal`, and `pair_result`. The device's masked frames match `pair_req` with a single 64-hex commit (125 B) and `pair_nonce` (61 B) by size. No token appeared.
+  - 47820 carried only TLS 1.2 records after the TCP handshake. That covers the hello and a press.
+- **Choices made in S3b:**
+  - Binary fields are lowercase hex rather than base64, so each value has one spelling and the C parser stays exact.
+  - `confirm_pairing(code)` replaces `submit_pair_code`. The user gets one guess per window.
+  - `forget_device` and a re-pair send the live session `error{unauthorized}` before closing it, so the device drops its pairing at once instead of retrying a dead token.
+  - The daemon verifies the token and registers the session under one lock. A forget can't slip between the two, and a failed `hello` never touches the live session. An unknown id is compared against a dummy hash.
+  - `name` in `pair_offer` is display-only and stays out of the code. The device pins the cert, not the name.
+  - Forget pairing on the device doesn't tell the daemon, so the desktop lists the device until it's forgotten there too.
+- **Device cost:** min free internal heap 312.8 KB after the first layout of a paired boot.
+
+### S3b review fixes (2026-10-10)
+
+- **Device-side confirm, the audit's blocker.** The device pinned whatever cert sent it `pair_result{ok:true}`, and anyone on the plain socket can send that. Now it asks the person whether the app says "Paired <device>" and saves only on Yes. No, 60 s without an answer, or a Wi-Fi drop wipes the token, cert and name from RAM.
+- **Lost `unauthorized` under load.** When a session closed with presses still unread, the kernel sent a reset. The reset discarded the `error` frame that Nagle was still holding. Sessions now send a close, then read until the device closes too, for at most 2 s.
+- **Presses behind a revoke.** The session loop polls its kick first (`biased`) and checks it again right before running a press, so a press queued behind a revoke never runs. A press already past that check can still start within microseconds of the revoke.
+- **Pairing window race.** A window publishes its end state and withdraws its port before it frees the slot, so a new window's `Waiting` can't be overwritten by the old window's end.
+- **Smaller fixes:**
+  - A device id must be exactly `wd-` plus 12 lowercase hex digits, as the firmware writes it.
+  - A store save counts once its rename lands. A failed dir fsync after that only warns.
+  - A `pairing_state` command lets the dialog recover from a missed event or a reload, and the dialog listens before it opens the window.
+  - The code prompt shows the device's IP.
+  - A Forget on the device that can't erase NVS keeps the pairing and shows the error.
+- **New tests:** in `device_sim`, pipelined presses then a forget, a valid message padded past 16 KB on each port, a re-pair cutting a live session with `unauthorized`, and a device speaking while the code is shown. A store unit test covers the fsync contract.
+- **Not yet run on hardware:** the question screen, Yes, No and the 60 s timeout. The board kept its earlier pairing, so the user can run them after a Forget.
 
 ## 8. Testing
 
@@ -328,10 +370,10 @@ Rollback: each slice is its own PR. Firmware rolls back by flashing the previous
 
 | # | Question | Default |
 |---|---|---|
-| 1 | Pairing strength | Commit/reveal SAS. TOFU is simpler but open to an active MITM while pairing |
+| 1 | Pairing strength | Settled in S3b: commit/reveal SAS, built and paired on hardware. TOFU was simpler but open to an active MITM while pairing |
 | 2 | UI design direction (look, references, palette, type) | Needed before S7 |
 | 3 | Desktop environment | KDE or another StatusNotifierItem tray. GNOME needs an extension |
-| 4 | Desktop firewall active? | Ports TCP 47820 and 47821 |
+| 4 | Desktop firewall active? | Ports TCP 47820 and 47821. On the dev desktop both answer the LAN (S3b) |
 | 5 | HTTPS to self-signed services (e.g. Home Assistant) | Unsupported in v1. A per-action `insecure_tls` opt-in later |
 | 6 | SVG icons | PNG, JPEG and WebP only. SVG via resvg later |
 | 7 | Non-ASCII labels | Rejected; the built-in fonts lack the glyphs |

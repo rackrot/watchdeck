@@ -2,7 +2,7 @@
 //! that serves it. Devices compare the cert bytes and check neither names nor dates.
 
 use std::fs::{self, File, OpenOptions, Permissions};
-use std::io::{self, Write};
+use std::io;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
@@ -17,6 +17,8 @@ use tokio_rustls::rustls::crypto::aws_lc_rs;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::{self, ServerConfig};
+
+use super::store::{check_private, write_private};
 
 const CERT_FILE: &str = "identity.pem";
 const KEY_FILE: &str = "identity.key";
@@ -50,7 +52,7 @@ impl Identity {
         let key_path = dir.join(KEY_FILE);
         match (cert_path.try_exists()?, key_path.try_exists()?) {
             (true, true) => {
-                check_key(&key_path, fs::metadata(dir)?.uid())?;
+                check_private(&key_path, fs::metadata(dir)?.uid())?;
                 Self::parse(fs::read_to_string(&cert_path)?, &fs::read(&key_path)?)
             }
             (false, false) => {
@@ -131,52 +133,6 @@ fn generate() -> Result<(String, String), rcgen::Error> {
     Ok((cert.pem(), key.serialize_pem()))
 }
 
-/// Refuses a key that is not a regular 0600 file owned by `uid`. `uid` is the config dir's
-/// owner, which is this user because `load_or_create` just chmod-ed the dir.
-fn check_key(path: &Path, uid: u32) -> io::Result<()> {
-    let meta = fs::symlink_metadata(path)?;
-    let mode = meta.mode() & 0o777;
-    let refuse = |problem: String| {
-        let display = path.display();
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "{display} {problem}; fix it with `chown $USER {display} && chmod 600 {display}`"
-            ),
-        ))
-    };
-    if !meta.is_file() {
-        return refuse("is not a regular file".into());
-    }
-    if mode != 0o600 {
-        return refuse(format!("has mode {mode:04o}, expected 0600"));
-    }
-    if meta.uid() != uid {
-        return refuse(format!("is owned by uid {}, expected {uid}", meta.uid()));
-    }
-    Ok(())
-}
-
-/// Writes `bytes` to `path` as 0600 through a temporary file, so a crash never leaves a
-/// partial file behind. The temp file is opened `create_new`, which (O_EXCL) fails on a planted
-/// symlink instead of following it, so it needs no separate O_NOFOLLOW. A temp file left by a
-/// crash is removed first, which is safe because the caller holds the identity lock.
-fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = path.with_added_extension("tmp");
-    match fs::remove_file(&tmp) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-        _ => {}
-    }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    fs::rename(&tmp, path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,8 +208,8 @@ mod tests {
         Identity::load_or_create(tmp.path()).unwrap();
         let key_path = tmp.path().join(KEY_FILE);
         let uid = fs::metadata(&key_path).unwrap().uid();
-        check_key(&key_path, uid).unwrap();
-        let err = check_key(&key_path, uid + 1).unwrap_err();
+        check_private(&key_path, uid).unwrap();
+        let err = check_private(&key_path, uid + 1).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 

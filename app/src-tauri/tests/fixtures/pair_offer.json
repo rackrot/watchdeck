@@ -1,0 +1,6 @@
+{
+  "t": "pair_offer",
+  "name": "buck-desktop",
+  "cert": "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----\n",
+  "c_host": "816b9e7c25d559c5766755b3bbb36654ad451e080ffa93694a793d6eed41f40a"
+}

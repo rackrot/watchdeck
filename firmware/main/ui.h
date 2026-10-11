@@ -1,6 +1,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include "link.h"
 #include "lvgl.h"
 #include "proto.h"
 
@@ -22,3 +23,17 @@ void ui_link_down(void);
 
 /** Show a toast for the result of a press this UI sent. Results with an unknown seq are ignored. */
 void ui_show_result(const proto_result_t *result);
+
+/* The pairing views below are thread-safe and ignored before ui_init succeeds. */
+
+/** Paired: show the grid area and Forget pairing. Unpaired: show the pairable daemons. */
+void ui_set_paired(bool paired);
+
+/** Replace the list of daemons open for pairing (unpaired only). */
+void ui_show_daemons(const link_daemon_t *daemons, size_t n);
+
+/** Show the pairing code for `name`, or with `code` NULL go back to the list. */
+void ui_show_pair_code(const char *code, const char *name);
+
+/** Ask whether the watchdeck app on `name` shows "Paired <device>", with Yes and No. */
+void ui_show_pair_confirm(const char *device, const char *name);

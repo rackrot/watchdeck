@@ -21,6 +21,7 @@
 #include "mbedtls/ssl.h"
 #include "mbedtls/x509.h"
 #include "mdns.h"
+#include "pairing.h"
 
 #define SERVICE "_watchdeck"
 #define SERVICE_PROTO "_tcp"
@@ -34,6 +35,9 @@
 #define SEND_TIMEOUT_MS 2000
 #define PING_INTERVAL_S 10
 #define PINGPONG_TIMEOUT_S 25
+#define BROWSE_INTERVAL_MS 4000  // unpaired: pause between looks for daemons open for pairing
+#define PAIR_TIMEOUT_MS 130000   // one attempt, tap to verdict; the daemon's own window is 120 s
+#define CONFIRM_TIMEOUT_MS 60000 // then the person's Yes or No on the device
 #define WS_OP_TEXT 0x1
 
 static const char *TAG = "link";
@@ -41,16 +45,14 @@ static const char *TAG = "link";
 // Backoff steps in seconds; the last one is the cap. Each wait gets +/-20% jitter.
 static const uint32_t BACKOFF_S[] = {1, 2, 4, 8, 16, 30};
 
-// S3a seam: the daemon cert the link pins, compiled in from main/daemon_cert.pem.local and empty
-// without it (see main/CMakeLists.txt). S3b replaces it with the cert stored in NVS at pairing,
-// which must stay alive as long as any client points at it.
-extern const char pinned_pem[] asm("_binary_daemon_cert_pem_start");
-
 typedef enum {
     ST_NO_IP,      // waiting for Wi-Fi
-    ST_BACKOFF,    // waiting to retry (retry_at_ms)
-    ST_CONNECTING, // client started, no CONNECTED yet
-    ST_UP,         // hello sent
+    ST_BACKOFF,    // paired: waiting to retry (retry_at_ms)
+    ST_CONNECTING, // paired: client started, no CONNECTED yet
+    ST_UP,         // paired: hello sent
+    ST_BROWSE,     // unpaired: listing daemons open for pairing (browse_at_ms)
+    ST_PAIRING,    // unpaired: an attempt on a daemon's pairing port
+    ST_CONFIRM,    // unpaired: the daemon said ok, and the person must confirm it on the device
 } state_t;
 
 typedef enum {
@@ -62,6 +64,10 @@ typedef enum {
     EV_WS_BAD,      // oversize or broken frame: close the link
     EV_WS_BAD_CERT, // the daemon's cert is not the pinned one
     EV_PRESS,
+    EV_PAIR,         // the user picked a daemon to pair with
+    EV_PAIR_CANCEL,  // the user abandoned the attempt, or said No to its question
+    EV_PAIR_CONFIRM, // the user said Yes, the desktop shows the pairing
+    EV_FORGET,       // the user asked to forget the pairing
 } ev_type_t;
 
 typedef struct {
@@ -76,6 +82,7 @@ typedef struct {
             char btn[PROTO_ID_MAX];
             uint32_t seq;
         } press;
+        link_daemon_t daemon;
     };
 } link_ev_t;
 
@@ -89,8 +96,11 @@ typedef struct {
 static struct {
     QueueHandle_t queue;
     link_cbs_t cbs;
-    proto_msg_t *msg;          // parse target, in PSRAM
-    char fp[PROTO_FP_LEN + 1]; // of pinned_pem, matched against mDNS TXT "fp"
+    proto_msg_t *msg;           // parse target, in PSRAM
+    pairing_t *pairing;         // in PSRAM; while paired, the client points at its cert_pem
+    pairing_session_t *session; // in PSRAM, the attempt in ST_PAIRING and ST_CONFIRM
+    bool paired;
+    char fp[PROTO_FP_LEN + 1]; // of the pinned cert, matched against mDNS TXT "fp"
     state_t state;
     esp_websocket_client_handle_t client;
     uint32_t gen;
@@ -104,6 +114,13 @@ static struct {
     size_t ncand;
     size_t next_cand; // the next one to try
     bool wrong_cert;  // a candidate in this pass presented a cert other than the pinned one
+    int64_t browse_at_ms;
+    link_daemon_t daemons[LINK_MAX_DAEMONS]; // the pairable list the UI shows
+    size_t ndaemons;
+    bool listed;              // the UI has been given a list, even an empty one
+    link_daemon_t pair_with;  // the daemon of the attempt
+    bool pair_up;             // that attempt's socket is connected
+    int64_t pair_deadline_ms; // the attempt, or its question in ST_CONFIRM, ends after this
 } s;
 
 // Reassembly state and connect measurements, touched only by the websocket event handler, which
@@ -264,33 +281,71 @@ static void on_net_event(void *arg, esp_event_base_t base, int32_t id, void *dat
     post(&ev);
 }
 
-/* ---- Discovery ---- */
+/* ---- mDNS ---- */
 
 static bool same_subnet(uint32_t a, uint32_t b, uint32_t mask)
 {
     return (a & mask) == (b & mask);
 }
 
-// Whether an instance advertises the pinned daemon's fp. avahi sends TXT along with the PTR
-// answer, and an instance without it gets a TXT query. *mismatch is set when the TXT was read and
-// its fp is absent or different, as opposed to not being read at all.
+// What is left of a pass's follow-up budget, capped at one query's timeout. 0 when spent.
+static uint32_t budget_left(int64_t end_ms)
+{
+    int64_t left = end_ms - now_ms();
+    return left <= 0 ? 0 : left < DISCOVER_TIMEOUT_MS ? (uint32_t)left : DISCOVER_TIMEOUT_MS;
+}
+
+// The TXT of `r`: its own, since avahi sends TXT along with the PTR answer, or else a follow-up
+// query's. Free *queried with mdns_query_results_free.
+static const mdns_result_t *txt_of(const mdns_result_t *r, uint32_t timeout_ms, mdns_result_t **queried)
+{
+    *queried = NULL;
+    if (r->txt_count == 0 && r->instance_name && timeout_ms > 0 &&
+        mdns_query_txt(r->instance_name, SERVICE, SERVICE_PROTO, timeout_ms, queried) == ESP_OK && *queried) {
+        return *queried;
+    }
+    return r;
+}
+
+// The value of TXT `key`, or NULL. *len gets its length.
+static const char *txt_get(const mdns_result_t *t, const char *key, size_t *len)
+{
+    for (size_t i = 0; i < t->txt_count; i++) {
+        if (t->txt[i].key && strcasecmp(t->txt[i].key, key) == 0 && t->txt[i].value) {
+            *len = t->txt_value_len[i];
+            return t->txt[i].value;
+        }
+    }
+    return NULL;
+}
+
+// Up to `max` IPv4 addresses of `r`: from the PTR answer, or else an A query.
+static size_t addrs_of(const mdns_result_t *r, uint32_t timeout_ms, esp_ip4_addr_t *out, size_t max)
+{
+    size_t n = 0;
+    for (const mdns_ip_addr_t *a = r->addr; a && n < max; a = a->next) {
+        if (a->addr.type == ESP_IPADDR_TYPE_V4) {
+            out[n++] = a->addr.u_addr.ip4;
+        }
+    }
+    if (n == 0 && r->hostname && timeout_ms > 0) {
+        ESP_LOGI(TAG, "%s has no address in the PTR answer, querying A", r->hostname);
+        if (mdns_query_a(r->hostname, timeout_ms, &out[0]) == ESP_OK) {
+            n = 1;
+        }
+    }
+    return n;
+}
+
+// Whether an instance advertises the pinned daemon's fp. *mismatch is set when the TXT was read
+// and its fp is absent or different, as opposed to not being read at all.
 static bool fp_matches(const mdns_result_t *r, uint32_t timeout_ms, bool *mismatch)
 {
     const char *name = r->instance_name ? r->instance_name : "?";
-    mdns_result_t *queried = NULL;
-    const mdns_result_t *t = r;
-    if (r->txt_count == 0 && r->instance_name &&
-        mdns_query_txt(r->instance_name, SERVICE, SERVICE_PROTO, timeout_ms, &queried) == ESP_OK && queried) {
-        t = queried;
-    }
-    const char *fp = NULL;
+    mdns_result_t *queried;
+    const mdns_result_t *t = txt_of(r, timeout_ms, &queried);
     size_t fp_len = 0;
-    for (size_t i = 0; i < t->txt_count && !fp; i++) {
-        if (t->txt[i].key && strcasecmp(t->txt[i].key, "fp") == 0 && t->txt[i].value) {
-            fp = t->txt[i].value;
-            fp_len = t->txt_value_len[i];
-        }
-    }
+    const char *fp = txt_get(t, "fp", &fp_len);
     bool match = fp && fp_len == PROTO_FP_LEN && memcmp(fp, s.fp, PROTO_FP_LEN) == 0;
     if (!fp) {
         ESP_LOGI(TAG, "skipping %s: no fp in TXT", name);
@@ -306,10 +361,10 @@ static bool fp_matches(const mdns_result_t *r, uint32_t timeout_ms, bool *mismat
     return match;
 }
 
-// Browse for the pinned daemon and fill s.cands with every address of every instance whose fp
-// matches, own subnet first. Instances whose A record is missing get a follow-up query. The TXT
-// and A follow-ups share DISCOVER_BUDGET_MS, so junk instances cannot hold the link task for
-// long. Sets *mismatch when instances were seen but none matched the pinned fp.
+// Paired: browse for the pinned daemon and fill s.cands with every address of every instance
+// whose fp matches, own subnet first. The TXT and A follow-ups share DISCOVER_BUDGET_MS, so junk
+// instances cannot hold the link task for long. Sets *mismatch when instances were seen but none
+// matched the pinned fp.
 static void discover(bool *mismatch)
 {
     s.ncand = 0;
@@ -336,30 +391,17 @@ static void discover(bool *mismatch)
     bool any_mismatch = false;
     int64_t budget_end_ms = now_ms() + DISCOVER_BUDGET_MS;
     for (const mdns_result_t *r = results; r; r = r->next) {
-        int64_t left_ms = budget_end_ms - now_ms();
-        if (left_ms <= 0) {
+        uint32_t left = budget_left(budget_end_ms);
+        if (left == 0) {
             ESP_LOGW(TAG, "discovery budget of %d ms spent, ignoring the remaining instances", DISCOVER_BUDGET_MS);
             break;
         }
-        if (!fp_matches(r, left_ms < DISCOVER_TIMEOUT_MS ? (uint32_t)left_ms : DISCOVER_TIMEOUT_MS, &any_mismatch)) {
+        if (!fp_matches(r, left, &any_mismatch)) {
             continue;
         }
         any_match = true;
         esp_ip4_addr_t addrs[4];
-        size_t na = 0;
-        for (const mdns_ip_addr_t *a = r->addr; a && na < 4; a = a->next) {
-            if (a->addr.type == ESP_IPADDR_TYPE_V4) {
-                addrs[na++] = a->addr.u_addr.ip4;
-            }
-        }
-        left_ms = budget_end_ms - now_ms();
-        if (na == 0 && r->hostname && left_ms > 0) {
-            ESP_LOGI(TAG, "%s has no address in the PTR answer, querying A", r->hostname);
-            uint32_t timeout_ms = left_ms < DISCOVER_TIMEOUT_MS ? (uint32_t)left_ms : DISCOVER_TIMEOUT_MS;
-            if (mdns_query_a(r->hostname, timeout_ms, &addrs[0]) == ESP_OK) {
-                na = 1;
-            }
-        }
+        size_t na = addrs_of(r, budget_left(budget_end_ms), addrs, 4);
         for (size_t i = 0; i < na && n < MAX_CANDIDATES; i++) {
             found[n].ip = addrs[i];
             found[n].port = r->port;
@@ -379,6 +421,79 @@ static void discover(bool *mismatch)
         }
     }
     *mismatch = any_mismatch && !any_match;
+}
+
+// TXT "pair": the pairing port, 1 to 5 decimal digits in 1..65535. 0 when absent or invalid.
+static uint16_t pair_port(const mdns_result_t *t)
+{
+    size_t len = 0;
+    const char *value = txt_get(t, "pair", &len);
+    if (!value || len == 0 || len > 5) {
+        return 0;
+    }
+    uint32_t port = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (value[i] < '0' || value[i] > '9') {
+            return 0;
+        }
+        port = port * 10 + (uint32_t)(value[i] - '0');
+    }
+    return port <= 65535 ? (uint16_t)port : 0;
+}
+
+// Unpaired: list the protocol-v1 daemons open for pairing, and hand the list to the UI when it
+// changes.
+static void browse(void)
+{
+    link_daemon_t found[LINK_MAX_DAEMONS];
+    size_t n = 0;
+    mdns_result_t *results = NULL;
+    esp_err_t err = mdns_query_ptr(SERVICE, SERVICE_PROTO, DISCOVER_TIMEOUT_MS, MAX_CANDIDATES, &results);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "mdns_query_ptr: %s", esp_err_to_name(err));
+    }
+    int64_t budget_end_ms = now_ms() + DISCOVER_BUDGET_MS;
+    for (const mdns_result_t *r = results; r && n < LINK_MAX_DAEMONS; r = r->next) {
+        uint32_t left = budget_left(budget_end_ms);
+        if (left == 0) {
+            break;
+        }
+        mdns_result_t *queried;
+        const mdns_result_t *t = txt_of(r, left, &queried);
+        size_t v_len = 0;
+        const char *v = txt_get(t, "v", &v_len);
+        uint16_t port = (!v || (v_len == 1 && v[0] == '1')) ? pair_port(t) : 0;
+        if (queried) {
+            mdns_query_results_free(queried);
+        }
+        esp_ip4_addr_t ip;
+        if (port == 0 || addrs_of(r, budget_left(budget_end_ms), &ip, 1) == 0) {
+            continue;
+        }
+        link_daemon_t *d = &found[n++];
+        memset(d, 0, sizeof(*d)); // zeroed padding keeps the memcmp below meaningful
+        strlcpy(d->name, r->instance_name ? r->instance_name : "?", sizeof(d->name));
+        d->ip = ip;
+        d->port = port;
+    }
+    if (results) {
+        mdns_query_results_free(results);
+    }
+
+    if (!s.listed || n != s.ndaemons || memcmp(found, s.daemons, n * sizeof(found[0])) != 0) {
+        memcpy(s.daemons, found, n * sizeof(found[0]));
+        s.ndaemons = n;
+        s.listed = true;
+        ESP_LOGI(TAG, "%u daemon(s) open for pairing", (unsigned)n);
+        for (size_t i = 0; i < n; i++) {
+            ESP_LOGI(TAG, "  %s at " IPSTR ", pairing port %u", s.daemons[i].name, IP2STR(&s.daemons[i].ip),
+                     s.daemons[i].port);
+        }
+        if (s.cbs.on_daemons) {
+            s.cbs.on_daemons(s.daemons, n);
+        }
+    }
+    s.browse_at_ms = now_ms() + BROWSE_INTERVAL_MS;
 }
 
 /* ---- Session control (link task only) ---- */
@@ -410,6 +525,14 @@ static void schedule_retry(const char *reason)
     report_retry();
 }
 
+// Wi-Fi is up: retry the paired daemon now, or look for daemons to pair with.
+static void resume(void)
+{
+    s.state = s.paired ? ST_BACKOFF : ST_BROWSE;
+    s.retry_at_ms = now_ms();
+    s.browse_at_ms = now_ms();
+}
+
 // Destroy the client (never from its own handler) and fence off its late events.
 static void drop_client(void)
 {
@@ -437,19 +560,16 @@ static void lost(const char *why)
     lost_as(why, "offline");
 }
 
-static void candidate_failed(const char *why);
-
-static void start_client(const cand_t *c)
+// Start a client for `uri`. `cert_pem` pins the daemon on wss and is NULL on plain ws. The
+// pinned cert is the only trust anchor and the chain check stays on. The daemon's IP changes,
+// so the name check is off, which also turns off SNI.
+static esp_err_t open_client(const char *uri, const char *cert_pem)
 {
-    char uri[48];
-    snprintf(uri, sizeof(uri), "wss://" IPSTR ":%u/", IP2STR(&c->ip), c->port);
     s.gen++;
     const esp_websocket_client_config_t cfg = {
         .uri = uri,
-        // The pinned cert is the only trust anchor and the chain check stays on. The daemon's
-        // IP changes, so the name check is off, which also turns off SNI.
-        .cert_pem = pinned_pem,
-        .skip_cert_common_name_check = true,
+        .cert_pem = cert_pem,
+        .skip_cert_common_name_check = cert_pem != NULL,
         .disable_auto_reconnect = true,
         .ping_interval_sec = PING_INTERVAL_S,
         .pingpong_timeout_sec = PINGPONG_TIMEOUT_S,
@@ -466,6 +586,17 @@ static void start_client(const cand_t *c)
     }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "websocket start: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+static void candidate_failed(const char *why);
+
+static void start_client(const cand_t *c)
+{
+    char uri[48];
+    snprintf(uri, sizeof(uri), "wss://" IPSTR ":%u/", IP2STR(&c->ip), c->port);
+    if (open_client(uri, s.pairing->cert_pem) != ESP_OK) {
         candidate_failed("websocket start failed");
         return;
     }
@@ -501,36 +632,223 @@ static void attempt(void)
     start_client(&s.cands[s.next_cand++]);
 }
 
-static void send_text(const char *json, size_t len)
+// "wd-" plus the C6's STA MAC. esp_wifi_get_mac asks the C6 for its real MAC;
+// esp_read_mac(ESP_MAC_WIFI_STA) returns a placeholder on the P4, which has no Wi-Fi radio.
+static esp_err_t device_id(char out[PROTO_DEVICE_ID_LEN])
 {
-    ESP_LOGI(TAG, "tx: %s", json);
+    uint8_t mac[6];
+    esp_err_t err = esp_wifi_get_mac(WIFI_IF_STA, mac);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_get_mac: %s", esp_err_to_name(err));
+        return err;
+    }
+    proto_device_id(out, mac);
+    return ESP_OK;
+}
+
+static void pair_failed(const char *why);
+
+// Send one text frame. `what` stands in for the JSON in the log when the JSON holds a secret.
+static void send_text(const char *json, size_t len, const char *what)
+{
+    ESP_LOGI(TAG, "tx: %s", what ? what : json);
     if (esp_websocket_client_send_text(s.client, json, (int)len, pdMS_TO_TICKS(SEND_TIMEOUT_MS)) < 0) {
-        lost("send failed");
+        if (s.state == ST_PAIRING) {
+            pair_failed("send failed");
+        } else {
+            lost("send failed");
+        }
     }
 }
 
 static void send_hello(void)
 {
-    // esp_wifi_get_mac asks the C6 for its real STA MAC. esp_read_mac(ESP_MAC_WIFI_STA) returns
-    // a placeholder on the P4, which has no Wi-Fi radio of its own.
-    uint8_t mac[6];
-    esp_err_t err = esp_wifi_get_mac(WIFI_IF_STA, mac);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_wifi_get_mac: %s", esp_err_to_name(err));
+    char device[PROTO_DEVICE_ID_LEN];
+    if (device_id(device) != ESP_OK) {
         lost("no MAC");
         return;
     }
-    char device[PROTO_DEVICE_ID_LEN];
-    proto_device_id(device, mac);
-    char buf[160];
-    size_t len =
-        proto_build_hello(buf, sizeof(buf), device, esp_app_get_description()->version, DISPLAY_H_RES, DISPLAY_V_RES);
+    char buf[256];
+    size_t len = proto_build_hello(buf, sizeof(buf), device, s.pairing->token, esp_app_get_description()->version,
+                                   DISPLAY_H_RES, DISPLAY_V_RES);
     if (len == 0) {
         lost("hello does not fit");
         return;
     }
-    send_text(buf, len);
+    send_text(buf, len, "hello (token redacted)");
 }
+
+/* ---- Pairing mode ---- */
+
+// Enter paired or unpaired mode and tell the UI. Paired, s.pairing holds the blob.
+static void set_paired(bool paired)
+{
+    s.paired = paired;
+    if (paired) {
+        if (proto_fp(s.pairing->cert_pem, s.fp) != ESP_OK) {
+            s.fp[0] = '\0'; // matches no instance, so the status will say why
+        }
+        ESP_LOGI(TAG, "paired with %s, pinned daemon fp %s", s.pairing->name, s.fp);
+    } else {
+        memset(s.pairing, 0, sizeof(*s.pairing));
+        s.fp[0] = '\0';
+        s.listed = false; // the next browse reports even an empty list
+    }
+    if (s.cbs.on_paired) {
+        s.cbs.on_paired(paired);
+    }
+}
+
+// Drop the pairing from RAM, because the daemon refused the token or the user asked, and list
+// again. The caller erases the blob first.
+static void unpair(const char *reason)
+{
+    ESP_LOGW(TAG, "unpairing: %s", reason);
+    drop_client();
+    if (s.cbs.on_down) {
+        s.cbs.on_down();
+    }
+    set_paired(false);
+    set_status("%s", reason);
+    if (s.state != ST_NO_IP) {
+        s.state = ST_BROWSE;
+        s.browse_at_ms = now_ms();
+    }
+}
+
+static void start_pairing(const link_daemon_t *d)
+{
+    char uri[48];
+    snprintf(uri, sizeof(uri), "ws://" IPSTR ":%u/", IP2STR(&d->ip), d->port);
+    s.pair_with = *d;
+    s.pair_up = false;
+    s.state = ST_PAIRING;
+    s.connect_deadline_ms = now_ms() + CONNECT_TIMEOUT_MS;
+    s.pair_deadline_ms = now_ms() + PAIR_TIMEOUT_MS;
+    set_status("pairing with %s", d->name);
+    if (open_client(uri, NULL) != ESP_OK) {
+        pair_failed("could not start");
+    }
+}
+
+// End the attempt, wipe its token, cert, and name, and go back to the list.
+static void end_attempt(void)
+{
+    drop_client();
+    pairing_end(s.session);
+    if (s.cbs.on_pair_code) {
+        s.cbs.on_pair_code(NULL, NULL);
+    }
+    s.state = ST_BROWSE;
+    s.browse_at_ms = now_ms();
+}
+
+// End the attempt with `why` on the status line.
+static void pair_failed(const char *why)
+{
+    char reason[sizeof(s.session->error)];
+    strlcpy(reason, why, sizeof(reason)); // `why` may live in the session wiped below
+    ESP_LOGW(TAG, "pairing with %s failed: %s", s.pair_with.name, reason);
+    end_attempt();
+    set_status("pairing failed: %s", reason);
+}
+
+// The person said No to the question, or did not answer it.
+static void pair_declined(const char *why)
+{
+    ESP_LOGW(TAG, "pairing with %s cancelled: %s", s.pair_with.name, why);
+    end_attempt();
+    set_status("pairing cancelled");
+}
+
+// Anyone on the plain pairing socket can send pair_result ok, so it proves nothing about the
+// daemon. Keep the result in RAM until the person confirms on the device that the desktop shows
+// the pairing. An honest daemon has already stored its side.
+static void ask_confirm(void)
+{
+    drop_client();
+    s.state = ST_CONFIRM;
+    s.pair_deadline_ms = now_ms() + CONFIRM_TIMEOUT_MS;
+    ESP_LOGI(TAG, "%s says paired, asking the person to confirm", s.session->result.name);
+    set_status("confirm the pairing below");
+    if (s.cbs.on_pair_confirm) {
+        s.cbs.on_pair_confirm(s.session->device, s.session->result.name);
+    }
+}
+
+// The person said Yes: save the pairing and connect.
+static void pair_done(void)
+{
+    if (pairing_save(&s.session->result) != ESP_OK) {
+        pair_failed("could not save the pairing");
+        return;
+    }
+    *s.pairing = s.session->result;
+    pairing_end(s.session);
+    if (s.cbs.on_pair_code) {
+        s.cbs.on_pair_code(NULL, NULL);
+    }
+    ESP_LOGI(TAG, "pairing saved, link task stack %u bytes unused", (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    set_paired(true);
+    set_status("paired with %s", s.pairing->name);
+    s.backoff_idx = 0;
+    s.state = ST_BACKOFF;
+    s.retry_at_ms = now_ms();
+}
+
+static void pair_connected(void)
+{
+    s.pair_up = true;
+    char device[PROTO_DEVICE_ID_LEN];
+    if (device_id(device) != ESP_OK) {
+        pair_failed("no MAC");
+        return;
+    }
+    char buf[160];
+    size_t len = pairing_begin(s.session, device, buf, sizeof(buf));
+    if (len == 0) {
+        pair_failed(s.session->error);
+        return;
+    }
+    send_text(buf, len, NULL);
+}
+
+static void handle_pair_msg(const char *json, size_t len)
+{
+    ESP_LOGI(TAG, "rx: %.*s", (int)(len > 160 ? 160 : len), json);
+    proto_msg_t *m = s.msg;
+    if (proto_parse(json, len, m) != ESP_OK) {
+        pair_failed("bad message from the daemon");
+        return;
+    }
+    if (m->type == PROTO_MSG_UNKNOWN) {
+        ESP_LOGW(TAG, "unknown message type \"%s\", ignored", m->unknown_t);
+        return;
+    }
+    char reply[160];
+    size_t reply_len;
+    switch (pairing_feed(s.session, m, reply, sizeof(reply), &reply_len)) {
+    case PAIRING_REPLY:
+        send_text(reply, reply_len, NULL);
+        break;
+    case PAIRING_CODE:
+        // Every input to the code crossed the wire in the clear, so the code is no secret.
+        ESP_LOGI(TAG, "pairing code %s", s.session->code);
+        if (s.cbs.on_pair_code) {
+            s.cbs.on_pair_code(s.session->code, s.session->result.name);
+        }
+        set_status("type the code into watchdeck on %s", s.session->result.name);
+        break;
+    case PAIRING_DONE:
+        ask_confirm();
+        break;
+    case PAIRING_FAILED:
+        pair_failed(s.session->error);
+        break;
+    }
+}
+
+/* ---- Paired session ---- */
 
 static void handle_msg(const char *json, size_t len)
 {
@@ -548,7 +866,15 @@ static void handle_msg(const char *json, size_t len)
         break;
     case PROTO_MSG_ERROR:
         ESP_LOGE(TAG, "daemon error %s: %s", m->error.code, m->error.msg);
-        set_status("daemon error: %s", m->error.code);
+        // Only the pinned daemon can say this, over the TLS session, so it is safe to obey.
+        if (strcmp(m->error.code, "unauthorized") == 0) {
+            // pairing_erase logs its own failure. The daemon refuses this token, so a blob that
+            // outlives a failed erase is refused again at the next connect.
+            pairing_erase();
+            unpair("the desktop forgot this device, pair again");
+        } else {
+            set_status("daemon error: %s", m->error.code);
+        }
         break;
     case PROTO_MSG_LAYOUT:
     case PROTO_MSG_RESULT:
@@ -563,6 +889,9 @@ static void handle_msg(const char *json, size_t len)
     case PROTO_MSG_UNKNOWN:
         ESP_LOGW(TAG, "unknown message type \"%s\", ignored", m->unknown_t);
         break;
+    default:
+        ESP_LOGW(TAG, "pairing message on the session, ignored");
+        break;
     }
 }
 
@@ -572,13 +901,18 @@ static void handle_event(link_ev_t *ev)
     switch (ev->type) {
     case EV_GOT_IP:
         s.backoff_idx = 0;
-        if (s.state == ST_NO_IP || s.state == ST_BACKOFF) {
-            s.state = ST_BACKOFF;
-            s.retry_at_ms = now_ms();
+        if (s.state == ST_NO_IP || s.state == ST_BACKOFF || s.state == ST_BROWSE) {
+            resume();
         }
         break;
     case EV_WIFI_DOWN:
         if (s.state != ST_NO_IP) {
+            if (s.state == ST_PAIRING || s.state == ST_CONFIRM) {
+                pairing_end(s.session);
+                if (s.cbs.on_pair_code) {
+                    s.cbs.on_pair_code(NULL, NULL);
+                }
+            }
             drop_client();
             if (s.cbs.on_down) {
                 s.cbs.on_down();
@@ -591,12 +925,16 @@ static void handle_event(link_ev_t *ev)
         if (current && s.state == ST_CONNECTING) {
             s.state = ST_UP;
             send_hello();
+        } else if (current && s.state == ST_PAIRING && !s.pair_up) {
+            pair_connected();
         }
         break;
     case EV_WS_DOWN:
         if (current && s.client) {
             if (s.state == ST_CONNECTING) {
                 candidate_failed("connection closed");
+            } else if (s.state == ST_PAIRING) {
+                pair_failed("connection closed");
             } else {
                 lost("connection closed");
             }
@@ -604,11 +942,17 @@ static void handle_event(link_ev_t *ev)
         break;
     case EV_WS_BAD:
         if (current && s.client) {
-            lost("bad frame");
+            if (s.state == ST_PAIRING) {
+                pair_failed("bad frame");
+            } else {
+                lost("bad frame");
+            }
         }
         break;
     case EV_WS_BAD_CERT:
-        if (current && s.client) {
+        if (current && s.client && s.state == ST_PAIRING) {
+            pair_failed("connection closed"); // plain ws has no cert, so this is just a drop
+        } else if (current && s.client) {
             ESP_LOGE(TAG, "the daemon at candidate %u presented a cert other than the pinned one",
                      (unsigned)s.next_cand);
             s.wrong_cert = true;
@@ -618,6 +962,8 @@ static void handle_event(link_ev_t *ev)
     case EV_WS_MSG:
         if (current && s.state == ST_UP) {
             handle_msg(ev->msg.data, ev->msg.len);
+        } else if (current && s.state == ST_PAIRING) {
+            handle_pair_msg(ev->msg.data, ev->msg.len);
         }
         free(ev->msg.data);
         break;
@@ -626,10 +972,41 @@ static void handle_event(link_ev_t *ev)
             char buf[PROTO_ID_MAX + 64];
             size_t len = proto_build_press(buf, sizeof(buf), ev->press.btn, ev->press.seq);
             if (len > 0) {
-                send_text(buf, len);
+                send_text(buf, len, NULL);
             }
         } else {
             ESP_LOGW(TAG, "link down, press %u dropped", (unsigned)ev->press.seq);
+        }
+        break;
+    case EV_PAIR:
+        if (!s.paired && s.state == ST_BROWSE) {
+            start_pairing(&ev->daemon);
+        } else {
+            ESP_LOGW(TAG, "pair request ignored: not listing daemons");
+        }
+        break;
+    case EV_PAIR_CANCEL:
+        if (s.state == ST_PAIRING) {
+            pair_failed("cancelled");
+        } else if (s.state == ST_CONFIRM) {
+            pair_declined("the person said No");
+        }
+        break;
+    case EV_PAIR_CONFIRM:
+        if (s.state == ST_CONFIRM) {
+            pair_done();
+        }
+        break;
+    case EV_FORGET:
+        if (s.paired) {
+            // A blob that survives a failed erase comes back at the next boot, and the daemon
+            // still accepts its token, so stay paired and say so.
+            esp_err_t err = pairing_erase();
+            if (err == ESP_OK) {
+                unpair("pairing forgotten");
+            } else {
+                set_status("forget failed: %s", esp_err_to_name(err));
+            }
         }
         break;
     }
@@ -639,22 +1016,48 @@ static void link_task(void *arg)
 {
     for (;;) {
         TickType_t wait = pdMS_TO_TICKS(1000);
-        if (s.state == ST_BACKOFF) {
-            int64_t left = s.retry_at_ms - now_ms();
+        int64_t due_ms = s.state == ST_BACKOFF ? s.retry_at_ms : s.state == ST_BROWSE ? s.browse_at_ms : -1;
+        if (due_ms >= 0) {
+            int64_t left = due_ms - now_ms();
             wait = left <= 0 ? 0 : pdMS_TO_TICKS(left < 1000 ? left : 1000) + 1;
         }
         link_ev_t ev;
         if (xQueueReceive(s.queue, &ev, wait) == pdTRUE) {
             handle_event(&ev);
         }
-        if (s.state == ST_BACKOFF) {
-            if (now_ms() >= s.retry_at_ms) {
+        int64_t now = now_ms();
+        switch (s.state) {
+        case ST_BACKOFF:
+            if (now >= s.retry_at_ms) {
                 attempt();
             } else {
                 report_retry();
             }
-        } else if (s.state == ST_CONNECTING && now_ms() > s.connect_deadline_ms) {
-            candidate_failed("connect timeout");
+            break;
+        case ST_CONNECTING:
+            if (now > s.connect_deadline_ms) {
+                candidate_failed("connect timeout");
+            }
+            break;
+        case ST_BROWSE:
+            if (now >= s.browse_at_ms) {
+                browse();
+            }
+            break;
+        case ST_PAIRING:
+            if (!s.pair_up && now > s.connect_deadline_ms) {
+                pair_failed("could not connect");
+            } else if (now > s.pair_deadline_ms) {
+                pair_failed("timed out");
+            }
+            break;
+        case ST_CONFIRM:
+            if (now > s.pair_deadline_ms) {
+                pair_declined("no answer");
+            }
+            break;
+        default:
+            break;
         }
     }
 }
@@ -663,16 +1066,20 @@ esp_err_t link_start(const link_cbs_t *cbs)
 {
     ESP_RETURN_ON_FALSE(cbs && !s.queue, ESP_ERR_INVALID_STATE, TAG, "bad start");
     s.cbs = *cbs;
-    if (pinned_pem[0] == '\0') {
-        ESP_LOGE(TAG, "no pinned daemon cert; S3b pairing provides it");
-        set_status("no pinned daemon cert, not connecting");
-        return ESP_ERR_NOT_FOUND;
-    }
-    ESP_RETURN_ON_ERROR(proto_fp(pinned_pem, s.fp), TAG, "fp");
-    ESP_LOGI(TAG, "pinned daemon fp %s", s.fp);
     s.msg = heap_caps_malloc(sizeof(*s.msg), MALLOC_CAP_SPIRAM);
+    s.pairing = heap_caps_calloc(1, sizeof(*s.pairing), MALLOC_CAP_SPIRAM);
+    s.session = heap_caps_calloc(1, sizeof(*s.session), MALLOC_CAP_SPIRAM);
     s.queue = xQueueCreate(QUEUE_LEN, sizeof(link_ev_t));
-    ESP_RETURN_ON_FALSE(s.msg && s.queue, ESP_ERR_NO_MEM, TAG, "alloc");
+    ESP_RETURN_ON_FALSE(s.msg && s.pairing && s.session && s.queue, ESP_ERR_NO_MEM, TAG, "alloc");
+
+    esp_err_t err = pairing_load(s.pairing);
+    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
+        ESP_LOGE(TAG, "the stored pairing is unreadable (%s), starting unpaired", esp_err_to_name(err));
+    }
+    set_paired(err == ESP_OK);
+    if (!s.paired) {
+        ESP_LOGI(TAG, "not paired");
+    }
 
     ESP_RETURN_ON_ERROR(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, on_net_event, NULL), TAG, "ip evt");
     ESP_RETURN_ON_ERROR(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, on_net_event, NULL), TAG,
@@ -682,11 +1089,13 @@ esp_err_t link_start(const link_cbs_t *cbs)
     esp_netif_ip_info_t info = {0};
     esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     if (sta && esp_netif_get_ip_info(sta, &info) == ESP_OK && info.ip.addr != 0) {
-        s.state = ST_BACKOFF;
-        s.retry_at_ms = now_ms();
+        resume();
     } else {
         s.state = ST_NO_IP;
         set_status("waiting for Wi-Fi");
+    }
+    if (!s.paired && s.state != ST_NO_IP) {
+        set_status("not paired");
     }
     ESP_RETURN_ON_FALSE(xTaskCreate(link_task, "link", TASK_STACK, NULL, 5, NULL) == pdPASS, ESP_ERR_NO_MEM, TAG,
                         "task");
@@ -700,4 +1109,33 @@ esp_err_t link_press(const char *btn, uint32_t seq)
     ESP_RETURN_ON_FALSE(strlen(btn) < sizeof(ev.press.btn), ESP_ERR_INVALID_ARG, TAG, "id too long");
     strcpy(ev.press.btn, btn);
     return post(&ev) ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+esp_err_t link_pair(const link_daemon_t *daemon)
+{
+    ESP_RETURN_ON_FALSE(s.queue && daemon, ESP_ERR_INVALID_STATE, TAG, "not started");
+    link_ev_t ev = {.type = EV_PAIR, .daemon = *daemon};
+    return post(&ev) ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+static esp_err_t post_type(ev_type_t type)
+{
+    ESP_RETURN_ON_FALSE(s.queue, ESP_ERR_INVALID_STATE, TAG, "not started");
+    link_ev_t ev = {.type = type};
+    return post(&ev) ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+esp_err_t link_pair_cancel(void)
+{
+    return post_type(EV_PAIR_CANCEL);
+}
+
+esp_err_t link_pair_confirm(void)
+{
+    return post_type(EV_PAIR_CONFIRM);
+}
+
+esp_err_t link_forget(void)
+{
+    return post_type(EV_FORGET);
 }

@@ -1,26 +1,54 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "esp_netif_ip_addr.h"
 #include "proto.h"
+
+#define LINK_MAX_DAEMONS 4 // daemons open for pairing that the unpaired screen lists
+
+/** A daemon open for pairing, as mDNS shows it. */
+typedef struct {
+    char name[PROTO_NAME_MAX]; // mDNS instance name, maybe truncated
+    esp_ip4_addr_t ip;
+    uint16_t port; // its pairing port, from TXT "pair"
+} link_daemon_t;
 
 /**
  * Callbacks into the UI. All run on the link task, so they may block briefly (they take the
  * LVGL lock) but must not call back into link_*. Any may be NULL.
  */
 typedef struct {
-    void (*on_status)(const char *text);             // "searching", "connected to <name>", ...
-    void (*on_layout)(const proto_layout_t *layout); // valid only during the call
-    void (*on_down)(void);                           // session lost, grid must stop taking presses
-    void (*on_result)(const proto_result_t *result); // valid only during the call
+    void (*on_status)(const char *text);                           // "searching", "connected to <name>", ...
+    void (*on_layout)(const proto_layout_t *layout);               // valid only during the call
+    void (*on_down)(void);                                         // session lost, grid must stop taking presses
+    void (*on_result)(const proto_result_t *result);               // valid only during the call
+    void (*on_paired)(bool paired);                                // at start and on every change
+    void (*on_daemons)(const link_daemon_t *daemons, size_t n);    // unpaired: the pairable list changed
+    void (*on_pair_code)(const char *code, const char *name);      // show the code, or NULL when the attempt ends
+    void (*on_pair_confirm)(const char *device, const char *name); // ask: does `name` show "Paired <device>"?
 } link_cbs_t;
 
 /**
- * Start the link task: discover the daemon over mDNS, connect, and keep reconnecting with
- * backoff. Call after wifi_start(). `cbs` is copied.
+ * Start the link task. Paired, it finds the daemon over mDNS, connects, and keeps reconnecting
+ * with backoff. Unpaired, it lists the daemons open for pairing. Call after wifi_start().
+ * `cbs` is copied.
  */
 esp_err_t link_start(const link_cbs_t *cbs);
 
 /** Queue a press for the link task to send. Safe from any task. Dropped while the link is down. */
 esp_err_t link_press(const char *btn, uint32_t seq);
+
+/** Pair with `daemon`. Ignored unless unpaired and idle. Safe from any task. */
+esp_err_t link_pair(const link_daemon_t *daemon);
+
+/** Abandon the pairing attempt in progress, or answer No to its question. Safe from any task. */
+esp_err_t link_pair_cancel(void);
+
+/** Answer Yes to the attempt's question: save the pairing and connect. Safe from any task. */
+esp_err_t link_pair_confirm(void);
+
+/** Forget the pairing and go back to the unpaired list. Safe from any task. */
+esp_err_t link_forget(void);

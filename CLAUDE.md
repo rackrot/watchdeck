@@ -31,6 +31,7 @@ Add new tools to `mise.toml`, not to CI or the hooks. The hooks call the mise-pi
 - 32 MB PSRAM at 200 MHz, 16 MB flash.
 - The board enumerates as `/dev/ttyUSB0`. Serial access needs the `uucp` group.
 - The board advertises `watchdeck.local` via mDNS (hostname only, no services yet).
+- The board keeps its pairing (token, daemon name, pinned cert) as one NVS blob, namespace `watchdeck`, key `pairing`. It saves the blob only after a person taps Yes on its "Paired <device>?" question, and holding Forget pairing for 2 s erases it.
 - The second USB-C port (J16, native high-speed USB, device only, separate from the CH340 console port) exposes the raw TF card to a host as a mass-storage drive. The firmware reads `wifi.txt`, then releases its own mount and hands the card to USB. Host writes apply on the next reboot.
 - USB MSC writes are acked to the host before they reach the card, and card write errors never reach the host (upstream esp_tinyusb behavior, unchanged as of 2026-09), so eject before unplugging.
 - Pin map, from Elecrow's V1.2 schematic and examples:
@@ -48,11 +49,16 @@ Add new tools to `mise.toml`, not to CI or the hooks. The hooks call the mise-pi
 - The C6 runs ESP-Hosted slave 2.12.3 and the host is 3.0.9. Hosted logs a "major version mismatch" line, which is only advisory. Don't OTA the C6 without asking.
 - `monitor` needs a real TTY. Without one, read the boot log with pyserial from the IDF Python env (`~/.espressif/python_env/idf6.1_py3.12_env/bin/python`). Opening the port resets the board, so every capture starts from boot.
 
+## Daemon facts
+
+- The daemon serves `wss` on 47820 and opens plain `ws` on 47821 only while the pairing dialog is open. `site/src/protocol.md` is the wire spec.
+- Its TLS identity and `state.json` (device id → SHA-256 of its token) live in `~/.config/dev.rackrot.watchdeck/`. A new identity makes every paired device pair again, so tests use temp dirs.
+
 ## Conventions
 
 - `firmware/sdkconfig` is generated and gitignored. Persistent config goes in `firmware/sdkconfig.defaults`. Kconfig silently drops unknown names, so check the generated `sdkconfig` after adding one.
 - C follows ESP-IDF style (4 spaces, `.clang-format`). TS/JSON uses Biome, from `app/biome.json`. Run biome from `app/`, because the repo root errors with "nested root configuration".
-- Never commit secrets. Wi-Fi credentials live in the gitignored `firmware/sdkconfig.defaults.local` or in `wifi.txt` on the SD card.
+- Never commit secrets. Wi-Fi credentials live in the gitignored `firmware/sdkconfig.defaults.local` or in `wifi.txt` on the SD card. Never print device tokens or `identity.key`; both sides redact tokens in their logs.
 
 ## CI
 

@@ -3,13 +3,16 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use futures_util::{SinkExt, StreamExt};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
+use tokio::sync::broadcast;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
@@ -26,13 +29,21 @@ use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::Message as Ws;
 use tokio_tungstenite::{client_async, connect_async, WebSocketStream};
 use watchdeck_lib::daemon::actions::{ActionResult, Runner};
-use watchdeck_lib::daemon::protocol::{ErrorCode, Message};
-use watchdeck_lib::daemon::server::{DaemonEvent, Server};
+use watchdeck_lib::daemon::pairing::{Pairing, PairingState};
+use watchdeck_lib::daemon::protocol::{
+    decode_hex, encode_hex, pairing_code, ErrorCode, Message, Token,
+};
+use watchdeck_lib::daemon::server::{DaemonEvent, DeviceInfo, Devices, Server};
+use watchdeck_lib::daemon::store::Store;
 use watchdeck_lib::daemon::tls::Identity;
 
 type Client = WebSocketStream<TlsStream<TcpStream>>;
 
+/// Paired in every test daemon before it starts.
 const DEVICE: &str = "wd-000000000001";
+const TOKEN: [u8; 32] = [7; 32];
+const OTHER: &str = "wd-000000000002";
+const OTHER_TOKEN: [u8; 32] = [8; 32];
 
 /// Accepts one exact end-entity cert. Handshake signatures are still verified.
 #[derive(Debug)]
@@ -104,15 +115,50 @@ fn stub_runner() -> Runner {
     })
 }
 
-async fn start() -> (SocketAddr, tokio::sync::broadcast::Receiver<DaemonEvent>) {
+struct Daemon {
+    addr: SocketAddr,
+    events: broadcast::Receiver<DaemonEvent>,
+    devices: Devices,
+    pairing: Arc<Pairing>,
+    _state: tempfile::TempDir,
+}
+
+/// A daemon on an ephemeral port with `DEVICE` paired, whose pairing listener binds `pair_addr`
+/// for at most `window` once started, and whose actions `runner` runs.
+async fn start_with(pair_addr: SocketAddr, window: Duration, runner: Runner) -> Daemon {
+    let state = tempfile::tempdir().unwrap();
     let tls = identity().server_config().unwrap();
-    let server = Server::bind("127.0.0.1:0", tls, stub_runner())
+    let store = Store::load(state.path()).unwrap();
+    let server = Server::bind("127.0.0.1:0", tls, runner, store)
         .await
         .unwrap();
-    let addr = server.local_addr().unwrap();
-    let events = server.subscribe();
+    let devices = server.devices();
+    devices.pair(DEVICE, Sha256::digest(TOKEN).into()).unwrap();
+    let pairing = Pairing::new(
+        pair_addr,
+        window,
+        "test-daemon".into(),
+        identity().cert_pem().into(),
+        devices.clone(),
+    );
+    let daemon = Daemon {
+        addr: server.local_addr().unwrap(),
+        events: server.subscribe(),
+        devices,
+        pairing,
+        _state: state,
+    };
     tokio::spawn(server.run());
-    (addr, events)
+    daemon
+}
+
+async fn start() -> Daemon {
+    start_with(
+        "127.0.0.1:0".parse().unwrap(),
+        Duration::from_secs(30),
+        stub_runner(),
+    )
+    .await
 }
 
 /// Opens wss to `addr` pinned to `pin`'s cert, over TLS 1.2 like the device's mbedTLS.
@@ -143,11 +189,12 @@ async fn connect(addr: SocketAddr) -> Client {
     connect_pinned(addr, identity()).await.unwrap()
 }
 
-fn hello(v: u32, device: &str) -> Ws {
+fn hello(v: u32, device: &str, token: Option<&[u8; 32]>) -> Ws {
     Ws::text(
         serde_json::to_string(&Message::Hello {
             v,
             device: device.into(),
+            token: token.map(|t| Token(encode_hex(t))),
             fw: "0.2.0".into(),
             screen: [1024, 600],
         })
@@ -165,7 +212,7 @@ fn press(btn: &str, seq: u64) -> Ws {
     )
 }
 
-async fn recv(c: &mut Client) -> Message {
+async fn recv<S: AsyncRead + AsyncWrite + Unpin>(c: &mut WebSocketStream<S>) -> Message {
     loop {
         match c.next().await.expect("stream ended").unwrap() {
             Ws::Text(t) => return serde_json::from_str(t.as_str()).unwrap(),
@@ -176,7 +223,7 @@ async fn recv(c: &mut Client) -> Message {
 }
 
 /// Reads until the server ends the connection, however it chooses to (close frame, EOF or reset).
-async fn expect_closed(c: &mut Client) {
+async fn expect_closed<S: AsyncRead + AsyncWrite + Unpin>(c: &mut WebSocketStream<S>) {
     loop {
         match c.next().await {
             None | Some(Err(_)) | Some(Ok(Ws::Close(_))) => return,
@@ -185,9 +232,17 @@ async fn expect_closed(c: &mut Client) {
     }
 }
 
-async fn handshake(addr: SocketAddr, device: &str) -> Client {
+/// Expects the server to end the connection without sending anything first.
+async fn expect_closed_unanswered<S: AsyncRead + AsyncWrite + Unpin>(c: &mut WebSocketStream<S>) {
+    match c.next().await {
+        None | Some(Err(_)) | Some(Ok(Ws::Close(_))) => {}
+        Some(Ok(frame)) => panic!("expected the connection to end, got {frame:?}"),
+    }
+}
+
+async fn handshake(addr: SocketAddr, device: &str, token: &[u8; 32]) -> Client {
     let mut c = connect(addr).await;
-    c.send(hello(1, device)).await.unwrap();
+    c.send(hello(1, device, Some(token))).await.unwrap();
     assert!(matches!(recv(&mut c).await, Message::Welcome { .. }));
     assert!(matches!(recv(&mut c).await, Message::Layout { .. }));
     c
@@ -195,7 +250,8 @@ async fn handshake(addr: SocketAddr, device: &str) -> Client {
 
 #[tokio::test]
 async fn a_client_pinning_another_cert_fails_the_handshake() {
-    let (addr, _events) = start().await;
+    let daemon = start().await;
+    let addr = daemon.addr;
     let dir = tempfile::tempdir().unwrap();
     let other = Identity::load_or_create(dir.path()).unwrap();
     assert_ne!(other.fp(), identity().fp());
@@ -217,10 +273,11 @@ async fn a_client_pinning_another_cert_fails_the_handshake() {
 
 #[tokio::test]
 async fn plain_ws_is_refused() {
-    let (addr, _events) = start().await;
+    let daemon = start().await;
+    let addr = daemon.addr;
     assert!(connect_async(format!("ws://{addr}/")).await.is_err());
     // The refused attempt must not have taken the listener down.
-    handshake(addr, DEVICE).await;
+    handshake(addr, DEVICE, &TOKEN).await;
 }
 
 /// Reads a raw socket until the server closes it, returning how long that took.
@@ -237,7 +294,8 @@ async fn time_to_close(mut tcp: TcpStream, started: Instant) -> Duration {
 // Real clock, like the other timeout tests.
 #[tokio::test]
 async fn a_socket_that_sends_nothing_is_closed_after_five_seconds() {
-    let (addr, _events) = start().await;
+    let daemon = start().await;
+    let addr = daemon.addr;
     let started = Instant::now();
     let tcp = TcpStream::connect(addr).await.unwrap();
     let waited = time_to_close(tcp, started).await;
@@ -247,7 +305,8 @@ async fn a_socket_that_sends_nothing_is_closed_after_five_seconds() {
 
 #[tokio::test]
 async fn a_client_hello_that_stalls_midway_is_closed_after_five_seconds() {
-    let (addr, _events) = start().await;
+    let daemon = start().await;
+    let addr = daemon.addr;
     let started = Instant::now();
     let mut tcp = TcpStream::connect(addr).await.unwrap();
     // A TLS record header announcing 240 bytes of handshake, then 4 of them.
@@ -261,7 +320,8 @@ async fn a_client_hello_that_stalls_midway_is_closed_after_five_seconds() {
 
 #[tokio::test]
 async fn connections_beyond_64_are_dropped_until_one_frees_up() {
-    let (addr, _events) = start().await;
+    let daemon = start().await;
+    let addr = daemon.addr;
     let mut held = Vec::new();
     for _ in 0..64 {
         held.push(TcpStream::connect(addr).await.unwrap());
@@ -283,15 +343,16 @@ async fn connections_beyond_64_are_dropped_until_one_frees_up() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    c.send(hello(1, DEVICE)).await.unwrap();
+    c.send(hello(1, DEVICE, Some(&TOKEN))).await.unwrap();
     assert!(matches!(recv(&mut c).await, Message::Welcome { .. }));
 }
 
 #[tokio::test]
 async fn hello_gets_welcome_then_the_layout() {
-    let (addr, _events) = start().await;
+    let daemon = start().await;
+    let addr = daemon.addr;
     let mut c = connect(addr).await;
-    c.send(hello(1, DEVICE)).await.unwrap();
+    c.send(hello(1, DEVICE, Some(&TOKEN))).await.unwrap();
 
     let Message::Welcome { v, name } = recv(&mut c).await else {
         panic!("expected welcome")
@@ -317,8 +378,9 @@ async fn hello_gets_welcome_then_the_layout() {
 
 #[tokio::test]
 async fn press_hello_gets_one_ok_result() {
-    let (addr, _events) = start().await;
-    let mut c = handshake(addr, DEVICE).await;
+    let daemon = start().await;
+    let addr = daemon.addr;
+    let mut c = handshake(addr, DEVICE, &TOKEN).await;
     c.send(press("hello", 17)).await.unwrap();
     assert_eq!(
         recv(&mut c).await,
@@ -335,8 +397,9 @@ async fn press_hello_gets_one_ok_result() {
 
 #[tokio::test]
 async fn press_unknown_button_fails_without_running_anything() {
-    let (addr, _events) = start().await;
-    let mut c = handshake(addr, DEVICE).await;
+    let daemon = start().await;
+    let addr = daemon.addr;
+    let mut c = handshake(addr, DEVICE, &TOKEN).await;
     c.send(press("nope", 3)).await.unwrap();
     assert_eq!(
         recv(&mut c).await,
@@ -353,8 +416,9 @@ async fn press_unknown_button_fails_without_running_anything() {
 
 #[tokio::test]
 async fn unknown_message_type_does_not_end_the_session() {
-    let (addr, _events) = start().await;
-    let mut c = handshake(addr, DEVICE).await;
+    let daemon = start().await;
+    let addr = daemon.addr;
+    let mut c = handshake(addr, DEVICE, &TOKEN).await;
     c.send(Ws::text(r#"{"t":"future","x":1}"#)).await.unwrap();
     c.send(press("hello", 1)).await.unwrap();
     assert!(matches!(
@@ -365,9 +429,10 @@ async fn unknown_message_type_does_not_end_the_session() {
 
 #[tokio::test]
 async fn wrong_version_gets_an_error_then_close() {
-    let (addr, _events) = start().await;
+    let daemon = start().await;
+    let addr = daemon.addr;
     let mut c = connect(addr).await;
-    c.send(hello(2, DEVICE)).await.unwrap();
+    c.send(hello(2, DEVICE, Some(&TOKEN))).await.unwrap();
     let Message::Error { code, .. } = recv(&mut c).await else {
         panic!("expected error")
     };
@@ -382,7 +447,8 @@ async fn any_hello_with_a_wrong_version_gets_a_version_error() {
         r#"{"t":"hello","v":-1}"#,
         r#"{"t":"hello","v":"1"}"#,
     ] {
-        let (addr, _events) = start().await;
+        let daemon = start().await;
+        let addr = daemon.addr;
         let mut c = connect(addr).await;
         c.send(Ws::text(hello)).await.unwrap();
         let Message::Error { code, .. } = recv(&mut c).await else {
@@ -395,8 +461,9 @@ async fn any_hello_with_a_wrong_version_gets_a_version_error() {
 
 #[tokio::test]
 async fn a_button_id_over_64_bytes_gets_bad_request_then_close() {
-    let (addr, _events) = start().await;
-    let mut c = handshake(addr, DEVICE).await;
+    let daemon = start().await;
+    let addr = daemon.addr;
+    let mut c = handshake(addr, DEVICE, &TOKEN).await;
     c.send(press(&"a".repeat(65), 1)).await.unwrap();
     let Message::Error { code, .. } = recv(&mut c).await else {
         panic!("expected error")
@@ -407,7 +474,8 @@ async fn a_button_id_over_64_bytes_gets_bad_request_then_close() {
 
 #[tokio::test]
 async fn malformed_hello_gets_bad_request_then_close() {
-    let (addr, _events) = start().await;
+    let daemon = start().await;
+    let addr = daemon.addr;
     let mut c = connect(addr).await;
     c.send(Ws::text("not json")).await.unwrap();
     let Message::Error { code, .. } = recv(&mut c).await else {
@@ -421,7 +489,8 @@ async fn malformed_hello_gets_bad_request_then_close() {
 // waits on socket I/O, which fires the daemon's timers before the traffic under test arrives.
 #[tokio::test]
 async fn silence_after_connecting_closes_after_five_seconds() {
-    let (addr, _events) = start().await;
+    let daemon = start().await;
+    let addr = daemon.addr;
     // The deadline starts at the TCP accept, so the TLS and WebSocket handshakes count too.
     let started = Instant::now();
     let mut c = connect(addr).await;
@@ -433,10 +502,11 @@ async fn silence_after_connecting_closes_after_five_seconds() {
 
 #[tokio::test]
 async fn a_session_silent_for_thirty_seconds_is_dropped() {
-    let (addr, mut events) = start().await;
-    let mut c = handshake(addr, DEVICE).await;
+    let mut daemon = start().await;
+    let addr = daemon.addr;
+    let mut c = handshake(addr, DEVICE, &TOKEN).await;
     assert_eq!(
-        events.recv().await.unwrap(),
+        daemon.events.recv().await.unwrap(),
         DaemonEvent::DeviceConnected(DEVICE.into())
     );
     let started = Instant::now();
@@ -445,37 +515,41 @@ async fn a_session_silent_for_thirty_seconds_is_dropped() {
     assert!(waited >= Duration::from_secs(29), "{waited:?}");
     assert!(waited < Duration::from_secs(31), "{waited:?}");
     assert_eq!(
-        events.recv().await.unwrap(),
+        daemon.events.recv().await.unwrap(),
         DaemonEvent::DeviceDisconnected(DEVICE.into())
     );
 }
 
 #[tokio::test]
 async fn pings_are_answered_with_pongs() {
-    let (addr, _events) = start().await;
-    let mut c = handshake(addr, DEVICE).await;
+    let daemon = start().await;
+    let addr = daemon.addr;
+    let mut c = handshake(addr, DEVICE, &TOKEN).await;
     c.send(Ws::Ping(vec![7].into())).await.unwrap();
     let frame = c.next().await.unwrap().unwrap();
     assert!(matches!(frame, Ws::Pong(p) if p.as_ref() == [7]));
 }
 
 #[tokio::test]
-async fn a_message_over_16_kb_closes_the_session() {
-    let (addr, _events) = start().await;
-    let mut c = handshake(addr, DEVICE).await;
+async fn a_valid_message_over_16_kb_closes_the_session_unanswered() {
+    let daemon = start().await;
+    let addr = daemon.addr;
+    let mut c = handshake(addr, DEVICE, &TOKEN).await;
+    // A press the daemon would run but for its size: the padding is a field it ignores.
     let big = format!(
-        r#"{{"t":"press","btn":"{}","seq":1}}"#,
+        r#"{{"t":"press","btn":"hello","seq":1,"pad":"{}"}}"#,
         "a".repeat(16 * 1024)
     );
     c.send(Ws::text(big)).await.unwrap();
-    expect_closed(&mut c).await;
+    expect_closed_unanswered(&mut c).await;
 }
 
 #[tokio::test]
 async fn reconnecting_device_replaces_its_old_session() {
-    let (addr, mut events) = start().await;
-    let mut old = handshake(addr, DEVICE).await;
-    let mut new = handshake(addr, DEVICE).await;
+    let mut daemon = start().await;
+    let addr = daemon.addr;
+    let mut old = handshake(addr, DEVICE, &TOKEN).await;
+    let mut new = handshake(addr, DEVICE, &TOKEN).await;
 
     expect_closed(&mut old).await;
 
@@ -487,15 +561,512 @@ async fn reconnecting_device_replaces_its_old_session() {
     ));
 
     assert_eq!(
-        events.recv().await.unwrap(),
+        daemon.events.recv().await.unwrap(),
         DaemonEvent::DeviceConnected(DEVICE.into())
     );
     assert_eq!(
-        events.recv().await.unwrap(),
+        daemon.events.recv().await.unwrap(),
         DaemonEvent::DeviceDisconnected(DEVICE.into())
     );
     assert_eq!(
-        events.recv().await.unwrap(),
+        daemon.events.recv().await.unwrap(),
         DaemonEvent::DeviceConnected(DEVICE.into())
     );
+}
+
+// ---- Authentication on 47820 ----
+
+/// Sends `hello`, expects `error`, then a close. Returns the error for comparison.
+async fn refused_hello(addr: SocketAddr, hello: Ws) -> Message {
+    let mut c = connect(addr).await;
+    c.send(hello).await.unwrap();
+    let error = recv(&mut c).await;
+    expect_closed(&mut c).await;
+    error
+}
+
+fn unauthorized() -> Message {
+    Message::Error {
+        code: ErrorCode::Unauthorized,
+        msg: "unauthorized".into(),
+    }
+}
+
+#[tokio::test]
+async fn a_missing_wrong_or_malformed_token_or_an_unknown_device_gets_the_same_unauthorized() {
+    let daemon = start().await;
+    let hellos = [
+        hello(1, DEVICE, None),
+        hello(1, DEVICE, Some(&[0; 32])),
+        Ws::text(
+            r#"{"t":"hello","v":1,"device":"wd-000000000001","token":"zz","fw":"0","screen":[1,1]}"#,
+        ),
+        hello(1, "wd-0000000000ff", Some(&TOKEN)),
+    ];
+    for hello in hellos {
+        assert_eq!(refused_hello(daemon.addr, hello).await, unauthorized());
+    }
+    // The real device still gets in.
+    handshake(daemon.addr, DEVICE, &TOKEN).await;
+}
+
+#[tokio::test]
+async fn a_token_for_one_device_does_not_open_another() {
+    let daemon = start().await;
+    daemon
+        .devices
+        .pair(OTHER, Sha256::digest(OTHER_TOKEN).into())
+        .unwrap();
+    assert_eq!(
+        refused_hello(daemon.addr, hello(1, OTHER, Some(&TOKEN))).await,
+        unauthorized()
+    );
+    assert_eq!(
+        refused_hello(daemon.addr, hello(1, DEVICE, Some(&OTHER_TOKEN))).await,
+        unauthorized()
+    );
+    handshake(daemon.addr, OTHER, &OTHER_TOKEN).await;
+}
+
+#[tokio::test]
+async fn an_impostor_with_a_stolen_device_id_cannot_kick_the_paired_session() {
+    let mut daemon = start().await;
+    let mut real = handshake(daemon.addr, DEVICE, &TOKEN).await;
+    assert_eq!(
+        daemon.events.recv().await.unwrap(),
+        DaemonEvent::DeviceConnected(DEVICE.into())
+    );
+
+    for token in [None, Some(&[0u8; 32])] {
+        assert_eq!(
+            refused_hello(daemon.addr, hello(1, DEVICE, token)).await,
+            unauthorized()
+        );
+    }
+
+    real.send(press("hello", 5)).await.unwrap();
+    assert!(matches!(
+        recv(&mut real).await,
+        Message::Result {
+            seq: 5,
+            ok: true,
+            ..
+        }
+    ));
+    assert!(
+        daemon.events.try_recv().is_err(),
+        "the impostor must not have disconnected the real session"
+    );
+    assert_eq!(
+        daemon.devices.list(),
+        [DeviceInfo {
+            id: DEVICE.into(),
+            connected: true
+        }]
+    );
+}
+
+#[tokio::test]
+async fn forget_closes_the_live_session_with_unauthorized_and_voids_the_token() {
+    let mut daemon = start().await;
+    let mut c = handshake(daemon.addr, DEVICE, &TOKEN).await;
+    assert_eq!(
+        daemon.events.recv().await.unwrap(),
+        DaemonEvent::DeviceConnected(DEVICE.into())
+    );
+
+    assert!(daemon.devices.forget(DEVICE).unwrap());
+    assert_eq!(recv(&mut c).await, unauthorized());
+    expect_closed(&mut c).await;
+    assert_eq!(
+        daemon.events.recv().await.unwrap(),
+        DaemonEvent::DeviceForgotten(DEVICE.into())
+    );
+    assert_eq!(
+        daemon.events.recv().await.unwrap(),
+        DaemonEvent::DeviceDisconnected(DEVICE.into())
+    );
+
+    assert!(daemon.devices.list().is_empty());
+    assert!(!daemon.devices.forget(DEVICE).unwrap());
+    assert_eq!(
+        refused_hello(daemon.addr, hello(1, DEVICE, Some(&TOKEN))).await,
+        unauthorized()
+    );
+}
+
+#[tokio::test]
+async fn presses_queued_behind_a_forget_never_run() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let counter = runs.clone();
+    let slow: Runner = Arc::new(move |_btn, _device| {
+        let runs = counter.clone();
+        Box::pin(async move {
+            runs.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            ActionResult {
+                ok: true,
+                code: 0,
+                text: String::new(),
+                ms: 200,
+            }
+        })
+    });
+    let daemon = start_with(
+        "127.0.0.1:0".parse().unwrap(),
+        Duration::from_secs(30),
+        slow,
+    )
+    .await;
+    let mut c = handshake(daemon.addr, DEVICE, &TOKEN).await;
+    for seq in 1..=4 {
+        c.send(press("hello", seq)).await.unwrap();
+    }
+
+    // Forget while the first press runs, with the other three queued behind it.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while runs.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "the first press never ran");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(daemon.devices.forget(DEVICE).unwrap());
+    let started = runs.load(Ordering::SeqCst);
+
+    assert!(matches!(recv(&mut c).await, Message::Result { seq: 1, .. }));
+    assert_eq!(recv(&mut c).await, unauthorized());
+    expect_closed(&mut c).await;
+    assert_eq!(started, 1);
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        started,
+        "a press started after forget returned"
+    );
+}
+
+// ---- Pairing on the pairing port ----
+
+type PairClient = WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
+
+/// Runs the device's side of the exchange up to the code, checking the daemon's commitment.
+async fn pair_until_code(
+    pair_addr: SocketAddr,
+    device: &str,
+    token: &[u8; 32],
+) -> (PairClient, String) {
+    let (mut ws, _) = connect_async(format!("ws://{pair_addr}/")).await.unwrap();
+    let commit: [u8; 32] = Sha256::digest(token).into();
+    let req = Message::PairReq {
+        v: 1,
+        device: device.into(),
+        commit: encode_hex(&commit),
+    };
+    ws.send(Ws::text(serde_json::to_string(&req).unwrap()))
+        .await
+        .unwrap();
+    let Message::PairOffer { name, cert, c_host } = recv(&mut ws).await else {
+        panic!("expected pair_offer")
+    };
+    assert_eq!(name, "test-daemon");
+    assert_eq!(cert, identity().cert_pem());
+
+    let n_dev = [0x5a; 16];
+    let nonce = Message::PairNonce {
+        n_dev: encode_hex(&n_dev),
+    };
+    ws.send(Ws::text(serde_json::to_string(&nonce).unwrap()))
+        .await
+        .unwrap();
+    let Message::PairReveal { n_host } = recv(&mut ws).await else {
+        panic!("expected pair_reveal")
+    };
+    let n_host = decode_hex::<16>(&n_host).expect("n_host is 32 hex digits");
+    assert_eq!(
+        encode_hex(&Sha256::digest(n_host)),
+        c_host,
+        "the reveal must match c_host"
+    );
+    (ws, pairing_code(device, &commit, &cert, &n_dev, &n_host))
+}
+
+async fn wait_for_state(pairing: &Pairing, want: impl Fn(&PairingState) -> bool) -> PairingState {
+    let mut states = pairing.subscribe();
+    let state = tokio::time::timeout(Duration::from_secs(5), states.wait_for(|s| want(s)))
+        .await
+        .expect("the pairing state did not arrive in 5 s")
+        .unwrap()
+        .clone();
+    state
+}
+
+async fn assert_port_closed(addr: SocketAddr) {
+    let err = TcpStream::connect(addr)
+        .await
+        .expect_err("the pairing port must be closed");
+    assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+}
+
+fn wrong(code: &str) -> String {
+    let n: u32 = code.parse().unwrap();
+    format!("{:06}", (n + 1) % 1_000_000)
+}
+
+#[tokio::test]
+async fn pairing_stores_the_device_and_its_token_then_opens_a_session() {
+    let daemon = start().await;
+    let pair_addr = daemon.pairing.start().await.unwrap();
+    let token = [0x42; 32];
+    let (mut ws, code) = pair_until_code(pair_addr, OTHER, &token).await;
+    let state = wait_for_state(&daemon.pairing, |s| {
+        matches!(s, PairingState::Confirm { .. })
+    })
+    .await;
+    assert_eq!(
+        state,
+        PairingState::Confirm {
+            device: OTHER.into(),
+            peer: "127.0.0.1".into(),
+        }
+    );
+
+    daemon.pairing.confirm(&code).unwrap();
+    assert_eq!(recv(&mut ws).await, Message::PairResult { ok: true });
+    expect_closed(&mut ws).await;
+    let state = wait_for_state(&daemon.pairing, |s| {
+        !matches!(s, PairingState::Confirm { .. })
+    })
+    .await;
+    assert_eq!(
+        state,
+        PairingState::Paired {
+            device: OTHER.into()
+        }
+    );
+    assert_port_closed(pair_addr).await;
+
+    let ids: Vec<String> = daemon.devices.list().into_iter().map(|d| d.id).collect();
+    assert_eq!(ids, [DEVICE, OTHER]);
+    handshake(daemon.addr, OTHER, &token).await;
+}
+
+#[tokio::test]
+async fn a_wrong_code_stores_nothing_and_ends_the_pairing() {
+    let daemon = start().await;
+    let pair_addr = daemon.pairing.start().await.unwrap();
+    let token = [0x42; 32];
+    let (mut ws, code) = pair_until_code(pair_addr, OTHER, &token).await;
+    wait_for_state(&daemon.pairing, |s| {
+        matches!(s, PairingState::Confirm { .. })
+    })
+    .await;
+
+    assert!(
+        daemon.pairing.confirm("12345").is_err(),
+        "a malformed code is not a guess"
+    );
+    daemon.pairing.confirm(&wrong(&code)).unwrap();
+    assert_eq!(recv(&mut ws).await, Message::PairResult { ok: false });
+    let state = wait_for_state(&daemon.pairing, |s| {
+        matches!(s, PairingState::Failed { .. })
+    })
+    .await;
+    assert!(matches!(state, PairingState::Failed { reason } if reason.contains("Wrong code")));
+    assert_port_closed(pair_addr).await;
+    assert!(
+        daemon.pairing.confirm(&code).is_err(),
+        "one guess per window"
+    );
+
+    assert_eq!(daemon.devices.list().len(), 1);
+    assert_eq!(
+        refused_hello(daemon.addr, hello(1, OTHER, Some(&token))).await,
+        unauthorized()
+    );
+}
+
+#[tokio::test]
+async fn cancel_tells_the_waiting_device_and_closes_the_port() {
+    let daemon = start().await;
+    let pair_addr = daemon.pairing.start().await.unwrap();
+    let (mut ws, _code) = pair_until_code(pair_addr, OTHER, &[0x42; 32]).await;
+    wait_for_state(&daemon.pairing, |s| {
+        matches!(s, PairingState::Confirm { .. })
+    })
+    .await;
+
+    daemon.pairing.cancel().await;
+    assert_eq!(recv(&mut ws).await, Message::PairResult { ok: false });
+    assert_eq!(*daemon.pairing.subscribe().borrow(), PairingState::Closed);
+    assert_port_closed(pair_addr).await;
+    assert_eq!(daemon.devices.list().len(), 1);
+}
+
+#[tokio::test]
+async fn re_pairing_a_device_ends_its_live_session_with_unauthorized() {
+    let daemon = start().await;
+    let mut live = handshake(daemon.addr, DEVICE, &TOKEN).await;
+    let pair_addr = daemon.pairing.start().await.unwrap();
+    let token = [0x43; 32];
+    let (mut ws, code) = pair_until_code(pair_addr, DEVICE, &token).await;
+    wait_for_state(&daemon.pairing, |s| {
+        matches!(s, PairingState::Confirm { .. })
+    })
+    .await;
+
+    daemon.pairing.confirm(&code).unwrap();
+    assert_eq!(recv(&mut ws).await, Message::PairResult { ok: true });
+    assert_eq!(recv(&mut live).await, unauthorized());
+    expect_closed(&mut live).await;
+    assert_eq!(
+        refused_hello(daemon.addr, hello(1, DEVICE, Some(&TOKEN))).await,
+        unauthorized()
+    );
+    handshake(daemon.addr, DEVICE, &token).await;
+}
+
+#[tokio::test]
+async fn a_device_speaking_out_of_turn_at_the_code_ends_the_window() {
+    let daemon = start().await;
+    let pair_addr = daemon.pairing.start().await.unwrap();
+    let (mut ws, code) = pair_until_code(pair_addr, OTHER, &[0x42; 32]).await;
+    wait_for_state(&daemon.pairing, |s| {
+        matches!(s, PairingState::Confirm { .. })
+    })
+    .await;
+
+    let nonce = Message::PairNonce {
+        n_dev: encode_hex(&[0x5a; 16]),
+    };
+    ws.send(Ws::text(serde_json::to_string(&nonce).unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(recv(&mut ws).await, Message::PairResult { ok: false });
+    let state = wait_for_state(&daemon.pairing, |s| {
+        matches!(s, PairingState::Failed { .. })
+    })
+    .await;
+    assert!(
+        matches!(&state, PairingState::Failed { reason } if reason.contains("unexpected message")),
+        "{state:?}"
+    );
+    assert_port_closed(pair_addr).await;
+    assert!(daemon.pairing.confirm(&code).is_err());
+    assert_eq!(daemon.devices.list().len(), 1);
+}
+
+#[tokio::test]
+async fn the_pairing_port_is_open_only_while_the_dialog_is() {
+    let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let pair_addr = free.local_addr().unwrap();
+    drop(free);
+    let daemon = start_with(pair_addr, Duration::from_secs(30), stub_runner()).await;
+    let mut advertised = daemon.pairing.advertised();
+
+    assert_port_closed(pair_addr).await;
+    assert_eq!(*advertised.borrow_and_update(), None);
+    assert!(
+        daemon.pairing.confirm("123456").is_err(),
+        "no window is open"
+    );
+
+    assert_eq!(daemon.pairing.start().await.unwrap(), pair_addr);
+    TcpStream::connect(pair_addr).await.unwrap();
+    assert_eq!(*advertised.borrow_and_update(), Some(pair_addr.port()));
+
+    daemon.pairing.cancel().await;
+    assert_port_closed(pair_addr).await;
+    assert_eq!(*advertised.borrow_and_update(), None);
+}
+
+// Real clock: the window must close on its own.
+#[tokio::test]
+async fn an_unused_pairing_window_closes_when_it_times_out() {
+    let daemon = start_with(
+        "127.0.0.1:0".parse().unwrap(),
+        Duration::from_secs(1),
+        stub_runner(),
+    )
+    .await;
+    let started = Instant::now();
+    let pair_addr = daemon.pairing.start().await.unwrap();
+    let state = wait_for_state(&daemon.pairing, |s| {
+        matches!(s, PairingState::Failed { .. })
+    })
+    .await;
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_secs(1), "{waited:?}");
+    assert!(waited < Duration::from_secs(2), "{waited:?}");
+    assert!(matches!(state, PairingState::Failed { reason } if reason.contains("in time")));
+    assert_port_closed(pair_addr).await;
+}
+
+#[tokio::test]
+async fn a_device_waiting_on_the_code_is_told_when_the_window_times_out() {
+    let daemon = start_with(
+        "127.0.0.1:0".parse().unwrap(),
+        Duration::from_secs(1),
+        stub_runner(),
+    )
+    .await;
+    let pair_addr = daemon.pairing.start().await.unwrap();
+    let (mut ws, code) = pair_until_code(pair_addr, OTHER, &[0x42; 32]).await;
+
+    assert_eq!(recv(&mut ws).await, Message::PairResult { ok: false });
+    wait_for_state(&daemon.pairing, |s| {
+        matches!(s, PairingState::Failed { .. })
+    })
+    .await;
+    assert!(daemon.pairing.confirm(&code).is_err());
+    assert_eq!(daemon.devices.list().len(), 1);
+}
+
+#[tokio::test]
+async fn a_bad_or_oversize_attempt_is_refused_and_the_window_stays_open() {
+    let daemon = start().await;
+    let pair_addr = daemon.pairing.start().await.unwrap();
+
+    for bad in [
+        "not json".to_string(),
+        r#"{"t":"pair_req","v":1,"device":"wd-1","commit":"00"}"#.to_string(),
+        r#"{"t":"pair_req","v":1,"device":"","commit":"630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd"}"#.to_string(),
+        r#"{"t":"hello","v":1,"device":"wd-1","fw":"0","screen":[1,1]}"#.to_string(),
+    ] {
+        let (mut ws, _) = connect_async(format!("ws://{pair_addr}/")).await.unwrap();
+        ws.send(Ws::text(bad.clone())).await.unwrap();
+        let Message::Error { code, .. } = recv(&mut ws).await else {
+            panic!("expected error for {bad}")
+        };
+        assert_eq!(code, ErrorCode::BadRequest, "{bad}");
+        expect_closed(&mut ws).await;
+    }
+    let (mut ws, _) = connect_async(format!("ws://{pair_addr}/")).await.unwrap();
+    ws.send(Ws::text(
+        r#"{"t":"pair_req","v":2,"device":"wd-1","commit":"00"}"#,
+    ))
+    .await
+    .unwrap();
+    assert!(matches!(
+        recv(&mut ws).await,
+        Message::Error {
+            code: ErrorCode::Version,
+            ..
+        }
+    ));
+    // A pair_req the daemon would answer but for its size: the padding is a field it ignores.
+    let (mut ws, _) = connect_async(format!("ws://{pair_addr}/")).await.unwrap();
+    let commit = encode_hex(&Sha256::digest([0x42u8; 32]));
+    let big = format!(
+        r#"{{"t":"pair_req","v":1,"device":"{OTHER}","commit":"{commit}","pad":"{}"}}"#,
+        "a".repeat(16 * 1024)
+    );
+    ws.send(Ws::text(big)).await.unwrap();
+    expect_closed_unanswered(&mut ws).await;
+
+    assert_eq!(*daemon.pairing.subscribe().borrow(), PairingState::Waiting);
+    let (mut ws, code) = pair_until_code(pair_addr, OTHER, &[0x42; 32]).await;
+    wait_for_state(&daemon.pairing, |s| {
+        matches!(s, PairingState::Confirm { .. })
+    })
+    .await;
+    daemon.pairing.confirm(&code).unwrap();
+    assert_eq!(recv(&mut ws).await, Message::PairResult { ok: true });
 }

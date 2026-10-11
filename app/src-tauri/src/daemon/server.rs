@@ -1,4 +1,4 @@
-//! `wss://` listener: one task per connection, one live session per device id.
+//! `wss://` listener: one task per connection, one live session per paired device id.
 
 use std::collections::HashMap;
 use std::io;
@@ -9,37 +9,62 @@ use std::time::Duration;
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
+use serde::Serialize;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::{broadcast, oneshot, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{timeout, timeout_at, Instant};
 use tokio_rustls::rustls::ServerConfig;
-use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message as WsMessage};
 use tokio_tungstenite::{accept_async_with_config, WebSocketStream};
 
 use super::actions::{self, ActionResult, Runner};
-use super::protocol::{ErrorCode, Message, MAX_MESSAGE_BYTES, VERSION};
+use super::protocol::{
+    decode_hex, valid_device_id, ErrorCode, Message, Token, MAX_MESSAGE_BYTES, TOKEN_BYTES, VERSION,
+};
+use super::store::Store;
 
 pub const PORT: u16 = 47820;
 /// From the TCP accept to the hello, covering the TLS handshake and the WebSocket upgrade.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a closing session waits for the device to close too.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_BUTTON_ID_BYTES: usize = 64;
 /// Concurrent connections, handshaking or live. Beyond this the listener drops new sockets.
 const MAX_CONNECTIONS: usize = 64;
+/// The one reply to every failed authentication, so a client can't tell an unknown device from
+/// a wrong token.
+const UNAUTHORIZED: &str = "unauthorized";
 
-type Ws = WebSocketStream<TlsStream<TcpStream>>;
-type WsSink = SplitSink<Ws, WsMessage>;
-type WsRead = SplitStream<Ws>;
+pub(super) type WsSink<S> = SplitSink<WebSocketStream<S>, WsMessage>;
+pub(super) type WsRead<S> = SplitStream<WebSocketStream<S>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonEvent {
     DeviceConnected(String),
     DeviceDisconnected(String),
+    DevicePaired(String),
+    DeviceForgotten(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceInfo {
+    pub id: String,
+    pub connected: bool,
+}
+
+/// Why a live session is told to end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kick {
+    /// The same device connected again.
+    Replaced,
+    /// The device's pairing was forgotten or replaced, so its token no longer opens a session.
+    Revoked,
 }
 
 pub struct Server {
@@ -47,14 +72,24 @@ pub struct Server {
     shared: Arc<Shared>,
 }
 
+/// The paired devices and their live sessions, for the desktop UI and for pairing.
+#[derive(Clone)]
+pub struct Devices(Arc<Shared>);
+
 struct Shared {
     hostname: String,
     tls: TlsAcceptor,
     runner: Runner,
     events: broadcast::Sender<DaemonEvent>,
     next_id: AtomicU64,
+    /// One lock, so a session is only ever registered under a pairing that still exists.
+    registry: Mutex<Registry>,
+}
+
+struct Registry {
+    store: Store,
     /// device id -> (session id, kick that closes the session)
-    sessions: Mutex<HashMap<String, (u64, oneshot::Sender<()>)>>,
+    sessions: HashMap<String, (u64, oneshot::Sender<Kick>)>,
 }
 
 impl Server {
@@ -62,6 +97,7 @@ impl Server {
         addr: impl ToSocketAddrs,
         tls: Arc<ServerConfig>,
         runner: Runner,
+        store: Store,
     ) -> io::Result<Self> {
         let hostname = gethostname::gethostname().to_string_lossy().into_owned();
         let (events, _) = broadcast::channel(64);
@@ -73,7 +109,10 @@ impl Server {
                 runner,
                 events,
                 next_id: AtomicU64::new(0),
-                sessions: Mutex::new(HashMap::new()),
+                registry: Mutex::new(Registry {
+                    store,
+                    sessions: HashMap::new(),
+                }),
             }),
         })
     }
@@ -88,6 +127,10 @@ impl Server {
 
     pub fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
         self.shared.events.subscribe()
+    }
+
+    pub fn devices(&self) -> Devices {
+        Devices(self.shared.clone())
     }
 
     /// Accepts connections until the future is dropped, which also drops every session.
@@ -122,35 +165,110 @@ impl Server {
     }
 }
 
+impl Devices {
+    pub fn list(&self) -> Vec<DeviceInfo> {
+        let registry = self.0.registry();
+        registry
+            .store
+            .ids()
+            .map(|id| DeviceInfo {
+                id: id.to_string(),
+                connected: registry.sessions.contains_key(id),
+            })
+            .collect()
+    }
+
+    /// Stores `device`'s pairing, replacing any earlier one, and ends the session that the
+    /// earlier token opened.
+    pub fn pair(&self, device: &str, token_sha256: [u8; TOKEN_BYTES]) -> io::Result<()> {
+        let mut registry = self.0.registry();
+        registry.store.insert(device, token_sha256)?;
+        let revoked = registry.revoke(device);
+        drop(registry);
+        log::info!("paired {device}");
+        self.0.emit(DaemonEvent::DevicePaired(device.to_string()));
+        if revoked {
+            self.0
+                .emit(DaemonEvent::DeviceDisconnected(device.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Forgets `device` and closes its live session, which is told `unauthorized` first so the
+    /// device drops its pairing too. Returns whether it was paired.
+    pub fn forget(&self, device: &str) -> io::Result<bool> {
+        let mut registry = self.0.registry();
+        if !registry.store.remove(device)? {
+            return Ok(false);
+        }
+        let revoked = registry.revoke(device);
+        drop(registry);
+        log::info!("forgot {device}");
+        self.0
+            .emit(DaemonEvent::DeviceForgotten(device.to_string()));
+        if revoked {
+            self.0
+                .emit(DaemonEvent::DeviceDisconnected(device.to_string()));
+        }
+        Ok(true)
+    }
+}
+
+impl Registry {
+    /// Tells `device`'s live session, if any, that its token is void. Returns whether there was one.
+    fn revoke(&mut self, device: &str) -> bool {
+        match self.sessions.remove(device) {
+            Some((_, kick)) => {
+                // An error only means the session is already ending.
+                let _ = kick.send(Kick::Revoked);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 impl Shared {
-    /// Registers a session for `device`, kicking the one it replaces.
-    fn register(&self, device: &str) -> (u64, oneshot::Receiver<()>) {
+    fn registry(&self) -> std::sync::MutexGuard<'_, Registry> {
+        self.registry.lock().expect("device registry poisoned")
+    }
+
+    /// Checks `token` for `device` and, only if it is valid, registers a session for it, kicking
+    /// the one it replaces. An impostor using a paired device's id never gets this far, so it
+    /// can't kick the real session.
+    fn authenticate(
+        &self,
+        device: &str,
+        token: &[u8; TOKEN_BYTES],
+    ) -> Option<(u64, oneshot::Receiver<Kick>)> {
+        let mut registry = self.registry();
+        if !registry.store.verify(device, token) {
+            return None;
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (kick_tx, kick_rx) = oneshot::channel();
-        let old = self
-            .sessions
-            .lock()
-            .expect("session registry poisoned")
-            .insert(device.to_string(), (id, kick_tx));
+        let old = registry.sessions.insert(device.to_string(), (id, kick_tx));
+        drop(registry);
         if let Some((_, old_kick)) = old {
             log::info!("{device} reconnected, replacing its old session");
             // An error only means the old session is already ending.
-            let _ = old_kick.send(());
+            let _ = old_kick.send(Kick::Replaced);
             self.emit(DaemonEvent::DeviceDisconnected(device.to_string()));
         }
         self.emit(DaemonEvent::DeviceConnected(device.to_string()));
-        (id, kick_rx)
+        Some((id, kick_rx))
     }
 
     fn unregister(&self, device: &str, id: u64) {
-        let mut sessions = self.sessions.lock().expect("session registry poisoned");
-        // A replaced session finds its slot taken and stays silent.
-        if sessions
+        let mut registry = self.registry();
+        // A replaced or revoked session finds its slot taken or gone and stays silent.
+        if registry
+            .sessions
             .get(device)
             .is_some_and(|(current, _)| *current == id)
         {
-            sessions.remove(device);
-            drop(sessions);
+            registry.sessions.remove(device);
+            drop(registry);
             self.emit(DaemonEvent::DeviceDisconnected(device.to_string()));
         }
     }
@@ -167,7 +285,7 @@ async fn handle(stream: TcpStream, peer: SocketAddr, shared: &Shared) {
     }
 }
 
-enum Incoming {
+pub(super) enum Incoming {
     Msg(Message),
     BadRequest(String),
     /// A hello with a `v` other than 1 that may not parse as a full [`Message::Hello`].
@@ -179,7 +297,10 @@ enum Incoming {
 
 /// Next text message. Control frames are skipped (tungstenite answers pings itself).
 /// `IDLE_TIMEOUT` applies per frame, so pings keep a session alive.
-async fn next_message(rx: &mut WsRead) -> Incoming {
+pub(super) async fn next_message<S>(rx: &mut WsRead<S>) -> Incoming
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     loop {
         let frame = match timeout(IDLE_TIMEOUT, rx.next()).await {
             Err(_) => return Incoming::Idle,
@@ -207,7 +328,10 @@ async fn next_message(rx: &mut WsRead) -> Incoming {
 }
 
 /// Sends one message. A peer that stops reading ends the session instead of parking it.
-async fn send(tx: &mut WsSink, msg: &Message) -> Result<(), WsError> {
+pub(super) async fn send<S>(tx: &mut WsSink<S>, msg: &Message) -> Result<(), WsError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let json = serde_json::to_string(msg).expect("protocol messages serialize");
     match timeout(WRITE_TIMEOUT, tx.send(WsMessage::text(json))).await {
         Ok(sent) => sent,
@@ -218,11 +342,21 @@ async fn send(tx: &mut WsSink, msg: &Message) -> Result<(), WsError> {
     }
 }
 
-async fn send_error(tx: &mut WsSink, code: ErrorCode, msg: String) -> Result<(), WsError> {
+pub(super) async fn send_error<S>(
+    tx: &mut WsSink<S>,
+    code: ErrorCode,
+    msg: String,
+) -> Result<(), WsError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     send(tx, &Message::Error { code, msg }).await
 }
 
-async fn close(tx: &mut WsSink) {
+pub(super) async fn close<S>(tx: &mut WsSink<S>)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     match timeout(WRITE_TIMEOUT, tx.close()).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => log::debug!("close: {e}"),
@@ -238,10 +372,6 @@ fn hello_version_mismatch(text: &str) -> Option<String> {
     }
     let v = value.get("v")?;
     (*v != VERSION).then(|| format!("unsupported protocol version {v}"))
-}
-
-fn valid_device_id(device: &str) -> bool {
-    (1..=64).contains(&device.len()) && device.bytes().all(|b| b.is_ascii_graphic())
 }
 
 async fn session(stream: TcpStream, peer: SocketAddr, shared: &Shared) -> Result<(), WsError> {
@@ -279,77 +409,94 @@ async fn session(stream: TcpStream, peer: SocketAddr, shared: &Shared) -> Result
         return Ok(());
     };
     let (mut tx, mut rx) = ws?.split();
+    let outcome = converse(&mut tx, &mut rx, peer, deadline, shared).await;
+    close(&mut tx).await;
+    drain(&mut rx).await;
+    outcome
+}
 
-    let hello = match timeout_at(deadline, next_message(&mut rx)).await {
+/// Reads and drops whatever the device still sends until it closes too, for at most
+/// `DRAIN_TIMEOUT`. Closing a socket that holds unread input resets the connection, and the reset
+/// discards frames still queued to send, such as the error that says why the session ended.
+async fn drain<S>(rx: &mut WsRead<S>)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let until_closed = async { while let Some(Ok(_)) = rx.next().await {} };
+    if timeout(DRAIN_TIMEOUT, until_closed).await.is_err() {
+        log::debug!("the device did not close within {DRAIN_TIMEOUT:?}");
+    }
+}
+
+/// The hello, then the session it opens. The caller closes the connection however this ends.
+async fn converse<S>(
+    tx: &mut WsSink<S>,
+    rx: &mut WsRead<S>,
+    peer: SocketAddr,
+    deadline: Instant,
+    shared: &Shared,
+) -> Result<(), WsError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let hello = match timeout_at(deadline, next_message(rx)).await {
         Ok(incoming) => incoming,
         Err(_) => {
             log::warn!("no hello within {HELLO_TIMEOUT:?}");
-            close(&mut tx).await;
             return Ok(());
         }
     };
-    let device = match hello {
+    let (device, token, fw, screen) = match hello {
         Incoming::Msg(Message::Hello {
             v,
             device,
+            token,
             fw,
             screen,
         }) => {
             if v != VERSION {
-                send_error(
-                    &mut tx,
-                    ErrorCode::Version,
-                    format!("unsupported protocol version {v}"),
-                )
-                .await?;
-                close(&mut tx).await;
-                return Ok(());
+                let why = format!("unsupported protocol version {v}");
+                return send_error(tx, ErrorCode::Version, why).await;
             }
             if !valid_device_id(&device) {
-                send_error(&mut tx, ErrorCode::BadRequest, "invalid device id".into()).await?;
-                close(&mut tx).await;
-                return Ok(());
+                return send_error(tx, ErrorCode::BadRequest, "invalid device id".into()).await;
             }
-            log::info!(
-                "hello from {device} (fw {fw}, screen {}x{})",
-                screen[0],
-                screen[1]
-            );
-            device
+            (device, token, fw, screen)
         }
-        Incoming::BadRequest(msg) => {
-            send_error(&mut tx, ErrorCode::BadRequest, msg).await?;
-            close(&mut tx).await;
-            return Ok(());
-        }
-        Incoming::BadVersion(msg) => {
-            send_error(&mut tx, ErrorCode::Version, msg).await?;
-            close(&mut tx).await;
-            return Ok(());
-        }
+        Incoming::BadRequest(msg) => return send_error(tx, ErrorCode::BadRequest, msg).await,
+        Incoming::BadVersion(msg) => return send_error(tx, ErrorCode::Version, msg).await,
         Incoming::Msg(_) => {
-            send_error(&mut tx, ErrorCode::BadRequest, "expected hello".into()).await?;
-            close(&mut tx).await;
-            return Ok(());
+            return send_error(tx, ErrorCode::BadRequest, "expected hello".into()).await
         }
         Incoming::Idle | Incoming::Closed => return Ok(()),
         Incoming::Failed(e) => return Err(e),
     };
 
-    let (id, kick) = shared.register(&device);
-    let outcome = serve(&mut tx, &mut rx, kick, shared, &device).await;
+    let token = token.and_then(|Token(hex)| decode_hex::<TOKEN_BYTES>(&hex));
+    let Some((id, kick)) = token.and_then(|token| shared.authenticate(&device, &token)) else {
+        log::warn!("{peer}: refused {device}: not paired, or a missing or wrong token");
+        return send_error(tx, ErrorCode::Unauthorized, UNAUTHORIZED.into()).await;
+    };
+    log::info!(
+        "hello from {device} (fw {fw:?}, screen {}x{})",
+        screen[0],
+        screen[1]
+    );
+    let outcome = serve(tx, rx, kick, shared, &device).await;
     shared.unregister(&device, id);
-    close(&mut tx).await;
     outcome
 }
 
-async fn serve(
-    tx: &mut WsSink,
-    rx: &mut WsRead,
-    mut kick: oneshot::Receiver<()>,
+async fn serve<S>(
+    tx: &mut WsSink<S>,
+    rx: &mut WsRead<S>,
+    mut kick: oneshot::Receiver<Kick>,
     shared: &Shared,
     device: &str,
-) -> Result<(), WsError> {
+) -> Result<(), WsError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let buttons = actions::buttons();
     send(
         tx,
@@ -372,7 +519,9 @@ async fn serve(
 
     loop {
         let incoming = tokio::select! {
-            _ = &mut kick => return Ok(()),
+            // The kick goes first, so presses queued behind a revocation never run.
+            biased;
+            kicked = &mut kick => return end_kicked(tx, kicked.ok(), device).await,
             incoming = next_message(rx) => incoming,
         };
         match incoming {
@@ -382,6 +531,11 @@ async fn serve(
                 return Ok(());
             }
             Incoming::Msg(Message::Press { btn, seq }) => {
+                // The kick may have landed while this press was being read.
+                match kick.try_recv() {
+                    Err(oneshot::error::TryRecvError::Empty) => {}
+                    kicked => return end_kicked(tx, kicked.ok(), device).await,
+                }
                 let result = if buttons.iter().any(|b| b.id == btn) {
                     (shared.runner)(btn.clone(), device.to_string()).await
                 } else {
@@ -424,4 +578,17 @@ async fn serve(
             Incoming::Failed(e) => return Err(e),
         }
     }
+}
+
+/// Ends a session whose kick fired. A revoked device is told `unauthorized` first, so it drops
+/// its pairing instead of retrying a dead token.
+async fn end_kicked<S>(tx: &mut WsSink<S>, kick: Option<Kick>, device: &str) -> Result<(), WsError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if kick == Some(Kick::Revoked) {
+        log::info!("{device}: pairing revoked, closing its session");
+        send_error(tx, ErrorCode::Unauthorized, UNAUTHORIZED.into()).await?;
+    }
+    Ok(())
 }
