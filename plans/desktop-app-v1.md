@@ -10,12 +10,17 @@
 | S4 Config and actions | ✅ | d42c1d0 | — |
 | S5 Icons | ✅ | 147e695 | — |
 | S6 Tiles | ✅ | 1d05fdf | — |
-| S7 Config UI | Built, reviewed, audit fixes in | this commit | The user's manual check (steps under "S7 results") |
-| S8 App shape | Built, reviewed | ceb6f62 | The user's manual check: a release build with autostart, tray, close-to-tray and single-instance |
+| S7 Config UI | Built, reviewed, audit fixes in | c9e9fe9 | The user's manual check (steps under "S7 results") |
+| S8 App shape | Built, reviewed | e709869, 37016e3, merged in ceb6f62 | The user's manual check: a release build with autostart, tray, close-to-tray and single-instance |
 
 - Every slice passed `review` and, where it touches security, `security-auditor`. Each fix round then got its own review.
-- CI is green through 1d05fdf.
-- Open beyond v1: the Backlog section at the end (Sentry error reporting), and the S7 gaps listed in "S7 results" (no secret delete, no `list_icons`, no `test_action`).
+- CI is green through c9e9fe9: lint, firmware, app (clippy, `cargo test`, `pnpm test`, debug Tauri build) and site.
+- v1 is done when the S7 and S8 manual checks pass.
+- Still untested on hardware, from earlier slices: the board recovering after the desktop's IP changes (S2), and a bad frame at the device's icon and tile parsers (S5, S6).
+- Open beyond v1:
+  - the Backlog section at the end (Sentry error reporting)
+  - the S7 gaps listed in "S7 results": no secret delete, no `list_icons`, no `test_action`
+  - optionally, avahi `deny-interfaces` for docker bridges, so `_watchdeck._tcp` isn't advertised on them
 
 ## Decisions
 
@@ -71,10 +76,17 @@ Nothing here imports `tauri`, so tests run headless.
 - `lib.rs` builds Tauri, plugins and the tray, starts the daemon and mDNS, and forwards events to the UI and the tray status line.
 - `commands.rs` exposes the Tauri commands:
   - config: `get_config`, `save_config`
-  - devices and pairing: `list_devices`, `forget_device` (closes the live session too), `start_pairing`, `cancel_pairing`, `confirm_pairing`
+  - devices and pairing: `list_devices`, `forget_device` (closes the live session too), `start_pairing`, `pairing_state`, `cancel_pairing`, `confirm_pairing`
   - secrets: `list_secrets`, `set_secret` (write-only)
-  - tools: `test_action`, `import_icon`
-- React UI in `app/src`: GridEditor, ButtonForm, PairDialog, Devices, Secrets, plus `api.ts` (typed invoke wrappers) and `config.ts` (types). Rust validation is the authority.
+  - tiles: `tile_values`
+  - icons: `import_icon`, which opens the native file dialog itself and takes no path from the window
+  - `test_action` was planned but not built (an S7 gap)
+- Events to the UI: `devices-changed`, `pairing`, `config-status`, `layout-pushed` and `tile-values`.
+- React UI in `app/src`:
+  - pages: ConfigPage (GridEditor, ButtonForm, ActionForm, SaveBar), Secrets, Devices with PairDialog
+  - preview: `preview.ts`, `lvtext.ts`, `montserrat.ts`, which mirror the firmware geometry and LVGL line breaking
+  - shared: `api.ts` (typed invoke wrappers), `config.ts` (types), `errors.ts`, `saveflow.ts`, `theme.css`
+  - Rust validation is the authority.
 
 ### Firmware: `firmware/main/`
 
@@ -535,16 +547,16 @@ The review and the security audit found no blockers. These fixes followed:
 | Bug in the custom pairing protocol | Standard commit/reveal shape, a shared test vector, a security audit on S3 |
 | Autostart env lacks PATH or the SSH agent | Document it. stderr shows in results |
 
-Rollback: each slice is its own PR. Firmware rolls back by flashing the previous build, since the partition table doesn't change. Forget pairing wipes NVS.
+Rollback: each slice is its own commit on `main` (see the status table), so `git revert` undoes one. Firmware rolls back by flashing the previous build, since the partition table doesn't change. Forget pairing wipes NVS.
 
 ## Open questions
 
 | # | Question | Default |
 |---|---|---|
 | 1 | Pairing strength | Settled in S3b: commit/reveal SAS, built and paired on hardware. TOFU was simpler but open to an active MITM while pairing |
-| 2 | UI design direction (look, references, palette, type) | Needed before S7 |
+| 2 | UI design direction (look, references, palette, type) | Settled 2026-10-11 by the user: a dark control-room look (always dark, dense, monospace accents, status colors), a live device-accurate preview, palette left to Claude. Built in S7 |
 | 3 | Desktop environment | KDE or another StatusNotifierItem tray. GNOME needs an extension |
-| 4 | Desktop firewall active? | Ports TCP 47820 and 47821. On the dev desktop both answer the LAN (S3b) |
+| 4 | Desktop firewall active? | Yes, ufw on the dev desktop. The user added `ufw allow from 192.168.0.0/24 to any port 47820,47821 proto tcp`. The daemon can't add rules itself without root |
 | 5 | HTTPS to self-signed services (e.g. Home Assistant) | Unsupported in v1. A per-action `insecure_tls` opt-in later |
 | 6 | SVG icons | PNG, JPEG and WebP only. SVG via resvg later |
 | 7 | Non-ASCII labels | Rejected; the built-in fonts lack the glyphs |
