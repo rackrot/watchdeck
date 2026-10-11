@@ -66,6 +66,12 @@ A version that breaks any rule on this page doesn't apply. The last good config 
 - If the file breaks a rule when the app starts, the device shows an empty grid until you fix it.
 - Deleting the file while the app runs keeps the last good config. The next start writes the default again.
 
+### Saving from the window
+
+The Layout page writes `config.toml` for you. A save rewrites the whole file from the config on screen, so **it does not keep your comments** (the file starts with a note saying so). A save is refused, and nothing is written, if the file changed on disk since the page loaded it.
+
+If the file on disk breaks a rule, the page says so and offers **Replace config.toml**. It asks you to confirm what it will write, then saves the config on screen over the file. If the file was already broken when the app started, that config is an empty grid, not your file. The text it replaces is kept in the config folder as `config.toml.bak.<UTC time>`, for example `config.toml.bak.20261011T021449Z`. The newest 5 are kept, and each save makes a new one, so an earlier backup is never overwritten. Copy anything you want to keep out of the folder.
+
 ## Grid
 
 | Key | Rule |

@@ -1,0 +1,321 @@
+import { useEffect, useState } from "react";
+import { type Action, METHODS, newHttp, newShell } from "./config";
+import { duplicateNames, type Row, recordToRows, rowsToRecord } from "./edit";
+import type { ActionField } from "./errors";
+import { Field, NumberField, Problems } from "./fields";
+
+type Problem = string[] | undefined;
+
+/** A list of one-line values, such as a command's arguments. */
+function ArgvRows({
+  argv,
+  onChange,
+}: {
+  argv: string[];
+  onChange: (argv: string[]) => void;
+}) {
+  return (
+    <div className="rows">
+      {argv.map((arg, i) => (
+        // An argument has no identity but its place.
+        // biome-ignore lint/suspicious/noArrayIndexKey: see above
+        <div className="row-pair single" key={i}>
+          <input
+            className="mono"
+            aria-label={i === 0 ? "Program" : `Argument ${i}`}
+            placeholder={i === 0 ? "program" : `argument ${i}`}
+            value={arg}
+            onChange={(e) =>
+              onChange(
+                argv.map((a, j) => (j === i ? e.currentTarget.value : a)),
+              )
+            }
+          />
+          <button
+            type="button"
+            className="quiet"
+            aria-label={`Remove ${i === 0 ? "program" : `argument ${i}`}`}
+            onClick={() => onChange(argv.filter((_, j) => j !== i))}
+          >
+            Remove
+          </button>
+        </div>
+      ))}
+      <button
+        type="button"
+        className="quiet"
+        onClick={() => onChange([...argv, ""])}
+      >
+        Add argument
+      </button>
+    </div>
+  );
+}
+
+/**
+ * Name and value rows for a header table. The rows keep their blanks and their order while the
+ * table, which the config holds, can't.
+ */
+function PairRows({
+  rows,
+  onChange,
+  pick,
+  names,
+}: {
+  rows: Row[];
+  onChange: (rows: Row[]) => void;
+  /** Choices for the value, in place of free text. */
+  pick?: string[];
+  names: [string, string];
+}) {
+  const set = (i: number, part: Partial<Row>) =>
+    onChange(rows.map((r, j) => (j === i ? { ...r, ...part } : r)));
+  return (
+    <div className="rows">
+      {rows.map((row, i) => (
+        // biome-ignore lint/suspicious/noArrayIndexKey: a row has no identity but its place
+        <div className="row-pair" key={i}>
+          <input
+            className="mono"
+            aria-label={names[0]}
+            placeholder={names[0]}
+            value={row.name}
+            onChange={(e) => set(i, { name: e.currentTarget.value })}
+          />
+          {pick ? (
+            <select
+              className="mono"
+              aria-label={names[1]}
+              value={row.value}
+              onChange={(e) => set(i, { value: e.currentTarget.value })}
+            >
+              <option value="">(choose a secret)</option>
+              {[...new Set([...pick, row.value])]
+                .filter((name) => name !== "")
+                .map((name) => (
+                  <option key={name} value={name}>
+                    {pick.includes(name) ? name : `${name} (not set)`}
+                  </option>
+                ))}
+            </select>
+          ) : (
+            <input
+              className="mono"
+              aria-label={names[1]}
+              placeholder={names[1]}
+              value={row.value}
+              onChange={(e) => set(i, { value: e.currentTarget.value })}
+            />
+          )}
+          <button
+            type="button"
+            className="quiet"
+            aria-label={`Remove ${names[0].toLowerCase()} row ${i + 1}`}
+            onClick={() => onChange(rows.filter((_, j) => j !== i))}
+          >
+            Remove
+          </button>
+        </div>
+      ))}
+      <button
+        type="button"
+        className="quiet"
+        onClick={() => onChange([...rows, { name: "", value: "" }])}
+      >
+        Add
+      </button>
+      <Problems
+        list={duplicateNames(rows).map(
+          (name) => `${name === "" ? "A blank name" : name} is listed twice`,
+        )}
+      />
+    </div>
+  );
+}
+
+/** The form for a shell or HTTP action. A button and a tile source both use it. */
+export default function ActionForm({
+  action,
+  onChange,
+  problems,
+  secrets,
+  onDuplicates,
+}: {
+  action: Action;
+  onChange: (action: Action) => void;
+  /** Rust's complaints about each field of this action. */
+  problems: (field: ActionField) => Problem;
+  /** The names `list_secrets` returned. */
+  secrets: string[];
+  /** Reports header names listed twice, which a table can't hold, so a save can wait. */
+  onDuplicates: (messages: string[]) => void;
+}) {
+  const [headers, setHeaders] = useState<Row[]>(
+    action.kind === "http" ? recordToRows(action.headers) : [],
+  );
+  const [secretRows, setSecretRows] = useState<Row[]>(
+    action.kind === "http" ? recordToRows(action.secret_headers) : [],
+  );
+
+  useEffect(() => {
+    const messages = [
+      ...duplicateNames(headers).map(
+        (n) => `Header ${n || "(blank)"} is listed twice`,
+      ),
+      ...duplicateNames(secretRows).map(
+        (n) => `Secret header ${n || "(blank)"} is listed twice`,
+      ),
+    ];
+    onDuplicates(messages);
+    return () => onDuplicates([]);
+  }, [headers, secretRows, onDuplicates]);
+
+  const timeout = (
+    <Field
+      label="Timeout"
+      hint="seconds, 1 to 600"
+      problems={problems("timeout_s")}
+    >
+      <NumberField
+        value={action.timeout_s}
+        onChange={(timeout_s) => onChange({ ...action, timeout_s })}
+      />
+    </Field>
+  );
+
+  const switchKind = (kind: string) => {
+    const next = kind === "http" ? newHttp() : newShell();
+    setHeaders([]);
+    setSecretRows([]);
+    onChange({ ...next, timeout_s: action.timeout_s });
+  };
+
+  if (action.kind === "shell") {
+    return (
+      <div className="form-grid">
+        <KindField kind="shell" onChange={switchKind} />
+        {timeout}
+        <fieldset className="field wide">
+          <legend className="field-label">
+            Command
+            <span className="field-hint">
+              one argument per row, no shell, run in your home directory
+            </span>
+          </legend>
+          <ArgvRows
+            argv={action.argv}
+            onChange={(argv) => onChange({ ...action, argv })}
+          />
+          <Problems list={problems("argv")} />
+        </fieldset>
+      </div>
+    );
+  }
+
+  const setHttp = (part: Partial<typeof action>) =>
+    onChange({ ...action, ...part });
+  return (
+    <div className="form-grid">
+      <KindField kind="http" onChange={switchKind} />
+      {timeout}
+      <Field label="Method" problems={problems("method")}>
+        <select
+          className="mono"
+          value={action.method}
+          onChange={(e) => setHttp({ method: e.currentTarget.value })}
+        >
+          {METHODS.map((m) => (
+            <option key={m}>{m}</option>
+          ))}
+        </select>
+      </Field>
+      <Field label="URL" wide problems={problems("url")}>
+        <input
+          className="mono"
+          value={action.url}
+          spellCheck={false}
+          onChange={(e) => setHttp({ url: e.currentTarget.value })}
+        />
+      </Field>
+      <Field label="Body" hint="optional" wide problems={problems("body")}>
+        <textarea
+          className="mono"
+          rows={2}
+          spellCheck={false}
+          value={action.body ?? ""}
+          onChange={(e) =>
+            setHttp({ body: e.currentTarget.value || undefined })
+          }
+        />
+      </Field>
+      <fieldset className="field wide">
+        <legend className="field-label">
+          Headers <span className="field-hint">sent as written</span>
+        </legend>
+        <PairRows
+          rows={headers}
+          names={["Header", "Value"]}
+          onChange={(rows) => {
+            setHeaders(rows);
+            setHttp({ headers: rowsToRecord(rows) });
+          }}
+        />
+        <Problems list={problems("headers")} />
+      </fieldset>
+      <fieldset className="field wide">
+        <legend className="field-label">
+          Secret headers
+          <span className="field-hint">
+            the value comes from a secret, never shown
+          </span>
+        </legend>
+        <PairRows
+          rows={secretRows}
+          names={["Header", "Secret"]}
+          pick={secrets}
+          onChange={(rows) => {
+            setSecretRows(rows);
+            setHttp({ secret_headers: rowsToRecord(rows) });
+          }}
+        />
+        <Problems list={problems("secret_headers")} />
+      </fieldset>
+      <div className="field wide">
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={action.insecure_http ?? false}
+            onChange={(e) =>
+              setHttp({ insecure_http: e.currentTarget.checked || undefined })
+            }
+          />
+          Allow secret headers over plain http://
+        </label>
+        {action.insecure_http && (
+          <p className="warning" role="note">
+            Anyone on the network path can read these secrets. Use https://
+            unless the host is on a network you trust.
+          </p>
+        )}
+        <Problems list={problems("insecure_http")} />
+      </div>
+    </div>
+  );
+}
+
+function KindField({
+  kind,
+  onChange,
+}: {
+  kind: Action["kind"];
+  onChange: (kind: string) => void;
+}) {
+  return (
+    <Field label="Action">
+      <select value={kind} onChange={(e) => onChange(e.currentTarget.value)}>
+        <option value="shell">Shell command</option>
+        <option value="http">HTTP request</option>
+      </select>
+    </Field>
+  );
+}

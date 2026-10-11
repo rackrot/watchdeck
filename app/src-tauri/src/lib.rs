@@ -10,8 +10,9 @@ use daemon::config::Configs;
 use daemon::mdns::{self, MdnsStatus};
 use daemon::pairing::{Pairing, PAIR_PORT, PAIR_WINDOW};
 use daemon::secrets::Secrets;
-use daemon::server::{Server, PORT};
+use daemon::server::{DaemonEvent, Server, PORT};
 use daemon::store::Store;
+use daemon::tiles::TileView;
 use daemon::tls::Identity;
 use tauri::{Emitter, Manager, WindowEvent};
 use tauri_plugin_log::{RotationStrategy, Target, TargetKind};
@@ -49,6 +50,8 @@ pub fn run() {
             Some(vec![tray::HIDDEN_ARG]),
         ))
         .plugin(tauri_plugin_opener::init())
+        // The icon import dialog is opened from Rust (`import_icon`), never from the window.
+        .plugin(tauri_plugin_dialog::init())
         // Closing the window hides it. The daemon and the device link keep running; Quit is in
         // the tray menu.
         .on_window_event(|window, event| {
@@ -120,6 +123,12 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 loop {
                     match events.recv().await {
+                        Ok(DaemonEvent::LayoutPushed(device)) => {
+                            if let Err(e) = handle.emit("layout-pushed", device) {
+                                log::error!("emitting layout-pushed: {e}");
+                            }
+                            continue;
+                        }
                         Ok(event) => log::info!("{event:?}"),
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             log::warn!("missed {n} daemon events")
@@ -141,6 +150,18 @@ pub fn run() {
                     let state = pairing_rx.borrow_and_update().clone();
                     if let Err(e) = handle.emit("pairing", state) {
                         log::error!("emitting pairing: {e}");
+                    }
+                }
+            });
+
+            // The window follows `tile-values` for the live values on its preview.
+            let handle = app.handle().clone();
+            let mut tile_rx = devices.tile_values();
+            tauri::async_runtime::spawn(async move {
+                while tile_rx.changed().await.is_ok() {
+                    let views = TileView::all(&tile_rx.borrow_and_update());
+                    if let Err(e) = handle.emit("tile-values", views) {
+                        log::error!("emitting tile-values: {e}");
                     }
                 }
             });
@@ -178,6 +199,7 @@ pub fn run() {
             commands::list_secrets,
             commands::set_secret,
             commands::import_icon,
+            commands::tile_values,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

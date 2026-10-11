@@ -1,6 +1,21 @@
 # watchdeck v1: daemon, device protocol, screen config
 
-Status: plan, 2026-10-10. S1 to S5 are done (see the slice table). S8 is built and waits on a manual check. S6 and S7 are not built.
+## Status (2026-10-11)
+
+| Slice | State | Commit | Waiting on |
+|---|---|---|---|
+| S1 Touch | ✅ | 5cc9501 | — |
+| S2 Thin end-to-end | ✅ | 50e63c2, eeb664d | — |
+| S3 Security gate (TLS, pairing) | ✅ | f48c5b2, 889e6c8 | — |
+| S4 Config and actions | ✅ | d42c1d0 | — |
+| S5 Icons | ✅ | 147e695 | — |
+| S6 Tiles | ✅ | 1d05fdf | — |
+| S7 Config UI | Built, reviewed, audit fixes in | this commit | The user's manual check (steps under "S7 results") |
+| S8 App shape | Built, reviewed | ceb6f62 | The user's manual check: a release build with autostart, tray, close-to-tray and single-instance |
+
+- Every slice passed `review` and, where it touches security, `security-auditor`. Each fix round then got its own review.
+- CI is green through 1d05fdf.
+- Open beyond v1: the Backlog section at the end (Sentry error reporting), and the S7 gaps listed in "S7 results" (no secret delete, no `list_icons`, no `test_action`).
 
 ## Decisions
 
@@ -259,11 +274,11 @@ Tauri on Linux:
 |---|---|---|---|
 | S1 ✅ | Touch: GT911, plus a 5×3 test grid that highlights and logs taps. Done 2026-10-10: answers at 0x5D, pins as assumed, no axis swap or mirror, 0 phantom taps in 5 min | Every cell, corners included, maps correctly. No phantom touches in 5 min. Pins and address confirmed | `fw:build`, serial log on device |
 | S2 ✅ | Thin end-to-end, no auth. Done 2026-10-10: tap → notify-send → toast verified on hardware; board reconnects after a daemon restart (IP change untested). Write `site/src/protocol.md` first. Daemon in Tauri, mDNS, plain ws, hello → one hard-coded button → `notify-send` → result toast. Add `cargo test` to CI | Connects within 10 s. Survives a daemon restart and an IP change. Result shows within 1 s. Heap logged | Fake-device integration test, `avahi-browse`, device |
-| S3 | **Security gate.** S3a: TLS interop spike (rcgen + rustls ↔ mbedTLS). S3a done 2026-10-10: wss with the pinned cert works on hardware, and 47820 is wss-only (results below). S3b: pairing on both sides, Forget pairing. S3b built 2026-10-10: paired on hardware, and every hello needs its token (results below). Security review done 2026-10-10 and its fixes applied (review fixes below). tcpdump passed. On hardware, a run covered Forget from both sides, Yes, a wrong code, right-then-No, the 60 s timeout and re-pair, and all passed. **S3 ✅ 2026-10-10** | SAS test vector passes. A wrong code stores nothing. The device pins nothing without the person's Yes. A bad or forgotten token gets `unauthorized`. Oversize messages close the link. Device rejects a regenerated cert. tcpdump: TLS only on 47820, no token on 47821 | `cargo test`, device, tcpdump, security review |
+| S3 ✅ | **Security gate.** S3a: TLS interop spike (rcgen + rustls ↔ mbedTLS). S3a done 2026-10-10: wss with the pinned cert works on hardware, and 47820 is wss-only (results below). S3b: pairing on both sides, Forget pairing. S3b built 2026-10-10: paired on hardware, and every hello needs its token (results below). Security review done 2026-10-10 and its fixes applied (review fixes below). tcpdump passed. On hardware, a run covered Forget from both sides, Yes, a wrong code, right-then-No, the 60 s timeout and re-pair, and all passed. **S3 ✅ 2026-10-10** | SAS test vector passes. A wrong code stores nothing. The device pins nothing without the person's Yes. A bad or forgotten token gets `unauthorized`. Oversize messages close the link. Device rejects a regenerated cert. tcpdump: TLS only on 47820, no token on 47821 | `cargo test`, device, tcpdump, security review |
 | S4 ✅ | Config and actions: `config.toml`, validation, shell and HTTP runners, secrets, live layout push, result modal. S4 built 2026-10-10: `cargo test` covers the acceptance list, and on hardware a live edit pushed with no reconnect while invalid edits pushed nothing. The user's tap check passed all six steps. Review and security audit done 2026-10-10 and their fixes applied (results below). **S4 ✅ 2026-10-10** | A timeout kills grandchildren. Output caps, exit codes, "already running". HTTP: secret headers, no redirects, caps. Live push needs no reconnect | `cargo test`, device, security review |
-| S5 | Icons: import, render, hash, `icon_get`, PSRAM cache. S5 built 2026-10-10: `cargo test` covers the acceptance list, and on hardware the icons were requested, received, validated, cached and hit again after a reconnect. The visual check and the recheck after the review fixes both passed (results below). **S5 ✅ 2026-10-10** | Exact-bytes render test. An RGB + transparent quadrant icon shows correctly | `cargo test`, device |
+| S5 ✅ | Icons: import, render, hash, `icon_get`, PSRAM cache. S5 built 2026-10-10: `cargo test` covers the acceptance list, and on hardware the icons were requested, received, validated, cached and hit again after a reconnect. The visual check and the recheck after the review fixes both passed (results below). **S5 ✅ 2026-10-10** | Exact-bytes render test. An RGB + transparent quadrant icon shows correctly | `cargo test`, device |
 | S6 ✅ | Tiles. **S6 ✅ 2026-10-11** after the user's visual check, the review and the audit fixes (below). S6 built 2026-10-10: `src/daemon/tiles.rs` polls each `tile` source while a device is connected and the sessions push the values as `tile` messages. `cargo test` covers the acceptance list on a paused clock, and on hardware updates flowed, polling stopped when the board dropped and resumed when it returned. The user's visual check passed on 2026-10-11 (results below) | Paused-clock tests: interval, no overlap, idle stop, poll after press | `cargo test`, device |
-| S7 | Config UI (needs design direction first). Design note from the S4 review: with an invalid `config.toml` at startup the revision is empty, so `save_config` can never repair the file from the UI. S7 must handle that case | A save reaches the device within 2 s. Field errors write nothing. Secrets are never returned. Strict CSP | `pnpm build`, `app:dev` |
+| S7 | Config UI. S7 built 2026-10-11, manual check pending (steps and results below). Dark control-room design. Grid editor with a device-accurate preview, button form, secrets page, save flow with push confirmation, repair of an invalid file, strict CSP. Design note from the S4 review: with an invalid `config.toml` at startup the revision was empty, so `save_config` could never repair the file; fixed below | A save reaches the device within 2 s. Field errors write nothing. Secrets are never returned. Strict CSP | `pnpm build`, `app:dev` |
 | S8 | App shape: tray menu, hidden start, close-to-tray, autostart, single-instance, logging. Built 2026-10-10, manual check pending: `src/tray.rs` holds a tray with a disabled status line (`Connected: ids` or `Offline`, refreshed on daemon events), Open window, a Start at login checkbox (the autostart plugin, no Tauri command) and Quit. The window starts hidden and shows unless launched with `--hidden`, which the autostart entry passes. `CloseRequested` hides the window. A second launch focuses it. `tauri-plugin-log` replaces env_logger (log dir file, 1 MB x 3, plus stdout in debug, level info, `RUST_LOG` gone). No capability changes: all plugins are used from Rust only. Pair-from-tray is left out, since the dialog belongs to the window (S7) | Tray-only after login. Closing the window keeps the device connected. A second launch focuses the window | `app:build`, manual check |
 
 Order: S1 → S2 → S3 → S4 → {S5, S6, S8} → S7. S8 can start any time after S2, but it shares `lib.rs` with S3 and S4.
@@ -470,6 +485,25 @@ The review and the security audit found no blockers. These fixes followed:
 - **Surprises:**
   - `prek run --all-files` skips untracked files, so typos flagged a word in the new `tiles.rs` only under `--files`.
   - Opening the serial port reset the board this time.
+
+### S7 results (2026-10-11)
+
+- **Backend changes:**
+  - `ConfigStatus.revision` is now the SHA-256 of the file as last read, live or not (empty if missing or unreadable). `save` has one rule: the revision must equal the file's hash now. That repairs a file that was invalid at startup (the window passes the revision `get_config` returns), and a hand edit made after load is still refused. A save over a file that isn't live keeps the old text as `config.toml.bak.<UTC YYYYMMDDTHHMMSSZ>` (0600), never over an existing one, newest 5 kept. `ConfigStatus.loaded` says whether any good config has loaded since start, so the window can tell an empty startup grid from a last good config. A deleted file is recreated by a save naming "".
+  - `DaemonEvent::LayoutPushed(device)`, sent after a config change reaches a connected device as a new layout (not for the first layout of a session). `lib.rs` forwards it as `layout-pushed`. The device sends no acknowledgement, so "pushed" means the daemon wrote it.
+  - `tile_values` command and `tile-values` event (`TileView`: button, tile definition, text, state), so the preview shows real tile values. The window ignores a reading whose tile definition differs from the draft's.
+  - `tauri-plugin-dialog` 2.8 (plan §6), used from Rust only: `import_icon` opens the native file dialog itself (PNG, JPEG, WebP filter), takes no path from the window, and returns the icon name or none on cancel. No JS dialog package and no `dialog:allow-open` capability, since that would widen the asset scope. Tauri's `protocol-asset` feature lets the preview load icon files.
+- **CSP:** `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' asset: http://asset.localhost; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'`. `devCsp` adds `'unsafe-inline'` to script-src (the Vite React preamble) and style-src, and `ws://localhost:1420` to connect-src. Asset protocol scope: `$APPCONFIG/icons/*`. No capability was added. Running under the CSP in the webview is not yet seen.
+- **Preview fidelity:** geometry (`preview.ts`), icon box (`box_px`, pinned by the same table as the Rust test), label line limits, tile layout and colors mirror `ui.c`. Line breaking and "..." (`lvtext.ts`) port LVGL 9's `lv_text_get_next_line` and the DOTS long mode with the firmware's break characters, using Montserrat 24 and 32 advance widths read from the LVGL font sources. Kerning is left out: about 1 px mean and 3 px at p95 per label (measured on 3000 sample labels). Glyph shapes are the system font. Not compared with LVGL running; the port follows its source.
+- **Tests:** 22 TS tests (`pnpm test`, Node's runner, no new package; Vitest is not installed), 4 new config tests, and `device_sim` asserts `LayoutPushed`. Totals: 144 unit and 51 `device_sim`.
+- **Review and audit fixes (2026-10-11):**
+  - Icon import moved into Rust (above). Replacing a not-live file needs an in-page confirmation that names what is written (an empty grid if the file never loaded) and where the backup goes. A note by Save says comments are not kept, and `site/src/config.md` documents both.
+  - Errors: Rust's `\u{..}` escapes in ids are read back. A message about a button the draft lacks goes to a general list, a refused save always shows a "Save refused" banner with every message, and out-of-grid or any buttons show as chips (marked when they have problems) when the grid size is invalid. An invalid header name shows under both header tables.
+  - Duplicate header rows block a save with an inline error, and the forms start over from the draft after Revert or Reload.
+  - The page listens before it reads, ignores the `config-status` event of its own save, and does not reload during a save.
+  - Pairing resumes on the Devices tab. A hidden icon can show again. Tabs have `aria-controls` and arrow keys, and the hex input, Remove, Replace and Forget buttons are labelled.
+  - `pnpm build` type-checks `tests/` (`tsconfig.test.json`, with a small ambient shim for the two Node modules), and CI runs `pnpm test`. The save and dirty logic is in `saveflow.ts`, with tests.
+- **Gaps:** no secret delete command; no `list_icons` (the picker offers icons the config uses plus ones imported this session); no `test_action`; the device never acknowledges a layout; a config deleted while running is recreated only by a save.
 
 ## 8. Testing
 

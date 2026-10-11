@@ -1223,6 +1223,11 @@ async fn a_config_edit_reaches_a_connected_device_without_a_reconnect() {
             ..
         }
     ));
+    assert_eq!(
+        daemon.events.recv().await.unwrap(),
+        DaemonEvent::LayoutPushed(DEVICE.into()),
+        "the window hears of the push"
+    );
     assert!(
         daemon.events.try_recv().is_err(),
         "the session was replaced"

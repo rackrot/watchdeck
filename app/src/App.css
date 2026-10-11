@@ -1,120 +1,476 @@
-:root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 24px;
-  font-weight: 400;
+/* Colors come from theme.css; nothing here names one. */
 
-  color: #0f0f0f;
-  background-color: #f6f6f6;
-
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
-}
-
-.container {
-  margin: 0;
-  padding-top: 10vh;
+.app {
+  min-height: 100vh;
   display: flex;
   flex-direction: column;
-  justify-content: center;
-  text-align: center;
 }
 
-.row {
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
   display: flex;
-  justify-content: center;
-  gap: 5px;
+  align-items: center;
+  gap: 20px;
+  padding: 0 16px;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line);
 }
 
-.devices {
+.wordmark {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+}
+
+.tabs {
+  display: flex;
+  gap: 2px;
+  flex: 1;
+}
+
+.tabs button {
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: none;
+  color: var(--text-1);
+  padding: 11px 12px 9px;
+}
+
+.tabs button[aria-selected="true"] {
+  color: var(--text-0);
+  border-bottom-color: var(--accent);
+}
+
+.device-count {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-1);
+}
+
+main {
+  flex: 1;
+  padding: 12px 16px 32px;
+}
+
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+section,
+.button-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.grid-editor,
+.button-form,
+.page > section {
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.button-form section {
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.panel-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.panel-head .id {
+  color: var(--accent);
+}
+
+.hint {
+  font-size: 12px;
+}
+
+/* Status */
+
+.dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.dot.ok {
+  background: var(--ok);
+}
+
+.dot.offline {
+  background: var(--offline);
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  border: 1px solid transparent;
+  background: none;
+  color: var(--text-1);
+}
+
+.chip.ok {
+  color: var(--ok);
+  background: var(--ok-dim);
+}
+
+.chip.bad {
+  color: var(--bad);
+  background: var(--bad-dim);
+}
+
+.chip.stale {
+  color: var(--stale);
+  background: var(--stale-dim);
+}
+
+.chip.offline {
+  color: var(--offline);
+  background: var(--offline-dim);
+}
+
+.chip.busy {
+  color: var(--busy);
+  background: var(--busy-dim);
+}
+
+button.chip.selected {
+  border-color: var(--accent);
+}
+
+.banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  border: 1px solid;
+}
+
+.banner ul {
+  flex-basis: 100%;
+  padding-left: 18px;
+}
+
+.banner.bad {
+  color: var(--text-0);
+  background: var(--bad-dim);
+  border-color: var(--bad);
+}
+
+.banner.stale {
+  background: var(--stale-dim);
+  border-color: var(--stale);
+}
+
+.problems {
   list-style: none;
+  padding: 0;
+  color: var(--bad);
+  font-size: 12px;
+}
+
+.warning {
+  color: var(--stale);
+  font-size: 12px;
+}
+
+.ok-note {
+  color: var(--ok);
+}
+
+/* Save bar */
+
+.save-bar {
+  position: sticky;
+  top: 41px;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.save-status {
+  flex: 1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Forms */
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 10px 12px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  border: 0;
+  padding: 0;
+  margin: 0;
+}
+
+.field.wide {
+  grid-column: 1 / -1;
+}
+
+.field-label {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  color: var(--text-1);
+  font-size: 12px;
   padding: 0;
 }
 
-.devices li {
+.field-hint {
+  color: var(--text-2);
+  font-size: 11px;
+}
+
+.field input,
+.field select,
+.field textarea {
+  width: 100%;
+}
+
+.check {
   display: flex;
-  justify-content: center;
   align-items: center;
-  gap: 1em;
-  margin: 0.5em 0;
+  gap: 8px;
+  color: var(--text-1);
 }
 
-dialog {
-  border: none;
-  border-radius: 8px;
-  padding: 1.5em;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+.color,
+.icon-pick {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
+.thumb {
+  width: 28px;
+  height: 28px;
+  object-fit: contain;
+  background: var(--bg-0);
+  border-radius: 4px;
 }
 
-a:hover {
-  color: #535bf2;
+.rows {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
 }
 
-h1 {
+.row-pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: 6px;
+  width: 100%;
+}
+
+.row-pair.single {
+  grid-template-columns: 1fr auto;
+}
+
+.size-controls {
+  display: flex;
+  gap: 12px;
+}
+
+.size-controls .field {
+  width: 90px;
+}
+
+.name-list {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.name-list li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.name-list li:last-child {
+  border-bottom: 0;
+}
+
+.grow {
+  flex: 1;
+}
+
+.outside {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+/* The device preview. Everything inside .screen is in the device's own pixels. */
+
+.stage {
+  width: 100%;
+}
+
+.screen {
+  position: relative;
+  transform-origin: top left;
+  background: var(--dev-screen);
+  border-radius: 4px;
+  touch-action: none;
+  user-select: none;
+}
+
+.dev-button,
+.dev-empty,
+.drop-target {
+  position: absolute;
+  border-radius: 13px;
+}
+
+.dev-button {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: 4px;
+  overflow: hidden;
+  cursor: grab;
+  box-shadow: 0 2px 2px var(--dev-shadow);
+}
+
+.dev-button.tile-unknown {
+  background: var(--dev-tile-unknown);
+}
+
+.dev-button.tile-bad {
+  background: var(--dev-tile-bad);
+}
+
+.dev-button.selected {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.dev-button.invalid {
+  outline: 3px solid var(--bad);
+  outline-offset: 2px;
+}
+
+.dev-button.dragging {
+  opacity: 0.35;
+}
+
+.dev-icon {
+  flex: none;
+  pointer-events: none;
+}
+
+.dev-text {
+  flex: none;
+  overflow: hidden;
   text-align: center;
 }
 
-input,
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
-  transition: border-color 0.25s;
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
+.dev-line {
+  white-space: pre;
 }
 
-button {
-  cursor: pointer;
+.dev-empty {
+  padding: 0;
+  font-size: 28px;
+  color: var(--text-2);
+  background: none;
+  border: 1px dashed var(--line-strong);
 }
 
-button:hover {
-  border-color: #396cd8;
-}
-button:active {
-  border-color: #396cd8;
-  background-color: #e8e8e8;
+.dev-empty:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: none;
 }
 
-input,
-button {
-  outline: none;
+.drop-target {
+  border: 2px solid var(--accent);
+  background: var(--accent-dim);
+  opacity: 0.6;
+  pointer-events: none;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
-  }
+/* Pairing */
 
-  a:hover {
-    color: #24c8db;
-  }
+.pair-dialog {
+  min-width: 340px;
+}
 
-  dialog {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
-  }
+.pair-dialog h3 {
+  margin-bottom: 10px;
+}
 
-  input,
-  button {
-    color: #ffffff;
-    background-color: #0f0f0f98;
-  }
-  button:active {
-    background-color: #0f0f0f69;
-  }
+.pair-dialog p {
+  margin-bottom: 10px;
+}
+
+.inline {
+  display: flex;
+  gap: 8px;
+}
+
+.code {
+  font-size: 20px;
+  letter-spacing: 0.2em;
+  width: 9ch;
+  text-align: center;
+}
+
+.dialog-close {
+  margin-top: 4px;
+}
+
+.field input[type="checkbox"] {
+  width: auto;
 }

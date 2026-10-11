@@ -32,6 +32,8 @@ pub const MAX_TIMEOUT_S: u64 = 600;
 /// A tile polls at most this often, and at least this rarely (a day).
 pub const MIN_EVERY_S: u64 = 2;
 pub const MAX_EVERY_S: u64 = 24 * 60 * 60;
+/// How many `config.toml.bak.*` files a repairing save leaves behind.
+const KEEP_BACKUPS: usize = 5;
 const DEFAULT_TIMEOUT_S: u64 = 10;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_BODY_BYTES: usize = 64 * 1024;
@@ -515,10 +517,15 @@ fn toml_error(text: &str, e: &toml::de::Error) -> String {
 /// What the window needs to know about the file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ConfigStatus {
-    /// SHA-256 of the file text the live config came from. A save must name it.
+    /// SHA-256 of the file text as the last reload read it, live or not. It is empty when the file
+    /// was missing or unreadable. A save must name it, and is refused if the file has changed
+    /// since.
     pub revision: String,
     /// Why the file on disk is not live, or empty when it is.
     pub errors: Vec<String>,
+    /// Whether a good config has loaded since the app started. If not, the live config is the
+    /// empty grid and not any version of the file.
+    pub loaded: bool,
 }
 
 /// The live config, and the file it comes from.
@@ -554,6 +561,7 @@ impl Configs {
             status: watch::channel(ConfigStatus {
                 revision: String::new(),
                 errors: Vec::new(),
+                loaded: false,
             })
             .0,
             icons: Icons::new(icons_dir.clone()),
@@ -591,13 +599,15 @@ impl Configs {
         let mut read = self.locked();
         let before = self.stamp();
         let mut icons_before = None;
+        let mut revision = String::new();
         let loaded = read_capped(&self.path).and_then(|bytes| {
+            revision = sha256_hex(&bytes);
             let text = String::from_utf8(bytes).map_err(|_| vec!["not UTF-8".to_string()])?;
             let config = parse(&text, &self.secrets.names())?;
             self.watch(&config);
             icons_before = Some(self.stamp().icons);
             let icons = self.icons.load(&config)?;
-            Ok((sha256_hex(text.as_bytes()), Live { config, icons }))
+            Ok(Live { config, icons })
         });
         let now = self.stamp();
         if now.files != before.files || icons_before.is_some_and(|icons| icons != now.icons) {
@@ -605,8 +615,8 @@ impl Configs {
             return Ok(false);
         }
         *read = now;
-        let (revision, live) = match loaded {
-            Ok(loaded) => loaded,
+        let live = match loaded {
+            Ok(live) => live,
             Err(errors) => {
                 log::error!(
                     "{} not applied, keeping the live config: {}",
@@ -614,8 +624,9 @@ impl Configs {
                     errors.join("; ")
                 );
                 self.status.send_if_modified(|status| {
-                    let changed = status.errors != errors;
+                    let changed = status.errors != errors || status.revision != revision;
                     status.errors = errors.clone();
+                    status.revision = revision;
                     changed
                 });
                 return Err(errors);
@@ -629,9 +640,10 @@ impl Configs {
         Ok(changed)
     }
 
-    /// Checks `config` and writes it in place of the file, which must still be the one the
-    /// window loaded at `revision`, with no edits on disk that aren't live. Returns the new
-    /// revision. Nothing is written unless every check passes.
+    /// Checks `config` and writes it in place of the file, which must still be the one at
+    /// `revision`, the text the window saw. Returns the new revision. Nothing is written unless
+    /// every check passes. When the file on disk is not live (it breaks a rule), this is how the
+    /// window repairs it, and the text it replaces is kept as `config.toml.bak.<UTC time>`, newest 5 kept.
     pub fn save(&self, config: Config, revision: &str) -> Result<String, Vec<String>> {
         let errors = config.check(&self.secrets.names());
         if !errors.is_empty() {
@@ -642,16 +654,15 @@ impl Configs {
         self.icons.load(&config)?;
         let _read = self.locked();
         let icons = self.icons.load(&config)?;
-        let live = self.status.borrow().revision.clone();
-        if revision != live {
+        let on_disk = self.read_file()?;
+        if on_disk.as_deref().map_or_else(String::new, sha256_hex) != revision {
             return Err(vec![format!(
                 "{FILE} changed since it was loaded; load it again before saving"
             )]);
         }
-        if read_capped(&self.path).map(|bytes| sha256_hex(&bytes)) != Ok(live) {
-            return Err(vec![format!(
-                "{FILE} has edits on disk that are not live; fix or revert them first"
-            )]);
+        if let Some(bytes) = on_disk.filter(|_| !self.status.borrow().errors.is_empty()) {
+            let backup = self.backup(&bytes)?;
+            log::warn!("kept the replaced {FILE} as {}", backup.display());
         }
         let text = format!(
             "# Written by the watchdeck app, which does not keep comments.\n{}",
@@ -665,6 +676,78 @@ impl Configs {
         }
         self.set_status(revision.clone());
         Ok(revision)
+    }
+
+    /// Writes `bytes` to a new `config.toml.bak.<UTC YYYYMMDDTHHMMSSZ>` beside the file, never over
+    /// an existing one, then drops all but the newest [`KEEP_BACKUPS`].
+    fn backup(&self, bytes: &[u8]) -> Result<PathBuf, Vec<String>> {
+        let dir = self.path.parent().unwrap_or(Path::new("."));
+        let prefix = format!("{FILE}.bak.");
+        let mut old = self.backups(dir, &prefix);
+        let newest = old
+            .last()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_os_string());
+        let mut at = time::OffsetDateTime::now_utc();
+        // The stamp sorts after every backup there is, so name order is age order even when
+        // saves land in one second or the clock steps back.
+        let path = loop {
+            let stamp = format!(
+                "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+                at.year(),
+                u8::from(at.month()),
+                at.day(),
+                at.hour(),
+                at.minute(),
+                at.second()
+            );
+            let name = std::ffi::OsString::from(format!("{prefix}{stamp}"));
+            if newest.as_ref().is_none_or(|n| name > *n) {
+                break dir.join(name);
+            }
+            at += time::Duration::seconds(1);
+        };
+        write_private(&path, bytes)
+            .map_err(|e| vec![format!("Could not keep {} first: {e}", path.display())])?;
+        old.push(path.clone());
+        for stale in old.iter().take(old.len().saturating_sub(KEEP_BACKUPS)) {
+            if let Err(e) = fs::remove_file(stale) {
+                log::warn!("could not remove the old backup {}: {e}", stale.display());
+            }
+        }
+        Ok(path)
+    }
+
+    /// The backups in `dir`, oldest first. Only regular files named exactly
+    /// `<prefix><YYYYMMDDTHHMMSSZ>` count, so pruning never touches the user's own files and a
+    /// stray name can't sort above every stamp.
+    fn backups(&self, dir: &Path, prefix: &str) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+                    .filter(|e| {
+                        e.file_name()
+                            .to_str()
+                            .and_then(|n| n.strip_prefix(prefix))
+                            .is_some_and(is_backup_stamp)
+                    })
+                    .map(|e| e.path())
+                    .collect()
+            })
+            .unwrap_or_default();
+        found.sort();
+        found
+    }
+
+    /// The file's bytes, or `None` if there is no file.
+    fn read_file(&self) -> Result<Option<Vec<u8>>, Vec<String>> {
+        match self.path.try_exists() {
+            Ok(false) => Ok(None),
+            Ok(true) => read_capped(&self.path).map(Some),
+            Err(e) => Err(vec![format!("{}: {e}", self.path.display())]),
+        }
     }
 
     /// Copies the image at `src` into `icons/` and returns the file name for a button's `icon`.
@@ -762,6 +845,7 @@ impl Configs {
         let next = ConfigStatus {
             revision,
             errors: Vec::new(),
+            loaded: true,
         };
         self.status.send_if_modified(|status| {
             let changed = *status != next;
@@ -815,6 +899,15 @@ fn read_capped(path: &Path) -> Result<Vec<u8>, Vec<String>> {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     encode_hex(&Sha256::digest(bytes))
+}
+
+/// `YYYYMMDDTHHMMSSZ`, the stamp `backup` writes.
+fn is_backup_stamp(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 16
+        && b[8] == b'T'
+        && b[15] == b'Z'
+        && b[..8].iter().chain(&b[9..15]).all(u8::is_ascii_digit)
 }
 
 #[cfg(test)]
@@ -1415,7 +1508,168 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
         assert_eq!(configs.current().config, Config::empty());
         let status = configs.status().borrow().clone();
         assert!(status.errors[0].contains("version is 2"), "{status:?}");
-        assert_eq!(status.revision, "");
+        assert!(!status.loaded, "no good config has loaded");
+        assert_eq!(
+            status.revision,
+            sha256_hex(b"version = 2\n[layout]\ncols = 5\nrows = 3\n"),
+            "the revision names the file that was refused, so a save can replace it"
+        );
+    }
+
+    #[test]
+    fn a_save_repairs_a_file_that_was_invalid_at_start_and_keeps_the_old_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(FILE);
+        let broken = "version = 2\n[layout]\ncols = 5\nrows = 3\n";
+        fs::write(&path, broken).unwrap();
+        let configs = open(tmp.path());
+        let status = configs.status().borrow().clone();
+        assert!(!status.errors.is_empty());
+
+        let mut config = Config::empty();
+        config.layout.cols = 4;
+        let revision = configs.save(config.clone(), &status.revision).unwrap();
+        assert_eq!(fs::read_to_string(&backups(tmp.path())[0]).unwrap(), broken);
+        assert_eq!(mode(&backups(tmp.path())[0]), 0o600);
+        assert_eq!(configs.current().config, config);
+        let status = configs.status().borrow().clone();
+        assert!(status.errors.is_empty() && status.loaded);
+        assert_eq!(status.revision, revision);
+        assert_eq!(
+            parse(&fs::read_to_string(&path).unwrap(), &Ok(Vec::new())).unwrap(),
+            config
+        );
+    }
+
+    /// The `config.toml.bak.*` files in `dir`, oldest first.
+    fn backups(dir: &Path) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("config.toml.bak.")
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn repeated_repairs_keep_each_old_text_in_its_own_timestamped_backup_and_the_newest_five() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(FILE);
+        fs::write(&path, "broken 0").unwrap();
+        let configs = open(tmp.path());
+        let mut config = Config::empty();
+        for n in 1..=7 {
+            let revision = configs.status().borrow().revision.clone();
+            configs.save(config.clone(), &revision).unwrap();
+            // A hand edit breaks the file again.
+            fs::write(&path, format!("broken {n}")).unwrap();
+            configs.reload().unwrap_err();
+        }
+        let kept = backups(tmp.path());
+        assert_eq!(kept.len(), KEEP_BACKUPS);
+        let name = kept[0].file_name().unwrap().to_string_lossy().into_owned();
+        let stamp = name.strip_prefix("config.toml.bak.").unwrap();
+        assert!(
+            stamp.len() == 16 && stamp.ends_with('Z') && stamp.as_bytes()[8] == b'T',
+            "{name}"
+        );
+        // Saves in the same second never overwrite, so the newest five texts are 2..=6.
+        let texts: Vec<String> = kept
+            .iter()
+            .map(|p| fs::read_to_string(p).unwrap())
+            .collect();
+        assert_eq!(
+            texts,
+            ["broken 2", "broken 3", "broken 4", "broken 5", "broken 6"].map(String::from)
+        );
+        config.layout.cols = 3;
+    }
+
+    #[test]
+    fn backup_pruning_ignores_files_that_only_look_like_backups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(FILE);
+        // A name that sorts above every stamp used to stall the stamp search, and a user's own
+        // file or a directory used to be pruned.
+        let others = ["config.toml.bak.zzz", "config.toml.bak.manual"];
+        for name in others {
+            fs::write(tmp.path().join(name), "mine").unwrap();
+        }
+        fs::create_dir(tmp.path().join("config.toml.bak.20000101T000000Z")).unwrap();
+        fs::write(&path, "broken 0").unwrap();
+        let configs = open(tmp.path());
+        for n in 1..=KEEP_BACKUPS + 2 {
+            let revision = configs.status().borrow().revision.clone();
+            configs.save(Config::empty(), &revision).unwrap();
+            fs::write(&path, format!("broken {n}")).unwrap();
+            configs.reload().unwrap_err();
+        }
+        for name in others {
+            assert_eq!(fs::read_to_string(tmp.path().join(name)).unwrap(), "mine");
+        }
+        assert!(tmp.path().join("config.toml.bak.20000101T000000Z").is_dir());
+        assert_eq!(
+            configs.backups(tmp.path(), "config.toml.bak.").len(),
+            KEEP_BACKUPS
+        );
+    }
+
+    #[test]
+    fn a_repair_never_overwrites_a_newer_hand_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(FILE);
+        fs::write(&path, "version = 2\n").unwrap();
+        let configs = open(tmp.path());
+        let seen = configs.status().borrow().revision.clone();
+
+        // The window loaded the first broken file; then the user edited it again.
+        fs::write(&path, "version = 3\n").unwrap();
+        let errors = configs.save(Config::empty(), &seen).unwrap_err();
+        assert!(errors[0].contains("changed since"), "{errors:?}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "version = 3\n");
+        assert!(backups(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn a_hand_edit_that_breaks_a_live_config_is_replaced_only_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(FILE);
+        let configs = open(tmp.path());
+        let loaded = configs.status().borrow().revision.clone();
+        let config = configs.current().config.clone();
+
+        fs::write(&path, "not toml [").unwrap();
+        configs.reload().unwrap_err();
+        // The window still holds the old revision, which no longer matches the file.
+        assert!(configs.save(config.clone(), &loaded).is_err());
+        let refused = configs.status().borrow().revision.clone();
+        assert_ne!(refused, loaded);
+        configs.save(config, &refused).unwrap();
+        assert_eq!(
+            fs::read_to_string(&backups(tmp.path())[0]).unwrap(),
+            "not toml ["
+        );
+    }
+
+    #[test]
+    fn a_deleted_file_is_recreated_by_a_save_naming_no_revision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(FILE);
+        let configs = open(tmp.path());
+        let config = configs.current().config.clone();
+        fs::remove_file(&path).unwrap();
+        configs.reload().unwrap_err();
+        assert_eq!(configs.status().borrow().revision, "");
+        assert!(configs.save(config.clone(), "0123").is_err());
+        configs.save(config, "").unwrap();
+        assert!(path.exists());
+        assert!(backups(tmp.path()).is_empty());
     }
 
     #[test]
@@ -1474,7 +1728,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
     }
 
     #[test]
-    fn save_writes_0600_and_goes_live_but_only_from_the_live_revision() {
+    fn save_writes_0600_and_goes_live_but_only_from_the_revision_on_disk() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(FILE);
         let configs = open(tmp.path());
@@ -1504,7 +1758,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
         // A hand edit that isn't live yet is never overwritten.
         fs::write(&path, "version = 1\n").unwrap();
         let held = configs.save(config, &revision).unwrap_err();
-        assert!(held[0].contains("edits on disk"), "{held:?}");
+        assert!(held[0].contains("changed since"), "{held:?}");
         assert_eq!(fs::read_to_string(&path).unwrap(), "version = 1\n");
     }
 

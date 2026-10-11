@@ -1,15 +1,16 @@
 //! Tauri commands for the window. They only forward to the daemon, which owns the rules.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use serde::Serialize;
-use tauri::State;
+use tauri::{AppHandle, State};
+use tauri_plugin_dialog::DialogExt;
 
 use crate::daemon::config::{Config, Configs};
 use crate::daemon::pairing::{Pairing, PairingState};
 use crate::daemon::secrets::Secrets;
 use crate::daemon::server::{DeviceInfo, Devices};
+use crate::daemon::tiles::TileView;
 
 pub struct Daemon {
     pub devices: Devices,
@@ -64,10 +65,14 @@ pub async fn cancel_pairing(daemon: State<'_, Daemon>) -> Result<(), String> {
 pub struct ConfigView {
     /// The live config.
     config: Config,
-    /// Pass back to `save_config`. A save from an older revision is refused.
+    /// The file text this view is about, to pass back to `save_config`. A save is refused if the
+    /// file has changed since. When `errors` is not empty the file is not live, `config` is the
+    /// last good one, and a save with this revision replaces the file with it.
     revision: String,
     /// Why `config.toml` on disk is not live, or empty when it is.
     errors: Vec<String>,
+    /// False if no good config has loaded since the app started, so `config` is an empty grid.
+    loaded: bool,
 }
 
 #[tauri::command]
@@ -77,6 +82,7 @@ pub fn get_config(daemon: State<'_, Daemon>) -> ConfigView {
         config: daemon.configs.current().config.clone(),
         revision: status.revision,
         errors: status.errors,
+        loaded: status.loaded,
     }
 }
 
@@ -92,6 +98,13 @@ pub async fn save_config(
     blocking(move || configs.save(config, &revision))
         .await
         .map_err(|e| vec![e])?
+}
+
+/// The latest reading of each polled tile. Readings change as devices connect, so this is the
+/// starting point for the `tile-values` event.
+#[tauri::command]
+pub fn tile_values(daemon: State<'_, Daemon>) -> Vec<TileView> {
+    TileView::all(&daemon.devices.tile_values().borrow())
 }
 
 /// Secret names. Values never leave the daemon.
@@ -117,12 +130,37 @@ pub async fn set_secret(
     .await?
 }
 
-/// Copies a PNG, JPEG or WebP into the icons directory and returns the file name for a button's
-/// `icon`. The file must pass the same size and decoding checks as a configured icon.
+/// Asks the user for a PNG, JPEG or WebP in a native file dialog, copies it into the icons
+/// directory and returns the file name for a button's `icon`, or `None` if they cancel. The
+/// dialog is opened here, so the window never names a path, and the file must pass the same size
+/// and decoding checks as a configured icon.
 #[tauri::command]
-pub async fn import_icon(daemon: State<'_, Daemon>, path: String) -> Result<String, String> {
+pub async fn import_icon(
+    app: AppHandle,
+    daemon: State<'_, Daemon>,
+) -> Result<Option<String>, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("Import an icon")
+        .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
+        .pick_file(move |picked| {
+            // The receiver only goes away if the command was dropped.
+            let _ = tx.send(picked);
+        });
+    let picked = rx
+        .await
+        .map_err(|_| "the file dialog closed unexpectedly".to_string())?;
+    let Some(picked) = picked else {
+        return Ok(None);
+    };
+    let path = picked
+        .into_path()
+        .map_err(|e| format!("not a local file: {e}"))?;
     let configs = daemon.configs.clone();
-    blocking(move || configs.import_icon(Path::new(&path))).await?
+    blocking(move || configs.import_icon(&path))
+        .await?
+        .map(Some)
 }
 
 /// Runs `work` on the blocking pool, since it may decode images or wait on the config lock.

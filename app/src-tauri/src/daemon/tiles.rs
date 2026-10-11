@@ -8,6 +8,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde::Serialize;
 use tokio::sync::{watch, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, sleep_until, Instant};
@@ -45,6 +46,30 @@ pub type Values = BTreeMap<String, Reading>;
 
 /// What a session has told its device, by button id.
 pub type Sent = BTreeMap<String, TileValue>;
+
+/// A reading as the window shows it: the tile definition it was read under lets the window
+/// ignore a reading of a source that has since been edited.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TileView {
+    pub btn: String,
+    pub tile: TileConfig,
+    pub text: String,
+    pub state: TileState,
+}
+
+impl TileView {
+    pub fn all(values: &Values) -> Vec<Self> {
+        values
+            .iter()
+            .map(|(btn, reading)| Self {
+                btn: btn.clone(),
+                tile: reading.tile.clone(),
+                text: reading.value.text.clone(),
+                state: reading.value.state,
+            })
+            .collect()
+    }
+}
 
 /// Takes one reading of a tile. [`Actions`] runs the real source; tests stand in their own.
 pub trait Sample: Clone + Send + Sync + 'static {

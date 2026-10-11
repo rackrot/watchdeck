@@ -93,8 +93,8 @@ export default function PairDialog({
   const open =
     state === null || state.state === "waiting" || state.state === "confirm";
   return (
-    <dialog ref={dialog} onClose={closed}>
-      <h2>Pair a device</h2>
+    <dialog ref={dialog} onClose={closed} className="pair-dialog">
+      <h3>Pair a device</h3>
       {state?.state === "waiting" && (
         <p>
           On the device, tap this computer in the list. Pairing stays open for 2
@@ -106,9 +106,10 @@ export default function PairDialog({
           <p>
             Type the 6-digit code shown on {state.device} ({state.peer}).
           </p>
-          <div className="row">
+          <div className="inline">
             <input
               ref={input}
+              className="mono code"
               inputMode="numeric"
               autoComplete="off"
               maxLength={7}
@@ -116,18 +117,32 @@ export default function PairDialog({
               value={code}
               onChange={(e) => setCode(e.currentTarget.value)}
             />
-            <button type="submit">Pair</button>
+            <button type="submit" className="primary">
+              Pair
+            </button>
           </div>
         </form>
       )}
       {state?.state === "paired" && (
         <p>Paired {state.device}. Tap Yes on the device to finish.</p>
       )}
-      {state?.state === "failed" && <p role="alert">{state.reason}</p>}
+      {state?.state === "failed" && (
+        <p className="problems" role="alert">
+          {state.reason}
+        </p>
+      )}
       {state?.state === "closed" && <p>Pairing closed.</p>}
       {/* Once the window ends, a late error from a second submit is stale. */}
-      {error && open && <p role="alert">{error}</p>}
-      <button type="button" onClick={() => dialog.current?.close()}>
+      {error && open && (
+        <p className="problems" role="alert">
+          {error}
+        </p>
+      )}
+      <button
+        type="button"
+        className="dialog-close"
+        onClick={() => dialog.current?.close()}
+      >
         {open ? "Cancel" : "Close"}
       </button>
     </dialog>

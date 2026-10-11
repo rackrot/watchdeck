@@ -1,0 +1,201 @@
+/* Dark control room: near-black surfaces in four steps, three text levels, one accent, and a
+   color for each state a device or action can be in. Every color in the app comes from here. */
+:root {
+  color-scheme: dark;
+
+  --bg-0: #0a0d11; /* window */
+  --bg-1: #10151b; /* panels */
+  --bg-2: #171e26; /* controls */
+  --bg-3: #212b36; /* hover */
+  --line: #232d38;
+  --line-strong: #364453;
+  --scrim: rgb(0 0 0 / 60%);
+
+  --text-0: #e7edf3;
+  --text-1: #a4b1be;
+  --text-2: #7b8997;
+
+  --accent: #38bdf8;
+  --accent-ink: #04202e; /* text on the accent */
+  --accent-dim: #0e3a52;
+
+  --ok: #3fb950;
+  --ok-dim: #123320;
+  --bad: #f85149;
+  --bad-dim: #3d171a;
+  --stale: #d29922;
+  --stale-dim: #382b0c;
+  --offline: #7b8997;
+  --offline-dim: #1b222a;
+  --busy: #a78bfa;
+  --busy-dim: #2a2149;
+
+  /* The device as firmware/main/ui.c draws it (lv_palette_darken level 2 for the tiles). */
+  --dev-screen: #000;
+  --dev-tile-unknown: #616161;
+  --dev-tile-bad: #d32f2f;
+  --dev-shadow: rgb(158 158 158 / 50%);
+
+  --font-ui: system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono:
+    ui-monospace, "JetBrains Mono", "DejaVu Sans Mono", Menlo, Consolas,
+    monospace;
+  --radius: 6px;
+
+  font-family: var(--font-ui);
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--text-0);
+  background: var(--bg-0);
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg-0);
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+p,
+ul {
+  margin: 0;
+}
+
+h3 {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+h4 {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-1);
+}
+
+h5 {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.muted {
+  color: var(--text-2);
+}
+
+input,
+select,
+textarea,
+button {
+  font: inherit;
+  color: var(--text-0);
+  background: var(--bg-2);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  padding: 4px 8px;
+  min-width: 0;
+}
+
+input.mono,
+select.mono,
+textarea.mono {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+button:focus-visible,
+[role="button"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+input[aria-invalid="true"] {
+  border-color: var(--bad);
+}
+
+input[type="color"] {
+  padding: 0;
+  width: 30px;
+  height: 28px;
+  cursor: pointer;
+}
+
+input[type="checkbox"] {
+  accent-color: var(--accent);
+}
+
+button {
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  background: var(--bg-3);
+}
+
+button:disabled {
+  color: var(--text-2);
+  cursor: default;
+}
+
+button.primary {
+  color: var(--accent-ink);
+  background: var(--accent);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+
+button.primary:hover:not(:disabled) {
+  background: var(--accent);
+  filter: brightness(1.1);
+}
+
+button.primary:disabled {
+  color: var(--text-2);
+  background: var(--bg-2);
+  border-color: var(--line-strong);
+}
+
+button.quiet {
+  background: none;
+  border-color: transparent;
+  color: var(--text-1);
+}
+
+button.danger {
+  color: var(--bad);
+  border-color: var(--bad-dim);
+}
+
+button.danger:hover:not(:disabled) {
+  background: var(--bad-dim);
+}
+
+dialog {
+  color: var(--text-0);
+  background: var(--bg-1);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  padding: 16px;
+}
+
+dialog::backdrop {
+  background: var(--scrim);
+}

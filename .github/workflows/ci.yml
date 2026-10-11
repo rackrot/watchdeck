@@ -64,6 +64,8 @@ jobs:
           workspaces: app/src-tauri -> target
       - run: pnpm install --frozen-lockfile
         working-directory: app
+      - run: pnpm test
+        working-directory: app
       - run: cargo clippy --locked -- -D warnings
         working-directory: app/src-tauri
       - run: cargo test --locked

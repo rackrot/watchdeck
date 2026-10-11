@@ -56,6 +56,9 @@ pub enum DaemonEvent {
     DeviceDisconnected(String),
     DevicePaired(String),
     DeviceForgotten(String),
+    /// A config change reached a connected device as a new layout. The first layout of a session
+    /// is not announced.
+    LayoutPushed(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -187,6 +190,11 @@ impl Server {
 }
 
 impl Devices {
+    /// The latest tile readings, which change as devices connect, poll and leave.
+    pub fn tile_values(&self) -> watch::Receiver<Values> {
+        self.0.tiles.values()
+    }
+
     pub fn list(&self) -> Vec<DeviceInfo> {
         let registry = self.0.registry();
         registry
@@ -660,6 +668,7 @@ where
                     rev += 1;
                     log::info!("{device}: pushing layout rev {rev}");
                     send(tx, &layout.message(rev)).await?;
+                    shared.emit(DaemonEvent::LayoutPushed(device.to_string()));
                     tiles.reset();
                     if let Some(kicked) = tiles.push(tx, &mut kick, &layout, &live).await? {
                         return end_kicked(tx, kicked, device).await;
