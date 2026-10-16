@@ -21,7 +21,6 @@
 - Open beyond v1:
   - the Backlog section at the end (Sentry error reporting)
   - the S7 gaps listed in "S7 results": no secret delete, no `list_icons`, no `test_action`
-  - optionally, avahi `deny-interfaces` for docker bridges, so `_watchdeck._tcp` isn't advertised on them
 
 ## Decisions
 
@@ -543,7 +542,7 @@ The review and the security audit found no blockers. These fixes followed:
 | avahi-daemon also owns UDP 5353 | The daemon registers through avahi's D-Bus API, so avahi is the only responder |
 | Desktop firewall blocks 47820/47821 | Document the ports. The tray status shows "no device" |
 | Tray support varies by desktop environment | GNOME needs the AppIndicator extension |
-| Docker/VPN addresses get advertised | The device's same-subnet preference. avahi answers on every interface, so `deny-interfaces` in `avahi-daemon.conf` is the host-side fix |
+| Docker/VPN addresses get advertised | The device's same-subnet preference. avahi answers on every interface by default. The host-side fix is `allow-interfaces` in `avahi-daemon.conf`, naming the LAN NICs, since `deny-interfaces` takes no wildcards and Docker's `br-<hash>` names change (devbox: `enp11s0,wlan0`, set 2026-10-15) |
 | GT911 pins or orientation wrong | S1 verifies, with `#define` knobs |
 | Bug in the custom pairing protocol | Standard commit/reveal shape, a shared test vector, a security audit on S3 |
 | Autostart env lacks PATH or the SSH agent | Document it. stderr shows in results |
