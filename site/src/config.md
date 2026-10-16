@@ -217,7 +217,7 @@ ha = "Bearer paste-your-token-here"
 
 Every press shows a result on the device: the button's label with OK or Failed, a one-line summary with the time taken, and the end of the output.
 
-The config editor's Test button runs a button's saved action the same way, with the same limits and result text, and shows the result in the editor. No device is sent anything. It is off while the form differs from the saved button.
+The config editor's Test button runs a button's saved action the same way, with the same limits and result text, and shows the result in the editor. No press result is sent to any device; a button with a tile polls it again, as a press does. It is off while the form differs from the saved button.
 
 | Outcome | Summary |
 |---|---|

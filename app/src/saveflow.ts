@@ -55,9 +55,17 @@ export function replaceNotice(view: ConfigView, draft: Config): string {
 
 /**
  * Why `button` can't be tested yet, or null if it can. A test runs the saved button, so the draft
- * must match what `saved` (the live config) has under the same id.
+ * must match what `saved` (the live config) has under the same id, and the file on disk must not
+ * have moved on, since the live config would then differ from what the form was built on.
  */
-export function testBlock(button: ButtonConfig, saved: Config): string | null {
+export function testBlock(
+  button: ButtonConfig,
+  saved: Config,
+  diskMoved: boolean,
+): string | null {
+  if (diskMoved) {
+    return "config.toml changed on disk; reload first.";
+  }
   const live = saved.button.find((b) => b.id === button.id);
   if (!live) {
     return "Save the button first. A test runs the saved action.";

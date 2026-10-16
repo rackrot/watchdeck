@@ -243,7 +243,8 @@ impl Devices {
     }
 
     /// Runs button `btn` as a device press would, from the live config and through the same
-    /// slots, and returns the result the device would get. Nothing is sent to a device. An
+    /// slots, and returns the result the device would get. No press result is sent to any
+    /// device; a button with a tile polls it again, as a press does. An
     /// unknown button is an error, and a refused run ("already running", "busy") is a result.
     pub async fn test_press(&self, btn: &str) -> Result<ActionResult, String> {
         if self.0.config.borrow().button(btn).is_none() {

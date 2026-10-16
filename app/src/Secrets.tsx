@@ -22,8 +22,11 @@ export default function Secrets({
   const [removeError, setRemoveError] = useState("");
   const value = useRef<HTMLInputElement>(null);
 
+  const [removeBusy, setRemoveBusy] = useState(false);
+
   async function remove(secret: string) {
     setNotice("");
+    setRemoveBusy(true);
     try {
       await deleteSecret(secret);
       setRemoving(null);
@@ -31,6 +34,8 @@ export default function Secrets({
     } catch (err) {
       setRemoving(null);
       setRemoveError(String(err));
+    } finally {
+      setRemoveBusy(false);
     }
   }
 
@@ -79,6 +84,7 @@ export default function Secrets({
                     <button
                       type="button"
                       className="danger"
+                      disabled={removeBusy}
                       onClick={() => void remove(n)}
                     >
                       Remove

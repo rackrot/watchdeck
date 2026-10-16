@@ -666,6 +666,11 @@ impl Configs {
         // That pass is a cache hit unless a file changed in between, as in `reload`.
         self.icons.load(&config)?;
         let _read = self.locked();
+        // Again under the lock, since a secret may have been deleted since the first check.
+        let errors = config.check(&self.secrets.names());
+        if !errors.is_empty() {
+            return Err(errors);
+        }
         let icons = self.icons.load(&config)?;
         let on_disk = self.read_file()?;
         if on_disk.as_deref().map_or_else(String::new, sha256_hex) != revision {
@@ -2058,6 +2063,37 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
             .unwrap_err()
             .contains("no secret"));
         assert!(configs.status().borrow().errors.is_empty());
+    }
+
+    #[test]
+    fn a_save_is_refused_when_its_secret_is_deleted_after_the_first_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let secrets = Arc::new(Secrets::new(tmp.path()));
+        secrets.set("ha", "Bearer x").unwrap();
+        let configs = Configs::open(tmp.path(), secrets.clone()).unwrap();
+        let revision = configs.status().borrow().revision.clone();
+        let mut config = configs.current().config.clone();
+        config.buttons[0].action = Action::Http {
+            method: "GET".into(),
+            url: "https://ha.lan/api".into(),
+            body: None,
+            headers: BTreeMap::new(),
+            secret_headers: BTreeMap::from([("Authorization".into(), "ha".into())]),
+            insecure_http: false,
+            timeout_s: 5,
+        };
+        // Hold the config lock so the save passes its first check, then waits. The secret goes
+        // while it waits, as a delete that got the lock first would remove it.
+        let errors = std::thread::scope(|s| {
+            let held = configs.locked();
+            let save = s.spawn(|| configs.save(config.clone(), &revision));
+            std::thread::sleep(Duration::from_millis(300));
+            secrets.remove("ha").unwrap();
+            drop(held);
+            save.join().unwrap().unwrap_err()
+        });
+        assert!(errors[0].contains("secret \"ha\""), "{errors:?}");
+        assert_ne!(configs.current().config, config);
     }
 
     #[test]

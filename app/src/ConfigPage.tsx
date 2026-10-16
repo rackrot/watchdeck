@@ -359,7 +359,7 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
           icons={icons}
           iconUrl={iconUrl}
           iconError={iconError}
-          testBlock={testBlock(button, view.config)}
+          testBlock={testBlock(button, view.config, diskChanged)}
           onImportIcon={pickIcon}
           onLocalProblems={setLocal}
           onChange={(next) =>

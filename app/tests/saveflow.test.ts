@@ -78,13 +78,21 @@ test("a button can be tested only when the draft matches the saved one", () => {
     action: { kind: "shell", argv: ["true"], timeout_s: 5 },
   };
   const saved: Config = { ...config, button: [button] };
-  assert.equal(testBlock(structuredClone(button), saved), null);
+  assert.equal(testBlock(structuredClone(button), saved, false), null);
   assert.ok(
-    testBlock({ ...button, id: "new" }, saved)?.includes("Save the button"),
+    testBlock({ ...button, id: "new" }, saved, false)?.includes(
+      "Save the button",
+    ),
   );
   const edited = { ...button, action: { ...button.action, timeout_s: 6 } };
-  assert.ok(testBlock(edited, saved)?.includes("Save your changes"));
-  assert.ok(testBlock({ ...button, label: "B" }, saved));
+  assert.ok(testBlock(edited, saved, false)?.includes("Save your changes"));
+  assert.ok(testBlock({ ...button, label: "B" }, saved, false));
+  assert.ok(
+    testBlock(structuredClone(button), saved, true)?.includes(
+      "changed on disk",
+    ),
+    "the file moved, so the live action may differ from the form",
+  );
 });
 
 test("a push is sent, waiting or late", () => {

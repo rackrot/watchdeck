@@ -147,7 +147,7 @@ pub async fn list_icons(daemon: State<'_, Daemon>) -> Result<Vec<String>, String
 
 /// Runs button `button`'s action from the live config, as a device press would, and returns what
 /// the device would see. The window names only the button, never an action, and no device gets
-/// the result.
+/// a press result.
 #[tauri::command]
 pub async fn test_action(
     daemon: State<'_, Daemon>,
