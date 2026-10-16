@@ -9,12 +9,13 @@ use daemon::actions::Actions;
 use daemon::config::Configs;
 use daemon::mdns::{self, MdnsStatus};
 use daemon::pairing::{Pairing, PAIR_PORT, PAIR_WINDOW};
+use daemon::reporting::{self, Reporting};
 use daemon::secrets::Secrets;
 use daemon::server::{DaemonEvent, Server, PORT};
 use daemon::store::Store;
 use daemon::tiles::TileView;
 use daemon::tls::Identity;
-use tauri::{Emitter, Manager, WindowEvent};
+use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 use tauri_plugin_log::{RotationStrategy, Target, TargetKind};
 use tokio::sync::{broadcast, watch};
 use tokio_rustls::rustls::crypto::aws_lc_rs;
@@ -36,15 +37,6 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             tray::show_window(app)
         }))
-        .plugin(
-            tauri_plugin_log::Builder::new()
-                .level(log::LevelFilter::Info)
-                .clear_targets()
-                .targets(targets)
-                .max_file_size(1_000_000)
-                .rotation_strategy(RotationStrategy::KeepSome(3))
-                .build(),
-        )
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![tray::HIDDEN_ARG]),
@@ -62,7 +54,19 @@ pub fn run() {
                 }
             }
         })
-        .setup(|app| {
+        .setup(move |app| {
+            // The log plugin is registered here and not on the builder, so its logger can be
+            // wrapped to report errors. With no Sentry client bound, the wrapper only logs.
+            let (log_plugin, max_level, logger) = tauri_plugin_log::Builder::new()
+                .level(log::LevelFilter::Info)
+                .clear_targets()
+                .targets(targets)
+                .max_file_size(1_000_000)
+                .rotation_strategy(RotationStrategy::KeepSome(3))
+                .split(app.handle())?;
+            tauri_plugin_log::attach_logger(max_level, Box::new(reporting::logger(logger)))?;
+            app.handle().plugin(log_plugin)?;
+
             let dir = app.path().app_config_dir()?;
             let identity = Identity::load_or_create(&dir)
                 .map_err(|e| format!("TLS identity in {}: {e}", dir.display()))?;
@@ -72,6 +76,12 @@ pub fn run() {
             let secrets = Arc::new(Secrets::new(&dir));
             let configs = Configs::open(&dir, secrets.clone())
                 .map_err(|e| format!("config in {}: {e}", dir.display()))?;
+            // [sentry] is read once. The client is closed on exit, and a later edit only logs.
+            let sentry = configs.current().sentry.clone();
+            if let Some(reporting) = reporting::start(sentry.as_ref(), secrets.clone()) {
+                app.manage(reporting);
+            }
+            tauri::async_runtime::spawn(reporting::warn_on_change(configs.subscribe(), sentry));
             // Shell actions run in the home directory, wherever the app was started from.
             let home = std::env::home_dir().ok_or("HOME is not set")?;
             let actions = Actions::new(secrets.clone(), home)
@@ -204,6 +214,13 @@ pub fn run() {
             commands::test_action,
             commands::tile_values,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let RunEvent::Exit = event {
+                if let Some(reporting) = app.try_state::<Reporting>() {
+                    reporting.close();
+                }
+            }
+        });
 }

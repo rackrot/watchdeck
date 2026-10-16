@@ -60,7 +60,7 @@ Save the file and the change applies within about a second. The app checks `conf
 A version that breaks any rule on this page doesn't apply. The last good config stays live, and the app logs every problem it found:
 
 ```text
-[2026-10-11T02:14:49Z ERROR watchdeck_lib::daemon::config] /home/you/.config/dev.rackrot.watchdeck/config.toml not applied, keeping the live config: button "disk": pos [5, 0] is outside the 5x3 grid
+[2026-10-11T02:14:49Z ERROR watchdeck::config_rejected] /home/you/.config/dev.rackrot.watchdeck/config.toml not applied, keeping the live config: button "disk": pos [5, 0] is outside the 5x3 grid
 ```
 
 - If the file breaks a rule when the app starts, the device shows an empty grid until you fix it.
@@ -230,6 +230,38 @@ The config editor's Test button runs a button's saved action the same way, with 
 
 - The output is the last 1 KB of stdout followed by stderr, or of the HTTP body. Characters other than printable ASCII show as `?`.
 - An OK result closes after 4 s and a failure after 10 s. A tap closes it sooner.
+
+## Error reporting
+
+The app can report its own errors and panics to [Sentry](https://sentry.io). It is off unless `config.toml` has a `[sentry]` table. Without one the app makes no Sentry client and no network call, even if `SENTRY_DSN` is set in the environment.
+
+```toml
+[sentry]
+dsn = "https://<key>@<host>/<project>"
+pii = false
+```
+
+| Key | Required | Rule |
+|---|---|---|
+| `dsn` | yes | A Sentry DSN. It must be `https`, except for `localhost` and other loopback addresses. The app ignores `SENTRY_DSN` and `SSL_VERIFY` and always verifies the certificate |
+| `pii` | no | Default `false`. `true` turns off the scrubbing below |
+
+- The app reads `[sentry]` once, at startup. After you edit it, restart the app. It logs a warning once if it sees the change.
+- An event is sent for each `ERROR` log line and each panic of the app, with the app version as `watchdeck@<version>`, and `development` or `production` as the environment. Warnings and info lines are never events.
+- The `config.toml not applied` error, which names your button ids and labels, is never sent.
+- With `pii = false`, each event is scrubbed before it leaves the machine, in this order:
+  1. Values from `secrets.toml` are removed. If that file can't be read, the event is dropped.
+  2. Your home directory becomes `~`.
+  3. The hostname becomes `<host>`.
+  4. IPv4 and IPv6 addresses become `<ip>`.
+  5. Device ids (`wd-` and hex digits) become `<device>`.
+  6. Text inside double quotes is emptied.
+
+  This covers messages, exception text, stack frame paths, breadcrumbs, tags and extra data. The event has no user and no server name.
+- With `pii = true`, events keep their text as logged, and `WARN` lines are also kept as breadcrumbs on later events.
+- At most 30 events are sent per hour, and an identical event (same message and build) is sent once per 10 minutes.
+- Turn on "Prevent Storing of IP Addresses" and the data scrubber in the Sentry project as well.
+- The window keeps `[sentry]` when you save the layout from it.
 
 ## Security
 

@@ -6,6 +6,7 @@ pub mod icons;
 pub mod mdns;
 pub mod pairing;
 pub mod protocol;
+pub mod reporting;
 pub mod secrets;
 pub mod server;
 pub mod store;

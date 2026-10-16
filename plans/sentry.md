@@ -4,6 +4,16 @@
 
 Planned, not started. Decisions settled 2026-10-15 by the user: 1(a) device reports via the daemon, 2(b) `tauri-plugin-sentry` for the webview, 3(a), 4(a), 5(b) build S5 symbolication, 6(a). The `sentry` crate is approved. Build S1 to S5 in order.
 
+### S1 results
+
+Done: daemon SDK, config, scrubber, budget, log bridge and panic hook (`daemon/reporting.rs`, `[sentry]` in `Config`). Not done: the live-DSN check (a real `error!` and a release-build panic arriving scrubbed).
+
+- The log plugin now registers in `setup` through `split`, first thing, so the Sentry wrapper is in place before any app log line. With no client bound the wrapper only logs.
+- `Warn` breadcrumbs follow a process-wide flag that `start` sets from `pii`.
+- The scrubber drops the event if `secrets.toml` can't be read, since the values can't be removed.
+- The key cap evicts the oldest key. The 30 per hour cap makes 256 keys unreachable today, so `Budget::with_limits` exists for the test. `Budget::admit` takes a TTL, which is where S3's per-device hourly cap plugs in.
+- `Reporting::client()` hands S2 the same `Arc<Client>` for `tauri_plugin_sentry::init_with_options`.
+
 ## Goal and definition of done
 
 - Sentry reports are opt-in. They cover daemon errors and panics, webview errors, and board crashes and abnormal resets.

@@ -69,9 +69,45 @@ action = { kind = "shell", argv = ["notify-send", "watchdeck", "Hello from watch
 pub struct Config {
     pub version: u32,
     pub layout: Grid,
+    /// Absent means no Sentry client at all. The table goes before `[[button]]` for TOML.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sentry: Option<SentryConfig>,
     #[serde(default, rename = "button")]
     pub buttons: Vec<ButtonConfig>,
 }
+
+/// Opt-in error reporting, read once at startup. See `reporting`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SentryConfig {
+    pub dsn: String,
+    /// Sends events unscrubbed.
+    #[serde(default)]
+    pub pii: bool,
+}
+
+impl SentryConfig {
+    /// The DSN must parse, and must be https unless it points at this machine. Messages never
+    /// repeat the DSN.
+    fn check(&self) -> Option<String> {
+        let dsn = match self.dsn.parse::<sentry::types::Dsn>() {
+            Ok(dsn) => dsn,
+            Err(e) => return Some(format!("sentry.dsn is not a valid DSN: {e}")),
+        };
+        let host = dsn.host();
+        let loopback = host == "localhost"
+            || host
+                .trim_matches(['[', ']'])
+                .parse::<IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback());
+        (dsn.scheme() != sentry::types::Scheme::Https && !loopback)
+            .then(|| "sentry.dsn must be https, except for localhost".to_string())
+    }
+}
+
+/// The log target of the "not applied" line, which holds user ids and labels and is never
+/// reported.
+pub const CONFIG_REJECTED: &str = "watchdeck::config_rejected";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -265,6 +301,7 @@ impl Config {
         Self {
             version: 1,
             layout: Grid { cols: 5, rows: 3 },
+            sentry: None,
             buttons: Vec::new(),
         }
     }
@@ -301,6 +338,8 @@ impl Config {
         if !(1..=MAX_ROWS).contains(&rows) {
             errors.push(format!("layout.rows is {rows}, expected 1 to {MAX_ROWS}"));
         }
+
+        errors.extend(self.sentry.as_ref().and_then(SentryConfig::check));
 
         let mut ids = HashSet::new();
         let mut cells = HashMap::new();
@@ -632,6 +671,7 @@ impl Configs {
             Ok(live) => live,
             Err(errors) => {
                 log::error!(
+                    target: CONFIG_REJECTED,
                     "{} not applied, keeping the live config: {}",
                     self.path.display(),
                     errors.join("; ")
@@ -2137,5 +2177,28 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
         let text = fs::read_to_string(tmp.path().join(FILE)).unwrap();
         assert_eq!(text.matches("insecure_http").count(), 1, "{text}");
         assert_eq!(parse(&text, &names()).unwrap(), config);
+    }
+
+    #[test]
+    fn a_save_keeps_sentry_and_refuses_a_bad_dsn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let configs = Configs::open(tmp.path(), Arc::new(Secrets::new(tmp.path()))).unwrap();
+        let revision = configs.status().borrow().revision.clone();
+        let mut config = configs.current().config.clone();
+        config.sentry = Some(SentryConfig {
+            dsn: "http://k@example.com/1".into(),
+            pii: true,
+        });
+        let errors = configs.save(config.clone(), &revision).unwrap_err();
+        assert!(errors[0].starts_with("sentry.dsn"), "{errors:?}");
+
+        config.sentry.as_mut().unwrap().dsn = "https://k@o1.ingest.example.com/1".into();
+        configs.save(config.clone(), &revision).unwrap();
+        let text = fs::read_to_string(tmp.path().join(FILE)).unwrap();
+        assert_eq!(
+            parse(&text, &names()).unwrap().sentry,
+            config.sentry,
+            "{text}"
+        );
     }
 }
