@@ -49,6 +49,11 @@ description = "Open firmware menuconfig"
 dir = "firmware"
 run = '. "$IDF_PATH/export.sh" >/dev/null && idf.py menuconfig'
 
+[tasks."fw:test"]
+description = "Run the host unit tests for the device message parsers"
+dir = "firmware/test/host_proto"
+run = '. "$IDF_PATH/export.sh" >/dev/null && idf.py --preview set-target linux build && timeout 60 build/host_proto.elf'
+
 [tasks."app:dev"]
 description = "Run the desktop app in dev mode"
 dir = "app"

@@ -1,0 +1,2 @@
+# The same depth limit as firmware/sdkconfig.defaults, so the host run parses like the board.
+CONFIG_CJSON_NESTING_LIMIT=8

@@ -44,6 +44,15 @@ jobs:
           idf.py set-target esp32p4
           idf.py build
 
+      # Host unit tests of proto.c, built for the linux target. Fails the job on any failed case.
+      - name: Run host parser tests
+        shell: bash
+        working-directory: firmware/test/host_proto
+        run: |
+          . "$IDF_PATH/export.sh"
+          idf.py --preview set-target linux build
+          timeout 60 build/host_proto.elf
+
   app:
     runs-on: ubuntu-24.04
     steps:
