@@ -102,9 +102,6 @@ pub fn run() {
             // Subscribe before the tray reads its first status, so no device event slips between.
             let mut events = server.subscribe();
             let status_item = tray::build(app.handle(), &devices.list())?;
-            if !std::env::args().any(|a| a == tray::HIDDEN_ARG) {
-                tray::show_window(app.handle());
-            }
             let pairing = Pairing::new(
                 SocketAddr::from((Ipv4Addr::UNSPECIFIED, PAIR_PORT)),
                 PAIR_WINDOW,
@@ -195,6 +192,31 @@ pub fn run() {
                 secrets,
             });
             tauri::async_runtime::spawn(server.run());
+
+            // The window is built here, not by Tauri before `setup`, because the Sentry plugin's
+            // init script only reaches webviews built after it registers. The tray and
+            // single-instance callbacks only run once the event loop does, after this returns.
+            if let Some(reporting) = app.try_state::<Reporting>() {
+                app.handle().plugin(tauri_plugin_sentry::init_with_options(
+                    reporting.client(),
+                    tauri_plugin_sentry::Options {
+                        javascript: tauri_plugin_sentry::JavaScriptOptions {
+                            inject: true,
+                            debug: false,
+                        },
+                    },
+                ))?;
+            }
+            let window = app
+                .config()
+                .app
+                .windows
+                .first()
+                .ok_or("tauri.conf.json has no main window")?;
+            tauri::WebviewWindowBuilder::from_config(app.handle(), window)?.build()?;
+            if !std::env::args().any(|a| a == tray::HIDDEN_ARG) {
+                tray::show_window(app.handle());
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

@@ -69,6 +69,7 @@ sentry = { version = "0.49.3", default-features = false, features = [
   "reqwest",
   "rustls-no-provider",
 ] }
+tauri-plugin-sentry = { version = "=0.8.0", default-features = false }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

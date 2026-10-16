@@ -15,6 +15,14 @@ Done: daemon SDK, config, scrubber, budget, log bridge and panic hook (`daemon/r
 - The key cap evicts the oldest key. The 30 per hour cap makes 256 keys unreachable today, so `Budget::with_limits` exists for the test. `Budget::admit` takes a TTL, which is where S3's per-device hourly cap plugs in.
 - `Reporting::client()` hands S2 the same `Arc<Client>` for `tauri_plugin_sentry::init_with_options`.
 
+### S2 results
+
+Done: `tauri-plugin-sentry =0.8.0` (no default features), the `main` window created at the end of `setup`, `sentry:default` on the window's capability, the `component=ui` tag and `request` drop in `Filter::process`, a `TypedOnly` transport wrapper, and `window.Sentry?.captureException` at the three catch sites. Not done: the live check (a throw from devtools in a release build with a real DSN, under the unchanged CSP, so the CSP point above stays UNCONFIRMED).
+
+- The window is built right after the plugin registers, then shown unless `--hidden`. Tray and single-instance callbacks only run once the event loop starts, after `setup` returns, so `show_window` always finds it. A second launch during `setup` would hit its existing "no main window" log line.
+- The transport wrapper passes only envelopes made of `Event`, `Attachment` and `ClientReport` items. Raw envelopes, empty ones, and any with another item (transactions, sessions) are dropped.
+- `tauri.conf.json` gives the window `"label": "main"` explicitly, since `tray.rs` looks it up by that label.
+
 ## Goal and definition of done
 
 - Sentry reports are opt-in. They cover daemon errors and panics, webview errors, and board crashes and abnormal resets.

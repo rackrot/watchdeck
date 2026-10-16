@@ -42,7 +42,10 @@ export const useTileReadings = (): TileReading[] =>
 export function useIconUrls(): (name: string) => string | null {
   const [dir, setDir] = useState<string | null>(null);
   useEffect(() => {
-    configDir().then(setDir, (e) => console.error("app config dir:", e));
+    configDir().then(setDir, (e) => {
+      console.error("app config dir:", e);
+      window.Sentry?.captureException(e);
+    });
   }, []);
   return (name) => (dir === null ? null : iconUrl(dir, name));
 }
@@ -51,7 +54,10 @@ export function useIconUrls(): (name: string) => string | null {
 export function useSecrets(): [string[], () => void] {
   const [names, setNames] = useState<string[]>([]);
   const refresh = useCallback(() => {
-    listSecrets().then(setNames, (e) => console.error("list_secrets:", e));
+    listSecrets().then(setNames, (e) => {
+      console.error("list_secrets:", e);
+      window.Sentry?.captureException(e);
+    });
   }, []);
   useEffect(refresh, [refresh]);
   return [names, refresh];

@@ -4,6 +4,13 @@
 
 import type { Config } from "./config";
 
+declare global {
+  interface Window {
+    /** Set by tauri-plugin-sentry's init script, only when `[sentry]` is in config.toml. */
+    Sentry?: { captureException(error: unknown): string };
+  }
+}
+
 export type ActionField =
   | "timeout_s"
   | "argv"

@@ -76,7 +76,10 @@ export default function PairDialog({
   function closed() {
     // The dialog is gone by the time this settles, so a failure can only be logged. The daemon
     // still closes the window on its own deadline.
-    cancelPairing().catch((e) => console.error("cancel_pairing failed:", e));
+    cancelPairing().catch((e) => {
+      console.error("cancel_pairing failed:", e);
+      window.Sentry?.captureException(e);
+    });
     onClose();
   }
 

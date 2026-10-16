@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sentry::integrations::log::{LogFilter, SentryLogger};
-use sentry::protocol::{Context, Event, Frame, Stacktrace, Value};
-use sentry::{Client, ClientOptions, Hub};
+use sentry::protocol::{Context, Envelope, EnvelopeItem, Event, Frame, Stacktrace, Value};
+use sentry::{Client, ClientOptions, Hub, Transport, TransportFactory, TransportOptions};
 use tokio::sync::watch;
 
 use super::config::{Live, SentryConfig, CONFIG_REJECTED};
@@ -74,6 +74,10 @@ fn options(config: &SentryConfig, filter: Filter) -> ClientOptions {
     } else {
         "production".into()
     });
+    // `apply_defaults` always sets a transport.
+    if let Some(inner) = opts.transport.take() {
+        opts.transport = Some(Arc::new(TypedOnlyFactory(inner)));
+    }
     let filter = Arc::new(filter);
     opts.before_send = Some(Arc::new(move |event| filter.process(event)));
     opts
@@ -131,7 +135,13 @@ impl Filter {
         }
     }
 
-    fn process(&self, event: Event<'static>) -> Option<Event<'static>> {
+    fn process(&self, mut event: Event<'static>) -> Option<Event<'static>> {
+        // tauri-plugin-sentry stamps the webview's events `javascript`. The page URL and
+        // referrer in `request` say where in the UI the user was.
+        if event.platform == "javascript" {
+            event.tags.insert("component".into(), "ui".into());
+            event.request = None;
+        }
         let event = match &self.scrubber {
             Some(scrubber) => scrubber.event(event)?,
             None => event,
@@ -139,6 +149,47 @@ impl Filter {
         self.budget
             .admit(&event_key(&event), DEDUPE)
             .then_some(event)
+    }
+}
+
+/// Wraps the transport so only what `before_send` has seen leaves the process. The webview plugin
+/// forwards some envelopes straight to `Client::send_envelope`: raw bytes when it can't parse
+/// them, and non-event items such as transactions.
+struct TypedOnlyFactory(Arc<dyn TransportFactory>);
+
+impl TransportFactory for TypedOnlyFactory {
+    fn create_transport_with_options(&self, options: TransportOptions) -> Arc<dyn Transport> {
+        Arc::new(TypedOnly(self.0.create_transport_with_options(options)))
+    }
+}
+
+struct TypedOnly(Arc<dyn Transport>);
+
+impl Transport for TypedOnly {
+    /// Passes events, their attachments and client reports (counts only). A raw envelope has no
+    /// typed items, so it is dropped with the rest.
+    fn send_envelope(&self, envelope: Envelope) {
+        let mut items = envelope.items().peekable();
+        let allowed = items.peek().is_some()
+            && items.all(|item| {
+                matches!(
+                    item,
+                    EnvelopeItem::Event(_)
+                        | EnvelopeItem::Attachment(_)
+                        | EnvelopeItem::ClientReport(_)
+                )
+            });
+        if allowed {
+            self.0.send_envelope(envelope);
+        }
+    }
+
+    fn flush(&self, timeout: Duration) -> bool {
+        self.0.flush(timeout)
+    }
+
+    fn shutdown(&self, timeout: Duration) -> bool {
+        self.0.shutdown(timeout)
     }
 }
 
@@ -698,6 +749,63 @@ mod tests {
             sentry::capture_message("boom at 10.9.8.7", Level::Error);
         });
         assert_eq!(events[0].message.as_deref(), Some("boom at 10.9.8.7"));
+    }
+
+    #[test]
+    fn webview_events_are_tagged_ui_and_lose_their_request() {
+        let (_dir, secrets) = secrets_dir(&[]);
+        let events = captured(false, secrets, || {
+            let mut event = Event {
+                message: Some("boom at /home/buck/x".into()),
+                platform: "javascript".into(),
+                request: Some(Default::default()),
+                level: Level::Error,
+                ..Default::default()
+            };
+            event.request.as_mut().unwrap().url = "http://tauri.localhost/".parse().ok();
+            sentry::capture_event(event);
+            sentry::capture_message("daemon boom", Level::Error);
+        });
+        let component = |e: &Event| e.tags.get("component").cloned();
+        assert_eq!(component(&events[0]).as_deref(), Some("ui"));
+        assert!(events[0].request.is_none());
+        assert_eq!(events[0].message.as_deref(), Some("boom at ~/x"));
+        assert_eq!(component(&events[1]), None);
+    }
+
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<Envelope>>);
+
+    impl Transport for Recorder {
+        fn send_envelope(&self, envelope: Envelope) {
+            self.0.lock().unwrap().push(envelope);
+        }
+    }
+
+    #[test]
+    fn the_transport_drops_envelopes_that_skipped_before_send() {
+        use sentry::protocol::{ClientReport, Transaction};
+        let sink = Arc::new(Recorder::default());
+        let transport = TypedOnly(sink.clone());
+        let one = |item: EnvelopeItem| {
+            let mut envelope = Envelope::new();
+            envelope.add_item(item);
+            envelope
+        };
+        transport.send_envelope(Envelope::from_bytes_raw(b"{}\n".to_vec()).unwrap());
+        transport.send_envelope(Envelope::new());
+        transport.send_envelope(one(Transaction::default().into()));
+        let mut mixed = one(Event::default().into());
+        mixed.add_item(Transaction::default());
+        transport.send_envelope(mixed);
+        assert!(sink.0.lock().unwrap().is_empty());
+
+        transport.send_envelope(one(Event::default().into()));
+        transport.send_envelope(one(ClientReport::new(Vec::<
+            sentry::protocol::client_report::Item,
+        >::new())
+        .into()));
+        assert_eq!(sink.0.lock().unwrap().len(), 2);
     }
 
     #[test]

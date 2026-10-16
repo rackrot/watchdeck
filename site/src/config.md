@@ -248,6 +248,7 @@ pii = false
 
 - The app reads `[sentry]` once, at startup. After you edit it, restart the app. It logs a warning once if it sees the change.
 - An event is sent for each `ERROR` log line and each panic of the app, with the app version as `watchdeck@<version>`, and `development` or `production` as the environment. Warnings and info lines are never events.
+- With `[sentry]`, the window also reports its uncaught errors, unhandled rejections and a few handled failures, as events tagged `component=ui` with the page URL removed. They pass the same scrubbing and limits. Without it the window loads no Sentry code.
 - The `config.toml not applied` error, which names your button ids and labels, is never sent.
 - With `pii = false`, each event is scrubbed before it leaves the machine, in this order:
   1. Values from `secrets.toml` are removed. If that file can't be read, the event is dropped.

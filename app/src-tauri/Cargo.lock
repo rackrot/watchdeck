@@ -4593,6 +4593,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tauri-plugin-sentry"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38e95ef0266d65565a14c02b0d77cacff021a379c484097ab8cb24f200a80c14"
+dependencies = [
+ "base64 0.23.1",
+ "schemars 0.8.22",
+ "sentry",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-plugin",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "tauri-plugin-single-instance"
 version = "2.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5387,6 +5403,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-log",
  "tauri-plugin-opener",
+ "tauri-plugin-sentry",
  "tauri-plugin-single-instance",
  "tempfile",
  "time",
