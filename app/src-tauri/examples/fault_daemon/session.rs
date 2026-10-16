@@ -461,7 +461,14 @@ impl Rig {
         let mut lost = false;
         loop {
             tokio::select! {
-                done = &mut input => return done,
+                done = &mut input => {
+                    done?;
+                    // Never hand back a dead session.
+                    if lost {
+                        self.next_session(Duration::from_secs(120)).await?;
+                    }
+                    return Ok(());
+                }
                 () = Self::keep_up(&mut self.sess, &self.h, &mut lost) => {}
             }
         }
