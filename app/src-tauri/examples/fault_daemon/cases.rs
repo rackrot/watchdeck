@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::Data as OpData;
-use watchdeck_lib::daemon::protocol::{ICON_HEADER_BYTES, MAX_ICON_FRAME_BYTES};
+use watchdeck_lib::daemon::protocol::{encode_hex, ICON_HEADER_BYTES, MAX_ICON_FRAME_BYTES};
 
 use super::session::{buttons, fresh_icon, icon_x, prompt, Res, Rig};
 
@@ -13,10 +13,16 @@ use super::session::{buttons, fresh_icon, icon_x, prompt, Res, Rig};
 pub struct Rule {
     pub want: &'static [&'static str],
     pub not: &'static [&'static str],
+    /// Substrings that must appear at least twice.
+    pub twice: &'static [&'static str],
 }
 
 const fn rule(want: &'static [&'static str], not: &'static [&'static str]) -> Rule {
-    Rule { want, not }
+    Rule {
+        want,
+        not,
+        twice: &[],
+    }
 }
 
 pub struct Spec {
@@ -37,6 +43,19 @@ pub struct Spec {
 const CACHED: &str = "received, validated and cached";
 const NOT_DROPPED: &str = "dropped unparsable";
 
+/// A bad icon frame is dropped with `$msg`, and then the good frame for the same id and the
+/// liveness icon are both cached. The log line names only four id bytes, and the fresh ids are
+/// random, so the check counts two "cached" lines instead of matching the id.
+macro_rules! icon_fault {
+    ($msg:expr) => {
+        Rule {
+            want: &[$msg],
+            not: &[],
+            twice: &[CACHED],
+        }
+    };
+}
+
 const fn spec(id: &'static str, send: &'static str, today: Rule) -> Spec {
     Spec {
         id,
@@ -54,37 +73,37 @@ pub const CASES: &[Spec] = &[
     spec(
         "I1",
         "binary frame of 10 bytes",
-        rule(&["shorter than its header", CACHED], &[]),
+        icon_fault!("shorter than its header"),
     ),
     spec(
         "I2",
         "icon frame with bad magic",
-        rule(&["binary frame is not an icon", CACHED], &[]),
+        icon_fault!("binary frame is not an icon"),
     ),
     spec(
         "I3",
         "icon frame with w = 0",
-        rule(&["is outside 1..256", CACHED], &[]),
+        icon_fault!("is outside 1..256"),
     ),
     spec(
         "I4",
         "icon frame with w = 257",
-        rule(&["is outside 1..256", CACHED], &[]),
+        icon_fault!("is outside 1..256"),
     ),
     spec(
         "I5",
         "icon frame one byte too long",
-        rule(&["should be", CACHED], &[]),
+        icon_fault!("should be"),
     ),
     spec(
         "I6",
         "icon frame one byte too short",
-        rule(&["should be", CACHED], &[]),
+        icon_fault!("should be"),
     ),
     spec(
         "I7",
         "icon frame with a flipped pixel byte",
-        rule(&["does not match its pixels", CACHED], &[]),
+        icon_fault!("does not match its pixels"),
     ),
     spec(
         "I8",
@@ -182,10 +201,16 @@ pub const CASES: &[Spec] = &[
     },
     Spec {
         leak: false,
+        // The board keeps its grid across a reconnect: `ui_link_down` only fades it
+        // (ui.c:464-473) and `s_n_buttons` resets only on unpair (ui.c:621). So an early tile
+        // applies to the previous session's `t1` and is not ignored.
         ..spec(
             "T8",
-            "tile before the first layout",
-            rule(&["tile for t1 ignored"], &[]),
+            "tile before the first layout, on the grid kept from the last session",
+            rule(
+                &["rx: {\"t\":\"tile\""],
+                &[NOT_DROPPED, "tile for t1 ignored"],
+            ),
         )
     },
     Spec {
@@ -369,7 +394,15 @@ async fn once(rig: &mut Rig, id: &str) -> Res<String> {
             let mut json = br#"{"t":"layout","rev":99,"cols":4,"rows":1,"buttons":[{"id":"t1","col":0,"row":0,"label":"AAAA"#
                 .to_vec();
             json.push(0xf0);
-            json.extend_from_slice(br#"","bg":0,"fg":16777215,"tile":true}]}"#);
+            json.extend_from_slice(br#"","bg":0,"fg":16777215,"tile":true},"#);
+            // X stays named, so it stays cached and liveness sees only its fresh icon.
+            json.extend_from_slice(
+                format!(
+                    r#"{{"id":"ic","col":1,"row":0,"label":"Icon","bg":0,"fg":16777215,"icon":"{}"}}]}}"#,
+                    encode_hex(&icon_x().id)
+                )
+                .as_bytes(),
+            );
             rig.sess.send_text_bytes(json).await?;
             rig.sess.quiet(Duration::from_millis(500)).await?;
             Ok("sent a text frame holding a lone 0xF0".into())
@@ -508,6 +541,36 @@ async fn wedge(rig: &mut Rig, drop: bool) -> Res<String> {
         return Ok("rebooted by the operator".into());
     }
     let board = rig.sess.peer.ip();
+    // Prints the cleanup on any exit from here, including Ctrl-C and a closed stdin.
+    let mut guard = NftGuard(true);
+    let run = async {
+        install_and_wait(rig, board).await?;
+        guard.0 = false;
+        let secs = rig.next_session(Duration::from_secs(90)).await?;
+        Ok(format!(
+            "reconnected {secs:.1} s after the rule was removed"
+        ))
+    };
+    tokio::select! {
+        done = run => done,
+        _ = tokio::signal::ctrl_c() => Err("interrupted".into()),
+    }
+}
+
+/// Prints how to remove the nft rule unless the operator confirmed removing it.
+struct NftGuard(bool);
+
+impl Drop for NftGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            eprintln!(
+                "\nIf you installed the nft rule, remove it: sudo nft delete table inet wdfault"
+            );
+        }
+    }
+}
+
+async fn install_and_wait(rig: &mut Rig, board: std::net::IpAddr) -> Res<()> {
     prompt(&format!(
         "Drop all traffic with the board:\n\
          sudo nft add table inet wdfault\n\
@@ -518,9 +581,5 @@ async fn wedge(rig: &mut Rig, drop: bool) -> Res<String> {
     ))
     .await?;
     rig.sleep_deaf(40).await;
-    prompt("Remove the rule: sudo nft delete table inet wdfault").await?;
-    let secs = rig.next_session(Duration::from_secs(90)).await?;
-    Ok(format!(
-        "reconnected {secs:.1} s after the rule was removed"
-    ))
+    prompt("Remove the rule: sudo nft delete table inet wdfault").await
 }

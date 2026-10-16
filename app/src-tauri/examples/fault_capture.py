@@ -38,13 +38,18 @@ def main() -> None:
     print(f"capturing {args.port} to {args.out}; r+Enter resets the board, q+Enter stops")
     with open(args.out, "xb") as out:
         try:
+            watching = [port, sys.stdin]
             while True:
-                ready, _, _ = select.select([port, sys.stdin], [], [])
+                ready, _, _ = select.select(watching, [], [])
                 if port in ready:
                     out.write(port.read(4096))
                     out.flush()
                 if sys.stdin in ready:
-                    command = sys.stdin.readline().strip()
+                    line = sys.stdin.readline()
+                    if line == "":  # EOF: keep capturing, stop reading commands
+                        watching = [port]
+                        continue
+                    command = line.strip()
                     if command == "r":
                         pulse_reset(port)
                         print("reset pulse sent")

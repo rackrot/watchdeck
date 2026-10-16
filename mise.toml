@@ -68,11 +68,13 @@ run = "pnpm tauri build"
 # must be quit first. See plans/hw-gaps.md.
 [tasks."app:fault"]
 description = "Run the fault-injection harness against the paired board"
-dir = "app/src-tauri"
-run = "cargo run --example fault_daemon --"
+dir = "{{config_root}}"
+run = "cargo run --manifest-path app/src-tauri/Cargo.toml --example fault_daemon --"
 
+# Both fault tasks run from the repo root, so a log path means the same to each.
 [tasks."app:fault-capture"]
 description = "Capture the board's serial log for app:fault (output file after --)"
+dir = "{{config_root}}"
 run = '"$HOME/.espressif/python_env/idf6.1_py3.12_env/bin/python" app/src-tauri/examples/fault_capture.py'
 
 [tasks."site:build"]

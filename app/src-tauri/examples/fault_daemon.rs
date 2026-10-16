@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! fault_daemon --device wd-xxxxxxxxxxxx [--cases I1,T3] [--leak] [--pairing] [--dir DIR]
-//! fault_daemon --check board.log [--after-s5]
+//! fault_daemon --check board.log [--leak | --pairing] [--cases I1,T3] [--after-s5]
 //! ```
 //!
 //! It serves the real identity from the config dir and checks the board's token against
@@ -42,7 +42,7 @@ use watchdeck_lib::daemon::tls::{Identity, CERT_FILE, KEY_FILE};
 use cases::{is_session_case, spec_for, CASES};
 use session::{liveness, Harness, Lost, Res, Rig};
 
-const USAGE: &str = "usage: fault_daemon --device wd-<12 hex> [--cases ID,ID] [--leak | --pairing] [--dir DIR]\n       fault_daemon --check LOG [--after-s5]";
+const USAGE: &str = "usage: fault_daemon --device wd-<12 hex> [--cases ID,ID] [--leak | --pairing] [--dir DIR]\n       fault_daemon --check LOG [--leak | --pairing] [--cases ID,ID] [--after-s5]";
 const LEAK_ROUNDS: u32 = 3;
 const LEAK_REPS: u32 = 20;
 
@@ -55,7 +55,11 @@ struct Args {
 }
 
 enum Mode {
-    Check { log: PathBuf, after_s5: bool },
+    Check {
+        log: PathBuf,
+        after_s5: bool,
+        plan: check::Plan,
+    },
     Run(Args),
 }
 
@@ -75,11 +79,44 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Mode, String> {
             _ => return Err(format!("unknown argument {flag}")),
         }
     }
-    if let Some(log) = check {
-        return Ok(Mode::Check { log, after_s5 });
-    }
     if pairing && leak {
         return Err("--pairing and --leak are separate runs".into());
+    }
+    // The cases this kind of run covers. `--check` takes the same flags as the run it grades.
+    let covered = |id: &str| {
+        spec_for(id).is_some_and(|c| match (pairing, leak) {
+            (true, _) => !is_session_case(id),
+            (_, true) => is_session_case(id) && c.leak,
+            _ => is_session_case(id),
+        })
+    };
+    let cases: Vec<&'static str> = match only {
+        Some(list) => list
+            .split(',')
+            .map(|id| {
+                spec_for(id)
+                    .filter(|spec| covered(spec.id))
+                    .map(|spec| spec.id)
+                    .ok_or(format!("{id} is not a case of this kind of run"))
+            })
+            .collect::<Result<_, _>>()?,
+        None => CASES
+            .iter()
+            .map(|c| c.id)
+            .filter(|id| covered(id))
+            .collect(),
+    };
+    if let Some(log) = check {
+        let plan = check::Plan {
+            ids: cases,
+            runs: if leak { LEAK_ROUNDS as usize + 1 } else { 1 },
+            leak,
+        };
+        return Ok(Mode::Check {
+            log,
+            after_s5,
+            plan,
+        });
     }
     let device = device.ok_or("--device is required")?;
     if !valid_device_id(&device) {
@@ -91,22 +128,6 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Mode, String> {
         Some(dir) => dir,
         None => PathBuf::from(env::var("HOME").map_err(|_| "HOME is not set; pass --dir")?)
             .join(".config/dev.rackrot.watchdeck"),
-    };
-    let cases = match only {
-        Some(list) => list
-            .split(',')
-            .map(|id| {
-                spec_for(id)
-                    .filter(|spec| is_session_case(spec.id))
-                    .map(|spec| spec.id)
-                    .ok_or(format!("no such case {id}"))
-            })
-            .collect::<Result<_, _>>()?,
-        None => CASES
-            .iter()
-            .map(|c| c.id)
-            .filter(|id| is_session_case(id))
-            .collect(),
     };
     Ok(Mode::Run(Args {
         device,
@@ -216,15 +237,10 @@ async fn sample(rig: &mut Rig, round: u32) -> Res<()> {
 }
 
 async fn run_leak(rig: &mut Rig, ids: &[&str]) -> Res<usize> {
-    let ids: Vec<&str> = ids
-        .iter()
-        .copied()
-        .filter(|id| spec_for(id).is_some_and(|c| c.leak))
-        .collect();
-    let mut failed = run_cases(rig, &ids).await;
+    let mut failed = run_cases(rig, ids).await;
     sample(rig, 0).await?;
     for round in 1..=LEAK_ROUNDS {
-        for id in &ids {
+        for id in ids {
             println!("== round {round}: {id} x {LEAK_REPS}");
             if let Err(e) = execute(rig, id, LEAK_REPS).await {
                 failed += 1;
@@ -280,8 +296,18 @@ async fn run(args: Args) -> Res<ExitCode> {
     })
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime starts");
+    let code = rt.block_on(real_main());
+    // A prompt abandoned by Ctrl-C leaves a thread blocked on stdin, which a normal drop would wait for.
+    rt.shutdown_background();
+    code
+}
+
+async fn real_main() -> ExitCode {
     let mode = match parse(env::args().skip(1)) {
         Ok(mode) => mode,
         Err(e) => {
@@ -290,8 +316,12 @@ async fn main() -> ExitCode {
         }
     };
     let result = match mode {
-        Mode::Check { log, after_s5 } => fs::read(&log).map_err(Into::into).map(|bytes| {
-            let (report, ok) = check::grade(&String::from_utf8_lossy(&bytes), after_s5);
+        Mode::Check {
+            log,
+            after_s5,
+            plan,
+        } => fs::read(&log).map_err(Into::into).map(|bytes| {
+            let (report, ok) = check::grade(&String::from_utf8_lossy(&bytes), &plan, after_s5);
             print!("{report}");
             if ok {
                 ExitCode::SUCCESS
@@ -377,5 +407,16 @@ mod tests {
         assert!(run(&["--device", "nope"]).is_err());
         assert!(run(&["--device", DEVICE, "--leak", "--pairing"]).is_err());
         assert!(matches!(run(&["--check", "x.log"]), Ok(Mode::Check { .. })));
+        let plan = |args: &[&str]| match run(args) {
+            Ok(Mode::Check { plan, .. }) => plan,
+            _ => panic!("not a check"),
+        };
+        let normal = plan(&["--check", "x.log"]);
+        assert!(normal.ids.contains(&"I13") && !normal.ids.contains(&"P1") && normal.runs == 1);
+        let pairing = plan(&["--check", "x.log", "--pairing"]);
+        assert_eq!(pairing.ids, ["P1", "P2", "P3", "P4", "P5"]);
+        let leak = plan(&["--check", "x.log", "--leak"]);
+        assert!(leak.leak && leak.runs == 4 && !leak.ids.contains(&"I10"));
+        assert!(run(&["--check", "x.log", "--leak", "--cases", "I10"]).is_err());
     }
 }

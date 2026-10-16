@@ -1,10 +1,14 @@
 //! `--check <log>`: grades each case from the board's serial log. The harness puts a
 //! `{"t":"mark","case":"<id>"}` message before each case, and the board logs it on its `rx:` line,
-//! so the lines up to the next marker belong to that case.
+//! so the lines up to the next marker are that case's stretch.
+//!
+//! The caller says which run the log should hold (a [`Plan`]). A case with too few stretches
+//! fails, so an empty or garbled log cannot pass. Every stretch of every case is graded, and the
+//! crash and reboot markers are scanned in every stretch except the wedge cases'.
 
 use std::fmt::Write;
 
-use super::cases::{Rule, CASES};
+use super::cases::{spec_for, Rule, CASES};
 
 const MARK: &str = r#""t":"mark","case":""#;
 
@@ -20,6 +24,15 @@ const FAULTS: &[&str] = &[
     "rst:0x",
 ];
 
+/// What the run that wrote the log should have produced.
+pub struct Plan {
+    pub ids: Vec<&'static str>,
+    /// Stretches expected per case: 1, or the warm-up plus the rounds of a leak run.
+    pub runs: usize,
+    /// A leak run, which also needs one heap sample per run.
+    pub leak: bool,
+}
+
 /// The id a marker line names, if the line is one.
 fn mark_id(line: &str) -> Option<&str> {
     let rest = line.split_once(MARK)?.1;
@@ -34,34 +47,51 @@ fn number_after(line: &str, key: &str) -> Option<u64> {
         .ok()
 }
 
-/// The text of the last stretch of the log that follows a marker for `id`.
-fn segment(lines: &[&str], id: &str) -> Option<String> {
-    let start = lines.iter().rposition(|l| mark_id(l) == Some(id))?;
-    let end = lines[start + 1..]
+struct Stretch<'a> {
+    id: &'a str,
+    /// The 1-based line number of the marker.
+    line: usize,
+    lines: &'a [&'a str],
+}
+
+/// Every stretch, in log order. Lines before the first marker belong to none, since the board
+/// may have booted before the harness began.
+fn stretches<'a>(lines: &'a [&'a str]) -> Vec<Stretch<'a>> {
+    let marks: Vec<(usize, &str)> = lines
         .iter()
-        .position(|l| mark_id(l).is_some())
-        .map_or(lines.len(), |n| start + 1 + n);
-    Some(lines[start..end].join("\n"))
+        .enumerate()
+        .filter_map(|(i, l)| mark_id(l).map(|id| (i, id)))
+        .collect();
+    marks
+        .iter()
+        .enumerate()
+        .map(|(n, &(start, id))| {
+            let end = marks.get(n + 1).map_or(lines.len(), |m| m.0);
+            Stretch {
+                id,
+                line: start + 1,
+                lines: &lines[start..end],
+            }
+        })
+        .collect()
 }
 
 /// Why `seg` fails `rule`, one entry per problem.
-fn problems(seg: &str, rule: &Rule, wedge: bool) -> Vec<String> {
+fn problems(seg: &str, rule: &Rule) -> Vec<String> {
     let mut found = Vec::new();
     for want in rule.want {
         if !seg.contains(want) {
             found.push(format!("missing {want:?}"));
         }
     }
+    for twice in rule.twice {
+        if seg.matches(twice).count() < 2 {
+            found.push(format!("expected {twice:?} at least twice"));
+        }
+    }
     for not in rule.not {
         if seg.contains(not) {
             found.push(format!("unexpected {not:?}"));
-        }
-    }
-    if !wedge {
-        for fault in FAULTS {
-            if seg.contains(fault) {
-                found.push(format!("fault marker {fault:?}"));
-            }
         }
     }
     found
@@ -93,26 +123,33 @@ fn keeps_falling(values: &[u64]) -> bool {
     values.len() >= 3 && values.windows(2).all(|w| w[1] < w[0])
 }
 
-/// Grades `log` and returns the report and whether nothing failed.
-pub fn grade(log: &str, after_s5: bool) -> (String, bool) {
+/// Grades `log` against `plan` and returns the report and whether nothing failed.
+pub fn grade(log: &str, plan: &Plan, after_s5: bool) -> (String, bool) {
     let lines: Vec<&str> = log.lines().collect();
+    let all = stretches(&lines);
     let mut out = String::new();
     let mut ok = true;
-    for spec in CASES {
-        let Some(seg) = segment(&lines, spec.id) else {
-            writeln!(
-                out,
-                "{:<5} SKIP  {} (no marker in the log)",
-                spec.id, spec.send
-            )
-            .ok();
-            continue;
-        };
+
+    for spec in CASES.iter().filter(|c| plan.ids.contains(&c.id)) {
         let rule = match (&spec.after, after_s5) {
             (Some(after), true) => after,
             _ => &spec.today,
         };
-        let found = problems(&seg, rule, spec.wedge);
+        let mine: Vec<&Stretch> = all.iter().filter(|s| s.id == spec.id).collect();
+        let mut found = Vec::new();
+        if mine.len() < plan.runs {
+            found.push(format!(
+                "found {} of {} expected runs in the log",
+                mine.len(),
+                plan.runs
+            ));
+        }
+        for (n, stretch) in mine.iter().enumerate() {
+            let text = stretch.lines.join("\n");
+            for problem in problems(&text, rule) {
+                found.push(format!("run {} (line {}): {problem}", n + 1, stretch.line));
+            }
+        }
         let status = if !found.is_empty() {
             ok = false;
             "FAIL"
@@ -129,8 +166,42 @@ pub fn grade(log: &str, after_s5: bool) -> (String, bool) {
             writeln!(out, "        look: {look}").ok();
         }
     }
-    let samples = leak_samples(&lines);
-    if !samples.is_empty() {
+
+    let mut faults = Vec::new();
+    for stretch in &all {
+        if spec_for(stretch.id).is_some_and(|c| c.wedge) {
+            continue;
+        }
+        for (i, line) in stretch.lines.iter().enumerate() {
+            if let Some(fault) = FAULTS.iter().find(|f| line.contains(*f)) {
+                faults.push(format!(
+                    "{fault:?} at line {} (case {})",
+                    stretch.line + i,
+                    stretch.id
+                ));
+            }
+        }
+    }
+    if faults.is_empty() {
+        writeln!(
+            out,
+            "\nFAULT PASS  no crash or reboot marker outside the wedge cases"
+        )
+        .ok();
+    } else {
+        ok = false;
+        writeln!(
+            out,
+            "\nFAULT FAIL  crash or reboot outside the wedge cases:"
+        )
+        .ok();
+        for fault in faults {
+            writeln!(out, "        {fault}").ok();
+        }
+    }
+
+    if plan.leak {
+        let samples = leak_samples(&lines);
         writeln!(
             out,
             "\nheap before connect, per leak round (internal free, PSRAM free):"
@@ -141,7 +212,16 @@ pub fn grade(log: &str, after_s5: bool) -> (String, bool) {
         }
         let internal: Vec<u64> = samples.iter().map(|s| s.0).collect();
         let psram: Vec<u64> = samples.iter().map(|s| s.1).collect();
-        if keeps_falling(&internal) || keeps_falling(&psram) {
+        if samples.len() != plan.runs {
+            ok = false;
+            writeln!(
+                out,
+                "LEAK  FAIL  {} of {} heap samples",
+                samples.len(),
+                plan.runs
+            )
+            .ok();
+        } else if keeps_falling(&internal) || keeps_falling(&psram) {
             ok = false;
             writeln!(out, "LEAK  FAIL  free heap fell at every round").ok();
         } else {
@@ -159,59 +239,159 @@ mod tests {
         format!(r#"I (1) link: rx: {{"t":"mark","case":"{id}"}}"#)
     }
 
+    fn plan(ids: &[&'static str]) -> Plan {
+        Plan {
+            ids: ids.to_vec(),
+            runs: 1,
+            leak: false,
+        }
+    }
+
+    const CACHED: &str = "I (3) link: icon aabbccdd received, validated and cached, 0 still wanted";
+
     #[test]
-    fn grades_expected_lines_and_flags_faults() {
+    fn grades_expected_lines() {
         let log = [
             mark("I1"),
             "W (2) proto: icon frame of 10 bytes is shorter than its header".into(),
-            "I (3) link: icon aabbccdd received, validated and cached, 0 still wanted".into(),
+            CACHED.into(),
+            CACHED.into(),
             mark("I2"),
             "W (4) proto: binary frame is not an icon".into(),
+            CACHED.into(),
+        ]
+        .join("\n");
+        let (report, ok) = grade(&log, &plan(&["I1", "I2"]), false);
+        assert!(!ok);
+        assert!(report.contains("I1    PASS"), "{report}");
+        // Only the liveness icon was cached, so the good frame for the case's own id was not.
+        assert!(report.contains("I2    FAIL"), "{report}");
+        assert!(report.contains("at least twice"), "{report}");
+    }
+
+    #[test]
+    fn an_empty_or_unmarked_log_fails() {
+        for log in ["", "boot noise\nmore noise"] {
+            let (report, ok) = grade(log, &plan(&["I1", "T1"]), false);
+            assert!(!ok, "{report}");
+            assert!(report.contains("found 0 of 1"), "{report}");
+        }
+    }
+
+    #[test]
+    fn a_case_missing_from_the_log_fails_while_unplanned_ones_are_not_graded() {
+        let log = [
+            mark("I8"),
+            "W (2) link: icon aabbccdd was not requested, dropped".into(),
+        ]
+        .join("\n");
+        assert!(grade(&log, &plan(&["I8"]), false).1);
+        assert!(!grade(&log, &plan(&["I8", "I9"]), false).1);
+    }
+
+    #[test]
+    fn a_crash_outside_a_graded_stretch_fails() {
+        let log = [
+            mark("I8"),
+            "W (2) link: icon aabbccdd was not requested, dropped".into(),
+            mark("LEAK0"),
             "Guru Meditation Error: Core 0 panic'ed".into(),
         ]
         .join("\n");
-        let (report, ok) = grade(&log, false);
-        assert!(!ok);
-        assert!(report.contains("I1    PASS"), "{report}");
-        assert!(report.contains("I2    FAIL"), "{report}");
-        assert!(report.contains("Guru Meditation"), "{report}");
-        assert!(report.contains("I3    SKIP"), "{report}");
+        let (report, ok) = grade(&log, &plan(&["I8"]), false);
+        assert!(!ok, "{report}");
+        assert!(
+            report.contains("FAULT FAIL") && report.contains("LEAK0"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn a_reboot_in_a_wedge_case_is_expected() {
+        let log = [mark("I13"), "ESP-ROM:esp32p4-eco2".into(), mark("I13b")].join("\n");
+        assert!(grade(&log, &plan(&["I13"]), false).1);
+    }
+
+    #[test]
+    fn t8_expects_the_tile_to_apply_to_the_kept_grid() {
+        let applied = [
+            mark("T8"),
+            r#"I (1) link: rx: {"t":"tile","btn":"t1"}"#.into(),
+        ]
+        .join("\n");
+        let ignored = [
+            applied.clone(),
+            "W (2) ui: tile for t1 ignored: no such tile button".into(),
+        ]
+        .join("\n");
+        assert!(grade(&applied, &plan(&["T8"]), false).1);
+        assert!(!grade(&ignored, &plan(&["T8"]), false).1);
     }
 
     #[test]
     fn the_after_s5_rule_replaces_the_current_one() {
-        let log = [
-            mark("I12"),
-            "I (1) link: icon aabbccdd received, validated and cached".into(),
-        ]
-        .join("\n");
-        assert!(!grade(&log, false).1); // today it also expects "already cached"
-        assert!(grade(&log, true).1);
+        let log = [mark("I12"), CACHED.into()].join("\n");
+        assert!(!grade(&log, &plan(&["I12"]), false).1); // today it also expects "already cached"
+        assert!(grade(&log, &plan(&["I12"]), true).1);
+    }
+
+    fn sample(n: u32, internal: u64) -> String {
+        format!(
+            "{}\nI (9) link: heap before connect: internal free {internal} min 1, PSRAM free 5000 min 1",
+            mark(&format!("LEAK{n}"))
+        )
+    }
+
+    fn leak_plan() -> Plan {
+        Plan {
+            ids: vec!["I8"],
+            runs: 4,
+            leak: true,
+        }
+    }
+
+    fn rounds(extra: impl Fn(usize) -> Option<&'static str>, samples: [u64; 4]) -> String {
+        let mut log = Vec::new();
+        for (n, internal) in samples.iter().enumerate() {
+            log.push(mark("I8"));
+            log.push("W (2) link: icon aabbccdd was not requested, dropped".to_string());
+            if let Some(line) = extra(n) {
+                log.push(line.to_string());
+            }
+            log.push(sample(n as u32, *internal));
+        }
+        log.join("\n")
     }
 
     #[test]
     fn leak_check_fails_only_when_every_round_falls() {
-        let sample = |n: u32, internal: u64| {
-            format!(
-                "{}\nI (9) link: heap before connect: internal free {internal} min 1, PSRAM free 5000 min 1",
-                mark(&format!("LEAK{n}"))
-            )
-        };
-        let falling = [
-            sample(0, 900),
-            sample(1, 800),
-            sample(2, 700),
-            sample(3, 600),
-        ]
-        .join("\n");
-        let steady = [
-            sample(0, 900),
-            sample(1, 800),
-            sample(2, 850),
-            sample(3, 840),
-        ]
-        .join("\n");
-        assert!(!grade(&falling, false).1);
-        assert!(grade(&steady, false).1);
+        let falling = rounds(|_| None, [900, 800, 700, 600]);
+        let steady = rounds(|_| None, [900, 800, 850, 840]);
+        assert!(!grade(&falling, &leak_plan(), false).1);
+        assert!(grade(&steady, &leak_plan(), false).1);
+    }
+
+    #[test]
+    fn a_crash_in_an_earlier_leak_round_fails() {
+        let log = rounds(
+            |n| (n == 1).then_some("Guru Meditation Error"),
+            [900, 850, 880, 870],
+        );
+        let (report, ok) = grade(&log, &leak_plan(), false);
+        assert!(!ok, "{report}");
+        assert!(report.contains("FAULT FAIL"), "{report}");
+    }
+
+    #[test]
+    fn missing_leak_samples_fail() {
+        let log = rounds(|_| None, [900, 850, 880, 870]);
+        let short: String = log
+            .lines()
+            .take(log.lines().count() - 2)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (report, ok) = grade(&short, &leak_plan(), false);
+        assert!(!ok, "{report}");
+        assert!(report.contains("heap samples"), "{report}");
     }
 }
