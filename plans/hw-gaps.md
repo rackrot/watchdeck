@@ -259,6 +259,8 @@ Report Phase A and Phase B separately. Phase B mid-transfer is harness case I13b
 
 ## Open questions
 
+Settled 2026-10-15 by the user: (1) `192.168.0.250`; (2) keepalive only, no vendored patch and no upstream issue, since the stall needs an unauthenticated peer on the pairing socket and a vanished desktop is covered by keepalive; (3) run pairing mode once; (4) the baseline may wedge the board and reboot it with an RTS pulse. S7 drops the upstream issue.
+
 1. **Spare address for the IP-change test.** `192.168.0.250` if it's outside the router's DHCP pool (recommended), otherwise another free address outside the pool. Check with `ping -c2 -W1` first.
 2. **F1 fix.**
    - (a, recommended) TCP keepalive plus an upstream issue. Covers a desktop that vanishes mid-transfer (dropped in about 20 s). A live hostile peer on the pairing socket can still wedge the board while pairing is open; a reboot clears it.
