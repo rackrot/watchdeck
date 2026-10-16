@@ -1045,7 +1045,7 @@ static void handle_msg(const char *json, size_t len)
             // fill in later, so the ack means the buttons are on screen.
             char ack[48];
             size_t ack_len = proto_build_layout_ack(ack, sizeof(ack), m->layout.rev);
-            if (ack_len > 0) {
+            if (ack_len > 0 && s.welcomed) { // a failed icon_get send has already dropped the link
                 send_text(ack, ack_len, NULL);
             }
         } else if (m->type == PROTO_MSG_RESULT && s.cbs.on_result) {

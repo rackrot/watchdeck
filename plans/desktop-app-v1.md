@@ -81,7 +81,7 @@ Nothing here imports `tauri`, so tests run headless.
   - tiles: `tile_values`
   - icons: `import_icon`, which opens the native file dialog itself and takes no path from the window, and `list_icons`
   - actions: `test_action`, which takes a button id and runs that button's action from the live config
-- Events to the UI: `devices-changed`, `pairing`, `config-status`, `layout-pushed` and `tile-values`.
+- Events to the UI: `devices-changed`, `pairing`, `config-status`, `layout-pushed`, `layout-applied` and `tile-values`.
 - React UI in `app/src`:
   - pages: ConfigPage (GridEditor, ButtonForm, ActionForm, SaveBar), Secrets, Devices with PairDialog
   - preview: `preview.ts`, `lvtext.ts`, `montserrat.ts`, which mirror the firmware geometry and LVGL line breaking
