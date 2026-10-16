@@ -346,7 +346,7 @@ static void build_grid(const proto_layout_t *l)
     for (size_t i = 0; i < l->n_buttons; i++) {
         const proto_button_t *b = &l->buttons[i];
         strlcpy(s_ids[i], b->id, sizeof(s_ids[i]));
-        strlcpy(s_labels[i], b->label, sizeof(s_labels[i]));
+        copy_printable(s_labels[i], sizeof(s_labels[i]), b->label);
 
         s_has_icon[i] = b->has_icon;
         memcpy(s_icon_ids[i], b->icon, sizeof(s_icon_ids[i]));
@@ -378,7 +378,7 @@ static void build_grid(const proto_layout_t *l)
         lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_font(label, &lv_font_montserrat_32, 0);
         lv_obj_set_style_text_color(label, lv_color_hex(b->fg), 0);
-        lv_label_set_text(label, b->label);
+        lv_label_set_text(label, s_labels[i]);
 
         if (b->tile) {
             // The label shrinks to one line of 24 pt and the value goes under it. With an icon on a grid of
@@ -571,8 +571,10 @@ static void show_daemon_list(void)
     }
 }
 
-static void show_code(const char *code, const char *name)
+static void show_code(const char *code, const char *daemon)
 {
+    char name[PROTO_NAME_MAX];
+    copy_printable(name, sizeof(name), daemon);
     lv_obj_t *view = new_pair_view();
     add_text(view, &lv_font_montserrat_32, "Pairing code");
     char spaced[8]; // "123 456"
@@ -587,8 +589,10 @@ static void yes_tapped(lv_event_t *e)
     link_pair_confirm();
 }
 
-static void show_confirm(const char *device, const char *name)
+static void show_confirm(const char *device, const char *daemon)
 {
+    char name[PROTO_NAME_MAX];
+    copy_printable(name, sizeof(name), daemon);
     lv_obj_t *view = new_pair_view();
     lv_label_set_text_fmt(add_text(view, &lv_font_montserrat_32, ""), "Does the watchdeck app on %s say \"Paired %s\"?",
                           name, device);
@@ -633,6 +637,9 @@ void ui_show_daemons(const link_daemon_t *daemons, size_t n)
     lvgl_port_lock(0);
     s_n_daemons = n < LINK_MAX_DAEMONS ? n : LINK_MAX_DAEMONS;
     memcpy(s_daemons, daemons, s_n_daemons * sizeof(daemons[0]));
+    for (size_t i = 0; i < s_n_daemons; i++) {
+        copy_printable(s_daemons[i].name, sizeof(s_daemons[i].name), s_daemons[i].name);
+    }
     if (!s_paired && !s_attempt_shown) {
         show_daemon_list();
     }
@@ -700,7 +707,9 @@ void ui_set_daemon_text(const char *text)
     if (!s_daemon_label) {
         return;
     }
+    char printable[96]; // the longest status link.c builds
+    copy_printable(printable, sizeof(printable), text);
     lvgl_port_lock(0);
-    lv_label_set_text_fmt(s_daemon_label, "Daemon: %s", text);
+    lv_label_set_text_fmt(s_daemon_label, "Daemon: %s", printable);
     lvgl_port_unlock();
 }
