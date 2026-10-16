@@ -1,8 +1,10 @@
 # watchdeck: Sentry error reporting
 
-## Status (2026-10-15)
+## Status (2026-10-16)
 
-S1 to S3 are built; S4 (firmware) and S5 (optional symbolication) remain, and the live-DSN checks are still to do. Decisions settled 2026-10-15 by the user: 1(a) device reports via the daemon, 2(b) `tauri-plugin-sentry` for the webview, 3(a), 4(a), 5(b) build S5 symbolication, 6(a). The `sentry` crate is approved. Build S1 to S5 in order.
+S1 to S4 are built, reviewed and merged (S4 at 917a5ec, not yet flashed). The live-DSN checks are still to do, and they need the user's Sentry project.
+
+S5 is on hold behind a live experiment, decided by the user 2026-10-16. Sentry's `symbolic` library has no RISC-V `Arch` (`EM_RISCV` maps to `Unknown`; `symbolic-debuginfo/src/elf.rs`, `symbolic-common/src/types.rs` on master, checked 2026-10-16), so resolving a P4 PC in Sentry is UNCONFIRMED. The experiment: upload one build-id-stamped `watchdeck.elf` with `sentry-cli debug-files upload`, send one hand-made event whose `debug_meta` names that build-id with `arch` omitted, and check whether a known PC resolves to file:line. Build S5 only if it does; otherwise drop it and keep `addr2line` as the way to read PCs. Decisions settled 2026-10-15 by the user: 1(a) device reports via the daemon, 2(b) `tauri-plugin-sentry` for the webview, 3(a), 4(a), 5(b) build S5 symbolication, 6(a). The `sentry` crate is approved. Build S1 to S5 in order.
 
 ### S1 results
 
