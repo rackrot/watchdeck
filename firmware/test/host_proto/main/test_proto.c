@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cJSON.h"
 #include "esp_err.h"
 #include "proto.h"
 #include "psa/crypto.h"
@@ -191,6 +192,123 @@ void test_tile_btn_with_a_nul_escape_is_cut_at_the_nul(void)
     const char *s = "{\"t\":\"tile\",\"btn\":\"a\\u0000x\",\"text\":\"\"}";
     TEST_ASSERT_EQUAL(ESP_OK, proto_parse(s, strlen(s), &msg));
     TEST_ASSERT_EQUAL_STRING("a", msg.tile.btn);
+}
+
+// ---- Report builder and ack parser ----
+
+static const char ELF64[] = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
+
+static proto_report_t crash_report(void)
+{
+    proto_report_t r = {.kind = PROTO_REPORT_CRASH, .pc = 0x4ff01234, .ra = 0x5, .addr = 0, .same_build = true};
+    strcpy(r.id, "a1b2c3d4");
+    strcpy(r.reason, "panic");
+    strcpy(r.task, "link");
+    strcpy(r.cause, "LoadAccessFault");
+    strcpy(r.elf, ELF64);
+    return r;
+}
+
+static void assert_str_field(const cJSON *root, const char *key, const char *want)
+{
+    const cJSON *f = cJSON_GetObjectItemCaseSensitive(root, key);
+    TEST_ASSERT_TRUE_MESSAGE(cJSON_IsString(f), key);
+    TEST_ASSERT_EQUAL_STRING(want, f->valuestring);
+}
+
+void test_report_crash_has_every_field_with_the_right_type(void)
+{
+    proto_report_t r = crash_report();
+    size_t len = proto_build_report(json, sizeof(json), &r);
+    TEST_ASSERT_GREATER_THAN(0, len);
+    cJSON *root = cJSON_Parse(json);
+    TEST_ASSERT_NOT_NULL(root);
+    assert_str_field(root, "t", "report");
+    assert_str_field(root, "id", "a1b2c3d4");
+    assert_str_field(root, "kind", "crash");
+    assert_str_field(root, "reason", "panic");
+    assert_str_field(root, "task", "link");
+    assert_str_field(root, "pc", "0x4ff01234");
+    assert_str_field(root, "ra", "0x00000005");
+    assert_str_field(root, "cause", "LoadAccessFault");
+    assert_str_field(root, "addr", "0x00000000");
+    assert_str_field(root, "elf", ELF64);
+    TEST_ASSERT_TRUE(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "same_build")));
+    TEST_ASSERT_EQUAL_INT(11, cJSON_GetArraySize(root));
+    cJSON_Delete(root);
+}
+
+void test_report_reset_sends_only_id_kind_and_reason(void)
+{
+    proto_report_t r = {.kind = PROTO_REPORT_RESET};
+    strcpy(r.id, "00ff00ff");
+    strcpy(r.reason, "brownout");
+    TEST_ASSERT_GREATER_THAN(0, proto_build_report(json, sizeof(json), &r));
+    cJSON *root = cJSON_Parse(json);
+    TEST_ASSERT_NOT_NULL(root);
+    assert_str_field(root, "kind", "reset");
+    assert_str_field(root, "reason", "brownout");
+    TEST_ASSERT_EQUAL_INT(4, cJSON_GetArraySize(root));
+    cJSON_Delete(root);
+}
+
+void test_report_invalid_fields_are_refused(void)
+{
+    proto_report_t r = crash_report();
+    strcpy(r.id, "A1b2c3d4"); // uppercase
+    TEST_ASSERT_EQUAL_size_t(0, proto_build_report(json, sizeof(json), &r));
+    r = crash_report();
+    strcpy(r.reason, "oops");
+    TEST_ASSERT_EQUAL_size_t(0, proto_build_report(json, sizeof(json), &r));
+    r = crash_report();
+    r.elf[63] = 'G';
+    TEST_ASSERT_EQUAL_size_t(0, proto_build_report(json, sizeof(json), &r));
+    r = crash_report();
+    r.elf[10] = 'A'; // uppercase
+    TEST_ASSERT_EQUAL_size_t(0, proto_build_report(json, sizeof(json), &r));
+    r = crash_report();
+    strcpy(r.task, "bad\ntask");
+    TEST_ASSERT_EQUAL_size_t(0, proto_build_report(json, sizeof(json), &r));
+    r = crash_report();
+    r.cause[0] = '\0';
+    TEST_ASSERT_EQUAL_size_t(0, proto_build_report(json, sizeof(json), &r));
+}
+
+void test_report_task_of_16_fits_and_17_does_not(void)
+{
+    proto_report_t r = crash_report();
+    memcpy(r.task, run_of('t', 16), 17);
+    TEST_ASSERT_GREATER_THAN(0, proto_build_report(json, sizeof(json), &r));
+    memcpy(r.task, run_of('t', 17), 18);
+    TEST_ASSERT_EQUAL_size_t(0, proto_build_report(json, sizeof(json), &r));
+}
+
+void test_report_too_small_a_buffer_returns_zero(void)
+{
+    proto_report_t r = crash_report();
+    TEST_ASSERT_EQUAL_size_t(0, proto_build_report(json, 40, &r));
+}
+
+void test_report_ack_valid_id_is_parsed(void)
+{
+    const char *s = "{\"t\":\"report_ack\",\"id\":\"a1b2c3d4\"}";
+    TEST_ASSERT_EQUAL(ESP_OK, proto_parse(s, strlen(s), &msg));
+    TEST_ASSERT_EQUAL(PROTO_MSG_REPORT_ACK, msg.type);
+    TEST_ASSERT_EQUAL_STRING("a1b2c3d4", msg.report_ack_id);
+}
+
+void test_report_ack_bad_id_is_refused(void)
+{
+    const char *bad[] = {
+        "{\"t\":\"report_ack\"}",
+        "{\"t\":\"report_ack\",\"id\":5}",
+        "{\"t\":\"report_ack\",\"id\":\"a1b2c3d\"}",
+        "{\"t\":\"report_ack\",\"id\":\"a1b2c3d45\"}",
+        "{\"t\":\"report_ack\",\"id\":\"A1B2C3D4\"}",
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        TEST_ASSERT_EQUAL_MESSAGE(ESP_ERR_INVALID_ARG, proto_parse(bad[i], strlen(bad[i]), &msg), bad[i]);
+    }
 }
 
 // ---- General message handling ----
@@ -391,6 +509,13 @@ void app_main(void)
     RUN_TEST(test_tile_empty_text_is_accepted);
     RUN_TEST(test_tile_state_absent_weird_or_a_number_is_unknown);
     RUN_TEST(test_tile_btn_with_a_nul_escape_is_cut_at_the_nul);
+    RUN_TEST(test_report_crash_has_every_field_with_the_right_type);
+    RUN_TEST(test_report_reset_sends_only_id_kind_and_reason);
+    RUN_TEST(test_report_invalid_fields_are_refused);
+    RUN_TEST(test_report_task_of_16_fits_and_17_does_not);
+    RUN_TEST(test_report_too_small_a_buffer_returns_zero);
+    RUN_TEST(test_report_ack_valid_id_is_parsed);
+    RUN_TEST(test_report_ack_bad_id_is_refused);
     RUN_TEST(test_general_unknown_t_is_parsed_as_unknown);
     RUN_TEST(test_general_t_that_is_not_a_string_is_refused);
     RUN_TEST(test_general_root_that_is_not_an_object_is_refused);

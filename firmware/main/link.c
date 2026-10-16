@@ -4,6 +4,7 @@
 #include <string.h>
 #include <strings.h>
 
+#include "crash.h"
 #include "display.h"
 #include "esp_app_desc.h"
 #include "esp_check.h"
@@ -713,6 +714,24 @@ static void send_hello(void)
     send_text(buf, len, "hello (token redacted)");
 }
 
+// Send the pending crash or reset report, if any. It goes out once per session and stays pending
+// until the daemon acks it.
+static void send_report(void)
+{
+    const proto_report_t *r = crash_pending();
+    if (!r) {
+        return;
+    }
+    char buf[512];
+    size_t len = proto_build_report(buf, sizeof(buf), r);
+    if (len == 0) {
+        ESP_LOGE(TAG, "report %s is invalid or does not fit, dropped", r->id);
+        crash_erase(); // the daemon would ack and discard a malformed one anyway
+        return;
+    }
+    send_text(buf, len, NULL);
+}
+
 /* ---- Pairing mode ---- */
 
 // Enter paired or unpaired mode and tell the UI. Paired, s.pairing holds the blob.
@@ -989,6 +1008,15 @@ static void handle_msg(const char *json, size_t len)
         s.welcomed = true;
         s.backoff_idx = 0;
         set_status("connected to %s", m->welcome_name);
+        send_report();
+        crash_test_arm();
+        break;
+    case PROTO_MSG_REPORT_ACK:
+        if (!s.welcomed) {
+            ESP_LOGW(TAG, "message before welcome, ignored");
+        } else if (!crash_ack(m->report_ack_id)) {
+            ESP_LOGW(TAG, "report_ack for an unknown report, ignored");
+        }
         break;
     case PROTO_MSG_ERROR:
         ESP_LOGE(TAG, "daemon error %s: %s", m->error.code, m->error.msg);
@@ -1144,6 +1172,7 @@ static void handle_event(link_ev_t *ev)
             // still accepts its token, so stay paired and say so.
             esp_err_t err = pairing_erase();
             if (err == ESP_OK) {
+                crash_erase(); // a dump may hold the token
                 unpair("pairing forgotten");
             } else {
                 set_status("forget failed: %s", esp_err_to_name(err));

@@ -7,6 +7,7 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 
+#include "crash.h"
 #include "display.h"
 #include "link.h"
 #include "sdcard.h"
@@ -41,6 +42,7 @@ void app_main(void)
     ESP_LOGI(TAG, "watchdeck starting: chip rev v%d.%d, PSRAM %u bytes", info.revision / 100, info.revision % 100,
              (unsigned)psram);
 
+    crash_init();
     ESP_ERROR_CHECK(power_init());
 
     esp_err_t nvs_err = nvs_flash_init();

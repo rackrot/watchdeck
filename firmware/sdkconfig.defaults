@@ -54,6 +54,12 @@ CONFIG_TINYUSB_DESC_MSC_STRING="watchdeck"
 # Empty: esp_tinyusb derives the serial number from the eFuse MAC.
 CONFIG_TINYUSB_DESC_SERIAL_STRING=""
 
+# Crash reports: a panic writes a coredump to the coredump partition, and main/crash.c sends its
+# summary to the daemon. IDF v6.1 has no ESP_COREDUMP_DATA_FORMAT_ELF option (ELF is the only format;
+# the flash option selects it). The ELF SHA must be the 64 hex digits the report's `elf` field carries.
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_APP_RETRIEVE_LEN_ELF_SHA=64
+
 # cJSON recursion depth. The deepest legitimate message nests 4 levels; the default of 1000
 # would overflow the link task stack on a hostile frame.
 CONFIG_CJSON_NESTING_LIMIT=8

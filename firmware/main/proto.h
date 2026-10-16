@@ -25,6 +25,7 @@
 #define PROTO_HASH_LEN 32        // bytes in a SHA-256 digest (commit, c_host)
 #define PROTO_NONCE_LEN 16       // bytes in each pairing nonce (n_dev, n_host)
 #define PROTO_CERT_MAX 2048      // the daemon cert PEM plus NUL
+#define PROTO_REPORT_ID_LEN 9    // 8 hex digits plus NUL
 #define PROTO_ICON_ID_LEN 16     // bytes in an icon id, shown as 32 hex digits in a layout
 #define PROTO_ICON_HEADER_LEN 24 // "WDI1", the id, then width and height as u16 LE
 #define PROTO_ICON_MAX_SIDE 256
@@ -40,6 +41,7 @@ typedef enum {
     PROTO_MSG_PAIR_OFFER,
     PROTO_MSG_PAIR_REVEAL,
     PROTO_MSG_PAIR_RESULT,
+    PROTO_MSG_REPORT_ACK,
 } proto_type_t;
 
 typedef struct {
@@ -98,6 +100,25 @@ typedef struct {
     const uint8_t *pixels; // w * h * 4 bytes of B, G, R, A (LVGL's ARGB8888), straight alpha
 } proto_icon_t;
 
+typedef enum {
+    PROTO_REPORT_CRASH, // from a coredump of an earlier boot; every field is set
+    PROTO_REPORT_RESET, // from esp_reset_reason() with no dump; only id and reason are sent
+} proto_report_kind_t;
+
+// What the device tells the daemon about an earlier crash or reset. Strings are NUL-terminated.
+typedef struct {
+    char id[PROTO_REPORT_ID_LEN]; // 8 lowercase hex digits
+    proto_report_kind_t kind;
+    char reason[12]; // panic, int_wdt, task_wdt, wdt or brownout
+    char task[17];   // printable ASCII, at most 16 characters, may be empty
+    uint32_t pc;
+    uint32_t ra;
+    char cause[33]; // 1 to 32 printable ASCII characters
+    uint32_t addr;
+    char elf[65]; // 64 lowercase hex digits
+    bool same_build;
+} proto_report_t;
+
 typedef struct {
     proto_type_t type;
     char unknown_t[16]; // PROTO_MSG_UNKNOWN: the "t" value, truncated, for logging
@@ -111,8 +132,9 @@ typedef struct {
         proto_result_t result;
         proto_tile_t tile;
         proto_pair_offer_t pair_offer;
-        uint8_t n_host[PROTO_NONCE_LEN]; // PROTO_MSG_PAIR_REVEAL
-        bool pair_ok;                    // PROTO_MSG_PAIR_RESULT
+        uint8_t n_host[PROTO_NONCE_LEN];         // PROTO_MSG_PAIR_REVEAL
+        bool pair_ok;                            // PROTO_MSG_PAIR_RESULT
+        char report_ack_id[PROTO_REPORT_ID_LEN]; // PROTO_MSG_REPORT_ACK, 8 lowercase hex digits
     };
 } proto_msg_t;
 
@@ -140,6 +162,14 @@ size_t proto_build_icon_get(char *buf, size_t buf_len, const uint8_t ids[][PROTO
 
 /** Build a press message. Returns the JSON length, or 0 if it does not fit in `buf`. */
 size_t proto_build_press(char *buf, size_t buf_len, const char *btn, uint32_t seq);
+
+/**
+ * Build a report. The daemon acks and discards a mistyped or malformed one, so this returns 0 for an
+ * invalid `id` or `reason`, and for a crash whose `elf` is not 64 lowercase hex digits or whose `task`
+ * or `cause` is not printable ASCII of the allowed length. It also returns 0 if the JSON does not fit
+ * in `buf`. A reset sends only `id`, `kind` and `reason`.
+ */
+size_t proto_build_report(char *buf, size_t buf_len, const proto_report_t *r);
 
 /**
  * Parse one daemon message. Unknown fields are ignored. An unknown "t" returns ESP_OK with

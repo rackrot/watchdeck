@@ -33,6 +33,7 @@ Add new tools to `mise.toml`, not to CI or the hooks. The hooks call the mise-pi
 - The board advertises `watchdeck.local` via mDNS (hostname only, no services yet).
 - The board keeps its pairing (token, daemon name, pinned cert) as one NVS blob, namespace `watchdeck`, key `pairing`. It saves the blob only after a person taps Yes on its "Paired <device>?" question, and holding Forget pairing for 2 s erases it.
 - The second USB-C port (J16, native high-speed USB, device only, separate from the CH340 console port) exposes the raw TF card to a host as a mass-storage drive. The firmware reads `wifi.txt`, then releases its own mount and hands the card to USB. Host writes apply on the next reboot.
+- A 512 KB `coredump` partition (after `factory`, at 0x410000) holds the ELF coredump of the last panic. `main/crash.c` sends its summary to the daemon as a `report` and erases the dump on `report_ack`. Forget pairing erases it too, since a dump may hold the token. The partition table changed, so a device flashed before it needs a full flash (`fw:flash` alone leaves the old table).
 - USB MSC writes are acked to the host before they reach the card, and card write errors never reach the host (upstream esp_tinyusb behavior, unchanged as of 2026-09), so eject before unplugging.
 - Pin map, from Elecrow's V1.2 schematic and examples:
   - Display: EK79007 over 2-lane MIPI-DSI, backlight on GPIO31 (active high).

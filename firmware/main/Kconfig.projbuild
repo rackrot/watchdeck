@@ -11,4 +11,11 @@ menu "watchdeck"
         string "Wi-Fi password"
         default ""
 
+    config WATCHDECK_TEST_CRASH
+        bool "Crash 30 s after the first welcome (manual checks only)"
+        default n
+        help
+            Dereferences NULL 30 s after the first welcome from the daemon, to
+            exercise the coredump and report path. Leave off in real builds.
+
 endmenu

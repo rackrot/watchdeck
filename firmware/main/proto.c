@@ -133,6 +133,69 @@ size_t proto_build_icon_get(char *buf, size_t buf_len, const uint8_t ids[][PROTO
     return print_into(root, buf, buf_len);
 }
 
+static bool is_hex(const char *s, size_t n)
+{
+    if (strlen(s) != n) {
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (hex_digit(s[i]) < 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool is_printable(const char *s, size_t min, size_t max)
+{
+    size_t n = strlen(s);
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] < 0x20 || s[i] > 0x7e) {
+            return false;
+        }
+    }
+    return n >= min && n <= max;
+}
+
+static void add_addr(cJSON *root, const char *key, uint32_t v)
+{
+    char hex[11];
+    snprintf(hex, sizeof(hex), "0x%08x", (unsigned)v);
+    cJSON_AddStringToObject(root, key, hex);
+}
+
+size_t proto_build_report(char *buf, size_t buf_len, const proto_report_t *r)
+{
+    static const char *const reasons[] = {"panic", "int_wdt", "task_wdt", "wdt", "brownout"};
+    bool reason_ok = false;
+    for (size_t i = 0; i < sizeof(reasons) / sizeof(reasons[0]); i++) {
+        reason_ok |= strcmp(r->reason, reasons[i]) == 0;
+    }
+    bool crash = r->kind == PROTO_REPORT_CRASH;
+    if (!reason_ok || !is_hex(r->id, 8) ||
+        (crash && (!is_hex(r->elf, 64) || !is_printable(r->task, 0, 16) || !is_printable(r->cause, 1, 32)))) {
+        return 0;
+    }
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return 0;
+    }
+    cJSON_AddStringToObject(root, "t", "report");
+    cJSON_AddStringToObject(root, "id", r->id);
+    cJSON_AddStringToObject(root, "kind", crash ? "crash" : "reset");
+    cJSON_AddStringToObject(root, "reason", r->reason);
+    if (crash) {
+        cJSON_AddStringToObject(root, "task", r->task);
+        add_addr(root, "pc", r->pc);
+        add_addr(root, "ra", r->ra);
+        cJSON_AddStringToObject(root, "cause", r->cause);
+        add_addr(root, "addr", r->addr);
+        cJSON_AddStringToObject(root, "elf", r->elf);
+        cJSON_AddBoolToObject(root, "same_build", r->same_build);
+    }
+    return print_into(root, buf, buf_len);
+}
+
 size_t proto_build_press(char *buf, size_t buf_len, const char *btn, uint32_t seq)
 {
     cJSON *root = cJSON_CreateObject();
@@ -358,6 +421,11 @@ esp_err_t proto_parse(const char *json, size_t len, proto_msg_t *out)
         const cJSON *ok = cJSON_GetObjectItemCaseSensitive(root, "ok");
         err = cJSON_IsBool(ok) ? ESP_OK : ESP_ERR_INVALID_ARG;
         out->pair_ok = cJSON_IsTrue(ok);
+    } else if (strcmp(t, "report_ack") == 0) {
+        out->type = PROTO_MSG_REPORT_ACK;
+        bool ok =
+            get_str(root, "id", out->report_ack_id, sizeof(out->report_ack_id), true) && is_hex(out->report_ack_id, 8);
+        err = ok ? ESP_OK : ESP_ERR_INVALID_ARG;
     } else {
         out->type = PROTO_MSG_UNKNOWN;
         strlcpy(out->unknown_t, t, sizeof(out->unknown_t));
