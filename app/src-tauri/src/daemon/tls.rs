@@ -20,8 +20,10 @@ use tokio_rustls::rustls::{self, ServerConfig};
 
 use super::store::{check_private, write_private};
 
-const CERT_FILE: &str = "identity.pem";
-const KEY_FILE: &str = "identity.key";
+/// The identity's file names, public so the fault harness can check for them before
+/// `load_or_create`, which would otherwise create a new identity.
+pub const CERT_FILE: &str = "identity.pem";
+pub const KEY_FILE: &str = "identity.key";
 const LOCK_FILE: &str = "identity.lock";
 /// Hex digits in `fp`, the cert fingerprint advertised in mDNS TXT.
 const FP_HEX_LEN: usize = 16;

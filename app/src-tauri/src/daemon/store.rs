@@ -14,7 +14,8 @@ use sha2::{Digest, Sha256};
 
 use super::protocol::{decode_hex, encode_hex, valid_device_id, TOKEN_BYTES};
 
-const STATE_FILE: &str = "state.json";
+/// Public so the fault harness can check for the file before `load`, which treats a missing one as empty.
+pub const STATE_FILE: &str = "state.json";
 const STATE_VERSION: u32 = 1;
 
 /// Paired devices, as loaded from `state.json` and saved back on every change. Only the process

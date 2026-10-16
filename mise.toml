@@ -64,6 +64,17 @@ description = "Build the desktop app"
 dir = "app"
 run = "pnpm tauri build"
 
+# Flags after `--` go to the harness: `mise run app:fault -- --device wd-xxxxxxxxxxxx`. The tray app
+# must be quit first. See plans/hw-gaps.md.
+[tasks."app:fault"]
+description = "Run the fault-injection harness against the paired board"
+dir = "app/src-tauri"
+run = "cargo run --example fault_daemon --"
+
+[tasks."app:fault-capture"]
+description = "Capture the board's serial log for app:fault (output file after --)"
+run = '"$HOME/.espressif/python_env/idf6.1_py3.12_env/bin/python" app/src-tauri/examples/fault_capture.py'
+
 [tasks."site:build"]
 description = "Build the GitHub Pages site"
 run = "mdbook build site"
