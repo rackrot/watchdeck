@@ -2,7 +2,7 @@
 
 ## Status (2026-10-15)
 
-Planned, not started. It needs the user's decisions below, then S1 to S4 in order. S5 is optional.
+Planned, not started. Decisions settled 2026-10-15 by the user: 1(a) device reports via the daemon, 2(b) `tauri-plugin-sentry` for the webview, 3(a), 4(a), 5(b) build S5 symbolication, 6(a). The `sentry` crate is approved. Build S1 to S5 in order.
 
 ## Goal and definition of done
 
@@ -94,7 +94,7 @@ Planned, not started. It needs the user's decisions below, then S1 to S4 in orde
 
 ```text
 board ──wss: report {crash summary}──▶ daemon ──https──▶ Sentry ingest
-webview ──invoke report_ui_error──▶ daemon ┘
+webview ──tauri-plugin-sentry IPC─────▶ daemon ┘
 daemon log::error!, panics ───────────────┘
 ```
 
@@ -133,13 +133,15 @@ The module is named `reporting` rather than `sentry` so it doesn't shadow the cr
   - Firmware reports get a per-device cap across sessions: one per (elf, pc) per hour.
 - **Device reports** become `level=fatal` events tagged `component=firmware`, `reset_reason`, `elf` and `cause`. Their exception frames are the PC and RA as `instruction_addr`. `release = watchdeck-firmware@<fw>` is set only when the crashed build matches the running one. The device id is attached only with `pii`. The daemon **always** writes one `warn!` line per report, whether Sentry is on or off.
 
-### Webview
+### Webview (tauri-plugin-sentry, user decision 2(b); checked 2026-10-15 against the 0.8.0 crate, tauri 2.12.2, sentry-types 0.49.3)
 
-- `main.tsx` gets `error` and `unhandledrejection` listeners, plus React 19 `createRoot(…, { onUncaughtError, onCaughtError })`. They send `invoke("report_ui_error", { kind, message, stack })`.
-- A `reportError(where, e)` helper in `errors.ts` replaces the three `console.error` catch sites (`hooks.ts:45,54`, `PairDialog.tsx:79`).
-- The reporter swallows its own failed invoke with `console.error` and never rethrows, so it can't loop.
-- The `report_ui_error` command caps message and stack at 2 KB each. It makes a message-only event: the exception type is the JS error name, the value is the message, and the scrubbed stack goes in extra. Production stacks are minified and no source maps are uploaded, which is an accepted limit.
-- No npm dependency, no CSP change, no capability change. App commands need no capability entry, as with `save_config` today.
+- `init_with_options(&client, …{ inject: true, debug: false })` takes our S1 client (`lib.rs:128` @0.8.0). Events go through `sentry::capture_event`, so they get Rust breadcrumbs, `before_send` and the budget.
+- Tauri builds config windows before `setup` (`app.rs:2691` @2.12.2), and a webview's init scripts are fixed when it's built. So `main` gets `"create": false`. The end of `setup` registers the plugin only if `[sentry]` exists, then calls `WebviewWindowBuilder::from_config(…)`. Without `[sentry]` there is no plugin and no `window.Sentry`.
+- The 351 KB script (`@sentry/browser` 10.8.0) sets `window.Sentry`, catches global errors and rejections, and sends envelopes and breadcrumbs over `__TAURI_INTERNALS__` IPC. Its DSN is a dummy and is never fetched.
+- The three catch sites (`hooks.ts:45,54`, `PairDialog.tsx:79`) call `window.Sentry?.captureException(e)`, typed in `errors.ts`. No npm dependency.
+- `before_send` tags `platform == "javascript"` events `component=ui` and drops `request` (page URL, Referer). The plugin removes only User-Agent.
+- Capability: `sentry:default`.
+- CSP: no change. Init scripts are webview user scripts outside page CSP, like Tauri's IPC bootstrap, and IPC is already in `connect-src`. UNCONFIRMED until S2's check in a release build.
 
 ### Protocol (add to `site/src/protocol.md`)
 
@@ -183,7 +185,7 @@ H→D report_ack {"t":"report_ack","id":"<8 hex>"}
 | sentry-micro as is | Arduino and PlatformIO only, a two-month-old prototype with no releases, and TLS unverified by default |
 | Fork sentry-micro: device builds envelopes, daemon relays them | The DSN goes to the device. The daemon would have to parse and rewrite opaque envelopes to enforce privacy. It means ~15 vendored C files plus an IDF transport, an id derived from the eFuse MAC, and the same two P4 frames anyway. Its extras (metrics, logs, spans, an NVS queue) aren't requested, and the coredump partition already persists the report |
 | Device posts to Sentry over `esp_http_client` | A second TLS context, a CA bundle, a DSN on the device and internet egress, all duplicating a pipe the device already has |
-| `tauri-plugin-sentry` + `@sentry/browser` | It injects ~100 KB of JS into the strict-CSP webview (whether init scripts get past the CSP is UNCONFIRMED). It also needs a new capability, and its default minidump child process complicates single-instance and autostart. Release 0.8.0 is two days old |
+| Webview errors routed through a custom `report_ui_error` command | The plan's first recommendation. The user chose `tauri-plugin-sentry` instead, for breadcrumbs and browser context |
 | `@sentry/react` directly | Needs `connect-src` to the ingest host, which loosens the S7 CSP, and a second DSN path |
 | Rebinding the client live on config change | Restart-only is simpler. The setting rarely changes |
 | `sentry-minidump` for WebKitGTK native crashes | Its re-exec'd crash-reporter process. Open question 4 |
@@ -193,7 +195,7 @@ H→D report_ack {"t":"report_ack","id":"<8 hex>"}
 | # | Slice | Files | Depends on | Acceptance | Cheapest check | Agent |
 |---|---|---|---|---|---|---|
 | S1 | Daemon SDK, config, scrubber, budget, log bridge, panic | `Cargo.toml`, `Cargo.lock`, `lib.rs`, `daemon/mod.rs`, new `daemon/reporting.rs`, `daemon/config.rs`, `app/src/config.ts`, `site/src/config.md` | user approves `sentry` | No `[sentry]` means no client, even with `SENTRY_DSN` set. A bad or http DSN is refused on both reload and `save_config`. `SSL_VERIFY=false` doesn't disable verification. A UI save keeps `[sentry]`. Scrubber tests cover the secret-first ordering, quotes, IPs, home, hostname, `wd-` ids and frame paths. Budget tests cover distinct crashes, floods, and the 256-key cap. `cargo tree -i openssl-sys` and `cargo tree -i ring` are empty | `cargo test`, clippy. Manually, with a real DSN, a forced `error!` and a release-build panic arrive scrubbed | coder-high |
-| S2 | Webview errors through Rust | `commands.rs`, `lib.rs` (invoke_handler), `app/src/main.tsx`, `errors.ts`, `api.ts`, `hooks.ts`, `PairDialog.tsx` | S1 | A thrown error and a rejected promise each arrive as `component=ui`. The three catch sites report. A failing reporter doesn't recurse. CSP and capabilities are unchanged | `pnpm build`, `pnpm test`, `cargo test`, then manually throw from the devtools console | coder |
+| S2 | Webview errors via tauri-plugin-sentry | `tauri.conf.json`, `lib.rs`, `capabilities/default.json`, `daemon/reporting.rs`, `errors.ts`, `hooks.ts`, `PairDialog.tsx` | S1 | With `[sentry]`, the page loads under the release CSP, and a thrown error, a rejection and the three catch sites arrive scrubbed as `component=ui`. Without it, no plugin and no `window.Sentry`. Tray and single-instance still show the window. `cargo tree -i sentry-minidump` is empty | `cargo test`, `pnpm build`, then throw from devtools in a release build | coder-high |
 | S3 | `report`/`report_ack` and device-report events | `daemon/protocol.rs`, `daemon/server.rs`, `daemon/reporting.rs`, `site/src/protocol.md` | S1 | Parse and bounds tests pass. Captured-event tests (`sentry` with `features=["test"]` in dev-deps) show the event shape, `same_build` controlling release, no device id without pii, and the cross-session cap. Ack goes out with Sentry off. Over-limit reports are logged and acked but not sent | `cargo test` | coder-high |
 | S4 | Firmware coredump and report | `firmware/partitions.csv`, `sdkconfig.defaults`, `main/crash.c`, `main/crash.h`, `main/proto.c`, `main/proto.h`, `main/link.c`, `main/main.c`, `main/CMakeLists.txt`, `main/Kconfig.projbuild`, `CLAUDE.md` hardware facts | S3 (spec) | Clean `fw:build`. The generated `sdkconfig` has all three keys. Manually, with `WATCHDECK_TEST_CRASH=y`: crash, reboot, then a daemon log line and Sentry event, then the dump is erased after ack. Against the current daemon (no ack) the dump survives. Forget pairing erases it. A brownout or WDT gives `kind=reset`. Pairing survives the reflash. The panic log shows the coredump written with no space error | `mise run fw:build`, then flash and check on the board | coder-high |
 | S5 (optional) | Firmware symbolication in Sentry | stamp script (borrowed), `firmware/CMakeLists.txt`, `mise.toml` (sentry-cli), `ci.yml`, `protocol.rs`/`reporting.rs` (`build_id`, `debug_meta`) | S4, user decision | A known PC from the test crash resolves to `file:line` in Sentry against the uploaded ELF. Image address and size come from the ELF | Manual, on one build | coder-high |
@@ -204,6 +206,7 @@ Commit each slice once its checks pass. S2 and S3 can run in parallel after S1. 
 
 - `sentry = { version = "0.49.3", default-features = false, features = ["contexts", "panic", "log", "reqwest", "rustls-no-provider"] }`. This brings in sentry-core, -types, -panic, -backtrace, -contexts and -log.
 - Dev: the same crate with `features = ["test"]`.
+- `tauri-plugin-sentry = { version = "=0.8.0", default-features = false }`. It wants `sentry ^0.49` with default features off, so it shares our 0.49.3 and adds no TLS. Turning off default features also drops `minidump`. Its other deps are already locked.
 - S5 only: `sentry-cli` pinned in mise, and a Sentry auth token as a CI secret.
 - Firmware: none. `espcoredump` ships with IDF.
 
@@ -218,6 +221,9 @@ Commit each slice once its checks pass. S2 and S3 can run in parallel after S1. 
 | OpenSSL or ring creeps in | `default-features = false`, plus the `cargo tree` check in S1 |
 | `split()` ordering in `setup` misbehaves | The coder confirms early that the logger attaches before the first `log::info!` |
 | Release frames are bare addresses (`strip = true`) | Accepted. The panic message and `file:line` still arrive. Open question 3 |
+| Raw envelopes from the plugin (`commands.rs:30-34` @0.8.0, sent when parsing fails) and non-event envelopes (`:73`) skip `before_send` and the budget | Wrap the transport and drop envelopes with no typed items (`items()` is empty for raw, `envelope.rs:480`). Client reports (counts only) remain. Test it |
+| The plugin's injected script fails under the release CSP | `init_with_no_injection`, plus `@sentry/browser` and the plugin's ~40-line `index.ts` bundled in (a new npm dependency, which needs the user's approval) |
+| `tauri-plugin-sentry` 0.8.0 is two days old | Pin `=0.8.0`. Rollback is reverting S2 |
 | The coredump partition is too small | 512K is an estimate, not measured. The S4 manual check reads the dump size from the panic log |
 
 Rollback: remove `[sentry]` and reporting stops. Each slice is one revertible commit, and only S4's partition table needs a reflash to undo.
