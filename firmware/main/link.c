@@ -176,10 +176,16 @@ static bool post(const link_ev_t *ev)
 
 static void on_ws_data(const esp_websocket_event_data_t *d, uint32_t gen)
 {
-    // PING and PONG payloads arrive as DATA too. Fragmented messages (continuation op_code 0) are
-    // dropped on purpose, since the protocol uses single frames.
+    // PING and PONG payloads arrive as DATA too. Fragmented messages (a first frame without FIN, and
+    // its continuations with op_code 0) are dropped on purpose, since the protocol uses single frames.
     bool binary = d->op_code == WS_OP_BINARY;
     if (d->op_code != WS_OP_TEXT && !binary) {
+        return;
+    }
+    if (!d->fin) {
+        if (d->payload_offset == 0) {
+            ESP_LOGW(TAG, "fragmented message dropped");
+        }
         return;
     }
     if (binary && !s_binary_ok) {
@@ -194,7 +200,7 @@ static void on_ws_data(const esp_websocket_event_data_t *d, uint32_t gen)
     if (d->payload_len > max_len) {
         if (d->payload_offset == 0) { // later chunks of the same frame need no second close
             ESP_LOGE(TAG, "frame of %d bytes exceeds %d, closing", d->payload_len, max_len);
-            post(&bad);
+            post_wait(&bad, pdMS_TO_TICKS(RX_POST_WAIT_MS));
         }
         return;
     }
@@ -599,6 +605,12 @@ static esp_err_t open_client(const char *uri, const char *cert_pem)
         .buffer_size = PROTO_MAX_MSG,
         .task_stack = WS_TASK_STACK,
         .network_timeout_ms = 5000,
+        // A peer that vanishes mid-frame blocks the websocket task, so drop it at the TCP level after
+        // about 20 s.
+        .keep_alive_enable = true,
+        .keep_alive_idle = 5,
+        .keep_alive_interval = 5,
+        .keep_alive_count = 3,
     };
     s.client = esp_websocket_client_init(&cfg);
     esp_err_t err =
@@ -1044,6 +1056,7 @@ static void handle_event(link_ev_t *ev)
     case EV_WS_UP:
         if (current && s.state == ST_CONNECTING) {
             s.state = ST_UP;
+            s.connect_deadline_ms = now_ms() + CONNECT_TIMEOUT_MS; // for the welcome
             send_hello();
         } else if (current && s.state == ST_PAIRING && !s.pair_up) {
             pair_connected();
@@ -1165,6 +1178,11 @@ static void link_task(void *arg)
         case ST_CONNECTING:
             if (now > s.connect_deadline_ms) {
                 candidate_failed("connect timeout");
+            }
+            break;
+        case ST_UP:
+            if (!s.welcomed && now > s.connect_deadline_ms) {
+                candidate_failed("no welcome");
             }
             break;
         case ST_BROWSE:
