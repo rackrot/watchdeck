@@ -198,7 +198,10 @@ pub fn run() {
             commands::save_config,
             commands::list_secrets,
             commands::set_secret,
+            commands::delete_secret,
             commands::import_icon,
+            commands::list_icons,
+            commands::test_action,
             commands::tile_values,
         ])
         .run(tauri::generate_context!())

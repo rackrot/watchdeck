@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use serde::Serialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::config::Action;
@@ -25,7 +26,7 @@ const TEXT_BYTES: usize = 1024;
 const SUMMARY_BYTES: usize = 96;
 
 /// How a press went, as the `result` message carries it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ActionResult {
     pub ok: bool,
     /// Exit code or HTTP status, or -1 when there is neither.

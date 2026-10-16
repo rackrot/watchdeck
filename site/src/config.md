@@ -110,7 +110,7 @@ icon = "plex.png"
 action = { kind = "shell", argv = ["ssh", "nas", "docker", "restart", "plex"] }
 ```
 
-To add one, either copy the file into `icons/` yourself (make the folder if it's missing) and name it in `config.toml`, or import it, which copies it there under a name made from its content, such as `3f2a9c1d0e44.png`. The app's `import_icon` command does the import; the config editor will offer it.
+To add one, either copy the file into `icons/` yourself (make the folder if it's missing) and name it in `config.toml`, or import it, which copies it there under a name made from its content, such as `3f2a9c1d0e44.png`. The config editor's Import button does the import. Its icon picker lists the files in `icons/` that the app would accept (a valid name, a regular file inside the folder, and a readable PNG, JPEG or WebP), and reads the folder again after an import.
 
 - `icon` is a plain file name: 1 to 63 letters, digits, `_`, `-` or `.`, not starting with a dot. It can't point outside `icons/`.
 - Only PNG, JPEG and WebP are read. The kind comes from the file's contents, not its name. SVG isn't supported.
@@ -208,6 +208,7 @@ ha = "Bearer paste-your-token-here"
 - The file must have mode 0600, or the app won't read it and logs the fix: `chmod 600 ~/.config/dev.rackrot.watchdeck/secrets.toml`.
 - A value goes out as an HTTP header, so it must be printable ASCII on one line, up to 4096 bytes. The app won't read a file with any other value, and the error names the secret.
 - A button that names a missing secret holds back the whole config. Adding the secret applies it.
+- The Secrets page can remove a secret, after a confirmation. It refuses while the running config still names the secret in a button's action or a tile's source, and the message lists the buttons. Change those buttons first, then remove it.
 - Secret values never appear in logs or error messages. Errors name the secret, and a syntax error in `secrets.toml` gives only its line number.
 - On the device, exact copies of a value in a reply show as `<secret>`, even one cut short by the 64 KB limit. An encoded copy, such as base64 or URL-encoded, isn't caught.
 - The file is plain text. Anything running as your user can read it.
@@ -215,6 +216,8 @@ ha = "Bearer paste-your-token-here"
 ## Results
 
 Every press shows a result on the device: the button's label with OK or Failed, a one-line summary with the time taken, and the end of the output.
+
+The config editor's Test button runs a button's saved action the same way, with the same limits and result text, and shows the result in the editor. No device is sent anything. It is off while the form differs from the saved button.
 
 | Outcome | Summary |
 |---|---|

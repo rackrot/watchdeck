@@ -20,7 +20,7 @@
 - Still untested on hardware, from earlier slices: the board recovering after the desktop's IP changes (S2), and a bad frame at the device's icon and tile parsers (S5, S6).
 - Open beyond v1:
   - the Backlog section at the end (Sentry error reporting)
-  - the S7 gaps listed in "S7 results": no secret delete, no `list_icons`, no `test_action`
+  - the two S7 gaps still open, listed in "S9 results": no layout acknowledgement, and a deleted config is recreated only by a save
 
 ## Decisions
 
@@ -77,10 +77,10 @@ Nothing here imports `tauri`, so tests run headless.
 - `commands.rs` exposes the Tauri commands:
   - config: `get_config`, `save_config`
   - devices and pairing: `list_devices`, `forget_device` (closes the live session too), `start_pairing`, `pairing_state`, `cancel_pairing`, `confirm_pairing`
-  - secrets: `list_secrets`, `set_secret` (write-only)
+  - secrets: `list_secrets`, `set_secret` (write-only), `delete_secret` (refused while the live config names the secret)
   - tiles: `tile_values`
-  - icons: `import_icon`, which opens the native file dialog itself and takes no path from the window
-  - `test_action` was planned but not built (an S7 gap)
+  - icons: `import_icon`, which opens the native file dialog itself and takes no path from the window, and `list_icons`
+  - actions: `test_action`, which takes a button id and runs that button's action from the live config
 - Events to the UI: `devices-changed`, `pairing`, `config-status`, `layout-pushed` and `tile-values`.
 - React UI in `app/src`:
   - pages: ConfigPage (GridEditor, ButtonForm, ActionForm, SaveBar), Secrets, Devices with PairDialog
@@ -515,7 +515,17 @@ The review and the security audit found no blockers. These fixes followed:
   - The page listens before it reads, ignores the `config-status` event of its own save, and does not reload during a save.
   - Pairing resumes on the Devices tab. A hidden icon can show again. Tabs have `aria-controls` and arrow keys, and the hex input, Remove, Replace and Forget buttons are labelled.
   - `pnpm build` type-checks `tests/` (`tsconfig.test.json`, with a small ambient shim for the two Node modules), and CI runs `pnpm test`. The save and dirty logic is in `saveflow.ts`, with tests.
-- **Gaps:** no secret delete command; no `list_icons` (the picker offers icons the config uses plus ones imported this session); no `test_action`; the device never acknowledges a layout; a config deleted while running is recreated only by a save.
+- **Gaps:** no secret delete command; no `list_icons` (the picker offers icons the config uses plus ones imported this session); no `test_action` (all three closed in S9); the device never acknowledges a layout; a config deleted while running is recreated only by a save.
+
+### S9 results (2026-10-15)
+
+Closes the first three S7 gaps. The last two stay open.
+
+- **`delete_secret(name)`:** `Configs::delete_secret` holds the config lock, refuses with the ids of the buttons whose action or tile source names the secret in `secret_headers` (`Config::secret_users`), else `Secrets::remove` rewrites `secrets.toml` through the same 0600 atomic write as `set`, then reloads. It checks the live config only: a file on disk that is not live and names the secret fails its next reload, which `config-status` reports. The Secrets page has a Remove button per row with an in-page confirm and the refusal inline.
+- **`list_icons`:** `Icons::list` returns the files in `icons/` with a valid name (`name_error`, so no hidden files), that are regular files, resolve inside the directory, and pass `read_image` and `decode`, which is what a configured icon must pass. The picker offers these, plus the selected button's own icon if its file is missing. The list is read on load and again after `import_icon`.
+- **`test_action(button)`:** `Devices::test_press` takes only a button id, claims the run through `Shared::begin_press` (the same code as a device press: live config, per-button slot, "already running", the global limit), runs it with the action's timeout and output caps, logs `test: ...` where a press logs `<device>: ...`, and pokes the button's tile. It returns `ActionResult` (`ok`, `code`, `summary`, `text`, `ms`), serialized as is. An unknown id is an error; "already running" and "busy" come back as results, as a device sees them. No `DaemonEvent` exists for presses, so there is none to send, and the result goes to no session. The button form's Test is off, with a hint, when the draft differs from `view.config` for that button or the id is not saved (`testBlock` in `saveflow.ts`).
+- **Tests:** Rust unit tests for `Secrets::remove`, `Configs::delete_secret` and `Icons::list`; `device_sim` checks that a test press runs the live action after a reconfigure, is refused while a device press runs, errors on an unknown id, and sends the device no frame; one TS test for `testBlock`.
+- **Known limit:** `save` checks secret names before it takes the config lock, so a save racing a delete of a secret it names can go live naming the removed secret. The next reload refuses that file and reports it through `config-status`.
 
 ## 8. Testing
 

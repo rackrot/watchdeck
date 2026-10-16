@@ -273,6 +273,19 @@ impl Config {
         self.buttons.iter().find(|b| b.id == id)
     }
 
+    /// The ids of the buttons whose action or tile source sends secret `name`.
+    pub fn secret_users(&self, name: &str) -> Vec<String> {
+        let uses = |action: &Action| {
+            matches!(action, Action::Http { secret_headers, .. }
+                if secret_headers.values().any(|s| s == name))
+        };
+        self.buttons
+            .iter()
+            .filter(|b| uses(&b.action) || b.tile.as_ref().is_some_and(|t| uses(&t.source)))
+            .map(|b| b.id.clone())
+            .collect()
+    }
+
     /// Every rule this config breaks. `secrets` holds the names in `secrets.toml`, and is
     /// consulted only for buttons that use a secret.
     pub fn check(&self, secrets: &io::Result<Vec<String>>) -> Vec<String> {
@@ -753,6 +766,31 @@ impl Configs {
     /// Copies the image at `src` into `icons/` and returns the file name for a button's `icon`.
     pub fn import_icon(&self, src: &Path) -> Result<String, String> {
         self.icons.import(src)
+    }
+
+    /// The files in `icons/` that a button's `icon` could name, sorted.
+    pub fn list_icons(&self) -> Result<Vec<String>, String> {
+        self.icons.list()
+    }
+
+    /// Removes secret `name`, unless the live config still uses it, since the next reload would
+    /// then refuse that config. The error names the buttons. The config lock is held so a save
+    /// can't go live with the secret between the check and the removal.
+    pub fn delete_secret(&self, name: &str) -> Result<(), String> {
+        let read = self.locked();
+        let users = self.current().secret_users(name);
+        if !users.is_empty() {
+            return Err(format!(
+                "Secret {name:?} is used by button {}. Change {} first.",
+                users.join(", "),
+                if users.len() == 1 { "it" } else { "them" }
+            ));
+        }
+        self.secrets.remove(name)?;
+        drop(read);
+        // Applies the change now instead of at the next poll. reload logs its own outcome.
+        let _ = self.reload();
+        Ok(())
     }
 
     /// Renders the icons that the file on disk names, before `reload` takes the lock, so that
@@ -1958,6 +1996,68 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
         let text = fs::read_to_string(tmp.path().join(FILE)).unwrap();
         assert_eq!(parse(&text, &names()).unwrap(), config);
         assert_eq!(configs.reload(), Ok(false), "{revision}");
+    }
+
+    #[test]
+    fn a_secret_in_use_by_a_button_or_a_tile_cant_be_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let secrets = Arc::new(Secrets::new(tmp.path()));
+        for name in ["ha", "tile-only", "spare"] {
+            secrets.set(name, "Bearer x").unwrap();
+        }
+        let http = |name: &str| Action::Http {
+            method: "GET".into(),
+            url: "https://ha.lan/api".into(),
+            body: None,
+            headers: BTreeMap::new(),
+            secret_headers: BTreeMap::from([("Authorization".into(), name.into())]),
+            insecure_http: false,
+            timeout_s: 5,
+        };
+        let button = |id: &str, col, action: Action, tile: Option<TileConfig>| ButtonConfig {
+            id: id.into(),
+            pos: [col, 0],
+            label: id.into(),
+            bg: "#000000".into(),
+            fg: "#ffffff".into(),
+            icon: None,
+            action,
+            tile,
+        };
+        let shell = Action::Shell {
+            argv: vec!["true".into()],
+            timeout_s: 5,
+        };
+        let tile = TileConfig {
+            every_s: 30,
+            json_pointer: None,
+            source: http("tile-only"),
+        };
+        let configs = Configs::open(tmp.path(), secrets.clone()).unwrap();
+        let revision = configs.status().borrow().revision.clone();
+        let mut config = configs.current().config.clone();
+        config.buttons = vec![
+            button("a", 0, http("ha"), None),
+            button("b", 1, shell, Some(tile)),
+            button("c", 2, http("ha"), None),
+        ];
+        configs.save(config, &revision).unwrap();
+
+        let err = configs.delete_secret("ha").unwrap_err();
+        assert!(err.contains("button a, c"), "{err}");
+        let err = configs.delete_secret("tile-only").unwrap_err();
+        assert!(err.contains("button b"), "{err}");
+        assert_eq!(secrets.names().unwrap(), ["ha", "spare", "tile-only"]);
+
+        configs.delete_secret("spare").unwrap();
+        assert_eq!(secrets.names().unwrap(), ["ha", "tile-only"]);
+        let mode = fs::metadata(secrets.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(configs
+            .delete_secret("spare")
+            .unwrap_err()
+            .contains("no secret"));
+        assert!(configs.status().borrow().errors.is_empty());
     }
 
     #[test]

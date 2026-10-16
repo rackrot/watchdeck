@@ -1,5 +1,5 @@
 import { type FormEvent, useRef, useState } from "react";
-import { setSecret } from "./api";
+import { deleteSecret, setSecret } from "./api";
 
 /**
  * Secret names, and a write-only form to set or replace one. The value lives only in an
@@ -17,7 +17,22 @@ export default function Secrets({
   const [name, setName] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  // The secret awaiting a click on Remove to confirm, and why the last removal was refused.
+  const [removing, setRemoving] = useState<string | null>(null);
+  const [removeError, setRemoveError] = useState("");
   const value = useRef<HTMLInputElement>(null);
+
+  async function remove(secret: string) {
+    setNotice("");
+    try {
+      await deleteSecret(secret);
+      setRemoving(null);
+      onChanged();
+    } catch (err) {
+      setRemoving(null);
+      setRemoveError(String(err));
+    }
+  }
 
   async function submit(e: FormEvent) {
     e.preventDefault();
@@ -55,18 +70,54 @@ export default function Secrets({
           <ul className="name-list">
             {names.map((n) => (
               <li key={n}>
-                <span className="mono">{n}</span>
-                <button
-                  type="button"
-                  className="quiet"
-                  aria-label={`Replace secret ${n}`}
-                  onClick={() => setName(n)}
-                >
-                  Replace
-                </button>
+                <span className="mono grow">{n}</span>
+                {removing === n ? (
+                  <>
+                    <span role="alertdialog" aria-label={`Remove secret ${n}`}>
+                      Remove {n} for good?
+                    </span>
+                    <button
+                      type="button"
+                      className="danger"
+                      onClick={() => void remove(n)}
+                    >
+                      Remove
+                    </button>
+                    <button type="button" onClick={() => setRemoving(null)}>
+                      Cancel
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      className="quiet"
+                      aria-label={`Replace secret ${n}`}
+                      onClick={() => setName(n)}
+                    >
+                      Replace
+                    </button>
+                    <button
+                      type="button"
+                      className="quiet"
+                      aria-label={`Remove secret ${n}`}
+                      onClick={() => {
+                        setRemoveError("");
+                        setRemoving(n);
+                      }}
+                    >
+                      Remove
+                    </button>
+                  </>
+                )}
               </li>
             ))}
           </ul>
+        )}
+        {removeError && (
+          <p className="problems" role="alert">
+            {removeError}
+          </p>
         )}
       </section>
       <section>
@@ -107,10 +158,6 @@ export default function Secrets({
             {error}
           </p>
         )}
-        <p className="muted hint">
-          There is no way to delete a secret from this window yet. Remove its
-          line from <span className="mono">secrets.toml</span> by hand.
-        </p>
       </section>
     </div>
   );

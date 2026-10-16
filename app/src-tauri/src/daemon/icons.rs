@@ -176,6 +176,30 @@ impl Icons {
         log::info!("imported {src:?} as {DIR}/{name}");
         Ok(name)
     }
+
+    /// The files in the directory that a button's `icon` could name, sorted: valid names
+    /// ([`name_error`]) of regular files that decode within the limits and don't link out of the
+    /// directory. An absent directory holds none.
+    pub fn list(&self) -> Result<Vec<String>, String> {
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("Could not read {}: {e}", self.dir.display())),
+        };
+        let root = fs::canonicalize(&self.dir).map_err(|e| e.to_string())?;
+        let mut names: Vec<String> = entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name_error(name).is_none())
+            .filter(|name| {
+                let path = self.dir.join(name);
+                fs::canonicalize(&path).is_ok_and(|real| real.starts_with(&root))
+                    && read_image(&path).is_ok_and(|bytes| decode(&bytes).is_ok())
+            })
+            .collect();
+        names.sort();
+        Ok(names)
+    }
 }
 
 fn file_stamp(path: &Path) -> Result<FileStamp, String> {
@@ -673,6 +697,43 @@ mod tests {
             fs::read_dir(&dir).unwrap().count(),
             2,
             "refusals copy nothing"
+        );
+    }
+
+    #[test]
+    fn list_offers_only_what_a_button_could_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(DIR);
+        let outside = tmp.path().join("outside.png");
+        fs::create_dir(&dir).unwrap();
+        fs::write(&outside, encoded(&quadrants(8), ImageFormat::Png)).unwrap();
+        let png = encoded(&quadrants(8), ImageFormat::Png);
+        fs::write(dir.join("b.png"), &png).unwrap();
+        fs::write(dir.join("a.jpg"), encoded(&quadrants(8), ImageFormat::Jpeg)).unwrap();
+        fs::write(
+            dir.join("c.webp"),
+            encoded(&quadrants(8), ImageFormat::WebP),
+        )
+        .unwrap();
+        fs::write(dir.join("inside.png"), &png).unwrap();
+        std::os::unix::fs::symlink(dir.join("inside.png"), dir.join("link-in.png")).unwrap();
+        fs::write(dir.join(".hidden.png"), &png).unwrap();
+        fs::write(dir.join("bad name.png"), &png).unwrap();
+        fs::write(dir.join("notes.txt"), b"hello").unwrap();
+        fs::write(dir.join("junk.png"), b"not an image").unwrap();
+        fs::write(dir.join("big.png"), vec![0; MAX_FILE_BYTES as usize + 1]).unwrap();
+        fs::create_dir(dir.join("dir.png")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("escape.png")).unwrap();
+        std::os::unix::fs::symlink("/nowhere", dir.join("dangling.png")).unwrap();
+
+        let store = Icons::new(dir);
+        assert_eq!(
+            store.list().unwrap(),
+            ["a.jpg", "b.png", "c.webp", "inside.png", "link-in.png"]
+        );
+        assert_eq!(
+            Icons::new(tmp.path().join("absent")).list().unwrap(),
+            Vec::<String>::new()
         );
     }
 

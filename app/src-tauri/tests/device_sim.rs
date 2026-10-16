@@ -29,7 +29,7 @@ use tokio_rustls::rustls::{
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::Message as Ws;
 use tokio_tungstenite::{client_async, connect_async, WebSocketStream};
-use watchdeck_lib::daemon::actions::Actions;
+use watchdeck_lib::daemon::actions::{ActionResult, Actions};
 use watchdeck_lib::daemon::config::{self, Configs};
 use watchdeck_lib::daemon::pairing::{Pairing, PairingState};
 use watchdeck_lib::daemon::protocol::{
@@ -803,6 +803,48 @@ async fn no_press_runs_after_a_forget_even_with_a_run_in_flight() {
         runs(&daemon),
         ["slow"],
         "a press started after forget returned"
+    );
+}
+
+#[tokio::test]
+async fn a_test_press_runs_the_live_action_and_sends_the_device_nothing() {
+    let daemon = start_configured(COUNTING).await;
+    let mut c = handshake(daemon.addr, DEVICE, &TOKEN).await;
+
+    // The button is busy with a device press, so a test press is refused like a second press.
+    c.send(press("slow", 1)).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while runs(&daemon).is_empty() {
+        assert!(Instant::now() < deadline, "the device press never ran");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        daemon.devices.test_press("slow").await.unwrap(),
+        ActionResult::failed("already running")
+    );
+    assert!(matches!(recv(&mut c).await, Message::Result { seq: 1, .. }));
+
+    // It runs what the live config says, and returns what the device would have been sent.
+    let ran = daemon.devices.test_press("count").await.unwrap();
+    assert_eq!(
+        (ran.ok, ran.code, ran.summary.as_str()),
+        (true, 0, "exit 0")
+    );
+    daemon
+        .reconfigure(&COUNTING.replace("echo count >>", "echo edited >>"))
+        .unwrap();
+    daemon.devices.test_press("count").await.unwrap();
+    assert_eq!(runs(&daemon), ["slow", "count", "edited"]);
+
+    let err = daemon.devices.test_press("nope").await.unwrap_err();
+    assert!(err.contains("\"nope\""), "{err}");
+
+    // Neither test press sent a result: the next frame answers this ping.
+    c.send(Ws::Ping(vec![9].into())).await.unwrap();
+    let frame = c.next().await.unwrap().unwrap();
+    assert!(
+        matches!(&frame, Ws::Pong(p) if p.as_ref() == [9]),
+        "{frame:?}"
     );
 }
 

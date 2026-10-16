@@ -43,6 +43,10 @@ export const listSecrets = () => invoke<string[]>("list_secrets");
 export const setSecret = (name: string, value: string) =>
   invoke<void>("set_secret", { name, value });
 
+/** Rejects, naming the buttons, while the live config still uses the secret. */
+export const deleteSecret = (name: string) =>
+  invoke<void>("delete_secret", { name });
+
 /** The latest reading of a polled tile, as `tile-values` carries it. */
 export type TileReading = {
   btn: string;
@@ -54,6 +58,26 @@ export const tileValues = () => invoke<TileReading[]>("tile_values");
 
 /** Opens the native file dialog in the daemon, imports the pick, and returns its name or null. */
 export const importIcon = () => invoke<string | null>("import_icon");
+
+/** The files in the icons directory that a button's `icon` could name. */
+export const listIcons = () => invoke<string[]>("list_icons");
+
+/** Mirrors `ActionResult` in `src-tauri/src/daemon/actions.rs`: what a device would be told. */
+export type ActionResult = {
+  ok: boolean;
+  code: number;
+  summary: string;
+  text: string;
+  ms: number;
+};
+
+/**
+ * Runs a button's saved action, as a press would, and returns the result. The daemon takes the
+ * action from its live config, so only the id goes over. No device is told. Rejects for an
+ * unknown button.
+ */
+export const testAction = (button: string) =>
+  invoke<ActionResult>("test_action", { button });
 
 /**
  * Turns an icon file name into a URL the webview may load, through the asset protocol, whose

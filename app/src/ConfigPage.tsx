@@ -1,6 +1,12 @@
 import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { getConfig, importIcon, listDevices, saveConfig } from "./api";
+import {
+  getConfig,
+  importIcon,
+  listDevices,
+  listIcons,
+  saveConfig,
+} from "./api";
 import ButtonForm from "./ButtonForm";
 import {
   type Config,
@@ -26,6 +32,7 @@ import {
   pushOutcome,
   replaceNotice,
   shouldFollowDisk,
+  testBlock,
 } from "./saveflow";
 
 /** A save reaches a connected device within this long, or the page says it didn't. */
@@ -49,7 +56,7 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
   const [pushes, setPushes] = useState<Record<string, number>>({});
   const [late, setLate] = useState(false);
   const [onDisk, setOnDisk] = useState<ConfigStatus | null>(null);
-  const [imported, setImported] = useState<string[]>([]);
+  const [iconFiles, setIconFiles] = useState<string[]>([]);
   const [iconError, setIconError] = useState("");
   // Messages of the last refused save, whole, so none can go unseen.
   const [refused, setRefused] = useState<string[]>([]);
@@ -65,7 +72,16 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
   const readings = useTileReadings();
   const iconUrl = useIconUrls();
 
+  const refreshIcons = useCallback(async () => {
+    try {
+      setIconFiles(await listIcons());
+    } catch (e) {
+      setIconError(String(e));
+    }
+  }, []);
+
   const load = useCallback(async () => {
+    void refreshIcons();
     try {
       const next = await getConfig();
       setView(next);
@@ -82,7 +98,7 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
     } catch (e) {
       setLoadError(String(e));
     }
-  }, []);
+  }, [refreshIcons]);
   // Listen first, then read, so no change falls between the two.
   useEffect(() => {
     const listeners = Promise.all([
@@ -209,7 +225,7 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
     try {
       const name = await importIcon();
       if (name !== null && selected !== null && draft) {
-        setImported((names) => [...new Set([...names, name])]);
+        await refreshIcons();
         set({
           ...draft,
           button: draft.button.map((b, i) =>
@@ -223,12 +239,12 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
   }
 
   const button = selected === null ? undefined : draft.button[selected];
-  const icons = [
-    ...new Set([
-      ...imported,
-      ...draft.button.flatMap((b) => (b.icon ? [b.icon] : [])),
-    ]),
-  ].sort();
+  // The picker offers the files in the icons directory, and the button's own icon even if its
+  // file is gone, so the select doesn't show "(none)" for a button that names one.
+  const icons =
+    button?.icon && !iconFiles.includes(button.icon)
+      ? [...iconFiles, button.icon].sort()
+      : iconFiles;
 
   return (
     <div className="page layout">
@@ -343,6 +359,7 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
           icons={icons}
           iconUrl={iconUrl}
           iconError={iconError}
+          testBlock={testBlock(button, view.config)}
           onImportIcon={pickIcon}
           onLocalProblems={setLocal}
           onChange={(next) =>

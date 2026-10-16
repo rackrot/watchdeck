@@ -1,6 +1,11 @@
 // The decisions behind the Layout page's save, dirty and on-disk logic, apart from React.
 
-import type { Config, ConfigStatus, ConfigView } from "./config.ts";
+import type {
+  ButtonConfig,
+  Config,
+  ConfigStatus,
+  ConfigView,
+} from "./config.ts";
 import { canon } from "./edit.ts";
 
 /** Whether the draft differs from what was loaded or last saved. */
@@ -46,6 +51,20 @@ export function replaceNotice(view: ConfigView, draft: Config): string {
     ? `the last good config, a ${grid}`
     : `an empty ${grid}. The app has not loaded your file since it started, so this is not your file`;
   return `This writes ${what}, over config.toml. The text now in the file is kept beside it as config.toml.bak.<UTC time>.`;
+}
+
+/**
+ * Why `button` can't be tested yet, or null if it can. A test runs the saved button, so the draft
+ * must match what `saved` (the live config) has under the same id.
+ */
+export function testBlock(button: ButtonConfig, saved: Config): string | null {
+  const live = saved.button.find((b) => b.id === button.id);
+  if (!live) {
+    return "Save the button first. A test runs the saved action.";
+  }
+  return canon(live) === canon(button)
+    ? null
+    : "Save your changes first. A test runs the saved action.";
 }
 
 export type PushOutcome =

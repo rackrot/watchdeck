@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { Config, ConfigView } from "../src/config.ts";
+import type { ButtonConfig, Config, ConfigView } from "../src/config.ts";
 import {
   diskChanged,
   isDirty,
@@ -8,6 +8,7 @@ import {
   pushOutcome,
   replaceNotice,
   shouldFollowDisk,
+  testBlock,
 } from "../src/saveflow.ts";
 
 const config: Config = { version: 1, layout: { cols: 5, rows: 3 }, button: [] };
@@ -65,6 +66,25 @@ test("the replace notice says what is written and where the old text goes", () =
   assert.ok(empty.includes("config.toml.bak.<UTC time>"), empty);
   const good = replaceNotice({ ...view, errors: ["bad"] }, config);
   assert.ok(good.includes("last good config"), good);
+});
+
+test("a button can be tested only when the draft matches the saved one", () => {
+  const button: ButtonConfig = {
+    id: "a",
+    pos: [0, 0],
+    label: "A",
+    bg: "#000000",
+    fg: "#ffffff",
+    action: { kind: "shell", argv: ["true"], timeout_s: 5 },
+  };
+  const saved: Config = { ...config, button: [button] };
+  assert.equal(testBlock(structuredClone(button), saved), null);
+  assert.ok(
+    testBlock({ ...button, id: "new" }, saved)?.includes("Save the button"),
+  );
+  const edited = { ...button, action: { ...button.action, timeout_s: 6 } };
+  assert.ok(testBlock(edited, saved)?.includes("Save your changes"));
+  assert.ok(testBlock({ ...button, label: "B" }, saved));
 });
 
 test("a push is sent, waiting or late", () => {

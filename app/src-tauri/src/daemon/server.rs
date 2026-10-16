@@ -22,8 +22,8 @@ use tokio_tungstenite::tungstenite::Bytes;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message as WsMessage};
 use tokio_tungstenite::{accept_async_with_config, WebSocketStream};
 
-use super::actions::{ActionResult, Actions, MAX_RUNNING};
-use super::config::{Layout, Live, MAX_COLS, MAX_ROWS};
+use super::actions::{ActionResult, Actions, Run, MAX_RUNNING};
+use super::config::{Action, Layout, Live, MAX_COLS, MAX_ROWS};
 use super::protocol::{
     decode_hex, encode_hex, valid_device_id, ErrorCode, Message, Token, ICON_ID_BYTES,
     MAX_MESSAGE_BYTES, TOKEN_BYTES, VERSION,
@@ -241,6 +241,27 @@ impl Devices {
         }
         Ok(true)
     }
+
+    /// Runs button `btn` as a device press would, from the live config and through the same
+    /// slots, and returns the result the device would get. Nothing is sent to a device. An
+    /// unknown button is an error, and a refused run ("already running", "busy") is a result.
+    pub async fn test_press(&self, btn: &str) -> Result<ActionResult, String> {
+        if self.0.config.borrow().button(btn).is_none() {
+            return Err(format!("There is no saved button {btn:?}."));
+        }
+        let (run, action) = match self.0.begin_press(btn) {
+            Ok(started) => started,
+            Err(refused) => {
+                log::info!("test: {btn:?}: {}", refused.summary);
+                return Ok(refused);
+            }
+        };
+        let result = run.run(&action).await;
+        log::info!("test: {btn:?}: {} ({} ms)", result.summary, result.ms);
+        // The press may have changed what the button's tile shows.
+        self.0.tiles.poker().poke(btn);
+        Ok(result)
+    }
 }
 
 impl Registry {
@@ -312,6 +333,16 @@ impl Shared {
     fn emit(&self, event: DaemonEvent) {
         // An error only means nobody is subscribed.
         let _ = self.events.send(event);
+    }
+
+    /// Claims the run for a press of `btn`, with its action from the live config, or says why
+    /// there is none: no such button, already running, or too many runs.
+    fn begin_press(&self, btn: &str) -> Result<(Run, Action), ActionResult> {
+        let action = self.config.borrow().button(btn).map(|b| b.action.clone());
+        match action {
+            Some(action) => self.actions.start(btn).map(|run| (run, action)),
+            None => Err(ActionResult::failed("unknown button")),
+        }
     }
 }
 
@@ -708,12 +739,7 @@ where
                     Err(oneshot::error::TryRecvError::Empty) => {}
                     kicked => return end_kicked(tx, kicked.ok(), device).await,
                 }
-                let action = config.borrow().button(&btn).map(|b| b.action.clone());
-                let started = match action {
-                    Some(action) => shared.actions.start(&btn).map(|run| (run, action)),
-                    None => Err(ActionResult::failed("unknown button")),
-                };
-                match started {
+                match shared.begin_press(&btn) {
                     Ok((run, action)) => {
                         let done = done_tx.clone();
                         let poker = shared.tiles.poker();

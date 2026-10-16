@@ -203,6 +203,15 @@ button.chip.selected {
   color: var(--ok);
 }
 
+/* A test run's output, which the daemon caps at 1 KB. */
+.button-form pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 12em;
+  overflow: auto;
+  margin: 6px 0 0;
+}
+
 /* Save bar */
 
 .save-bar {

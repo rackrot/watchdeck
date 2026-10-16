@@ -35,7 +35,7 @@ impl fmt::Debug for Secret {
 
 pub struct Secrets {
     dir: PathBuf,
-    /// Serializes `set`, which reads the file, changes it and writes it back.
+    /// Serializes `set` and `remove`, which read the file, change it and write it back.
     writing: Mutex<()>,
 }
 
@@ -116,6 +116,21 @@ impl Secrets {
         let _writing = self.writing.lock().expect("secrets lock poisoned");
         let mut all = self.load().map_err(|e| e.to_string())?;
         all.insert(name.to_string(), Secret(value.to_string()));
+        self.save(&all)
+    }
+
+    /// Removes `name`. The caller checks that no config still names it.
+    pub fn remove(&self, name: &str) -> Result<(), String> {
+        let _writing = self.writing.lock().expect("secrets lock poisoned");
+        let mut all = self.load().map_err(|e| e.to_string())?;
+        if all.remove(name).is_none() {
+            return Err(format!("There is no secret named {name:?}."));
+        }
+        self.save(&all)
+    }
+
+    /// Writes `all` over the file. The caller holds `writing`.
+    fn save(&self, all: &BTreeMap<String, Secret>) -> Result<(), String> {
         let table: BTreeMap<&str, &str> =
             all.iter().map(|(k, v)| (k.as_str(), v.expose())).collect();
         let text = toml::to_string(&table).expect("a table of strings serializes");
@@ -156,6 +171,23 @@ mod tests {
         let all = secrets.load().unwrap();
         assert_eq!(all["ha"].expose(), "replaced");
         assert_eq!(format!("{:?}", all["ha"]), "Secret(<redacted>)");
+    }
+
+    #[test]
+    fn remove_drops_one_secret_and_keeps_the_file_private() {
+        let tmp = tempfile::tempdir().unwrap();
+        let secrets = Secrets::new(tmp.path());
+        secrets.set("ha", VALUE).unwrap();
+        secrets.set("other", "x").unwrap();
+        secrets.remove("ha").unwrap();
+
+        let mode = fs::metadata(secrets.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(secrets.names().unwrap(), ["other"]);
+        assert_eq!(secrets.load().unwrap()["other"].expose(), "x");
+        assert!(secrets.remove("ha").unwrap_err().contains("no secret"));
+        secrets.remove("other").unwrap();
+        assert!(secrets.names().unwrap().is_empty());
     }
 
     #[test]

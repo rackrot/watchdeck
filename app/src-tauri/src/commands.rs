@@ -6,6 +6,7 @@ use serde::Serialize;
 use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
 
+use crate::daemon::actions::ActionResult;
 use crate::daemon::config::{Config, Configs};
 use crate::daemon::pairing::{Pairing, PairingState};
 use crate::daemon::secrets::Secrets;
@@ -128,6 +129,31 @@ pub async fn set_secret(
         Ok(())
     })
     .await?
+}
+
+/// Removes a secret, unless the live config still uses it. The error names the buttons.
+#[tauri::command]
+pub async fn delete_secret(daemon: State<'_, Daemon>, name: String) -> Result<(), String> {
+    let configs = daemon.configs.clone();
+    blocking(move || configs.delete_secret(&name)).await?
+}
+
+/// The files in `icons/` that a button's `icon` could name.
+#[tauri::command]
+pub async fn list_icons(daemon: State<'_, Daemon>) -> Result<Vec<String>, String> {
+    let configs = daemon.configs.clone();
+    blocking(move || configs.list_icons()).await?
+}
+
+/// Runs button `button`'s action from the live config, as a device press would, and returns what
+/// the device would see. The window names only the button, never an action, and no device gets
+/// the result.
+#[tauri::command]
+pub async fn test_action(
+    daemon: State<'_, Daemon>,
+    button: String,
+) -> Result<ActionResult, String> {
+    daemon.devices.test_press(&button).await
 }
 
 /// Asks the user for a PNG, JPEG or WebP in a native file dialog, copies it into the icons

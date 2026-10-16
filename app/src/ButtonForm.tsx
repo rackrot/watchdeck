@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import ActionForm from "./ActionForm";
+import { type ActionResult, testAction } from "./api";
 import { type ButtonConfig, newShell } from "./config";
 import type { ActionField, FieldErrors } from "./errors";
 import { Field, NumberField, Problems } from "./fields";
@@ -18,6 +19,8 @@ type Props = {
   iconUrl: (name: string) => string | null;
   onImportIcon: () => void;
   iconError: string;
+  /** Why Test is disabled (the draft differs from the saved button), or null if it can run. */
+  testBlock: string | null;
   /** Problems the form can see itself, which keep a save from going out. */
   onLocalProblems: (messages: string[]) => void;
 };
@@ -64,6 +67,7 @@ export default function ButtonForm({
   iconUrl,
   onImportIcon,
   iconError,
+  testBlock,
   onLocalProblems,
 }: Props) {
   const [dupes, setDupes] = useState<{ action: string[]; source: string[] }>({
@@ -82,6 +86,21 @@ export default function ButtonForm({
     onLocalProblems([...dupes.action, ...dupes.source]);
     return () => onLocalProblems([]);
   }, [dupes, onLocalProblems]);
+  const [testing, setTesting] = useState(false);
+  const [test, setTest] = useState<
+    { result: ActionResult } | { error: string } | null
+  >(null);
+  async function runTest() {
+    setTesting(true);
+    setTest(null);
+    try {
+      setTest({ result: await testAction(button.id) });
+    } catch (e) {
+      setTest({ error: String(e) });
+    } finally {
+      setTesting(false);
+    }
+  }
   const set = (part: Partial<ButtonConfig>) => onChange({ ...button, ...part });
   const actionProblems = (field: ActionField) => errors[`action.${field}`];
   const tile = button.tile;
@@ -182,6 +201,30 @@ export default function ButtonForm({
           onDuplicates={onActionDupes}
           onChange={(action) => set({ action })}
         />
+        <div className="outside">
+          <button
+            type="button"
+            disabled={testBlock !== null || testing}
+            onClick={() => void runTest()}
+          >
+            {testing ? "Testing…" : "Test"}
+          </button>
+          {testBlock && <span className="muted hint">{testBlock}</span>}
+        </div>
+        {test && "error" in test && (
+          <p className="problems" role="alert">
+            {test.error}
+          </p>
+        )}
+        {test && "result" in test && (
+          <div role="status">
+            <span className={`chip ${test.result.ok ? "ok" : "bad"}`}>
+              {test.result.ok ? "ok" : "failed"}: {test.result.summary}
+              {test.result.ms > 0 && ` (${test.result.ms} ms)`}
+            </span>
+            {test.result.text && <pre className="mono">{test.result.text}</pre>}
+          </div>
+        )}
       </section>
 
       <section>
