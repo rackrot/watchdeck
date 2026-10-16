@@ -11,11 +11,11 @@
 | S5 Icons | ✅ | 147e695 | — |
 | S6 Tiles | ✅ | 1d05fdf | — |
 | S7 Config UI | ✅ manual check passed 2026-10-15 | c9e9fe9 | — |
-| S8 App shape | Built, reviewed | e709869, 37016e3, merged in ceb6f62 | The user's manual check: a release build with autostart, tray, close-to-tray and single-instance |
+| S8 App shape | ✅ manual check passed 2026-10-15 | e709869, 37016e3, merged in ceb6f62 | — |
 
 - Every slice passed `review` and, where it touches security, `security-auditor`. Each fix round then got its own review.
 - CI is green through c9e9fe9: lint, firmware, app (clippy, `cargo test`, `pnpm test`, debug Tauri build) and site.
-- v1 is done when the S8 manual check passes.
+- v1 is done: S7 and S8 passed their manual checks on 2026-10-15, S8 on a release build with autostart.
 - The tray needs `libayatana-appindicator` installed on the desktop (Arch: `pacman -S libayatana-appindicator`). Without it the app panics at startup.
 - Still untested on hardware, from earlier slices: the board recovering after the desktop's IP changes (S2), and a bad frame at the device's icon and tile parsers (S5, S6).
 - Open beyond v1:
