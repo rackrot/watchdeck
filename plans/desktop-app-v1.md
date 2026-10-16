@@ -12,14 +12,15 @@
 | S6 Tiles | ✅ | 1d05fdf | — |
 | S7 Config UI | ✅ manual check passed 2026-10-15 | c9e9fe9 | — |
 | S8 App shape | ✅ manual check passed 2026-10-15 | e709869, 37016e3, merged in ceb6f62 | — |
+| S9 S7 gaps (secret delete, `list_icons`, `test_action`) | Built, reviewed, audited | 028f50e, 6061b3e | The user's window check |
 
 - Every slice passed `review` and, where it touches security, `security-auditor`. Each fix round then got its own review.
 - CI is green through c9e9fe9: lint, firmware, app (clippy, `cargo test`, `pnpm test`, debug Tauri build) and site.
 - v1 is done: S7 and S8 passed their manual checks on 2026-10-15, S8 on a release build with autostart.
 - The tray needs `libayatana-appindicator` installed on the desktop (Arch: `pacman -S libayatana-appindicator`). Without it the app panics at startup.
-- Still untested on hardware, from earlier slices: the board recovering after the desktop's IP changes (S2), and a bad frame at the device's icon and tile parsers (S5, S6).
+- Still untested on hardware, from earlier slices: the board recovering after the desktop's IP changes (S2), and a bad frame at the device's icon and tile parsers (S5, S6). `plans/hw-gaps.md` covers both: host parser tests, the fault harness and the firmware fixes are merged (ef09e32); the baseline run, flash, rerun and IP-change check wait on the user.
 - Open beyond v1:
-  - the Backlog section at the end (Sentry error reporting)
+  - Sentry error reporting (Backlog): planned in `plans/sentry.md`; S1–S4 merged (917a5ec), S5 held behind a live experiment
   - the two S7 gaps still open, listed in "S9 results": no layout acknowledgement, and a deleted config is recreated only by a save
 
 ## Decisions
