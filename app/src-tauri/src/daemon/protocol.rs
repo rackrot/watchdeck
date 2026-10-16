@@ -164,7 +164,7 @@ pub enum Message {
 
 /// A device's report as it arrives. A missing or wrong value is caught by [`Report::check`], not
 /// by parsing, so a bad report is dropped without ending the session.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Report {
     #[serde(default)]
     pub id: String,
@@ -201,6 +201,20 @@ fn is_address(s: &str) -> bool {
 }
 
 impl Report {
+    /// This report with the fields its kind doesn't use cleared: a reset has no crash fields.
+    pub fn normalized(&self) -> Self {
+        let mut report = self.clone();
+        if report.kind == "reset" {
+            report.pc = None;
+            report.ra = None;
+            report.cause = None;
+            report.addr = None;
+            report.elf = None;
+            report.same_build = false;
+        }
+        report
+    }
+
     /// Why this report is unacceptable. The text never repeats the report's values.
     pub fn check(&self) -> Result<(), String> {
         if decode_hex::<4>(&self.id).is_none() {
@@ -670,6 +684,8 @@ mod tests {
         report.elf = Some("junk".into());
         assert_eq!(report.check(), Ok(()));
         assert!(!report.to_string().contains("junk"));
+        report.same_build = true;
+        assert_eq!(report.normalized(), reset_report());
     }
 
     #[test]

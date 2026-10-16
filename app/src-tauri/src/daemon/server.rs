@@ -25,7 +25,7 @@ use tokio_tungstenite::{accept_async_with_config, WebSocketStream};
 use super::actions::{ActionResult, Actions, Run, MAX_RUNNING};
 use super::config::{Action, Layout, Live, MAX_COLS, MAX_ROWS};
 use super::protocol::{
-    decode_hex, encode_hex, valid_device_id, ErrorCode, Message, Token, ICON_ID_BYTES,
+    decode_hex, encode_hex, valid_device_id, ErrorCode, Message, Report, Token, ICON_ID_BYTES,
     MAX_MESSAGE_BYTES, MAX_REPORTS_PER_SESSION, TOKEN_BYTES, VERSION,
 };
 use super::reporting::Reporting;
@@ -396,7 +396,15 @@ fn incoming(frame: WsMessage) -> Option<Incoming> {
             Ok(msg) => Incoming::Msg(msg),
             Err(e) => match hello_version_mismatch(text.as_str()) {
                 Some(reason) => Incoming::BadVersion(reason),
-                None => Incoming::BadRequest(e.to_string()),
+                None => match unparsable_report_id(text.as_str()) {
+                    // A report with mistyped fields is rejected by `check` like any other bad
+                    // one (its kind is empty), instead of ending the session.
+                    Some(id) => Incoming::Msg(Message::Report(Report {
+                        id,
+                        ..Default::default()
+                    })),
+                    None => Incoming::BadRequest(e.to_string()),
+                },
             },
         }),
         WsMessage::Close(_) => Some(Incoming::Closed),
@@ -449,6 +457,23 @@ where
         Ok(Err(e)) => log::debug!("close: {e}"),
         Err(_) => log::warn!("close timed out after {WRITE_TIMEOUT:?}"),
     }
+}
+
+/// For a `report` that failed to parse, its `id` if that is a valid one and empty if not.
+fn unparsable_report_id(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    if value.get("t")? != "report" {
+        return None;
+    }
+    let id = value.get("id").and_then(|id| id.as_str()).unwrap_or("");
+    Some(
+        if decode_hex::<4>(id).is_some() {
+            id
+        } else {
+            ""
+        }
+        .to_string(),
+    )
 }
 
 /// `Some(reason)` when `text` is a hello whose `v` is not exactly 1, whatever else is wrong with it.
@@ -811,7 +836,14 @@ where
                         "{device}: dropping a report; a session takes {MAX_REPORTS_PER_SESSION}"
                     );
                 } else if let Err(why) = report.check() {
-                    log::warn!("{device}: dropping a malformed report: {why}");
+                    // With a usable id the device is told to drop it. Otherwise it would send
+                    // the same bad report on every session.
+                    if decode_hex::<4>(&report.id).is_some() {
+                        log::warn!("{device}: rejecting report {}: {why}", report.id);
+                        send(tx, &Message::ReportAck { id: report.id }).await?;
+                    } else {
+                        log::warn!("{device}: dropping a report: {why}");
+                    }
                 } else {
                     log::warn!("{device}: {report}");
                     if let Some(reporting) = &shared.reporting {

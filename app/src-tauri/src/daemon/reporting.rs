@@ -26,6 +26,8 @@ use super::secrets::Secrets;
 pub const DEDUPE: Duration = Duration::from_secs(10 * 60);
 const MAX_KEYS: usize = 256;
 const MAX_PER_HOUR: usize = 30;
+/// Device reports an hour across all devices, apart from [`MAX_PER_HOUR`].
+const MAX_FIRMWARE_PER_HOUR: usize = 10;
 const HOUR: Duration = Duration::from_secs(60 * 60);
 /// Time the client gets to send what is queued when the app exits.
 pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -66,18 +68,20 @@ impl Reporting {
 
     /// Reports a device's checked `report` from the session of `device`, whose `hello` said it
     /// runs firmware `fw`. Returns false, and sends nothing, if this device already had the same
-    /// report within the hour or the process is over its hourly cap.
+    /// report within the hour or device reports are over their hourly cap. A reset's crash fields
+    /// are ignored.
     pub fn device_report(&self, device: &str, fw: &str, report: &Report) -> bool {
+        let report = report.normalized();
         let key = format!(
             "{FIRMWARE}|{device}|{}|{}|{}",
             report.elf.as_deref().unwrap_or(""),
             report.pc.as_deref().unwrap_or(""),
             report.reason
         );
-        if !self.filter.budget.admit(&key, HOUR) {
+        if !self.filter.firmware.admit(&key, HOUR) {
             return false;
         }
-        let event = device_event(device, fw, report, self.pii);
+        let event = device_event(device, fw, &report, self.pii);
         self.client.capture_event(event, None);
         true
     }
@@ -155,6 +159,9 @@ pub async fn warn_on_change(mut live: watch::Receiver<Arc<Live>>, started: Optio
 struct Filter {
     scrubber: Option<Scrubber>,
     budget: Budget,
+    /// Device reports have a budget of their own, so a device that keeps crashing in new places
+    /// can't use up the hourly events of the daemon and the UI.
+    firmware: Budget,
 }
 
 impl Filter {
@@ -169,6 +176,7 @@ impl Filter {
                 host,
             }),
             budget: Budget::new(),
+            firmware: Budget::with_limits(MAX_KEYS, MAX_FIRMWARE_PER_HOUR),
         }
     }
 
@@ -178,6 +186,8 @@ impl Filter {
         if event.platform == "javascript" {
             event.tags.insert("component".into(), "ui".into());
             event.request = None;
+            // For `javascript` Sentry may infer the client's IP address from the request.
+            event.platform = "other".into();
         }
         let event = match &self.scrubber {
             Some(scrubber) => scrubber.event(event)?,
@@ -207,21 +217,20 @@ impl TransportFactory for TypedOnlyFactory {
 struct TypedOnly(Arc<dyn Transport>);
 
 impl Transport for TypedOnly {
-    /// Passes events, their attachments and client reports (counts only). A raw envelope has no
-    /// typed items, so it is dropped with the rest.
+    /// Passes events and client reports (counts only). Attachments are cut out, since nothing
+    /// scrubs them and the app attaches none. An envelope with any other item, a raw envelope,
+    /// or one with nothing left is dropped.
     fn send_envelope(&self, envelope: Envelope) {
-        let mut items = envelope.items().peekable();
-        let allowed = items.peek().is_some()
-            && items.all(|item| {
-                matches!(
-                    item,
-                    EnvelopeItem::Event(_)
-                        | EnvelopeItem::Attachment(_)
-                        | EnvelopeItem::ClientReport(_)
-                )
-            });
-        if allowed {
-            self.0.send_envelope(envelope);
+        let mut kept = Envelope::new().with_headers(envelope.headers().clone());
+        for item in envelope.into_items() {
+            match item {
+                EnvelopeItem::Event(_) | EnvelopeItem::ClientReport(_) => kept.add_item(item),
+                EnvelopeItem::Attachment(_) => {}
+                _ => return,
+            }
+        }
+        if kept.items().next().is_some() {
+            self.0.send_envelope(kept);
         }
     }
 
@@ -410,6 +419,7 @@ impl Scrubber {
             entry.params.iter_mut().for_each(|v| value(v, &text));
         }
         for exception in &mut event.exception.values {
+            exception.ty = text(&exception.ty);
             exception.value = exception.value.as_deref().map(text);
             if let Some(trace) = &mut exception.stacktrace {
                 frames(trace, &text);
@@ -838,7 +848,8 @@ mod tests {
         let filter = Arc::new(Filter::new(pii, secrets, Some(HOME.into()), HOST.into()));
         let transport = TestTransport::new();
         let mut opts = options(&config(DSN, pii), filter.clone());
-        opts.transport = Some(Arc::new(transport.clone()));
+        // Through the real wrapper, as `options` builds it around the network transport.
+        opts.transport = Some(Arc::new(TypedOnlyFactory(Arc::new(transport.clone()))));
         let client = Arc::new(Client::from(opts));
         (Reporting::new(client, filter, pii), transport)
     }
@@ -983,16 +994,98 @@ mod tests {
     }
 
     #[test]
-    fn device_reports_share_the_process_hourly_cap() {
+    fn device_reports_have_their_own_hourly_cap_and_leave_the_shared_one_alone() {
         let (_dir, secrets) = secrets_dir(&[]);
         let (reporting, transport) = reporter(false, secrets);
+        // One device crashing at a new PC each time, as in a reconnect loop.
         let sent = (0..40)
             .filter(|i| {
-                reporting.device_report(&format!("wd-{i:012x}"), "0.2.0", &crash("0x4ff01234"))
+                reporting.device_report(FW_DEVICE, "0.2.0", &crash(&format!("0x4ff0{i:04x}")))
             })
             .count();
-        assert_eq!(sent, MAX_PER_HOUR);
-        assert_eq!(transport.fetch_and_clear_events().len(), MAX_PER_HOUR);
+        assert_eq!(sent, MAX_FIRMWARE_PER_HOUR);
+        // The daemon and the UI still have all of their own 30.
+        let daemon_sent = (0..40)
+            .filter(|i| reporting.filter.budget.admit(&format!("d{i}"), DEDUPE))
+            .count();
+        assert_eq!(daemon_sent, MAX_PER_HOUR);
+        assert_eq!(
+            transport.fetch_and_clear_events().len(),
+            MAX_FIRMWARE_PER_HOUR
+        );
+    }
+
+    #[test]
+    fn a_resets_crash_fields_change_neither_its_event_nor_its_cap_key() {
+        let (_dir, secrets) = secrets_dir(&[]);
+        let (reporting, transport) = reporter(false, secrets);
+        let reset = |pc: &str| Report {
+            kind: "reset".into(),
+            reason: "brownout".into(),
+            pc: Some(pc.into()),
+            ra: Some("junk".into()),
+            cause: Some("Forged".into()),
+            addr: Some("junk".into()),
+            elf: Some("junk".into()),
+            same_build: true,
+            ..crash("0x4ff01234")
+        };
+        assert!(reporting.device_report(FW_DEVICE, "0.2.0", &reset("0x4ff00001")));
+        // Only the junk pc differs, so this is the same reset again.
+        assert!(!reporting.device_report(FW_DEVICE, "0.2.0", &reset("0x4ff00002")));
+        let events = transport.fetch_and_clear_events();
+        assert_eq!(events.len(), 1);
+        let tags: Vec<_> = events[0].tags.keys().map(String::as_str).collect();
+        assert_eq!(tags, ["component", "reset_reason"]);
+        assert_eq!(events[0].exception.values[0].ty, "Reset");
+        assert!(events[0].exception.values[0].stacktrace.is_none());
+        assert!(events[0].release.is_none());
+    }
+
+    #[test]
+    fn a_device_supplied_exception_type_is_scrubbed() {
+        let (_dir, secrets) = secrets_dir(&[]);
+        let (reporting, transport) = reporter(false, secrets);
+        let mut report = crash("0x4ff01234");
+        report.cause = Some("10.1.2.3".into());
+        assert!(reporting.device_report(FW_DEVICE, "0.2.0", &report));
+        let events = transport.fetch_and_clear_events();
+        assert_eq!(events[0].exception.values[0].ty, "<ip>");
+    }
+
+    #[test]
+    fn the_real_transport_passes_firmware_and_webview_events_and_nothing_else() {
+        use sentry::protocol::Attachment;
+        let (_dir, secrets) = secrets_dir(&[]);
+        let (reporting, transport) = reporter(false, secrets);
+        assert!(reporting.device_report(FW_DEVICE, "0.2.0", &crash("0x4ff01234")));
+        reporting.client().capture_event(
+            Event {
+                message: Some("ui boom".into()),
+                platform: "javascript".into(),
+                level: Level::Error,
+                ..Default::default()
+            },
+            None,
+        );
+        // What the webview plugin can forward without `before_send`.
+        let mut attachment_only = Envelope::new();
+        attachment_only.add_item(Attachment {
+            buffer: b"x".to_vec(),
+            ..Default::default()
+        });
+        reporting.client().send_envelope(attachment_only);
+        reporting
+            .client()
+            .send_envelope(Envelope::from_bytes_raw(b"{}\n".to_vec()).unwrap());
+        let events = transport.fetch_and_clear_events();
+        let components: Vec<_> = events
+            .iter()
+            .map(|e| e.tags["component"].as_str())
+            .collect();
+        assert_eq!(components, ["firmware", "ui"]);
+        assert_eq!(events[1].platform, "other");
+        assert!(transport.fetch_and_clear_envelopes().is_empty());
     }
 
     #[test]
@@ -1049,6 +1142,7 @@ mod tests {
         let component = |e: &Event| e.tags.get("component").cloned();
         assert_eq!(component(&events[0]).as_deref(), Some("ui"));
         assert!(events[0].request.is_none());
+        assert_eq!(events[0].platform, "other");
         assert_eq!(events[0].message.as_deref(), Some("boom at ~/x"));
         assert_eq!(component(&events[1]), None);
     }
@@ -1064,7 +1158,12 @@ mod tests {
 
     #[test]
     fn the_transport_drops_envelopes_that_skipped_before_send() {
-        use sentry::protocol::{ClientReport, Transaction};
+        use sentry::protocol::{Attachment, ClientReport, Transaction};
+        let attachment = || Attachment {
+            buffer: b"secret".to_vec(),
+            filename: "x.txt".into(),
+            ..Default::default()
+        };
         let sink = Arc::new(Recorder::default());
         let transport = TypedOnly(sink.clone());
         let one = |item: EnvelopeItem| {
@@ -1078,7 +1177,19 @@ mod tests {
         let mut mixed = one(Event::default().into());
         mixed.add_item(Transaction::default());
         transport.send_envelope(mixed);
+        // Nothing scrubs an attachment, so one alone never leaves.
+        transport.send_envelope(one(attachment().into()));
         assert!(sink.0.lock().unwrap().is_empty());
+
+        // An event goes without its attachment.
+        let mut with_attachment = one(Event::default().into());
+        with_attachment.add_item(attachment());
+        transport.send_envelope(with_attachment);
+        let sent = sink.0.lock().unwrap().pop().unwrap();
+        assert!(matches!(
+            sent.items().collect::<Vec<_>>()[..],
+            [EnvelopeItem::Event(_)]
+        ));
 
         transport.send_envelope(one(Event::default().into()));
         transport.send_envelope(one(ClientReport::new(Vec::<

@@ -1640,23 +1640,52 @@ async fn a_session_takes_two_reports_and_drops_the_rest_without_ending() {
 }
 
 #[tokio::test]
-async fn a_malformed_report_is_dropped_unacked_and_the_session_goes_on() {
+async fn a_report_with_a_usable_id_is_rejected_by_ack_so_the_device_drops_it() {
     install_logger();
     let elf = "c2".repeat(32);
     let daemon = start().await;
     let mut c = handshake(daemon.addr, DEVICE, &TOKEN).await;
     let mut bad_kind = crash_report("00000001", &elf);
     bad_kind.kind = "dump".into();
-    let mut long_task = crash_report("00000002", &elf);
-    long_task.task = "x".repeat(17);
     c.send(report(bad_kind)).await.unwrap();
-    // The two drops use up the session's limit of two.
-    c.send(report(long_task)).await.unwrap();
+    assert_eq!(recv(&mut c).await, ack("00000001"));
+    // Fields of the wrong JSON type used to end the session, and the device would resend the
+    // report on every one.
+    c.send(Ws::text(
+        r#"{"t":"report","id":"00000002","kind":5,"pc":[1]}"#,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(recv(&mut c).await, ack("00000002"));
     assert_next_is_a_press_result(&mut c).await;
     assert!(accepted_lines(&elf).is_empty());
 
+    // Rejected reports count toward the limit of two.
+    let mut c = handshake(daemon.addr, DEVICE, &TOKEN).await;
+    for id in ["00000003", "00000004", "00000005"] {
+        let mut long_task = crash_report(id, &elf);
+        long_task.task = "x".repeat(17);
+        c.send(report(long_task)).await.unwrap();
+    }
+    assert_eq!(recv(&mut c).await, ack("00000003"));
+    assert_eq!(recv(&mut c).await, ack("00000004"));
+    assert_next_is_a_press_result(&mut c).await;
+}
+
+#[tokio::test]
+async fn a_report_without_a_usable_id_is_dropped_unacked_and_the_session_goes_on() {
+    install_logger();
+    let elf = "c4".repeat(32);
+    let daemon = start().await;
     let mut c = handshake(daemon.addr, DEVICE, &TOKEN).await;
     c.send(Ws::text(r#"{"t":"report"}"#)).await.unwrap();
+    c.send(Ws::text(r#"{"t":"report","id":7,"kind":[]}"#))
+        .await
+        .unwrap();
+    assert_next_is_a_press_result(&mut c).await;
+
+    let mut c = handshake(daemon.addr, DEVICE, &TOKEN).await;
+    c.send(report(crash_report("zz", &elf))).await.unwrap();
     c.send(report(crash_report("00000003", &elf)))
         .await
         .unwrap();
