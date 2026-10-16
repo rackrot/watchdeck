@@ -9,6 +9,7 @@ Planned, not started. Decisions settled 2026-10-15 by the user: 1(a) device repo
 Done: daemon SDK, config, scrubber, budget, log bridge and panic hook (`daemon/reporting.rs`, `[sentry]` in `Config`). Not done: the live-DSN check (a real `error!` and a release-build panic arriving scrubbed).
 
 - The log plugin now registers in `setup` through `split`, first thing, so the Sentry wrapper is in place before any app log line. With no client bound the wrapper only logs.
+- Log lines written before `setup` registers the log plugin are lost. That is accepted.
 - `Warn` breadcrumbs follow a process-wide flag that `start` sets from `pii`.
 - The scrubber drops the event if `secrets.toml` can't be read, since the values can't be removed.
 - The key cap evicts the oldest key. The 30 per hour cap makes 256 keys unreachable today, so `Budget::with_limits` exists for the test. `Budget::admit` takes a TTL, which is where S3's per-device hourly cap plugs in.

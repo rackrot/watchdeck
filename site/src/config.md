@@ -257,7 +257,7 @@ pii = false
   5. Device ids (`wd-` and hex digits) become `<device>`.
   6. Text inside double quotes is emptied.
 
-  This covers messages, exception text, stack frame paths, breadcrumbs, tags and extra data. The event has no user and no server name.
+  This covers messages, exception text, stack frame paths, breadcrumbs, tags, extra data and the log context (the source file path and key-values of the log call). The event has no user and no server name.
 - With `pii = true`, events keep their text as logged, and `WARN` lines are also kept as breadcrumbs on later events.
 - At most 30 events are sent per hour, and an identical event (same message and build) is sent once per 10 minutes.
 - Turn on "Prevent Storing of IP Addresses" and the data scrubber in the Sentry project as well.

@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sentry::integrations::log::{LogFilter, SentryLogger};
-use sentry::protocol::{Event, Frame, Stacktrace, Value};
+use sentry::protocol::{Context, Event, Frame, Stacktrace, Value};
 use sentry::{Client, ClientOptions, Hub};
 use tokio::sync::watch;
 
@@ -270,6 +270,13 @@ impl Scrubber {
         }
         event.tags.values_mut().for_each(|t| *t = text(t));
         event.extra.values_mut().for_each(|v| value(v, &text));
+        // sentry-log puts the log call's file path and key-values in `Other` contexts. The
+        // typed contexts hold OS, device model and Rust version only.
+        for context in event.contexts.values_mut() {
+            if let Context::Other(map) = context {
+                map.values_mut().for_each(|v| value(v, &text));
+            }
+        }
         Some(event)
     }
 
@@ -320,7 +327,8 @@ fn ip_literals(s: &str) -> String {
         let run = &rest[start..];
         let end = run.find(|c| !is_ip_char(c)).unwrap_or(run.len());
         let (token, tail) = run.split_at(end);
-        out.push_str(&redact_ip_token(token));
+        let before = s[..s.len() - rest.len() + start].chars().next_back();
+        out.push_str(&redact_ip_token(token, before, tail.chars().next()));
         rest = tail;
     }
     out.push_str(rest);
@@ -328,16 +336,27 @@ fn ip_literals(s: &str) -> String {
 }
 
 /// `token` is a run of hex digits, ':' and '.'. It may carry leading or trailing separators from
-/// the sentence around it, and an IPv4 address may carry a `:port`.
-fn redact_ip_token(token: &str) -> String {
+/// the sentence around it, and an IPv4 address may carry a `:port`. `before` and `after` are the
+/// characters on either side of the run. An IPv6 literal needs a digit and can't touch an
+/// identifier character, so `Grid::check` and `Live::from` stay as they are.
+fn redact_ip_token(token: &str, before: Option<char>, after: Option<char>) -> String {
     use std::net::{IpAddr, Ipv4Addr};
+    let ident = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
     let core = token.trim_end_matches(['.', ':']);
     let suffix = &token[core.len()..];
     let candidates = [core, core.trim_start_matches(['.', ':'])];
     for ip in candidates {
         let prefix = &core[..core.len() - ip.len()];
-        if ip.parse::<IpAddr>().is_ok() {
-            return format!("{prefix}<ip>{suffix}");
+        match ip.parse::<IpAddr>() {
+            Ok(IpAddr::V4(_)) => return format!("{prefix}<ip>{suffix}"),
+            Ok(IpAddr::V6(_))
+                if ip.bytes().any(|b| b.is_ascii_digit())
+                    && !(prefix.is_empty() && ident(before))
+                    && !(suffix.is_empty() && ident(after)) =>
+            {
+                return format!("{prefix}<ip>{suffix}");
+            }
+            _ => {}
         }
         if let Some((addr, port)) = ip.rsplit_once(':') {
             if addr.parse::<Ipv4Addr>().is_ok()
@@ -447,6 +466,7 @@ mod tests {
         assert_eq!(t("peer 192.168.1.20:47820 gone"), "peer <ip>:47820 gone");
         assert_eq!(t("peer host:10.0.0.1."), "peer host:<ip>.");
         assert_eq!(t("to [::1]:80 and fe80::1"), "to [<ip>]:80 and <ip>");
+        assert_eq!(t("[::1]:47820 2601:681::2829."), "[<ip>]:47820 <ip>.");
         assert_eq!(t("lost wd-e8f60ae276ab link"), "lost <device> link");
         assert_eq!(t("kept wd- and wd-zzz"), "kept wd- and wd-zzz");
         assert_eq!(t(r#"button "disk" at "a\"b""#), r#"button "" at """#);
@@ -455,7 +475,8 @@ mod tests {
 
     #[test]
     fn leaves_ordinary_text_alone() {
-        let plain = "config reload failed at 12:30:45 for build 0.1.0 (deadbeef)";
+        let plain = "config reload failed at 12:30:45 for build 0.1.0 (deadbeef) in \
+                     Grid::check, Live::from and std::io::Error";
         assert_eq!(text(&[], plain), plain);
     }
 
@@ -511,7 +532,12 @@ mod tests {
                 ..Default::default()
             }]),
             tags: [("t".to_string(), dirty.clone())].into(),
-            extra: [("e".to_string(), Value::String(dirty))].into(),
+            extra: [("e".to_string(), Value::String(dirty.clone()))].into(),
+            contexts: [(
+                "Rust Log Metadata".to_string(),
+                Context::Other([("logger.file".to_string(), Value::String(dirty))].into()),
+            )]
+            .into(),
             server_name: Some(HOST.into()),
             user: Some(Default::default()),
             level: Level::Error,
