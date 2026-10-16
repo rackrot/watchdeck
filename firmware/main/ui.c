@@ -212,7 +212,8 @@ static const char *button_name(const char *id)
 static void show_result(const proto_result_t *r)
 {
     const char *verdict = r->ok ? "OK" : "Failed";
-    const char *name = button_name(r->btn);
+    char name[PROTO_ID_MAX]; // button_name falls back to the raw id
+    copy_printable(name, sizeof(name), button_name(r->btn));
     if (name[0]) {
         lv_label_set_text_fmt(s_result_title, "%s: %s", name, verdict);
     } else {

@@ -217,7 +217,7 @@ static void on_ws_data(const esp_websocket_event_data_t *d, uint32_t gen)
                  d->payload_len);
         free(s_rx);
         s_rx = NULL;
-        post(&bad);
+        post_wait(&bad, pdMS_TO_TICKS(RX_POST_WAIT_MS));
         return;
     }
     memcpy(s_rx + s_rx_len, d->data_ptr, d->data_len);
