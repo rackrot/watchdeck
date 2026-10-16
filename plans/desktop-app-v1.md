@@ -1,6 +1,6 @@
 # watchdeck v1: daemon, device protocol, screen config
 
-## Status (2026-10-11)
+## Status (2026-10-15)
 
 | Slice | State | Commit | Waiting on |
 |---|---|---|---|
@@ -10,12 +10,13 @@
 | S4 Config and actions | ✅ | d42c1d0 | — |
 | S5 Icons | ✅ | 147e695 | — |
 | S6 Tiles | ✅ | 1d05fdf | — |
-| S7 Config UI | Built, reviewed, audit fixes in | c9e9fe9 | The user's manual check (steps under "S7 results") |
+| S7 Config UI | ✅ manual check passed 2026-10-15 | c9e9fe9 | — |
 | S8 App shape | Built, reviewed | e709869, 37016e3, merged in ceb6f62 | The user's manual check: a release build with autostart, tray, close-to-tray and single-instance |
 
 - Every slice passed `review` and, where it touches security, `security-auditor`. Each fix round then got its own review.
 - CI is green through c9e9fe9: lint, firmware, app (clippy, `cargo test`, `pnpm test`, debug Tauri build) and site.
-- v1 is done when the S7 and S8 manual checks pass.
+- v1 is done when the S8 manual check passes.
+- The tray needs `libayatana-appindicator` installed on the desktop (Arch: `pacman -S libayatana-appindicator`). Without it the app panics at startup.
 - Still untested on hardware, from earlier slices: the board recovering after the desktop's IP changes (S2), and a bad frame at the device's icon and tile parsers (S5, S6).
 - Open beyond v1:
   - the Backlog section at the end (Sentry error reporting)
