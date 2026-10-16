@@ -28,6 +28,14 @@ pub const TOKEN_BYTES: usize = 32;
 /// Bytes in each pairing nonce (`n_dev`, `n_host`).
 pub const NONCE_BYTES: usize = 16;
 
+/// Reports a session accepts. The device resends until acked, so two is room for a crash and an
+/// abnormal reset.
+pub const MAX_REPORTS_PER_SESSION: u32 = 2;
+const REPORT_KINDS: [&str; 2] = ["crash", "reset"];
+const REPORT_REASONS: [&str; 5] = ["panic", "int_wdt", "task_wdt", "wdt", "brownout"];
+const MAX_REPORT_TASK_CHARS: usize = 16;
+const MAX_REPORT_CAUSE_CHARS: usize = 32;
+
 /// First field of the pairing code's input, which binds the code to this protocol version.
 const PAIR_LABEL: &str = "watchdeck-pair-v1";
 
@@ -126,6 +134,11 @@ pub enum Message {
         text: String,
         state: TileState,
     },
+    /// A crash or abnormal reset from an earlier boot. Unchecked until [`Report::check`] passes.
+    Report(Report),
+    ReportAck {
+        id: String,
+    },
     PairReq {
         v: u32,
         device: String,
@@ -147,6 +160,113 @@ pub enum Message {
     },
     #[serde(other)]
     Unknown,
+}
+
+/// A device's report as it arrives. A missing or wrong value is caught by [`Report::check`], not
+/// by parsing, so a bad report is dropped without ending the session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Report {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub task: String,
+    /// `pc` to `same_build` are required for a `crash` and ignored for a `reset`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ra: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elf: Option<String>,
+    /// The crashed firmware is the one now running, so its version is the `hello`'s `fw`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub same_build: bool,
+}
+
+fn printable(s: &str, max_chars: usize) -> bool {
+    s.chars().count() <= max_chars && s.bytes().all(|b| (b' '..=b'~').contains(&b))
+}
+
+/// `0x` and exactly 8 lowercase hex digits, a 32-bit address.
+fn is_address(s: &str) -> bool {
+    s.strip_prefix("0x")
+        .is_some_and(|hex| decode_hex::<4>(hex).is_some())
+}
+
+impl Report {
+    /// Why this report is unacceptable. The text never repeats the report's values.
+    pub fn check(&self) -> Result<(), String> {
+        if decode_hex::<4>(&self.id).is_none() {
+            return Err("id is not 8 lowercase hex digits".into());
+        }
+        if !REPORT_KINDS.contains(&self.kind.as_str()) {
+            return Err("kind is not crash or reset".into());
+        }
+        if !REPORT_REASONS.contains(&self.reason.as_str()) {
+            return Err("reason is not a known reset reason".into());
+        }
+        if !printable(&self.task, MAX_REPORT_TASK_CHARS) {
+            return Err(format!(
+                "task is not printable ASCII of at most {MAX_REPORT_TASK_CHARS} characters"
+            ));
+        }
+        if self.kind == "reset" {
+            return Ok(());
+        }
+        for (name, value) in [("pc", &self.pc), ("ra", &self.ra), ("addr", &self.addr)] {
+            if !value.as_deref().is_some_and(is_address) {
+                return Err(format!("{name} is not 0x and 8 lowercase hex digits"));
+            }
+        }
+        if !self
+            .elf
+            .as_deref()
+            .is_some_and(|elf| decode_hex::<32>(elf).is_some())
+        {
+            return Err("elf is not 64 lowercase hex digits".into());
+        }
+        let cause = self.cause.as_deref().unwrap_or("");
+        if cause.is_empty() || !printable(cause, MAX_REPORT_CAUSE_CHARS) {
+            return Err(format!(
+                "cause is not 1 to {MAX_REPORT_CAUSE_CHARS} printable ASCII characters"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The log line for a report that passed [`Report::check`].
+impl fmt::Display for Report {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "device report {}: {} {} in task {:?}",
+            self.id, self.kind, self.reason, self.task
+        )?;
+        // A reset's crash fields are ignored, so they may not have been checked.
+        if let (true, Some(pc), Some(ra), Some(cause), Some(addr), Some(elf)) = (
+            self.kind == "crash",
+            &self.pc,
+            &self.ra,
+            &self.cause,
+            &self.addr,
+            &self.elf,
+        ) {
+            write!(
+                f,
+                ", {cause} at pc {pc} ra {ra} addr {addr}, elf {elf}, same_build {}",
+                self.same_build
+            )?;
+        }
+        Ok(())
+    }
 }
 
 /// A button icon in the device's pixel format: ARGB8888 as LVGL stores it, which is the bytes
@@ -329,7 +449,7 @@ mod tests {
     use serde_json::Value;
 
     // The fixtures are the JSON examples from site/src/protocol.md.
-    const FIXTURES: [&str; 13] = [
+    const FIXTURES: [&str; 15] = [
         include_str!("../../tests/fixtures/hello.json"),
         include_str!("../../tests/fixtures/welcome.json"),
         include_str!("../../tests/fixtures/error.json"),
@@ -338,6 +458,8 @@ mod tests {
         include_str!("../../tests/fixtures/press.json"),
         include_str!("../../tests/fixtures/result.json"),
         include_str!("../../tests/fixtures/tile.json"),
+        include_str!("../../tests/fixtures/report.json"),
+        include_str!("../../tests/fixtures/report_ack.json"),
         include_str!("../../tests/fixtures/pair_req.json"),
         include_str!("../../tests/fixtures/pair_offer.json"),
         include_str!("../../tests/fixtures/pair_nonce.json"),
@@ -400,6 +522,154 @@ mod tests {
         let debug = format!("{msg:?}");
         assert!(!debug.contains(token.as_str()), "{debug}");
         assert!(debug.contains("<redacted>"), "{debug}");
+    }
+
+    fn fixture_report() -> Report {
+        match serde_json::from_str(include_str!("../../tests/fixtures/report.json")).unwrap() {
+            Message::Report(report) => report,
+            other => panic!("not a report: {other:?}"),
+        }
+    }
+
+    fn reset_report() -> Report {
+        Report {
+            id: "00000001".into(),
+            kind: "reset".into(),
+            reason: "brownout".into(),
+            task: String::new(),
+            pc: None,
+            ra: None,
+            cause: None,
+            addr: None,
+            elf: None,
+            same_build: false,
+        }
+    }
+
+    #[test]
+    fn the_fixture_report_is_acceptable_and_a_bare_reset_is_too() {
+        assert_eq!(fixture_report().check(), Ok(()));
+        assert_eq!(reset_report().check(), Ok(()));
+        assert_eq!(
+            fixture_report().to_string(),
+            "device report a1b2c3d4: crash panic in task \"link\", LoadAccessFault at pc \
+             0x4ff01234 ra 0x4ff05678 addr 0x00000000, elf \
+             0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0, same_build true"
+        );
+    }
+
+    #[test]
+    fn a_report_missing_fields_parses_and_fails_the_check() {
+        let msg: Message = serde_json::from_str(r#"{"t":"report"}"#).unwrap();
+        let Message::Report(report) = msg else {
+            panic!("not a report")
+        };
+        assert!(report.check().is_err());
+        // A crash report cut short of its crash fields.
+        let msg: Message = serde_json::from_str(
+            r#"{"t":"report","id":"a1b2c3d4","kind":"crash","reason":"panic","task":"x"}"#,
+        )
+        .unwrap();
+        let Message::Report(report) = msg else {
+            panic!("not a report")
+        };
+        assert_eq!(
+            report.check(),
+            Err("pc is not 0x and 8 lowercase hex digits".into())
+        );
+    }
+
+    #[test]
+    fn every_report_rule_refuses_its_violation() {
+        let edit = |f: &dyn Fn(&mut Report)| {
+            let mut report = fixture_report();
+            f(&mut report);
+            report.check().unwrap_err()
+        };
+        for bad in ["", "a1b2c3d", "a1b2c3d45", "A1B2C3D4", "a1b2c3dg"] {
+            assert!(edit(&|r| r.id = bad.into()).starts_with("id "), "{bad:?}");
+        }
+        for bad in ["", "Crash", "dump"] {
+            assert!(
+                edit(&|r| r.kind = bad.into()).starts_with("kind "),
+                "{bad:?}"
+            );
+        }
+        for bad in ["", "other", "PANIC"] {
+            assert!(
+                edit(&|r| r.reason = bad.into()).starts_with("reason "),
+                "{bad:?}"
+            );
+        }
+        // 16 characters pass, 17 and control characters or non-ASCII don't.
+        assert_eq!(edit_ok(&|r| r.task = "a".repeat(16)), Ok(()));
+        for bad in ["a".repeat(17), "li\nk".into(), "lïnk".into()] {
+            assert!(
+                edit(&|r| r.task = bad.clone()).starts_with("task "),
+                "{bad:?}"
+            );
+        }
+        for bad in [
+            "4ff01234",
+            "0x4ff0123",
+            "0x4ff012345",
+            "0x4FF01234",
+            "0x4ff0123g",
+        ] {
+            assert!(
+                edit(&|r| r.pc = Some(bad.into())).starts_with("pc "),
+                "{bad:?}"
+            );
+            assert!(
+                edit(&|r| r.ra = Some(bad.into())).starts_with("ra "),
+                "{bad:?}"
+            );
+            assert!(
+                edit(&|r| r.addr = Some(bad.into())).starts_with("addr "),
+                "{bad:?}"
+            );
+        }
+        assert!(edit(&|r| r.pc = None).starts_with("pc "));
+        for bad in [
+            Some("ab".repeat(31)),
+            Some("AB".repeat(32)),
+            Some("ab".repeat(33)),
+            None,
+        ] {
+            assert!(
+                edit(&|r| r.elf = bad.clone()).starts_with("elf "),
+                "{bad:?}"
+            );
+        }
+        for bad in [
+            None,
+            Some(String::new()),
+            Some("x".repeat(33)),
+            Some("a\tb".into()),
+        ] {
+            assert!(
+                edit(&|r| r.cause = bad.clone()).starts_with("cause "),
+                "{bad:?}"
+            );
+        }
+        // The message names the field and never repeats the value.
+        let why = edit(&|r| r.pc = Some("secret-value".into()));
+        assert!(!why.contains("secret"), "{why}");
+    }
+
+    fn edit_ok(f: &dyn Fn(&mut Report)) -> Result<(), String> {
+        let mut report = fixture_report();
+        f(&mut report);
+        report.check()
+    }
+
+    #[test]
+    fn a_reset_ignores_its_crash_fields() {
+        let mut report = reset_report();
+        report.pc = Some("junk\n".into());
+        report.elf = Some("junk".into());
+        assert_eq!(report.check(), Ok(()));
+        assert!(!report.to_string().contains("junk"));
     }
 
     #[test]

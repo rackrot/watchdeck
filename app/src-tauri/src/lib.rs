@@ -78,8 +78,9 @@ pub fn run() {
                 .map_err(|e| format!("config in {}: {e}", dir.display()))?;
             // [sentry] is read once. The client is closed on exit, and a later edit only logs.
             let sentry = configs.current().sentry.clone();
-            if let Some(reporting) = reporting::start(sentry.as_ref(), secrets.clone()) {
-                app.manage(reporting);
+            let reporting = reporting::start(sentry.as_ref(), secrets.clone());
+            if let Some(reporting) = &reporting {
+                app.manage(reporting.clone());
             }
             tauri::async_runtime::spawn(reporting::warn_on_change(configs.subscribe(), sentry));
             // Shell actions run in the home directory, wherever the app was started from.
@@ -94,6 +95,7 @@ pub fn run() {
                 store,
                 configs.subscribe(),
                 actions,
+                reporting,
             ))?;
             log::info!("listening on {} (wss)", server.local_addr()?);
             tauri::async_runtime::spawn(configs.clone().watch_files());

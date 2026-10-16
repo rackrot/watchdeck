@@ -5,7 +5,7 @@ use std::fs;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -33,8 +33,9 @@ use watchdeck_lib::daemon::actions::{ActionResult, Actions};
 use watchdeck_lib::daemon::config::{self, Configs};
 use watchdeck_lib::daemon::pairing::{Pairing, PairingState};
 use watchdeck_lib::daemon::protocol::{
-    decode_hex, encode_hex, pairing_code, ErrorCode, IconFrame, Message, TileState, Token,
+    decode_hex, encode_hex, pairing_code, ErrorCode, IconFrame, Message, Report, TileState, Token,
 };
+use watchdeck_lib::daemon::reporting::{self, Reporting};
 use watchdeck_lib::daemon::secrets::Secrets;
 use watchdeck_lib::daemon::server::{DaemonEvent, DeviceInfo, Devices, Server};
 use watchdeck_lib::daemon::store::Store;
@@ -141,6 +142,16 @@ impl Daemon {
 /// A daemon on an ephemeral port with `DEVICE` paired and `config` as its `config.toml`, whose
 /// pairing listener binds `pair_addr` for at most `window` once started.
 async fn start_with(pair_addr: SocketAddr, window: Duration, config: &str) -> Daemon {
+    start_reporting(pair_addr, window, config, None).await
+}
+
+/// [`start_with`] with device reports going to `reporting`.
+async fn start_reporting(
+    pair_addr: SocketAddr,
+    window: Duration,
+    config: &str,
+    reporting: Option<Reporting>,
+) -> Daemon {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join(config::FILE), config).unwrap();
     let secrets = Arc::new(Secrets::new(dir.path()));
@@ -152,9 +163,16 @@ async fn start_with(pair_addr: SocketAddr, window: Duration, config: &str) -> Da
     let actions = Actions::new(secrets.clone(), dir.path().to_path_buf()).unwrap();
     let tls = identity().server_config().unwrap();
     let store = Store::load(dir.path()).unwrap();
-    let server = Server::bind("127.0.0.1:0", tls, store, configs.subscribe(), actions)
-        .await
-        .unwrap();
+    let server = Server::bind(
+        "127.0.0.1:0",
+        tls,
+        store,
+        configs.subscribe(),
+        actions,
+        reporting,
+    )
+    .await
+    .unwrap();
     let devices = server.devices();
     devices.pair(DEVICE, Sha256::digest(TOKEN).into()).unwrap();
     let pairing = Pairing::new(
@@ -1404,9 +1422,20 @@ const SECRET: &str = "Bearer device-sim-s3cret";
 static LOG_RECORDS: AtomicUsize = AtomicUsize::new(0);
 static LOG_LEAKS: AtomicUsize = AtomicUsize::new(0);
 static LOG_INSECURE: AtomicUsize = AtomicUsize::new(0);
+/// Every warning about a device report that was accepted.
+static LOG_REPORTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-/// Counts every log record at every level, those that contain [`SECRET`], and the warnings
-/// about secrets sent over plain http.
+/// Installs [`LeakCheck`] as the process's logger, once, whichever test gets here first.
+fn install_logger() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        log::set_logger(&LeakCheck).expect("only LeakCheck sets a logger");
+        log::set_max_level(log::LevelFilter::Trace);
+    });
+}
+
+/// Counts every log record at every level, those that contain [`SECRET`], the warnings about
+/// secrets sent over plain http, and the warnings that accept a device report.
 struct LeakCheck;
 
 impl log::Log for LeakCheck {
@@ -1422,6 +1451,9 @@ impl log::Log for LeakCheck {
         }
         if record.level() == log::Level::Warn && text.contains("as insecure_http allows") {
             LOG_INSECURE.fetch_add(1, Ordering::SeqCst);
+        }
+        if record.level() == log::Level::Warn && text.contains(": device report ") {
+            LOG_REPORTS.lock().unwrap().push(text);
         }
     }
 
@@ -1458,8 +1490,7 @@ async fn echo_server() -> SocketAddr {
 
 #[tokio::test]
 async fn a_secret_header_reaches_the_server_but_never_the_device_or_the_logs() {
-    log::set_logger(&LeakCheck).expect("only this test sets a logger");
-    log::set_max_level(log::LevelFilter::Trace);
+    install_logger();
 
     let server = echo_server().await;
     let daemon = start().await;
@@ -1520,6 +1551,146 @@ action = {{ kind = "http", method = "GET", url = "http://{server}/state", secret
         0,
         "a log record held the secret"
     );
+}
+
+// ---- Device reports ----
+
+/// A checked-valid crash report. `elf` is also how a test finds its own log line.
+fn crash_report(id: &str, elf: &str) -> Report {
+    Report {
+        id: id.into(),
+        kind: "crash".into(),
+        reason: "panic".into(),
+        task: "link".into(),
+        pc: Some("0x4ff01234".into()),
+        ra: Some("0x4ff05678".into()),
+        cause: Some("LoadAccessFault".into()),
+        addr: Some("0x00000000".into()),
+        elf: Some(elf.into()),
+        same_build: true,
+    }
+}
+
+fn report(report: Report) -> Ws {
+    Ws::text(serde_json::to_string(&Message::Report(report)).unwrap())
+}
+
+fn accepted_lines(elf: &str) -> Vec<String> {
+    let lines = LOG_REPORTS.lock().unwrap();
+    lines.iter().filter(|l| l.contains(elf)).cloned().collect()
+}
+
+fn ack(id: &str) -> Message {
+    Message::ReportAck { id: id.into() }
+}
+
+/// A press that proves the session is alive and that nothing else was queued before its result.
+async fn assert_next_is_a_press_result(c: &mut Client) {
+    c.send(press("hello", 99)).await.unwrap();
+    assert!(
+        matches!(
+            recv(c).await,
+            Message::Result {
+                seq: 99,
+                ok: true,
+                ..
+            }
+        ),
+        "expected the press result next"
+    );
+}
+
+#[tokio::test]
+async fn a_report_is_logged_once_then_acked_with_sentry_off() {
+    install_logger();
+    let elf = "c0".repeat(32);
+    let daemon = start().await;
+    let mut c = handshake(daemon.addr, DEVICE, &TOKEN).await;
+    c.send(report(crash_report("a1b2c3d4", &elf)))
+        .await
+        .unwrap();
+    assert_eq!(recv(&mut c).await, ack("a1b2c3d4"));
+    // The line is written before the ack goes out.
+    let lines = accepted_lines(&elf);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains(DEVICE) && lines[0].contains("LoadAccessFault"));
+    assert_next_is_a_press_result(&mut c).await;
+}
+
+#[tokio::test]
+async fn a_session_takes_two_reports_and_drops_the_rest_without_ending() {
+    install_logger();
+    let elf = "c1".repeat(32);
+    let daemon = start().await;
+    let mut c = handshake(daemon.addr, DEVICE, &TOKEN).await;
+    for id in ["00000001", "00000002", "00000003", "00000004"] {
+        c.send(report(crash_report(id, &elf))).await.unwrap();
+    }
+    assert_eq!(recv(&mut c).await, ack("00000001"));
+    assert_eq!(recv(&mut c).await, ack("00000002"));
+    assert_next_is_a_press_result(&mut c).await;
+    assert_eq!(accepted_lines(&elf).len(), 2);
+
+    // The limit is per session: a new one takes reports again.
+    let mut c = handshake(daemon.addr, DEVICE, &TOKEN).await;
+    c.send(report(crash_report("00000005", &elf)))
+        .await
+        .unwrap();
+    assert_eq!(recv(&mut c).await, ack("00000005"));
+}
+
+#[tokio::test]
+async fn a_malformed_report_is_dropped_unacked_and_the_session_goes_on() {
+    install_logger();
+    let elf = "c2".repeat(32);
+    let daemon = start().await;
+    let mut c = handshake(daemon.addr, DEVICE, &TOKEN).await;
+    let mut bad_kind = crash_report("00000001", &elf);
+    bad_kind.kind = "dump".into();
+    let mut long_task = crash_report("00000002", &elf);
+    long_task.task = "x".repeat(17);
+    c.send(report(bad_kind)).await.unwrap();
+    // The two drops use up the session's limit of two.
+    c.send(report(long_task)).await.unwrap();
+    assert_next_is_a_press_result(&mut c).await;
+    assert!(accepted_lines(&elf).is_empty());
+
+    let mut c = handshake(daemon.addr, DEVICE, &TOKEN).await;
+    c.send(Ws::text(r#"{"t":"report"}"#)).await.unwrap();
+    c.send(report(crash_report("00000003", &elf)))
+        .await
+        .unwrap();
+    assert_eq!(recv(&mut c).await, ack("00000003"));
+}
+
+#[tokio::test]
+async fn a_report_is_acked_when_sentry_is_on_even_if_the_budget_refuses_it() {
+    install_logger();
+    let elf = "c3".repeat(32);
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = Arc::new(Secrets::new(dir.path()));
+    // A loopback DSN with nothing listening: the client queues the event and the send fails
+    // quietly, which is all this test needs.
+    let sentry = config::SentryConfig {
+        dsn: "http://key@127.0.0.1:9/1".into(),
+        pii: false,
+    };
+    let reporting = reporting::start(Some(&sentry), secrets).unwrap();
+    let daemon = start_reporting(
+        "127.0.0.1:0".parse().unwrap(),
+        Duration::from_secs(30),
+        CONFIG,
+        Some(reporting.clone()),
+    )
+    .await;
+    // The same crash in two sessions: the second is over the per-device cap.
+    for id in ["00000001", "00000002"] {
+        let mut c = handshake(daemon.addr, DEVICE, &TOKEN).await;
+        c.send(report(crash_report(id, &elf))).await.unwrap();
+        assert_eq!(recv(&mut c).await, ack(id));
+    }
+    assert_eq!(accepted_lines(&elf).len(), 2);
+    reporting.close();
 }
 
 // ---- Icons ----

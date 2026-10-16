@@ -2,7 +2,7 @@
 
 ## Status (2026-10-15)
 
-Planned, not started. Decisions settled 2026-10-15 by the user: 1(a) device reports via the daemon, 2(b) `tauri-plugin-sentry` for the webview, 3(a), 4(a), 5(b) build S5 symbolication, 6(a). The `sentry` crate is approved. Build S1 to S5 in order.
+S1 to S3 are built; S4 (firmware) and S5 (optional symbolication) remain, and the live-DSN checks are still to do. Decisions settled 2026-10-15 by the user: 1(a) device reports via the daemon, 2(b) `tauri-plugin-sentry` for the webview, 3(a), 4(a), 5(b) build S5 symbolication, 6(a). The `sentry` crate is approved. Build S1 to S5 in order.
 
 ### S1 results
 
@@ -22,6 +22,19 @@ Done: `tauri-plugin-sentry =0.8.0` (no default features), the `main` window crea
 - The window is built right after the plugin registers, then shown unless `--hidden`. Tray and single-instance callbacks only run once the event loop starts, after `setup` returns, so `show_window` always finds it. A second launch during `setup` would hit its existing "no main window" log line.
 - The transport wrapper passes only envelopes made of `Event`, `Attachment` and `ClientReport` items. Raw envelopes, empty ones, and any with another item (transactions, sessions) are dropped.
 - `tauri.conf.json` gives the window `"label": "main"` explicitly, since `tray.rs` looks it up by that label.
+
+### S3 results
+
+Done: `report` and `report_ack` (`daemon/protocol.rs`, `site/src/protocol.md`, `tests/fixtures/report*.json`), the session handler (`daemon/server.rs`), and `Reporting::device_report` (`daemon/reporting.rs`). Not done: the live-DSN check (a real report arriving as an event).
+
+- `Server::bind` takes an `Option<Reporting>`, and `Reporting` is `Clone`. `lib.rs` hands the same one to the server and to Tauri state.
+- A report parses leniently (missing fields become empty) and `Report::check` validates it. A failing report, and any past the session's second, is logged and dropped with no ack. The session stays up. A wrong JSON type still gets the usual `bad_request` and close.
+- `crash` requires `pc`, `ra`, `cause`, `addr` and `elf`. `reset` ignores them. S4 must send all of them for a crash. `task` and `cause` are also limited to printable ASCII, so they can't forge log lines.
+- The per-device cap is `Budget::admit(device|elf|pc|reason, 1 h)` in `device_report`, which also draws on the process's 30 per hour. `Filter::process` skips the 10-minute dedupe for `component=firmware` events so a slot isn't taken twice.
+- The client fills in `release` and the daemon host's contexts on every event. `Filter::process` removes both from firmware events, keeping only a `watchdeck-firmware@<fw>` release. A `fw` outside `[A-Za-z0-9._+-]{1,64}` gets no release.
+- The device id goes in `user.id`, only with `pii`.
+- The frames are `[ra, pc]`, since Sentry reads the last frame as the crash site.
+- `device_sim` with Sentry on uses a loopback DSN with nothing listening. It shows the ack doesn't depend on the budget, not that an event arrives.
 
 ## Goal and definition of done
 

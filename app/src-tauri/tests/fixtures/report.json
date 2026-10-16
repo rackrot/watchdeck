@@ -1,0 +1,13 @@
+{
+  "t": "report",
+  "id": "a1b2c3d4",
+  "kind": "crash",
+  "reason": "panic",
+  "task": "link",
+  "pc": "0x4ff01234",
+  "ra": "0x4ff05678",
+  "cause": "LoadAccessFault",
+  "addr": "0x00000000",
+  "elf": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+  "same_build": true
+}

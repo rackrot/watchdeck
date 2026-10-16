@@ -161,6 +161,8 @@ device                      daemon
   |<-- icon frame (binary) ---|   one per icon
   |--- press ---------------->|
   |<-- result ----------------|   exactly one per press
+  |--- report --------------->|   a crash or reset from an earlier boot, if the device has one
+  |<-- report_ack ------------|   after the daemon logs it
 ```
 
 - Presses run concurrently. Results arrive in the order the actions finish, and pings, presses and layouts keep flowing while an action runs.
@@ -332,3 +334,36 @@ The daemon polls each tile only while at least one device has a session, and sen
 - A session that the daemon has revoked or replaced gets no more `tile` messages. See [Config](config.md#tiles) for what the value and the state mean.
 
 The device updates the button's text and color in place and doesn't rebuild the grid.
+
+### `report` (device → daemon)
+
+```json
+{"t":"report","id":"a1b2c3d4","kind":"crash","reason":"panic","task":"link","pc":"0x4ff01234","ra":"0x4ff05678","cause":"LoadAccessFault","addr":"0x00000000","elf":"0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0","same_build":true}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `id` | string | 8 lowercase hex digits that name this report in `report_ack` |
+| `kind` | string | `crash` for a coredump from an earlier boot, or `reset` for an abnormal reset with no dump |
+| `reason` | string | `panic`, `int_wdt`, `task_wdt`, `wdt` or `brownout` |
+| `task` | string | The task that was running, or empty. Printable ASCII, at most 16 characters |
+| `pc`, `ra` | string | The faulting program counter and the return address, each `0x` and 8 lowercase hex digits |
+| `cause` | string | The fault's name, such as `LoadAccessFault`. 1 to 32 printable ASCII characters |
+| `addr` | string | The faulting address (`mtval`), in the same form as `pc` |
+| `elf` | string | SHA-256 of the crashed firmware's ELF, as 64 lowercase hex digits. With the `pc` it finds the source line using `riscv32-esp-elf-addr2line` |
+| `same_build` | bool | Optional, default `false`. `true` when the crashed firmware is the one now running, so the `fw` in `hello` names it |
+
+`pc`, `ra`, `cause`, `addr`, `elf` and `same_build` are required for `crash` and ignored for `reset`, which has no dump to read them from.
+
+- The device sends its report after `welcome` and again on every session until it gets the matching `report_ack`. It keeps the report until then.
+- The daemon checks every field above. A report that fails, or arrives after the session's second, is logged and dropped with no `report_ack`, and the session goes on. The log line for a drop names the failed field and never repeats the report's values.
+- The daemon writes one `warn` log line per accepted report, whether or not it sends the report to Sentry, and then sends `report_ack`. It sends the ack even when it is not configured to report to Sentry, or when it keeps the report out of Sentry to stay under its limits (one report per device, `elf`, `pc` and `reason` per hour, and 30 events an hour in all).
+- A daemon from before this message ignores it as an unknown `t` and never acks, so the device keeps the report for a newer daemon. Adding `report` and `report_ack` doesn't change `v`.
+
+### `report_ack` (daemon → device)
+
+```json
+{"t":"report_ack","id":"a1b2c3d4"}
+```
+
+`id` is the `id` of an accepted `report`. The device then erases the dump.

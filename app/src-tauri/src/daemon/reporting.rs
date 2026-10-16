@@ -12,11 +12,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sentry::integrations::log::{LogFilter, SentryLogger};
-use sentry::protocol::{Context, Envelope, EnvelopeItem, Event, Frame, Stacktrace, Value};
+use sentry::protocol::{
+    Addr, Context, Envelope, EnvelopeItem, Event, Exception, Frame, Level, Stacktrace, User, Value,
+};
 use sentry::{Client, ClientOptions, Hub, Transport, TransportFactory, TransportOptions};
 use tokio::sync::watch;
 
 use super::config::{Live, SentryConfig, CONFIG_REJECTED};
+use super::protocol::{decode_hex, Report};
 use super::secrets::Secrets;
 
 /// How long an identical event is dropped after one is sent.
@@ -31,17 +34,52 @@ const MAX_KEY_MESSAGE: usize = 256;
 /// Whether `Warn` lines become breadcrumbs, which is only with `pii`. Set by [`start`].
 static WARN_BREADCRUMBS: AtomicBool = AtomicBool::new(false);
 
-/// The running client, kept in Tauri's managed state so the app can close it on exit.
-pub struct Reporting(Arc<Client>);
+/// Value of the `component` tag on events from the board.
+const FIRMWARE: &str = "firmware";
+
+/// The running client, kept in Tauri's managed state so the app can close it on exit. Clones
+/// share the client and the budget.
+#[derive(Clone)]
+pub struct Reporting {
+    client: Arc<Client>,
+    filter: Arc<Filter>,
+    pii: bool,
+}
 
 impl Reporting {
+    fn new(client: Arc<Client>, filter: Arc<Filter>, pii: bool) -> Self {
+        Self {
+            client,
+            filter,
+            pii,
+        }
+    }
+
     pub fn client(&self) -> &Arc<Client> {
-        &self.0
+        &self.client
     }
 
     /// Sends what is queued, waiting at most [`CLOSE_TIMEOUT`].
     pub fn close(&self) {
-        self.0.close(Some(CLOSE_TIMEOUT));
+        self.client.close(Some(CLOSE_TIMEOUT));
+    }
+
+    /// Reports a device's checked `report` from the session of `device`, whose `hello` said it
+    /// runs firmware `fw`. Returns false, and sends nothing, if this device already had the same
+    /// report within the hour or the process is over its hourly cap.
+    pub fn device_report(&self, device: &str, fw: &str, report: &Report) -> bool {
+        let key = format!(
+            "{FIRMWARE}|{device}|{}|{}|{}",
+            report.elf.as_deref().unwrap_or(""),
+            report.pc.as_deref().unwrap_or(""),
+            report.reason
+        );
+        if !self.filter.budget.admit(&key, HOUR) {
+            return false;
+        }
+        let event = device_event(device, fw, report, self.pii);
+        self.client.capture_event(event, None);
+        true
     }
 }
 
@@ -50,8 +88,8 @@ pub fn start(config: Option<&SentryConfig>, secrets: Arc<Secrets>) -> Option<Rep
     let config = config?;
     let home = std::env::home_dir();
     let host = gethostname::gethostname().to_string_lossy().into_owned();
-    let filter = Filter::new(config.pii, secrets, home, host);
-    let client = Arc::new(Client::from(options(config, filter)));
+    let filter = Arc::new(Filter::new(config.pii, secrets, home, host));
+    let client = Arc::new(Client::from(options(config, filter.clone())));
     Hub::main().bind_client(Some(client.clone()));
     WARN_BREADCRUMBS.store(config.pii, Ordering::Relaxed);
     log::info!(
@@ -59,12 +97,12 @@ pub fn start(config: Option<&SentryConfig>, secrets: Arc<Secrets>) -> Option<Rep
         client.dsn().map_or("?", |dsn| dsn.host()),
         config.pii
     );
-    Some(Reporting(client))
+    Some(Reporting::new(client, filter, config.pii))
 }
 
 /// The client options. `SENTRY_DSN`, `SENTRY_RELEASE`, `SENTRY_ENVIRONMENT` and `SSL_VERIFY` feed
 /// `apply_defaults`, so the values that matter are forced afterwards.
-fn options(config: &SentryConfig, filter: Filter) -> ClientOptions {
+fn options(config: &SentryConfig, filter: Arc<Filter>) -> ClientOptions {
     let mut opts = sentry::apply_defaults(ClientOptions::default());
     opts.dsn = Some(config.dsn.parse().expect("Config::check accepted the DSN"));
     opts.accept_invalid_certs = false;
@@ -78,7 +116,6 @@ fn options(config: &SentryConfig, filter: Filter) -> ClientOptions {
     if let Some(inner) = opts.transport.take() {
         opts.transport = Some(Arc::new(TypedOnlyFactory(inner)));
     }
-    let filter = Arc::new(filter);
     opts.before_send = Some(Arc::new(move |event| filter.process(event)));
     opts
 }
@@ -146,6 +183,10 @@ impl Filter {
             Some(scrubber) => scrubber.event(event)?,
             None => event,
         };
+        if event.tags.get("component").map(String::as_str) == Some(FIRMWARE) {
+            // `Reporting::device_report` already took this event's slot, per device.
+            return Some(without_daemon_defaults(event));
+        }
         self.budget
             .admit(&event_key(&event), DEDUPE)
             .then_some(event)
@@ -193,8 +234,7 @@ impl Transport for TypedOnly {
     }
 }
 
-/// Component, message and build, so the same failure repeating is one event. Firmware reports
-/// (S3) key on the fault PC instead of the message.
+/// Component, message and build, so the same failure repeating is one event.
 fn event_key(event: &Event) -> String {
     let component = event.tags.get("component").map_or("daemon", String::as_str);
     let message = event
@@ -212,6 +252,69 @@ fn event_key(event: &Event) -> String {
     let message: String = message.chars().take(MAX_KEY_MESSAGE).collect();
     let release = event.release.as_deref().unwrap_or("");
     format!("{component}|{message}|{release}")
+}
+
+/// The event for a device's checked `report`. Frames run oldest first, so the return address comes
+/// before the PC that faulted. The device id is attached only with `pii`.
+fn device_event(device: &str, fw: &str, report: &Report, pii: bool) -> Event<'static> {
+    let address = |field: &Option<String>| {
+        let hex = field.as_deref()?.strip_prefix("0x")?;
+        Some(u64::from(u32::from_be_bytes(decode_hex::<4>(hex)?)))
+    };
+    let mut tags = sentry::protocol::Map::from([
+        ("component".to_string(), FIRMWARE.to_string()),
+        ("reset_reason".to_string(), report.reason.clone()),
+    ]);
+    for (name, value) in [("elf", &report.elf), ("cause", &report.cause)] {
+        tags.extend(value.clone().map(|v| (name.to_string(), v)));
+    }
+    let frame = |pc: Option<u64>| Frame {
+        instruction_addr: pc.map(Addr::from),
+        ..Default::default()
+    };
+    let stacktrace = (report.kind == "crash").then(|| Stacktrace {
+        frames: vec![frame(address(&report.ra)), frame(address(&report.pc))],
+        ..Default::default()
+    });
+    let value = match report.task.as_str() {
+        "" => report.reason.clone(),
+        task => format!("{} in task {task}", report.reason),
+    };
+    // Release names are short and plain. A version outside that is left off.
+    let release_ok = !fw.is_empty()
+        && fw.len() <= 64
+        && fw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b));
+    Event {
+        level: Level::Fatal,
+        tags,
+        exception: vec![Exception {
+            ty: report.cause.clone().unwrap_or_else(|| "Reset".into()),
+            value: Some(value),
+            stacktrace,
+            ..Default::default()
+        }]
+        .into(),
+        release: (report.same_build && release_ok)
+            .then(|| format!("watchdeck-firmware@{fw}").into()),
+        user: pii.then(|| User {
+            id: Some(device.to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// The client fills in the daemon's release and its contexts hold the daemon host's OS. Neither
+/// describes the board, so only the release `device_event` chose stays.
+fn without_daemon_defaults(mut event: Event<'static>) -> Event<'static> {
+    let own = |release: &str| release.starts_with("watchdeck-firmware@");
+    if !event.release.as_deref().is_some_and(own) {
+        event.release = None;
+    }
+    event.contexts.clear();
+    event
 }
 
 /// A bounded, expiring set of recent event keys, and a cap on events per hour for the process.
@@ -480,7 +583,8 @@ fn empty_quotes(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sentry::protocol::{Breadcrumb, Exception, Level, LogEntry, Values};
+    use sentry::protocol::{Breadcrumb, LogEntry, Values};
+    use sentry::test::TestTransport;
 
     const HOME: &str = "/home/buck";
     const HOST: &str = "cachy-box";
@@ -704,7 +808,7 @@ mod tests {
         std::env::set_var("SENTRY_DSN", "https://other@o2.example.com/9");
         std::env::set_var("SSL_VERIFY", "false");
         let (_dir, secrets) = secrets_dir(&[]);
-        let filter = Filter::new(false, secrets, None, String::new());
+        let filter = Arc::new(Filter::new(false, secrets, None, String::new()));
         let opts = options(&config(DSN, false), filter);
         let dsn = opts.dsn.unwrap();
         assert_eq!(
@@ -725,8 +829,184 @@ mod tests {
     }
 
     fn captured(pii: bool, secrets: Arc<Secrets>, f: impl FnOnce()) -> Vec<Event<'static>> {
-        let filter = Filter::new(pii, secrets, Some(HOME.into()), HOST.into());
+        let filter = Arc::new(Filter::new(pii, secrets, Some(HOME.into()), HOST.into()));
         sentry::test::with_captured_events_options(f, options(&config(DSN, pii), filter))
+    }
+
+    /// A reporter whose events land in the returned transport instead of on the network.
+    fn reporter(pii: bool, secrets: Arc<Secrets>) -> (Reporting, Arc<TestTransport>) {
+        let filter = Arc::new(Filter::new(pii, secrets, Some(HOME.into()), HOST.into()));
+        let transport = TestTransport::new();
+        let mut opts = options(&config(DSN, pii), filter.clone());
+        opts.transport = Some(Arc::new(transport.clone()));
+        let client = Arc::new(Client::from(opts));
+        (Reporting::new(client, filter, pii), transport)
+    }
+
+    fn crash(pc: &str) -> Report {
+        Report {
+            id: "a1b2c3d4".into(),
+            kind: "crash".into(),
+            reason: "panic".into(),
+            task: "link".into(),
+            pc: Some(pc.into()),
+            ra: Some("0x4ff05678".into()),
+            cause: Some("LoadAccessFault".into()),
+            addr: Some("0x00000000".into()),
+            elf: Some("ab".repeat(32)),
+            same_build: true,
+        }
+    }
+
+    const FW_DEVICE: &str = "wd-e8f60ae276ab";
+
+    #[test]
+    fn a_crash_becomes_a_fatal_firmware_event() {
+        let (_dir, secrets) = secrets_dir(&[]);
+        let (reporting, transport) = reporter(false, secrets);
+        assert!(reporting.device_report(FW_DEVICE, "0.2.0", &crash("0x4ff01234")));
+        let [event] = &transport.fetch_and_clear_events()[..] else {
+            panic!("expected one event")
+        };
+        assert_eq!(event.level, Level::Fatal);
+        let tags: Vec<_> = event
+            .tags
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let elf = "ab".repeat(32);
+        assert_eq!(
+            tags,
+            [
+                ("cause", "LoadAccessFault"),
+                ("component", "firmware"),
+                ("elf", elf.as_str()),
+                ("reset_reason", "panic"),
+            ]
+        );
+        let exception = &event.exception.values[0];
+        assert_eq!(exception.ty, "LoadAccessFault");
+        assert_eq!(exception.value.as_deref(), Some("panic in task link"));
+        let frames = &exception.stacktrace.as_ref().unwrap().frames;
+        let addrs: Vec<_> = frames.iter().map(|f| f.instruction_addr).collect();
+        assert_eq!(
+            addrs,
+            [Some(Addr::from(0x4ff05678)), Some(Addr::from(0x4ff01234))],
+            "the faulting PC is the last frame"
+        );
+        assert_eq!(event.release.as_deref(), Some("watchdeck-firmware@0.2.0"));
+        assert!(event.contexts.is_empty() && event.server_name.is_none());
+    }
+
+    #[test]
+    fn same_build_alone_sets_the_release() {
+        let (_dir, secrets) = secrets_dir(&[]);
+        let (reporting, transport) = reporter(false, secrets);
+        let mut other_build = crash("0x4ff01234");
+        other_build.same_build = false;
+        assert!(reporting.device_report(FW_DEVICE, "0.2.0", &other_build));
+        assert!(reporting.device_report(FW_DEVICE, "0.2.0", &crash("0x4ff01235")));
+        // A version that would make a bad release name is left off.
+        assert!(reporting.device_report(FW_DEVICE, "0.2/0 x", &crash("0x4ff01236")));
+        let releases: Vec<_> = transport
+            .fetch_and_clear_events()
+            .iter()
+            .map(|e| e.release.as_deref().map(str::to_string))
+            .collect();
+        assert_eq!(
+            releases,
+            [None, Some("watchdeck-firmware@0.2.0".into()), None]
+        );
+    }
+
+    #[test]
+    fn the_device_id_is_attached_only_with_pii() {
+        for pii in [false, true] {
+            let (_dir, secrets) = secrets_dir(&[]);
+            let (reporting, transport) = reporter(pii, secrets);
+            assert!(reporting.device_report(FW_DEVICE, "0.2.0", &crash("0x4ff01234")));
+            let events = transport.fetch_and_clear_events();
+            let json = serde_json::to_string(&events[0]).unwrap();
+            assert_eq!(json.contains(FW_DEVICE), pii, "pii {pii}: {json}");
+            assert_eq!(
+                events[0].user.as_ref().and_then(|u| u.id.as_deref()),
+                pii.then_some(FW_DEVICE)
+            );
+        }
+    }
+
+    #[test]
+    fn a_reset_has_no_frames_and_a_reset_type() {
+        let (_dir, secrets) = secrets_dir(&[]);
+        let (reporting, transport) = reporter(false, secrets);
+        let report = Report {
+            id: "00000001".into(),
+            kind: "reset".into(),
+            reason: "brownout".into(),
+            task: String::new(),
+            pc: None,
+            ra: None,
+            cause: None,
+            addr: None,
+            elf: None,
+            same_build: false,
+        };
+        assert!(reporting.device_report(FW_DEVICE, "0.2.0", &report));
+        let events = transport.fetch_and_clear_events();
+        let exception = &events[0].exception.values[0];
+        assert_eq!(exception.ty, "Reset");
+        assert_eq!(exception.value.as_deref(), Some("brownout"));
+        assert!(exception.stacktrace.is_none());
+        assert_eq!(
+            events[0].tags.get("reset_reason").map(String::as_str),
+            Some("brownout")
+        );
+        assert!(!events[0].tags.contains_key("elf") && events[0].release.is_none());
+    }
+
+    #[test]
+    fn a_device_reports_one_crash_an_hour_across_sessions() {
+        let (_dir, secrets) = secrets_dir(&[]);
+        let (reporting, transport) = reporter(false, secrets);
+        let sent = |device, report: &Report| reporting.device_report(device, "0.2.0", report);
+        assert!(sent(FW_DEVICE, &crash("0x4ff01234")));
+        // The same device resending the same crash, as from a later session.
+        assert!(!sent(FW_DEVICE, &crash("0x4ff01234")));
+        assert!(!sent(FW_DEVICE, &crash("0x4ff01234")));
+        // Another PC, another device, and another reason are other crashes.
+        assert!(sent(FW_DEVICE, &crash("0x4ff09999")));
+        assert!(sent("wd-000000000002", &crash("0x4ff01234")));
+        let mut wdt = crash("0x4ff01234");
+        wdt.reason = "task_wdt".into();
+        assert!(sent(FW_DEVICE, &wdt));
+        assert_eq!(transport.fetch_and_clear_events().len(), 4);
+    }
+
+    #[test]
+    fn device_reports_share_the_process_hourly_cap() {
+        let (_dir, secrets) = secrets_dir(&[]);
+        let (reporting, transport) = reporter(false, secrets);
+        let sent = (0..40)
+            .filter(|i| {
+                reporting.device_report(&format!("wd-{i:012x}"), "0.2.0", &crash("0x4ff01234"))
+            })
+            .count();
+        assert_eq!(sent, MAX_PER_HOUR);
+        assert_eq!(transport.fetch_and_clear_events().len(), MAX_PER_HOUR);
+    }
+
+    #[test]
+    fn a_report_is_scrubbed_like_any_event() {
+        let (_dir, secrets) = secrets_dir(&[]);
+        let (reporting, transport) = reporter(false, secrets);
+        let mut report = crash("0x4ff01234");
+        report.task = "10.1.2.3".into();
+        assert!(reporting.device_report(FW_DEVICE, "0.2.0", &report));
+        let json = serde_json::to_string(&transport.fetch_and_clear_events()[0]).unwrap();
+        assert!(
+            !json.contains("10.1.2.3") && json.contains("<ip>"),
+            "{json}"
+        );
     }
 
     #[test]
