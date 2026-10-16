@@ -1025,6 +1025,7 @@ static void handle_msg(const char *json, size_t len)
             // pairing_erase logs its own failure. The daemon refuses this token, so a blob that
             // outlives a failed erase is refused again at the next connect.
             pairing_erase();
+            crash_erase(); // a dump may hold the token
             unpair("the desktop forgot this device, pair again");
         } else {
             set_status("daemon error: %s", m->error.code);

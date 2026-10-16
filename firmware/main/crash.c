@@ -74,12 +74,27 @@ static void copy_printable(char *dst, size_t dst_len, const char *src, size_t sr
     dst[n] = '\0';
 }
 
+// A blank partition is skipped, since erasing all 512 KB stalls the caller for about a second.
+// A corrupt one is erased.
 static void erase_dump(void)
 {
+    size_t addr, size;
+    if (esp_core_dump_image_get(&addr, &size) == ESP_ERR_NOT_FOUND) {
+        return;
+    }
     esp_err_t err = esp_core_dump_image_erase();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "coredump erase failed: %s", esp_err_to_name(err));
     }
+}
+
+static uint32_t fnv1a(uint32_t h, const void *data, size_t n)
+{
+    const uint8_t *p = data;
+    for (size_t i = 0; i < n; i++) {
+        h = (h ^ p[i]) * 16777619u;
+    }
+    return h;
 }
 
 // Fill `report` from a dump that passed the image check. Returns false if the summary is unusable.
@@ -97,10 +112,15 @@ static bool read_dump(void)
         return false;
     }
     report.kind = PROTO_REPORT_CRASH;
-    // The summary has no reason, so take it from this boot's reset reason. A dump that outlived a
-    // later power cycle or restart is still reported as a panic.
-    const char *reason = reset_reason_name(esp_reset_reason());
-    strlcpy(report.reason, reason && strcmp(reason, "brownout") != 0 ? reason : "panic", sizeof(report.reason));
+    // The summary has no reason. This boot's reset reason describes the dump only if it is one that
+    // writes a dump. Otherwise the dump is older than this boot, and a panic is the best guess.
+    esp_reset_reason_t rr = esp_reset_reason();
+    bool writes_dump = rr == ESP_RST_PANIC || rr == ESP_RST_INT_WDT || rr == ESP_RST_TASK_WDT;
+    strlcpy(report.reason, writes_dump ? reset_reason_name(rr) : "panic", sizeof(report.reason));
+    if (!writes_dump && reset_reason_name(rr)) {
+        ESP_LOGW(TAG, "this boot's %s reset has no dump and is not reported, since an older dump is pending",
+                 reset_reason_name(rr));
+    }
     copy_printable(report.task, sizeof(report.task), sum->exc_task, sizeof(sum->exc_task));
     report.pc = sum->exc_pc;
     report.ra = sum->ex_info.ra;
@@ -109,6 +129,15 @@ static bool read_dump(void)
     copy_printable(report.elf, sizeof(report.elf), (const char *)sum->app_elf_sha256, sizeof(sum->app_elf_sha256));
     report.same_build = strncmp(report.elf, esp_app_get_elf_sha256_str(), sizeof(report.elf) - 1) == 0;
     free(sum);
+
+    // The id comes from the dump, so a resend after a reboot is the same report to the daemon.
+    // FNV-1a is enough, since the id only has to be stable.
+    uint32_t h = 2166136261u;
+    h = fnv1a(h, &report.pc, sizeof(report.pc));
+    h = fnv1a(h, &report.ra, sizeof(report.ra));
+    h = fnv1a(h, report.elf, strlen(report.elf));
+    h = fnv1a(h, report.task, strlen(report.task));
+    snprintf(report.id, sizeof(report.id), "%08x", (unsigned)h);
     return true;
 }
 
@@ -131,7 +160,7 @@ void crash_init(void)
 
     if (!pending) {
         const char *reason = reset_reason_name(esp_reset_reason());
-        if (reason && strcmp(reason, "panic") != 0) {
+        if (reason) {
             report.kind = PROTO_REPORT_RESET;
             strlcpy(report.reason, reason, sizeof(report.reason));
             pending = true;
