@@ -185,6 +185,15 @@ async fn advertise(identity: &Identity, pairing: bool) -> Res<watch::Sender<Opti
 /// Runs `id` `reps` times and then the liveness check. A lost link is replaced, so the next
 /// case starts on a live session.
 async fn execute(rig: &mut Rig, id: &str, reps: u32) -> Result<String, String> {
+    let result = run_case(rig, id, reps).await;
+    // The end marker goes on whatever session is live, so `--check` stops grading the case here.
+    if let Err(e) = rig.sess.mark(&format!("{id}{}", check::END)).await {
+        println!("    end marker for {id} not sent: {e}");
+    }
+    result
+}
+
+async fn run_case(rig: &mut Rig, id: &str, reps: u32) -> Result<String, String> {
     let note = match cases::run(rig, id, reps).await {
         Ok(note) => note,
         Err(e) => {

@@ -1,16 +1,36 @@
 //! `--check <log>`: grades each case from the board's serial log. The harness puts a
-//! `{"t":"mark","case":"<id>"}` message before each case, and the board logs it on its `rx:` line,
-//! so the lines up to the next marker are that case's stretch.
+//! `{"t":"mark","case":"<id>"}` message before each case and a `<id>/end` one after it, and the
+//! board logs both on its `rx:` lines. A case's stretch runs from its start marker to its end
+//! marker. A log without end markers (an older run) is graded the old way: a stretch runs to the
+//! next marker of any kind, and nothing counts as between cases.
 //!
 //! The caller says which run the log should hold (a [`Plan`]). A case with too few stretches
 //! fails, so an empty or garbled log cannot pass. Every stretch of every case is graded, and the
-//! crash and reboot markers are scanned in every stretch except the wedge cases'.
+//! crash and reboot markers are scanned in every stretch except the wedge cases'. The lines
+//! between an end marker and the next start are scanned for crashes only. The operator's reset
+//! there (`rst:0x1 (POWERON)`) is reported as INFO, since the harness asks for one between cases.
 
 use std::fmt::Write;
 
 use super::cases::{spec_for, Rule, CASES};
 
 const MARK: &str = r#""t":"mark","case":""#;
+
+/// Ends a case id in its end marker.
+pub const END: &str = "/end";
+
+/// The operator's RTS pulse prints the ROM banner and this reset line.
+const POWERON: &str = "rst:0x1 (POWERON";
+
+/// Between cases, only these mean a crash. Any `rst:` but POWERON does too.
+const CRASHES: &[&str] = &[
+    "Guru Meditation",
+    "abort()",
+    "Backtrace:",
+    "assert failed",
+    "CORRUPT HEAP",
+    "Task watchdog",
+];
 
 /// Output that means the board crashed or restarted.
 const FAULTS: &[&str] = &[
@@ -52,6 +72,10 @@ struct Stretch<'a> {
     /// The 1-based line number of the marker.
     line: usize,
     lines: &'a [&'a str],
+    /// The lines from its end marker to the next marker, and the 1-based number of the first.
+    /// Empty when the stretch has no end marker.
+    gap: &'a [&'a str],
+    gap_line: usize,
 }
 
 /// Every stretch, in log order. Lines before the first marker belong to none, since the board
@@ -62,18 +86,32 @@ fn stretches<'a>(lines: &'a [&'a str]) -> Vec<Stretch<'a>> {
         .enumerate()
         .filter_map(|(i, l)| mark_id(l).map(|id| (i, id)))
         .collect();
-    marks
-        .iter()
-        .enumerate()
-        .map(|(n, &(start, id))| {
-            let end = marks.get(n + 1).map_or(lines.len(), |m| m.0);
-            Stretch {
-                id,
-                line: start + 1,
-                lines: &lines[start..end],
-            }
-        })
-        .collect()
+    let mut all = Vec::new();
+    for (n, &(start, id)) in marks.iter().enumerate() {
+        if id.ends_with(END) {
+            continue;
+        }
+        let next = marks.get(n + 1);
+        let closed = next.is_some_and(|m| m.1.strip_suffix(END) == Some(id));
+        let end = match next {
+            Some(m) if closed => m.0 + 1,
+            Some(m) => m.0,
+            None => lines.len(),
+        };
+        let gap_end = if closed {
+            marks.get(n + 2).map_or(lines.len(), |m| m.0)
+        } else {
+            end
+        };
+        all.push(Stretch {
+            id,
+            line: start + 1,
+            lines: &lines[start..end],
+            gap: &lines[end..gap_end],
+            gap_line: end + 1,
+        });
+    }
+    all
 }
 
 /// Why `seg` fails `rule`, one entry per problem.
@@ -168,17 +206,38 @@ pub fn grade(log: &str, plan: &Plan, after_s5: bool) -> (String, bool) {
     }
 
     let mut faults = Vec::new();
+    let mut resets = Vec::new();
     for stretch in &all {
-        if spec_for(stretch.id).is_some_and(|c| c.wedge) {
-            continue;
+        if !spec_for(stretch.id).is_some_and(|c| c.wedge) {
+            for (i, line) in stretch.lines.iter().enumerate() {
+                if let Some(fault) = FAULTS.iter().find(|f| line.contains(*f)) {
+                    faults.push(format!(
+                        "{fault:?} at line {} (case {})",
+                        stretch.line + i,
+                        stretch.id
+                    ));
+                }
+            }
         }
-        for (i, line) in stretch.lines.iter().enumerate() {
-            if let Some(fault) = FAULTS.iter().find(|f| line.contains(*f)) {
+        for (i, line) in stretch.gap.iter().enumerate() {
+            let at = stretch.gap_line + i;
+            if let Some(crash) = CRASHES.iter().find(|f| line.contains(*f)) {
                 faults.push(format!(
-                    "{fault:?} at line {} (case {})",
-                    stretch.line + i,
+                    "{crash:?} at line {at} (after case {})",
                     stretch.id
                 ));
+            } else if line.contains("rst:0x") {
+                if line.contains(POWERON) {
+                    resets.push(format!(
+                        "operator reset at line {at} (after case {})",
+                        stretch.id
+                    ));
+                } else {
+                    faults.push(format!(
+                        "a reset other than POWERON at line {at} (after case {})",
+                        stretch.id
+                    ));
+                }
             }
         }
     }
@@ -198,6 +257,9 @@ pub fn grade(log: &str, plan: &Plan, after_s5: bool) -> (String, bool) {
         for fault in faults {
             writeln!(out, "        {fault}").ok();
         }
+    }
+    for reset in resets {
+        writeln!(out, "INFO  {reset}").ok();
     }
 
     if plan.leak {
@@ -310,6 +372,87 @@ mod tests {
     fn a_reboot_in_a_wedge_case_is_expected() {
         let log = [mark("I13"), "ESP-ROM:esp32p4-eco2".into(), mark("I13b")].join("\n");
         assert!(grade(&log, &plan(&["I13"]), false).1);
+    }
+
+    fn end(id: &str) -> String {
+        mark(&format!("{id}{END}"))
+    }
+
+    const DROPPED: &str = "W (2) link: icon aabbccdd was not requested, dropped";
+
+    #[test]
+    fn a_case_is_graded_only_up_to_its_end_marker() {
+        // The "already cached, ignored" line after the end marker belongs to no case.
+        let log = [
+            mark("I9"),
+            end("I9"),
+            "I (3) link: icon aabbccdd already cached, ignored".into(),
+        ]
+        .join("\n");
+        let (report, ok) = grade(&log, &plan(&["I9"]), false);
+        assert!(!ok, "{report}"); // I9 wants "already cached, ignored" inside its stretch
+        let inside = [
+            mark("I9"),
+            "I (3) link: icon aabbccdd already cached, ignored".into(),
+            end("I9"),
+        ]
+        .join("\n");
+        assert!(grade(&inside, &plan(&["I9"]), false).1);
+    }
+
+    #[test]
+    fn an_operator_reset_between_cases_is_info() {
+        let log = [
+            mark("I8"),
+            DROPPED.into(),
+            end("I8"),
+            "ESP-ROM:esp32p4-eco2".into(),
+            "rst:0x1 (POWERON),boot:0x1f".into(),
+            mark("I9"),
+        ]
+        .join("\n");
+        let (report, ok) = grade(&log, &plan(&["I8"]), false);
+        assert!(ok, "{report}");
+        assert!(
+            report.contains("INFO  operator reset at line 5"),
+            "{report}"
+        );
+        assert!(report.contains("FAULT PASS"), "{report}");
+    }
+
+    #[test]
+    fn a_crash_or_other_reset_between_cases_fails() {
+        for crash in [
+            "Guru Meditation Error: Core 0 panic'ed",
+            "rst:0xc (SW_CPU_RESET),boot:0x1f",
+        ] {
+            let log = [
+                mark("I8"),
+                DROPPED.into(),
+                end("I8"),
+                crash.into(),
+                mark("I9"),
+            ]
+            .join("\n");
+            let (report, ok) = grade(&log, &plan(&["I8"]), false);
+            assert!(!ok, "{report}");
+            assert!(
+                report.contains("FAULT FAIL") && report.contains("line 4"),
+                "{report}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reset_inside_a_stretch_still_fails() {
+        let log = [
+            mark("I8"),
+            DROPPED.into(),
+            "rst:0x1 (POWERON)".into(),
+            end("I8"),
+        ]
+        .join("\n");
+        assert!(!grade(&log, &plan(&["I8"]), false).1);
     }
 
     #[test]

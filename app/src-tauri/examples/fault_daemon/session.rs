@@ -193,6 +193,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         Ok(())
     }
 
+    /// Welcome, L0, and whatever icons the board asks for.
+    pub async fn bring_up(&mut self) -> Res<()> {
+        self.welcome("fault-harness").await?;
+        self.layout(buttons("T1", None)).await?;
+        self.serve_until_quiet(Duration::from_millis(1500)).await?;
+        Ok(())
+    }
+
     /// The marker the board logs on its `rx:` line, which ties the log to the case.
     pub async fn mark(&mut self, case: &str) -> Result<(), Lost> {
         self.send_text(&format!(r#"{{"t":"mark","case":"{case}"}}"#))
@@ -405,14 +413,8 @@ pub struct Rig {
 }
 
 impl Rig {
-    /// Welcome, L0, and whatever icons the board asks for.
     pub async fn bring_up(&mut self) -> Res<()> {
-        self.sess.welcome("fault-harness").await?;
-        self.sess.layout(buttons("T1", None)).await?;
-        self.sess
-            .serve_until_quiet(Duration::from_millis(1500))
-            .await?;
-        Ok(())
+        self.sess.bring_up().await
     }
 
     /// Closes the session and waits for the board to connect again. After `first_wait` it asks the
@@ -449,6 +451,46 @@ impl Rig {
         };
         self.sess = session;
         Ok(start.elapsed().as_secs_f64())
+    }
+
+    /// As `prompt`, but the board stays connected while the operator takes their time. The live
+    /// session is read, so pings are answered and icon requests served, and a lost link is
+    /// replaced by the board's next connection.
+    pub async fn ask(&mut self, msg: &str) -> Res<()> {
+        let mut input = Box::pin(prompt(msg));
+        let mut lost = false;
+        loop {
+            tokio::select! {
+                done = &mut input => return done,
+                () = Self::keep_up(&mut self.sess, &self.h, &mut lost) => {}
+            }
+        }
+    }
+
+    /// One step of `ask`: serve the session for a second, or, after a loss, wait for the board's
+    /// next connection and bring it up. The select drops this when the operator answers, which
+    /// abandons a handshake in flight.
+    async fn keep_up(sess: &mut Session<Tls>, h: &Harness, lost: &mut bool) {
+        if !*lost {
+            if let Err(e) = sess.serve_until_quiet(Duration::from_secs(1)).await {
+                println!("    {e}; waiting for the board to reconnect");
+                *lost = true;
+            }
+            return;
+        }
+        let up = async {
+            let mut next = h.accept(Duration::from_secs(120)).await?;
+            next.bring_up().await?;
+            Ok::<_, Box<dyn Error>>(next)
+        };
+        match up.await {
+            Ok(next) => {
+                *sess = next;
+                *lost = false;
+                println!("    the board reconnected");
+            }
+            Err(e) => println!("    {e}"),
+        }
     }
 
     /// Pauses without reading, so the board's pings go unanswered.

@@ -331,7 +331,12 @@ pub const LONG_NAME: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\u{e9
 /// An error is a host-side failure. The caller checks liveness and recovers.
 pub async fn run(rig: &mut Rig, id: &str, reps: u32) -> Res<String> {
     if id == "I13" || id == "I13b" {
-        prompt(&format!(
+        // A wedge case must not be skipped or run on a dead link, so wait for the board first.
+        if rig.sess.serve_until_quiet(SHORT).await.is_err() {
+            println!("    The board is not connected. Waiting for it before {id}.");
+            rig.next_session(Duration::from_secs(120)).await?;
+        }
+        rig.ask(&format!(
             "{id} wedges the board. Confirm the capture is running and the tray app is quit."
         ))
         .await?;
