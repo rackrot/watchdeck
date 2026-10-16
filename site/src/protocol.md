@@ -157,6 +157,7 @@ device                      daemon
   |--- hello ---------------->|   within 5 s of connecting
   |<-- welcome ---------------|   or error, then close
   |<-- layout ----------------|   and again whenever the grid changes
+  |--- layout_ack ----------->|   once the grid is built
   |--- icon_get ------------->|   for icons the device doesn't have
   |<-- icon frame (binary) ---|   one per icon
   |--- press ---------------->|
@@ -232,6 +233,22 @@ The daemon closes the connection after sending it. `code` is one of `version`, `
 The daemon sends `layout` after `welcome`. When the user's config changes the grid, a button, a label, a color or a position, the daemon pushes a new `layout` on the same session, and the device replaces its grid without reconnecting. An edit that changes only actions sends nothing. Empty cells have no button. A layout that turns a tile on or off for a button counts as a change to a button.
 
 The layout carries only icon ids. The device keeps the icons it has, and asks for the rest with `icon_get`. A button without its icon yet shows its label alone and gains the picture when the frame arrives.
+
+### `layout_ack` (device → daemon)
+
+```json
+{"t":"layout_ack","rev":2}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `rev` | int | The `rev` of the `layout` whose grid the device has built |
+
+The device sends it for every `layout`, after it has built the grid and sent its `icon_get`. Icons still on the way don't hold it back, because a button shows its label until its picture arrives. The daemon tells the desktop window that the device applied the layout.
+
+- The daemon logs and ignores an ack for a `rev` it never sent on this session (0 or above the latest), and one no newer than the latest ack it already took.
+- A `rev` that is not a non-negative integer of at most 32 bits is refused like any malformed message: `error` `bad_request` and a close.
+- A daemon from before this message ignores it as an unknown `t`. A board from before it never sends one, and the daemon then reports only that it sent the layout. Adding `layout_ack` doesn't change `v`.
 
 ### `icon_get` (device → daemon)
 

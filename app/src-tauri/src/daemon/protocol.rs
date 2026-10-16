@@ -111,6 +111,10 @@ pub enum Message {
         rows: u32,
         buttons: Vec<Button>,
     },
+    /// The device has built the grid of the layout with this `rev`. An older device never sends it.
+    LayoutAck {
+        rev: u32,
+    },
     /// The icons the device is missing. The daemon answers each known id with a binary frame.
     IconGet {
         ids: Vec<String>,
@@ -463,11 +467,12 @@ mod tests {
     use serde_json::Value;
 
     // The fixtures are the JSON examples from site/src/protocol.md.
-    const FIXTURES: [&str; 15] = [
+    const FIXTURES: [&str; 16] = [
         include_str!("../../tests/fixtures/hello.json"),
         include_str!("../../tests/fixtures/welcome.json"),
         include_str!("../../tests/fixtures/error.json"),
         include_str!("../../tests/fixtures/layout.json"),
+        include_str!("../../tests/fixtures/layout_ack.json"),
         include_str!("../../tests/fixtures/icon_get.json"),
         include_str!("../../tests/fixtures/press.json"),
         include_str!("../../tests/fixtures/result.json"),
@@ -514,6 +519,18 @@ mod tests {
     fn missing_tag_or_field_is_an_error() {
         assert!(serde_json::from_str::<Message>(r#"{"btn":"a"}"#).is_err());
         assert!(serde_json::from_str::<Message>(r#"{"t":"press","btn":"a"}"#).is_err());
+    }
+
+    #[test]
+    fn a_layout_ack_rev_must_be_a_non_negative_integer() {
+        let parse = |rev: &str| {
+            serde_json::from_str::<Message>(&format!(r#"{{"t":"layout_ack","rev":{rev}}}"#))
+        };
+        assert_eq!(parse("0").unwrap(), Message::LayoutAck { rev: 0 });
+        for bad in ["-1", "1.5", "\"2\"", "null", "4294967296"] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        assert!(serde_json::from_str::<Message>(r#"{"t":"layout_ack"}"#).is_err());
     }
 
     #[test]

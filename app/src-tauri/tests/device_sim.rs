@@ -1285,12 +1285,51 @@ async fn a_config_edit_reaches_a_connected_device_without_a_reconnect() {
     ));
     assert_eq!(
         daemon.events.recv().await.unwrap(),
-        DaemonEvent::LayoutPushed(DEVICE.into()),
+        DaemonEvent::LayoutPushed(DEVICE.into(), 2),
         "the window hears of the push"
     );
+    // A board from before layout_ack never answers, and the session goes on without an event.
     assert!(
         daemon.events.try_recv().is_err(),
         "the session was replaced"
+    );
+}
+
+fn layout_ack(rev: u32) -> Ws {
+    Ws::text(serde_json::to_string(&Message::LayoutAck { rev }).unwrap())
+}
+
+#[tokio::test]
+async fn a_layout_ack_is_announced_once_per_newer_rev_sent() {
+    let mut daemon = start().await;
+    let mut c = handshake(daemon.addr, DEVICE, &TOKEN).await;
+    assert_eq!(
+        daemon.events.recv().await.unwrap(),
+        DaemonEvent::DeviceConnected(DEVICE.into())
+    );
+    let edited = config_with("label = \"Hello\"", "label = \"Hi\"");
+    assert_eq!(daemon.reconfigure(&edited), Ok(true));
+    assert!(matches!(recv(&mut c).await, Message::Layout { rev: 2, .. }));
+    assert_eq!(
+        daemon.events.recv().await.unwrap(),
+        DaemonEvent::LayoutPushed(DEVICE.into(), 2)
+    );
+
+    // Revs never sent (0, 3) and ones no newer than the last ack (the second 2, then 1) are
+    // ignored. The first 2 counts.
+    for rev in [0, 3, 2, 2, 1] {
+        c.send(layout_ack(rev)).await.unwrap();
+    }
+    // The press result proves the daemon read every ack before it, since it handles frames in order.
+    c.send(press("hello", 1)).await.unwrap();
+    assert!(matches!(recv(&mut c).await, Message::Result { seq: 1, .. }));
+    assert_eq!(
+        daemon.events.recv().await.unwrap(),
+        DaemonEvent::LayoutApplied(DEVICE.into(), 2)
+    );
+    assert!(
+        daemon.events.try_recv().is_err(),
+        "only the first ack of a newer rev is announced"
     );
 }
 

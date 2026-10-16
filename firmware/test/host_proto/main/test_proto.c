@@ -289,6 +289,16 @@ void test_report_too_small_a_buffer_returns_zero(void)
     TEST_ASSERT_EQUAL_size_t(0, proto_build_report(json, 40, &r));
 }
 
+void test_layout_ack_carries_the_rev(void)
+{
+    size_t len = proto_build_layout_ack(json, sizeof(json), 7);
+    TEST_ASSERT_EQUAL_STRING("{\"t\":\"layout_ack\",\"rev\":7}", json);
+    TEST_ASSERT_EQUAL_size_t(strlen(json), len);
+    TEST_ASSERT_GREATER_THAN(0, proto_build_layout_ack(json, sizeof(json), UINT32_MAX));
+    TEST_ASSERT_EQUAL_STRING("{\"t\":\"layout_ack\",\"rev\":4294967295}", json);
+    TEST_ASSERT_EQUAL_size_t(0, proto_build_layout_ack(json, 10, 7));
+}
+
 void test_report_ack_valid_id_is_parsed(void)
 {
     const char *s = "{\"t\":\"report_ack\",\"id\":\"a1b2c3d4\"}";
@@ -514,6 +524,7 @@ void app_main(void)
     RUN_TEST(test_report_invalid_fields_are_refused);
     RUN_TEST(test_report_task_of_16_fits_and_17_does_not);
     RUN_TEST(test_report_too_small_a_buffer_returns_zero);
+    RUN_TEST(test_layout_ack_carries_the_rev);
     RUN_TEST(test_report_ack_valid_id_is_parsed);
     RUN_TEST(test_report_ack_bad_id_is_refused);
     RUN_TEST(test_general_unknown_t_is_parsed_as_unknown);

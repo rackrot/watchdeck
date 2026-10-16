@@ -21,7 +21,6 @@
 - Still untested on hardware, from earlier slices: the board recovering after the desktop's IP changes (S2), and a bad frame at the device's icon and tile parsers (S5, S6). `plans/hw-gaps.md` covers both: host parser tests, the fault harness and the firmware fixes are merged (ef09e32); the baseline run, flash, rerun and IP-change check wait on the user.
 - Open beyond v1:
   - Sentry error reporting (Backlog): planned in `plans/sentry.md`; S1–S4 merged (917a5ec), S5 held behind a live experiment
-  - the two S7 gaps still open, listed in "S9 results": no layout acknowledgement, and a deleted config is recreated only by a save
 
 ## Decisions
 
@@ -520,13 +519,17 @@ The review and the security audit found no blockers. These fixes followed:
 
 ### S9 results (2026-10-15)
 
-Closes the first three S7 gaps. The last two stay open.
+Closes the first three S7 gaps. The last two are resolved below, under "Layout ack and deleted config".
 
 - **`delete_secret(name)`:** `Configs::delete_secret` holds the config lock, refuses with the ids of the buttons whose action or tile source names the secret in `secret_headers` (`Config::secret_users`), else `Secrets::remove` rewrites `secrets.toml` through the same 0600 atomic write as `set`, then reloads. It checks the live config only: a file on disk that is not live and names the secret fails its next reload, which `config-status` reports. The Secrets page has a Remove button per row with an in-page confirm and the refusal inline.
 - **`list_icons`:** `Icons::list` returns the files in `icons/` with a valid name (`name_error`, so no hidden files), that are regular files, resolve inside the directory, and pass `read_image` and `decode`, which is what a configured icon must pass. The picker offers these, plus the selected button's own icon if its file is missing. The list is read on load and again after `import_icon`.
 - **`test_action(button)`:** `Devices::test_press` takes only a button id, claims the run through `Shared::begin_press` (the same code as a device press: live config, per-button slot, "already running", the global limit), runs it with the action's timeout and output caps, logs `test: ...` where a press logs `<device>: ...`, and pokes the button's tile. It returns `ActionResult` (`ok`, `code`, `summary`, `text`, `ms`), serialized as is. An unknown id is an error; "already running" and "busy" come back as results, as a device sees them. No `DaemonEvent` exists for presses, so there is none to send, and the result goes to no session. The button form's Test is off, with a hint, when the draft differs from `view.config` for that button or the id is not saved (`testBlock` in `saveflow.ts`).
 - **Tests:** Rust unit tests for `Secrets::remove`, `Configs::delete_secret` and `Icons::list`; `device_sim` checks that a test press runs the live action after a reconfigure, is refused while a device press runs, errors on an unknown id, and sends the device no frame; one TS test for `testBlock`.
 - **Save and delete:** `save` checks the config again once it holds the lock, so a save racing a delete of a secret it names is refused.
+- **Layout ack and deleted config (2026-10-16), the last two S7 gaps:**
+  - The board sends `layout_ack` `{rev}` after `ui_apply_layout` has built the grid and `sync_icons` has sent its `icon_get`. No `v` bump. The daemon ignores a rev it never sent or no newer than the last ack, and emits `DaemonEvent::LayoutApplied(device, rev)`. `LayoutPushed` now carries its rev too. `lib.rs` forwards both as `layout-pushed` and `layout-applied` with `{device, rev}`. The save bar says "layout sent to X" and upgrades to "layout applied on X" when an ack at or after that push names that rev or later (`pushOutcome`). A board without the ack stays at "sent".
+  - A config deleted while the app runs keeps the last good config live, and the next Save recreates the file. That is accepted behavior, documented in `site/src/config.md`.
+  - Not run on the board: the firmware change is built and unit-tested on the host only.
 
 ## 8. Testing
 

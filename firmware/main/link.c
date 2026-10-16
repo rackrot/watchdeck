@@ -1041,6 +1041,13 @@ static void handle_msg(const char *json, size_t len)
                 s.cbs.on_layout(&m->layout);
             }
             sync_icons(&m->layout);
+            // ui_apply_layout has built the grid and the icon request is out. Pictures still to come
+            // fill in later, so the ack means the buttons are on screen.
+            char ack[48];
+            size_t ack_len = proto_build_layout_ack(ack, sizeof(ack), m->layout.rev);
+            if (ack_len > 0) {
+                send_text(ack, ack_len, NULL);
+            }
         } else if (m->type == PROTO_MSG_RESULT && s.cbs.on_result) {
             s.cbs.on_result(&m->result);
         } else if (m->type == PROTO_MSG_TILE && s.cbs.on_tile) {

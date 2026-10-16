@@ -132,9 +132,17 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 loop {
                     match events.recv().await {
-                        Ok(DaemonEvent::LayoutPushed(device)) => {
-                            if let Err(e) = handle.emit("layout-pushed", device) {
+                        Ok(DaemonEvent::LayoutPushed(device, rev)) => {
+                            let payload = serde_json::json!({ "device": device, "rev": rev });
+                            if let Err(e) = handle.emit("layout-pushed", payload) {
                                 log::error!("emitting layout-pushed: {e}");
+                            }
+                            continue;
+                        }
+                        Ok(DaemonEvent::LayoutApplied(device, rev)) => {
+                            let payload = serde_json::json!({ "device": device, "rev": rev });
+                            if let Err(e) = handle.emit("layout-applied", payload) {
+                                log::error!("emitting layout-applied: {e}");
                             }
                             continue;
                         }

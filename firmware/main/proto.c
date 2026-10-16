@@ -208,6 +208,17 @@ size_t proto_build_press(char *buf, size_t buf_len, const char *btn, uint32_t se
     return print_into(root, buf, buf_len);
 }
 
+size_t proto_build_layout_ack(char *buf, size_t buf_len, uint32_t rev)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return 0;
+    }
+    cJSON_AddStringToObject(root, "t", "layout_ack");
+    cJSON_AddNumberToObject(root, "rev", rev);
+    return print_into(root, buf, buf_len);
+}
+
 // Copy a string field into dst. Missing or non-string fields return false. A value that does
 // not fit is truncated, or rejected when `exact` is set (ids must survive the round trip).
 static bool get_str(const cJSON *obj, const char *key, char *dst, size_t dst_len, bool exact)

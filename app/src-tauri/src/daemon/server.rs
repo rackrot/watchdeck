@@ -57,9 +57,12 @@ pub enum DaemonEvent {
     DeviceDisconnected(String),
     DevicePaired(String),
     DeviceForgotten(String),
-    /// A config change reached a connected device as a new layout. The first layout of a session
+    /// A config change reached a connected device as layout `rev`. The first layout of a session
     /// is not announced.
-    LayoutPushed(String),
+    LayoutPushed(String, u32),
+    /// The device built the grid of layout `rev`. Only a newer board sends the ack, and the first
+    /// layout's is announced too.
+    LayoutApplied(String, u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -713,6 +716,7 @@ where
     }
 
     let mut reports = 0;
+    let mut acked = 0;
     let (done_tx, mut done_rx) = mpsc::channel::<Done>(MAX_RUNNING);
     let idle = sleep(IDLE_TIMEOUT);
     tokio::pin!(idle);
@@ -734,7 +738,7 @@ where
                     rev += 1;
                     log::info!("{device}: pushing layout rev {rev}");
                     send(tx, &layout.message(rev)).await?;
-                    shared.emit(DaemonEvent::LayoutPushed(device.to_string()));
+                    shared.emit(DaemonEvent::LayoutPushed(device.to_string(), rev));
                     tiles.reset();
                     if let Some(kicked) = tiles.push(tx, &mut kick, &layout, &live).await? {
                         return end_kicked(tx, kicked, device).await;
@@ -793,6 +797,15 @@ where
                         log::info!("{device}: {btn:?}: {}", refused.summary);
                         send(tx, &result_message(btn, seq, refused)).await?;
                     }
+                }
+            }
+            Incoming::Msg(Message::LayoutAck { rev: applied }) => {
+                // A rev never sent, or no newer than the last ack, tells the window nothing.
+                if applied == 0 || applied > rev || applied <= acked {
+                    log::warn!("{device}: ignoring layout_ack for rev {applied} (sent {rev}, acked {acked})");
+                } else {
+                    acked = applied;
+                    shared.emit(DaemonEvent::LayoutApplied(device.to_string(), applied));
                 }
             }
             Incoming::Msg(Message::IconGet { ids }) => {

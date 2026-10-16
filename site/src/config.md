@@ -64,7 +64,7 @@ A version that breaks any rule on this page doesn't apply. The last good config 
 ```
 
 - If the file breaks a rule when the app starts, the device shows an empty grid until you fix it.
-- Deleting the file while the app runs keeps the last good config. The next start writes the default again.
+- Deleting the file while the app runs keeps the last good config. The next Save in the window recreates the file, and the next start writes the default again.
 
 ### Saving from the window
 

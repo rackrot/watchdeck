@@ -28,6 +28,7 @@ import SaveBar from "./SaveBar";
 import {
   diskChanged as diskMoved,
   isDirty,
+  type LayoutStamp,
   ownStatus,
   pushOutcome,
   replaceNotice,
@@ -37,6 +38,9 @@ import {
 
 /** A save reaches a connected device within this long, or the page says it didn't. */
 const PUSH_WITHIN_MS = 2000;
+
+/** Payload of `layout-pushed` and `layout-applied`. */
+type LayoutEvent = { device: string; rev: number };
 
 type Saved = {
   t0: number;
@@ -53,7 +57,8 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
   const [loadError, setLoadError] = useState("");
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState<Saved | null>(null);
-  const [pushes, setPushes] = useState<Record<string, number>>({});
+  const [pushes, setPushes] = useState<Record<string, LayoutStamp>>({});
+  const [applied, setApplied] = useState<Record<string, LayoutStamp>>({});
   const [late, setLate] = useState(false);
   const [onDisk, setOnDisk] = useState<ConfigStatus | null>(null);
   const [iconFiles, setIconFiles] = useState<string[]>([]);
@@ -107,8 +112,17 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
           setOnDisk(e.payload);
         }
       }),
-      listen<string>("layout-pushed", (e) =>
-        setPushes((p) => ({ ...p, [e.payload]: Date.now() })),
+      listen<LayoutEvent>("layout-pushed", (e) =>
+        setPushes((p) => ({
+          ...p,
+          [e.payload.device]: { at: Date.now(), rev: e.payload.rev },
+        })),
+      ),
+      listen<LayoutEvent>("layout-applied", (e) =>
+        setApplied((p) => ({
+          ...p,
+          [e.payload.device]: { at: Date.now(), rev: e.payload.rev },
+        })),
       ),
     ]);
     listeners.then(
@@ -262,7 +276,14 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
           setConfirming(false);
           setFormKey((k) => k + 1);
         }}
-        status={<SavedStatus saved={saved} pushes={pushes} late={late} />}
+        status={
+          <SavedStatus
+            saved={saved}
+            pushes={pushes}
+            applied={applied}
+            late={late}
+          />
+        }
       />
 
       {repair && (
@@ -383,25 +404,39 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
   );
 }
 
-/** What the last save did, and whether the devices it should reach were sent the layout. */
+/** What the last save did, and whether the devices it should reach were sent the layout and applied it. */
 function SavedStatus({
   saved,
   pushes,
+  applied,
   late,
 }: {
   saved: Saved | null;
-  pushes: Record<string, number>;
+  pushes: Record<string, LayoutStamp>;
+  applied: Record<string, LayoutStamp>;
   late: boolean;
 }) {
   if (!saved) {
     return <span className="chip offline">No changes</span>;
   }
   const lines = saved.targets.map((device) => {
-    const outcome = pushOutcome(pushes[device], saved.t0, late);
+    const outcome = pushOutcome(
+      pushes[device],
+      applied[device],
+      saved.t0,
+      late,
+    );
+    if (outcome.kind === "applied") {
+      return (
+        <span className="chip ok" key={device}>
+          layout applied on <span className="mono">{device}</span>
+        </span>
+      );
+    }
     if (outcome.kind === "sent") {
       return (
         <span className="chip ok" key={device}>
-          <span className="mono">{device}</span> sent the layout in {outcome.ms}{" "}
+          layout sent to <span className="mono">{device}</span> in {outcome.ms}{" "}
           ms
         </span>
       );

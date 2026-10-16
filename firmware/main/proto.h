@@ -160,6 +160,9 @@ size_t proto_build_pair_nonce(char *buf, size_t buf_len, const uint8_t n_dev[PRO
 /** Build icon_get for `n` ids. Returns the JSON length, or 0 if it does not fit in `buf`. */
 size_t proto_build_icon_get(char *buf, size_t buf_len, const uint8_t ids[][PROTO_ICON_ID_LEN], size_t n);
 
+/** Build layout_ack for the layout with revision `rev`. Returns the JSON length, or 0 if it does not fit in `buf`. */
+size_t proto_build_layout_ack(char *buf, size_t buf_len, uint32_t rev);
+
 /** Build a press message. Returns the JSON length, or 0 if it does not fit in `buf`. */
 size_t proto_build_press(char *buf, size_t buf_len, const char *btn, uint32_t seq);
 

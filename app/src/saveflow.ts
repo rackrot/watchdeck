@@ -76,18 +76,32 @@ export function testBlock(
 }
 
 export type PushOutcome =
+  | { kind: "applied"; ms: number }
   | { kind: "sent"; ms: number }
   | { kind: "waiting" }
   | { kind: "late" };
 
-/** Whether `device` was sent the layout a save caused: `at` is when it was announced, if it was. */
+/** A layout event for a device: when the window heard it, and the layout's rev. */
+export type LayoutStamp = { at: number; rev: number };
+
+/**
+ * Whether `device` was sent the layout a save caused, and whether it said it applied it. A board
+ * from before the ack never does, and stays "sent". An ack counts only if it came after this
+ * push and names this rev or a later one, so an earlier session's or save's ack can't claim it.
+ */
 export function pushOutcome(
-  at: number | undefined,
+  pushed: LayoutStamp | undefined,
+  applied: LayoutStamp | undefined,
   t0: number,
   late: boolean,
 ): PushOutcome {
-  if (at !== undefined && at >= t0) {
-    return { kind: "sent", ms: at - t0 };
+  if (pushed !== undefined && pushed.at >= t0) {
+    const ms = pushed.at - t0;
+    const acked =
+      applied !== undefined &&
+      applied.at >= pushed.at &&
+      applied.rev >= pushed.rev;
+    return { kind: acked ? "applied" : "sent", ms };
   }
   return late ? { kind: "late" } : { kind: "waiting" };
 }

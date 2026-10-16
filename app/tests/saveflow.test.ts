@@ -96,12 +96,41 @@ test("a button can be tested only when the draft matches the saved one", () => {
 });
 
 test("a push is sent, waiting or late", () => {
-  assert.deepEqual(pushOutcome(1300, 1000, false), { kind: "sent", ms: 300 });
+  const pushed = { at: 1300, rev: 2 };
+  assert.deepEqual(pushOutcome(pushed, undefined, 1000, false), {
+    kind: "sent",
+    ms: 300,
+  });
   assert.deepEqual(
-    pushOutcome(900, 1000, false),
+    pushOutcome({ at: 900, rev: 2 }, undefined, 1000, false),
     { kind: "waiting" },
     "before this save",
   );
-  assert.deepEqual(pushOutcome(undefined, 1000, false), { kind: "waiting" });
-  assert.deepEqual(pushOutcome(undefined, 1000, true), { kind: "late" });
+  assert.deepEqual(pushOutcome(undefined, undefined, 1000, false), {
+    kind: "waiting",
+  });
+  assert.deepEqual(pushOutcome(undefined, undefined, 1000, true), {
+    kind: "late",
+  });
+});
+
+test("an ack upgrades a push to applied only if it follows this push", () => {
+  const pushed = { at: 1300, rev: 2 };
+  const outcome = (applied: { at: number; rev: number }) =>
+    pushOutcome(pushed, applied, 1000, false).kind;
+  assert.equal(outcome({ at: 1350, rev: 2 }), "applied");
+  assert.equal(
+    outcome({ at: 1350, rev: 3 }),
+    "applied",
+    "a later rev covers it",
+  );
+  assert.equal(outcome({ at: 1350, rev: 1 }), "sent", "an earlier save's ack");
+  assert.equal(
+    outcome({ at: 1200, rev: 5 }),
+    "sent",
+    "an earlier session's ack",
+  );
+  assert.deepEqual(pushOutcome(undefined, { at: 1350, rev: 2 }, 1000, true), {
+    kind: "late",
+  });
 });
