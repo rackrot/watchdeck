@@ -12,15 +12,22 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# A zero-permission GitHub token (server-wide Forgejo variable) so mise gets
+# authenticated GitHub API rate limits.
+env:
+  MISE_GITHUB_TOKEN: ${{ vars.MISE_GITHUB_TOKEN }}
+
 jobs:
   lint:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: https://github.com/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+      - uses: https://github.com/jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          github_token: ${{ vars.MISE_GITHUB_TOKEN }}
       # clippy needs the Tauri system libs and runs in the app job; the gitleaks hook
       # only scans staged changes, so CI scans full history instead.
       - run: mise run lint
@@ -29,12 +36,24 @@ jobs:
       - run: gitleaks git --redact --no-banner
 
   firmware:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     container: espressif/idf:v6.1
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+      # The IDF image has git but no node, and forgejo-runner doesn't inject one,
+      # so JavaScript actions like checkout can't run here. Fetch the ref by hand.
+      - name: Check out
+        shell: bash
+        env:
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+        run: |
+          git init -q .
+          git config --global --add safe.directory "$PWD"
+          # Prefer the exact commit; fall back to the ref if the server refuses a SHA fetch.
+          git fetch -q --depth 1 "$REPO_URL" "$SHA" || git fetch -q --depth 1 "$REPO_URL" "$REF"
+          git checkout -q FETCH_HEAD
+          git log -1 --format='%H %s'
       # Container jobs bypass the image entrypoint, so export the IDF env by hand.
       - name: Build firmware
         shell: bash
@@ -54,21 +73,25 @@ jobs:
           timeout 60 build/host_proto.elf
 
   app:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: https://github.com/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install Tauri Linux dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          # Runner images may run as root without sudo.
+          SUDO=""
+          if [ "$(id -u)" -ne 0 ]; then SUDO="sudo"; fi
+          $SUDO apt-get update
+          $SUDO apt-get install -y --no-install-recommends \
             build-essential libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
             libayatana-appindicator3-dev librsvg2-dev
-      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+      - uses: https://github.com/jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
         with:
           install_args: rust node pnpm
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+          github_token: ${{ vars.MISE_GITHUB_TOKEN }}
+      - uses: https://github.com/Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: app/src-tauri -> target
       - run: pnpm install --frozen-lockfile
@@ -83,14 +106,15 @@ jobs:
         working-directory: app
 
   site:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     env:
       MISE_TASK_RUN_AUTO_INSTALL: "false"
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: https://github.com/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+      - uses: https://github.com/jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
         with:
           install_args: mdbook
+          github_token: ${{ vars.MISE_GITHUB_TOKEN }}
       - run: mise run site:build

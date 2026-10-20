@@ -78,11 +78,11 @@ dir = "{{config_root}}"
 run = '"$HOME/.espressif/python_env/idf6.1_py3.12_env/bin/python" app/src-tauri/examples/fault_capture.py'
 
 [tasks."site:build"]
-description = "Build the GitHub Pages site"
+description = "Build the docs site"
 run = "mdbook build site"
 
 [tasks."site:serve"]
-description = "Serve the GitHub Pages site locally"
+description = "Serve the docs site locally"
 run = "mdbook serve site --open"
 
 [tasks.lint]

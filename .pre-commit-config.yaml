@@ -71,14 +71,15 @@ repos:
       - id: actionlint
         name: actionlint
         language: system
-        entry: actionlint
-        files: ^\.github/workflows/.*\.ya?ml$
+        entry: actionlint -config-file .forgejo/actionlint.yaml
+        files: ^\.forgejo/workflows/.*\.ya?ml$
 
       - id: zizmor
         name: zizmor
         language: system
-        entry: zizmor
-        files: ^\.github/(workflows|actions)/.*\.ya?ml$
+        # Online audits can't resolve the full-URL `uses:` form; pinning is still checked.
+        entry: zizmor --no-online-audits
+        files: ^\.forgejo/(workflows|actions)/.*\.ya?ml$
 
       - id: shellcheck
         name: shellcheck

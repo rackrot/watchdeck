@@ -1,0 +1,6 @@
+# actionlint only knows GitHub's `owner/repo@ref` form for `uses:`. Forgejo also
+# accepts a full URL, which the workflow uses, so ignore that one complaint.
+paths:
+  .forgejo/workflows/**/*.yml:
+    ignore:
+      - 'specifying action ".*" in invalid format because owner and repo and ref should not be empty'

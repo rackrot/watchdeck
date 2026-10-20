@@ -8,8 +8,14 @@ A Stream Deck-style homelab controller: an Elecrow CrowPanel Advanced 10.1" ESP3
 |---|---|
 | `firmware/` | ESP-IDF v6.1 C project for the ESP32-P4 |
 | `app/` | Tauri 2 desktop app: React + TypeScript + Vite (pnpm), Rust in `app/src-tauri/` |
-| `site/` | mdBook site deployed to GitHub Pages (`https://rackrot.github.io/watchdeck/`) |
+| `site/` | mdBook docs site; moving to a separate repo |
 | `site/src/device-spec.md` | Hardware reference, transcribed from the vendor page |
+
+## Hosting
+
+- The repo lives on Forgejo at `https://git.voidrot.dev/rackrot/watchdeck` (remote `origin`). Issues, pull requests, releases and CI all happen there, and `#N` means a Forgejo issue or PR.
+- Use `fj`, the Forgejo MCP tools and the `forgejo-*` skills and agents (`forgejo-issues`, `forgejo-pr`, `forgejo-actions`, `forgejo-ship`, `forgejo-readme`, `renovate`). Never use `gh` or the GitHub skills (`gh-issues`, `gh-pr`, `gh-actions`, `ship`, `dependabot`, `gh-readme`) for this repo.
+- The `github` remote (`github.com/rackrot/watchdeck`) is the old home. Don't push to it or open issues or PRs there unless the user asks.
 
 ## Tooling
 
@@ -68,8 +74,12 @@ Add new tools to `mise.toml`, not to CI or the hooks. The hooks call the mise-pi
 
 ## CI
 
+- CI runs on Forgejo Actions. The workflow lives in `.forgejo/workflows/ci.yml`. Check runs with `fj` or the Forgejo MCP tools, and use the `forgejo-actions` skill (not `gh-actions`) to edit or debug it. Every job has `runs-on: ubuntu-latest`, which has to match a label registered on a runner at git.voidrot.dev.
+- Actions are referenced by full `https://github.com/...` URL, because short names only resolve against the instance's default actions host.
+- The `espressif/idf` image has no `node`, so the firmware job can't run JavaScript actions and checks out with plain `git`.
+- `MISE_GITHUB_TOKEN` comes from a server-wide Forgejo variable (`vars.`, not `secrets.`). It's a zero-permission GitHub token that only lifts mise's API rate limit, so it's a variable on purpose.
 - `ci.yml` runs four jobs: lint, firmware (in the `espressif/idf:v6.1` container), app (clippy plus a debug Tauri build), and site.
   - The lint job skips the clippy and gitleaks hooks. The app job runs clippy, and a separate step runs a full-history gitleaks scan.
-- `pages.yml` deploys `site/book` on pushes to `main` that touch `site/`.
+- The docs site will move to a separate repo, so nothing here deploys it. The `site` job only builds it.
 - Every action is pinned to a commit SHA with a version comment, and zizmor enforces this.
 - When bumping the ESP-IDF version, change `ESP_IDF_VERSION` in `mise.toml` and the container tag in `ci.yml` together.
