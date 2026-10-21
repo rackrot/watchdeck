@@ -1,3 +1,4 @@
 .vscode/mise-tools/
 site/book/
 .claude/worktrees/
+**/*.log
