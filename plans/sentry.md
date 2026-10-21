@@ -81,6 +81,82 @@ Run against `sentry.homelab.monster` (org `sentry`, project `watchdeck`), with `
     `debug_id` is the first 16 bytes of the build-id read as a little-endian GUID. `image_size` runs from the lowest PT_LOAD to the end of the highest one.
   - S5 is therefore buildable. The device report needs the build-id (or the daemon has to map `elf` to it) plus the image address and size from the ELF, and CI needs a debug-files upload.
 
+## S5 plan (2026-10-21)
+
+Planned by the architect after the live experiment, with an advisor self-critique. No second model reviewed it.
+
+### Outcome and done
+
+- A board crash event in Sentry shows `file:line` for both frames, PC and RA, matching `riscv32-esp-elf-addr2line`, whenever the crashed build's debug file was uploaded.
+- No protocol change, so `v` is unchanged. `same_build` still controls only `release`.
+- `watchdeck.elf` and `watchdeck.bin` stay byte-for-byte as today.
+- Only a debug-only copy is ever uploaded. It holds no Wi-Fi credentials and no `.rodata`.
+- Done when `cargo test` and CI are green, the CI structural check passes, and the manual acceptance passes.
+
+### Facts the design rests on
+
+- **The ELF hash.** `elf2image` hashes the whole ELF file after linking (esptool `cmds.py:3569`, IDF `project_include.cmake:541-546`). Stamping `watchdeck.elf` in place would change that stored hash and trigger a rebuild loop. So the stamp goes on a separate copy.
+- **The image base.** Sentry places the image at the first PT_LOAD of the debug file. Today that's `.spm` at `0x30100000`, which is also the lowest. The highest segment ends at `0x5010808c`. `image_addr = 0x30100000` and `image_size = 0x20010000` (up to the end of LP SRAM) are fixed by the P4 memory map. A build check guards both.
+- **The debug id.** It's the first 16 bytes of the build-id read as a little-endian GUID, which is `debugid::DebugId::from_guid_age(&b[..16], 0)`.
+- **What the crate emits** (sentry-types 0.49.3).
+  - A `DebugImage::Symbolic` serializes as `type: symbolic` with `name`, `id` and `arch: null`, not probe A's `elf` and `debug_id`.
+  - Stacktraces have no `instruction_addr_adjustment`, so `auto` applies.
+  - Events default to `platform: other`, but only `native` events get symbolicated.
+  - Slice 0 tests the first two points.
+- **The debug-only copy** (`objcopy --only-keep-debug`) keeps the segment addresses and drops the Wi-Fi password, and `addr2line` still resolves against it.
+- **Local builds.** The board runs local builds, which carry `sdkconfig.defaults.local`, absolute paths and the compile time. So a CI-built ELF never matches a flashed board, and the local upload (`fw:symbols`) is the main path.
+
+### Decisions
+
+1. **Build-id.** It's the first 20 bytes of SHA-256(`watchdeck.elf`), which is `elf[..40]` from the report. The daemon derives `code_id` and `debug_id` from the report's `elf` and adds the fixed image range. The device and the protocol don't change.
+2. **The stamp.** A CMake custom command in `firmware/CMakeLists.txt`, with `OUTPUT build/watchdeck.debug.elf`, `DEPENDS` on the ELF, and `ALL`. It runs a new `firmware/tools/stamp_build_id.py` with `${CMAKE_OBJCOPY}`, which takes an `--only-keep-debug` copy and adds a non-ALLOC GNU build-id note. The note layout is from sentry-micro (MIT, credited). `watchdeck.elf` is never touched, so there's no boot risk.
+3. **CI.** The IDF container has no node and no mise, so CI downloads the pinned `sentry` binary and checks its SHA-256. The same version is pinned in `mise.toml`. The upload runs only on pushes to main, takes the token from `secrets.` through `env:`, and skips with no token.
+4. **Local upload.** `mise run fw:symbols` uploads only `build/watchdeck.debug.elf`. Sentry doesn't re-symbolicate past events, so upload before the crash happens.
+5. **Every `crash`** gets `debug_meta` whatever `same_build` says. A `reset` never does. Builds from before S5 show a "missing debug file" note.
+
+### Slices
+
+| # | Slice | Files | Acceptance | Agent |
+|---|---|---|---|---|
+| 0 | Probe C (gate) | scratchpad only | A debug-only copy, stamped with build-id = SHA-256 prefix, is uploaded. One event in the crate's exact shape (`native`, `symbolic`, frames `[RA, PC]`, no adjustment) resolves both frames to the `addr2line` lines. If `auto` shifts the PC line, pick the fallback (pre-adjusting in the daemon) before slice 2. If the `symbolic` shape is refused, redesign | manual |
+| 1 | Stamp a debug copy and add the upload task | `firmware/CMakeLists.txt`, new `firmware/tools/stamp_build_id.py`, `mise.toml` (`sentry` pin, `fw:symbols`), `.gitignore` (`mise.local.toml`) | The debug copy's note equals sha256(`watchdeck.elf`)[..20]. Every PT_LOAD has `p_filesz == 0`. `watchdeck.elf` has no note. A shifted first PT_LOAD fails the build | coder-high |
+| 2 | Daemon `debug_meta` | `daemon/reporting.rs` | A crash gets `platform=native` and one image. A test pins probe A's build-id → debug id pair. A reset gets no image. The scrubber leaves the image intact | coder |
+| 3 | CI structural check | `.forgejo/workflows/ci.yml` | Checks the build-id = SHA prefix, `filesz` 0, the bin's ELF SHA = `sha256sum`, and no note in `watchdeck.elf` | coder-high |
+| 4 | CI upload (optional) | `ci.yml`, Forgejo secret | Uploads on a push to main, and skips cleanly with no token or on a PR | coder-high |
+| 5 | Docs | `site/src/protocol.md`, `site/src/config.md`, `CLAUDE.md` | Docs match the code | scribe |
+
+**Manual acceptance:**
+1. Build with `CONFIG_WATCHDECK_TEST_CRASH=y`, run `fw:symbols`, then flash.
+2. Check that the event shows the `test_crash_cb` line for the PC and the right RA line, with no processing errors.
+3. Flash the normal build back.
+
+### Rejected
+
+- **Stamp `watchdeck.elf` in place:** changes the stored hash and causes a rebuild loop, and risks the boot.
+- **Build-id in the report:** the device can't read a non-ALLOC note, and it means a protocol change.
+- **A daemon lookup:** the daemon has neither the ELF nor an API token.
+- **Upload the full ELF:** it leaks the Wi-Fi credentials.
+- **npm or mise in the IDF container:** neither is there.
+
+### Risks
+
+- **The crate's shape doesn't resolve.** Slice 0 gates everything.
+- **The first PT_LOAD moves.** The build fails, and the constant and the check change together.
+- **Sentry refuses the debug-only copy.** Slice 0 tests it.
+- **Issues regroup once frames are named.** That's expected.
+- **Home-dir paths in the DWARF.** `CONFIG_APP_REPRODUCIBLE_BUILD` is an option.
+
+### Incident: Wi-Fi password in the probe upload
+
+The 2026-10-21 experiment uploaded a full `watchdeck.elf`, which contains the Wi-Fi password from `sdkconfig.defaults.local`, as `project_debug_file/1`. The local full copies were deleted, and the remaining scratch copy is debug-only. On the user's decision the server copy was deleted the same day (`DELETE …/files/dsyms/?id=1`), and the project now lists no debug files.
+
+### User decisions (2026-10-21)
+
+1. The leaked debug file was deleted.
+2. The CI upload (slice 4) is deferred. Build slices 0–3 and 5.
+3. `fw:flash` runs `fw:symbols` first whenever `SENTRY_ORG` is set, and skips it otherwise.
+4. `CONFIG_APP_REPRODUCIBLE_BUILD=y` goes in its own commit after acceptance, with a reflash.
+
 ## Goal and definition of done
 
 - Sentry reports are opt-in. They cover daemon errors and panics, webview errors, and board crashes and abnormal resets.
