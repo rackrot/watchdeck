@@ -158,6 +158,8 @@ The 2026-10-21 experiment uploaded a full `watchdeck.elf`, which contains the Wi
 3. `fw:flash` runs `fw:symbols` first whenever `SENTRY_ORG` is set, and skips it otherwise.
 4. `CONFIG_APP_REPRODUCIBLE_BUILD=y` goes in its own commit after acceptance, with a reflash.
 
+Note for slice 4: `mise.toml` pins `npm:sentry` 0.47.0, because getsentry's GitHub release binaries stop at 0.45.0. The `espressif/idf` container has no node, so Decision 3's "download the pinned binary, same version as mise" can't hold as written. Pick another install route before building slice 4.
+
 ## Goal and definition of done
 
 - Sentry reports are opt-in. They cover daemon errors and panics, webview errors, and board crashes and abnormal resets.

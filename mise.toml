@@ -15,6 +15,9 @@ shellcheck = "0.11.0"
 yamllint = "1.38.0"
 gitleaks = "8.30.1"
 prek = "0.5.5"
+# The `sentry` npm package, getsentry's new CLI (not the older sentry-cli). fw:symbols uses it. It
+# comes from npm because its GitHub binaries stop at 0.45.0.
+"npm:sentry" = "0.47.0"
 
 [env]
 ESP_IDF_VERSION = "v6.1"
@@ -34,10 +37,38 @@ description = "Build the firmware"
 dir = "firmware"
 run = '. "$IDF_PATH/export.sh" >/dev/null && idf.py build'
 
+# Uploads only the debug-only copy, never watchdeck.elf, which holds the Wi-Fi password. Sentry
+# doesn't re-symbolicate past events, so run it before the crash. Set the target in the environment
+# or in the gitignored mise.local.toml, never here:
+#   [env]
+#   SENTRY_ORG = "..."
+#   SENTRY_PROJECT = "..."
+# and log in once with `mise exec -- sentry auth login`.
+[tasks."fw:symbols"]
+description = "Upload firmware/build/watchdeck.debug.elf to Sentry (needs SENTRY_ORG, SENTRY_PROJECT)"
+dir = "{{config_root}}"
+run = '''
+debug=firmware/build/watchdeck.debug.elf
+[ -f "$debug" ] || { echo "fw:symbols: $debug is missing. Run mise run fw:build first." >&2; exit 1; }
+[ -n "${SENTRY_ORG:-}" ] && [ -n "${SENTRY_PROJECT:-}" ] || { echo "fw:symbols: set SENTRY_ORG and SENTRY_PROJECT in the environment or mise.local.toml." >&2; exit 1; }
+[ firmware/build/watchdeck.elf -nt "$debug" ] && { echo "fw:symbols: $debug is older than watchdeck.elf. Run mise run fw:build first." >&2; exit 1; }
+# stdin is /dev/null so a missing login fails instead of prompting
+sentry debug-files upload "$debug" </dev/null
+'''
+
+# Builds, then with SENTRY_ORG set uploads the symbols, then flashes. A failed upload warns and the
+# flash still runs. Port args after `--` land on the last line, which is the flash.
 [tasks."fw:flash"]
-description = "Flash the firmware"
+description = "Build and flash the firmware (uploads symbols between the two when SENTRY_ORG is set)"
 dir = "firmware"
-run = '. "$IDF_PATH/export.sh" >/dev/null && idf.py flash'
+run = '''
+. "$IDF_PATH/export.sh" >/dev/null || exit 1
+idf.py build || exit 1
+if [ -n "${SENTRY_ORG:-}" ]; then
+  mise run fw:symbols || echo "fw:flash: symbol upload failed, flashing anyway." >&2
+fi
+idf.py flash
+'''
 
 [tasks."fw:monitor"]
 description = "Open the serial monitor"
