@@ -119,13 +119,14 @@ Planned by the architect after the live experiment, with an advisor self-critiqu
 | # | Slice | Files | Acceptance | Agent |
 |---|---|---|---|---|
 | 0 | Probe C (gate) | scratchpad only | A debug-only copy, stamped with build-id = SHA-256 prefix, is uploaded. One event in the crate's exact shape (`native`, `symbolic`, frames `[RA, PC]`, no adjustment) resolves both frames to the `addr2line` lines. If `auto` shifts the PC line, pick the fallback (pre-adjusting in the daemon) before slice 2. If the `symbolic` shape is refused, redesign | manual |
-| 1 | Stamp a debug copy and add the upload task | `firmware/CMakeLists.txt`, new `firmware/tools/stamp_build_id.py`, `mise.toml` (`sentry` pin, `fw:symbols`), `.gitignore` (`mise.local.toml`) | The debug copy's note equals sha256(`watchdeck.elf`)[..20]. Every PT_LOAD has `p_filesz == 0`. `watchdeck.elf` has no note. A shifted first PT_LOAD fails the build | coder-high |
+| 1 | Stamp a debug copy and add the upload task | `firmware/CMakeLists.txt`, new `firmware/tools/stamp_build_id.py`, `mise.toml` (`sentry` pin, `fw:symbols`), `.gitignore` (`mise.local.toml`) | The debug copy's note is the first 20 bytes of the SHA-256 of `watchdeck.elf`. Every PT_LOAD has `p_filesz == 0`. `watchdeck.elf` has no note. A shifted first PT_LOAD fails the build | coder-high |
 | 2 | Daemon `debug_meta` | `daemon/reporting.rs` | A crash gets `platform=native` and one image. A test pins probe A's build-id → debug id pair. A reset gets no image. The scrubber leaves the image intact | coder |
 | 3 | CI structural check | `.forgejo/workflows/ci.yml` | Checks the build-id = SHA prefix, `filesz` 0, the bin's ELF SHA = `sha256sum`, and no note in `watchdeck.elf` | coder-high |
 | 4 | CI upload (optional) | `ci.yml`, Forgejo secret | Uploads on a push to main, and skips cleanly with no token or on a PR | coder-high |
 | 5 | Docs | `site/src/protocol.md`, `site/src/config.md`, `CLAUDE.md` | Docs match the code | scribe |
 
 **Manual acceptance:**
+
 1. Build with `CONFIG_WATCHDECK_TEST_CRASH=y`, run `fw:symbols`, then flash.
 2. Check that the event shows the `test_crash_cb` line for the PC and the right RA line, with no processing errors.
 3. Flash the normal build back.
