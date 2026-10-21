@@ -18,7 +18,13 @@
 - CI is green through c9e9fe9: lint, firmware, app (clippy, `cargo test`, `pnpm test`, debug Tauri build) and site.
 - v1 is done: S7 and S8 passed their manual checks on 2026-10-15, S8 on a release build with autostart.
 - The tray needs `libayatana-appindicator` installed on the desktop (Arch: `pacman -S libayatana-appindicator`). Without it the app panics at startup.
-- Still untested on hardware, from earlier slices: the board recovering after the desktop's IP changes (S2), and a bad frame at the device's icon and tile parsers (S5, S6). `plans/hw-gaps.md` covers both: host parser tests, the fault harness and the firmware fixes are merged (ef09e32); the baseline run, flash, rerun and IP-change check wait on the user.
+- The two gaps that earlier slices left untested on hardware are now covered by `plans/hw-gaps.md`:
+  - **Desktop IP change (S2).** Passed on 2026-10-21, both phases.
+  - **Bad frames at the icon, tile and layout parsers (S5, S6).** Passed on the Oct 16 00:31 build, which includes ef09e32. Every harness case, the leak check and pairing mode were graded from the serial logs.
+    - What appeared on screen wasn't checked.
+    - The baseline on the old firmware covered only L4 and I13.
+    - The P5 wedge is accepted.
+  - The stall F1 is accepted by design: a live peer that stalls mid-frame still wedges the board until a reboot.
 - Open beyond v1:
   - Sentry error reporting (Backlog): planned in `plans/sentry.md`; S1–S4 merged (917a5ec), S5 held behind a live experiment
 

@@ -1,6 +1,6 @@
 # Hardware gaps: bad frames at the device parsers, desktop IP change
 
-Closes the two items in `plans/desktop-app-v1.md:20`.
+Closes the two hardware gaps listed in the Status section of `plans/desktop-app-v1.md`.
 
 ## Goal and done
 
@@ -204,6 +204,93 @@ Closes the two items in `plans/desktop-app-v1.md:20`.
 - Update `plans/desktop-app-v1.md:20`.
 - Add a line to `CLAUDE.md` Hardware facts about F1.
 - In `site/src/protocol.md`, note that the device drops fragmented frames.
+
+## Baseline results (S3)
+
+Graded 2026-10-21 from `baseline.log` (repo root; `*.log` is gitignored, so the four logs exist only on the devbox), the 2026-10-16 capture of the Oct 10 20:05 build, before S4 and S5. The run held only two cases, L4 and I13. Graded with `--check baseline.log --cases L4,I13`: L4 PASS, I13 INFO, no fault markers. A plain `--check baseline.log` fails every other case with "found 0 of 1", because they were never sent.
+
+| Id | Expected | Seen | Verdict |
+|---|---|---|---|
+| I1–I9 | Dropped with their messages | Not in the log | Not run |
+| I10, I11, I12 | I10 closes. I11 may lose the close (F5). I12 caches X (F4) | Not in the log | Not run |
+| I13 | Link task wedges (F1), reboot with RTS | Mark at 271700 (line 245). Press `plain` sent at 274680, press `ic` at 276080 only reached the UI. At 276680 `Could not lock ws-client within 200 timeout`, then `link lost: send failed` (lines 250–251). No `retry in` line follows, unlike a normal drop (lines 212–213). Nothing more until the operator's POWERON (line 254) | Wedged as expected. F1 confirmed |
+| I13b | Not expected on this build | Not in the log | Not run |
+| T1–T9 | As in the case table | Not in the log | Not run |
+| L1–L3 | Watch for a crash or garbage (F2) | Not in the log | Not run |
+| L4 | Board waits forever (F3) | Hello at 33210, mark at 33510, then nothing until the late `welcome` at 93310, 60 s later (lines 223–226). No `no welcome`, no `link lost`. The session then worked: layout applied, icon fetched | Waited as expected. F3 confirmed |
+
+S3's acceptance asked for F1 to F5 confirmed or refuted on hardware. Only F1 and F3 were tested on the old build.
+
+## After-fix results (S6)
+
+Graded 2026-10-21 from `after.log`, the Oct 16 00:31 build with S4 and S5, using `--check after.log --after-s5`. The grader passes every case and finds no fault markers. Its I13 is INFO by design. Line numbers are in `after.log`; it holds raw non-UTF-8 bytes, so read it with `grep -a`.
+
+| Id | Expected | Seen | Verdict |
+|---|---|---|---|
+| I1 | "shorter than its header", link up | Line 213 | Pass |
+| I2 | Dropped | "binary frame is not an icon", line 246 | Pass |
+| I3 / I4 | "outside 1..256" | Lines 279, 312 | Pass |
+| I5 / I6 | "should be N bytes" | "should be 40 bytes, got 41" / "got 39", lines 345, 378 | Pass |
+| I7 | "does not match its pixels" | Line 411 | Pass |
+| I8 | "was not requested" | Line 435 | Pass |
+| I9 | "already cached" | Line 450 | Pass |
+| T1 | "no such tile button" | Line 466 | Pass |
+| T2 | Ignored | "tile for plain ignored: no such tile button", line 482 | Pass |
+| T3 | "dropped unparsable message", previous value stays | `keep` sent, then `text` 5 dropped (lines 497–500). The screen is not in the log | Pass (log only) |
+| T4 | First 64 characters shown | Tile received, not dropped (line 515). Screen not in the log | Pass (log only) |
+| T5 | Grey for all three | All three received, none dropped (lines 530–532). Screen not in the log | Pass (log only) |
+| T6 | Dropped | "dropped unparsable message", line 549 | Pass |
+| T7 | `?` on screen | Received, not dropped (line 564). Screen not in the log | Pass (log only) |
+| T8 | Plan table: ignored | Tile `early` between `welcome` and layout (line 694), no "ignored" line. It applied to the grid kept from the last session. The grader expects this (`cases.rs` T8 note); the plan table is wrong | Pass. The table's "Ignored" is stale |
+| T9 | Applied | Received with `trailing` after the JSON, not dropped (line 579) | Pass |
+| L1 | `?` at the end of the label | Layout rev 33 applied, no crash (lines 594–597). Liveness icon fetched after. Screen not in the log | Pass (log only) |
+| L2 | Same as L1 | Label `AAAA` plus byte 0xF0 (line 615), rev 99 applied (line 618), no crash | Pass (log only) |
+| L3 | Status line ends in `?` | `welcome` with 46 `A` plus `é` (line 636). The `status:` log line ends in a lone 0xC3 (line 637), so `get_str` cut the character as F2 says. That line is logged before `copy_printable`; the screen is not in the log. No crash | Pass (log only) |
+| I12 | Fragment dropped (after S5) | `fragmented message dropped` at 62242 (line 663). The icon was cached only from the whole frame sent after it (line 664). No "already cached" | Pass. F4 fixed |
+| I10 | Link closes, new hello within 20 s | `exceeds 262168, closing` and `link lost: bad frame` at 71092 (lines 716–717). Next hello at 75882, about 5 s later | Pass |
+| I11 | Link closes (after S5) | 20 `was not requested` lines, `exceeds 262168, closing` at 78012 among them (line 759), `link lost: bad frame` at 78082 (line 773) after the queue drained. No "event queue full" | Pass. F5 fixed |
+| L4 | Board gives up and retries (after S5) | Hello at 90122, mark at 90202, `link lost: no welcome` at 105202 (line 821), 15 s after the hello (`CONNECT_TIMEOUT_MS`). Reconnected at 110432 and the next session worked | Pass. F3 fixed |
+| I13 | A live peer still wedges the link task | Mark at 322922 (line 855). Press `ic` sent at 325662, `Could not lock ws-client` and `link lost: send failed` at 327662 (lines 859–860), no `retry in` after. Operator POWERON at line 863 | Wedged, as expected with keepalive only |
+| I13b | Keepalive aborts within about 20 s, reconnect once the rule is removed | Mark at 18362 (line 1069). `read error -0x004C` at 44592, `link lost: connection closed` at 44612, then `retry in` (lines 1071–1078). The link task did not wedge. The 26 s from the mark includes the operator's time to install the nft rule, which the log can't separate, so it fits a 20 s keepalive. Discovery then failed for about 52 min (`pinned daemon not found`, 30 s backoff) while the rule stayed in place. After removal: candidate at 3149522, `connected` at 3150002, layout and icon fetch worked (lines 4195–4221) | Pass. F1 fixed for a vanished peer. The 52 min is operator time, not a board fault |
+
+No crash, panic or unplanned reset anywhere in the log. The only resets are the operator's POWERON for I13.
+
+### Leak check
+
+From `leak.log`, same build, `--check leak.log --leak --after-s5`: all 21 leak cases (I1–I9, I12, T1–T7, T9, L1–L3) pass and there are no fault markers. Each case ran once as a warm-up and then 20 times in each of three rounds: every per-case outcome line appears 61 times (1 + 3 × 20). Each sample is the `heap before connect` line after the round's `LEAK<n>` marker.
+
+| Round | Line | Internal free | Internal min | PSRAM free |
+|---|---|---|---|---|
+| LEAK0 (warm-up) | 700 | 351467 | 301432 | 32101936 |
+| LEAK1 | 4638 | 351487 | 301432 | 32101936 |
+| LEAK2 | 8577 | 351487 | 301012 | 32101936 |
+| LEAK3 | 12516 | 350975 | 301004 | 32101936 |
+
+- Internal free moved +20, 0, then −512 bytes. One step down is not a trend.
+- PSRAM free is the same in every round.
+- **Verdict: pass.** No leak. If a later run wants to rule out a slow leak of about 500 bytes per round, it needs more rounds.
+
+### Pairing mode
+
+From `pairing.log`, same build, `--check pairing.log --pairing --after-s5`. The operator held Forget pairing (line 207) before the run. The harness sent the cases in the order P1, P2, P4, P3, P5, and this log has no end markers.
+
+| Id | Expected | Seen | Verdict |
+|---|---|---|---|
+| P1 | Offer with 46 `A` plus `é` accepted, name ends in `?` | Offer received (line 220), `pair_nonce` sent (line 221). `pairing code 203612` at line 226. The status log line names the daemon with a lone 0xC3 at the end (line 227); the screen is not in the log. No crash. The grader marks P1 FAIL because the code line comes after the P2 marker, which the harness sends between `pair_offer` and `pair_reveal` | Pass. The grader FAIL is a stretch-boundary artifact |
+| P2 | Binary frame refused, attempt goes on | `binary frame of 10 bytes refused, this client takes text only` (line 224). The reveal and code followed | Pass |
+| P4 | Forged `pair_result` ok; tap No; board stays unpaired | `pair_result` ok (line 230), the board asked the person (line 231), `cancelled: the person said No` (line 233). It sent a fresh `pair_req` at the next attempt (line 241) | Pass |
+| P3 | Oversize text closes the attempt | `frame of 20018 bytes exceeds 16384, closing`, `pairing failed: bad frame` (lines 244–246) | Pass |
+| P5 | Header, 1,000 bytes, silence | `pairing with fault-harness failed: timed out` at 224232 (line 256), 130 s after the request (`PAIR_TIMEOUT_MS`). The `status: pairing failed:` line that `pair_failed` logs after `end_attempt` never came (compare P3, line 246), so the link task wedged in the drop. Operator POWERON at line 259 | Wedged. This is F1 on the pairing socket, the residual accepted in open question 2 |
+
+- **Unpaired after the forged result and the No:** yes. No save happened after the No, and after the reboot the board logged `not paired` (line 388) and found the harness open for pairing again.
+
+### Findings on hardware
+
+- **F1**: confirmed on hardware (baseline I13). Fixed for a peer that vanishes (S6 I13b; also IP-change Phase B). Not fixed for a live stalled peer, by choice: S6 I13 and pairing P5 still wedge until a reboot.
+- **F2**: the cut lead byte is confirmed on hardware (S6 L3 and P1 log lines end in a lone 0xC3). The LVGL over-read was never tested, since baseline L1–L3 were not run. Fixed as far as the log shows: L1–L3 and P1 apply with no crash. The `?` on screen is not in the log.
+- **F3**: confirmed on hardware (baseline L4 waited 60 s). Fixed (S6 L4 gave up after 15 s and reconnected).
+- **F4**: not confirmed on hardware, since baseline I12 was not run. Fixed (S6 I12 dropped the fragment).
+- **F5**: not confirmed on hardware, since baseline I11 was not run. Fixed as far as S6 I11 shows: the close came through after 20 queued frames. The old build was never shown to lose it.
 
 ## IP-change procedure
 

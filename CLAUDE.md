@@ -56,6 +56,7 @@ Add new tools to `mise.toml`, not to CI or the hooks. The hooks call the mise-pi
 - The C6 runs ESP-Hosted slave 2.12.3 and the host is 3.0.9. Hosted logs a "major version mismatch" line, which is only advisory. Don't OTA the C6 without asking.
 - The icon cache lives in PSRAM, so a reset (an RTS pulse included) empties it. To check that a reconnect hits the cache, restart the daemon and leave the board running.
 - `monitor` needs a real TTY. Without one, read the boot log with pyserial from the IDF Python env (`~/.espressif/python_env/idf6.1_py3.12_env/bin/python`). Opening the port doesn't reliably reset the board. To capture a boot, pulse RTS as esptool's hard reset does: DTR off, RTS on for 100 ms, then RTS off.
+- The esp_websocket_client receive loop can keep running with its lock held when a peer sends part of a frame and then stalls. Tearing the client down (`esp_websocket_client_destroy` in `drop_client`, `link.c`) then waits on the websocket task and blocks the link task indefinitely. TCP keepalive in `open_client` (idle 5 s, interval 5 s, count 3) drops a peer that has vanished in about 20 s; on 2026-10-21 the link dropped 19 s after the desktop's address went away. A live peer that stalls mid-frame still wedges the board until a reboot. That's accepted, with no vendored patch: it takes a daemon bug or an unauthenticated peer on the pairing socket. Don't remove the keepalive settings. To recover a wedged board, pulse RTS, which keeps the pairing.
 
 ## Daemon facts
 

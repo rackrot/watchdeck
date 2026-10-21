@@ -143,6 +143,7 @@ The daemon stores its side before the user answers, so a No leaves a token hash 
 - Messages are JSON in text frames. Every message has a string field `t` that names its type.
 - Each message is a single frame of at most 16 KB in either direction, on both ports. The receiver closes the connection on anything larger.
 - The one exception is an [icon frame](#icon-frames), a binary frame from the daemon to the device of at most 262,168 bytes. The device never sends binary frames, and the daemon answers one with `error` `bad_request` and a close.
+- Fragmented messages aren't supported. The device drops every frame without FIN, both the first fragment and its continuation frames, so the daemon must send each message as one frame. The device logs `fragmented message dropped` for the first fragment and keeps the link up, so the message gets no reply.
 - Both sides ignore unknown fields. An unknown `t` is logged and ignored.
 - Liveness uses WebSocket ping frames. The device pings every 10 s and drops the link after 25 s without a pong. The daemon drops a session that has been silent for over 30 s.
 - If the link drops, the device reconnects:
