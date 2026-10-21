@@ -12,7 +12,7 @@
 | S6 Tiles | ✅ | 1d05fdf | — |
 | S7 Config UI | ✅ manual check passed 2026-10-15 | c9e9fe9 | — |
 | S8 App shape | ✅ manual check passed 2026-10-15 | e709869, 37016e3, merged in ceb6f62 | — |
-| S9 S7 gaps (secret delete, `list_icons`, `test_action`) | Built, reviewed, audited | 028f50e, 6061b3e | The user's window check |
+| S9 S7 gaps (secret delete, `list_icons`, `test_action`) | ✅ manual check passed 2026-10-21 | 028f50e, 6061b3e, b823af9, 09c6a16 | — |
 
 - Every slice passed `review` and, where it touches security, `security-auditor`. Each fix round then got its own review.
 - CI is green through c9e9fe9: lint, firmware, app (clippy, `cargo test`, `pnpm test`, debug Tauri build) and site.
@@ -529,7 +529,8 @@ Closes the first three S7 gaps. The last two are resolved below, under "Layout a
 - **Layout ack and deleted config (2026-10-16), the last two S7 gaps:**
   - The board sends `layout_ack` `{rev}` after `ui_apply_layout` has built the grid and `sync_icons` has sent its `icon_get`. No `v` bump. The daemon ignores a rev it never sent or no newer than the last ack, and emits `DaemonEvent::LayoutApplied(device, rev)`. `LayoutPushed` now carries its rev too. `lib.rs` forwards both as `layout-pushed` and `layout-applied` with `{device, rev}`. The save bar says "layout sent to X" and upgrades to "layout applied on X" when an ack at or after that push names that rev or later (`pushOutcome`). A board without the ack stays at "sent".
   - A config deleted while the app runs keeps the last good config live, and the next Save recreates the file. That is accepted behavior, documented in `site/src/config.md`.
-  - Not run on the board: the firmware change is built and unit-tested on the host only.
+  - On the board (the Oct 16 00:31 build): the save bar went from "layout sent to" to "layout applied on" after a label edit, and the board showed the new label.
+- **Window check, passed 2026-10-21:** the user ran all four parts. (A) Remove was refused, naming the buttons, for a secret a button uses; an unused secret was removed and `secrets.toml` stayed 0600. (B) The picker listed every valid file in `icons/`, and an import appeared at once. (C) Test ran a saved action with nothing sent to the board, was disabled with a hint while the button had unsaved edits, and a second quick press returned "already running". (D) The layout ack, above.
 
 ## 8. Testing
 

@@ -2,9 +2,9 @@
 
 ## Status (2026-10-16)
 
-S1 to S4 are built, reviewed and merged (S4 at 917a5ec, not yet flashed). The live-DSN checks are still to do, and they need the user's Sentry project.
+S1 to S4 are built, reviewed and merged (S4 at 917a5ec). The live checks passed on 2026-10-21 (see "Live checks" below), apart from `kind=reset` on hardware and a webview rejection.
 
-S5 is on hold behind a live experiment, decided by the user 2026-10-16. Sentry's `symbolic` library has no RISC-V `Arch` (`EM_RISCV` maps to `Unknown`; `symbolic-debuginfo/src/elf.rs`, `symbolic-common/src/types.rs` on master, checked 2026-10-16), so resolving a P4 PC in Sentry is UNCONFIRMED. The experiment: upload one build-id-stamped `watchdeck.elf` with `sentry-cli debug-files upload`, send one hand-made event whose `debug_meta` names that build-id with `arch` omitted, and check whether a known PC resolves to file:line. Build S5 only if it does; otherwise drop it and keep `addr2line` as the way to read PCs. Decisions settled 2026-10-15 by the user: 1(a) device reports via the daemon, 2(b) `tauri-plugin-sentry` for the webview, 3(a), 4(a), 5(b) build S5 symbolication, 6(a). The `sentry` crate is approved. Build S1 to S5 in order.
+The S5 experiment passed on 2026-10-21: Sentry resolved a P4 PC to `file:line` (see "Live checks"). S5 can be built once the user gives the go-ahead. Earlier history: S5 was put on hold behind this live experiment, decided by the user 2026-10-16. Sentry's `symbolic` library has no RISC-V `Arch` (`EM_RISCV` maps to `Unknown`; `symbolic-debuginfo/src/elf.rs`, `symbolic-common/src/types.rs` on master, checked 2026-10-16), so resolving a P4 PC in Sentry is UNCONFIRMED. The experiment: upload one build-id-stamped `watchdeck.elf` with `sentry-cli debug-files upload`, send one hand-made event whose `debug_meta` names that build-id with `arch` omitted, and check whether a known PC resolves to file:line. Build S5 only if it does; otherwise drop it and keep `addr2line` as the way to read PCs. Decisions settled 2026-10-15 by the user: 1(a) device reports via the daemon, 2(b) `tauri-plugin-sentry` for the webview, 3(a), 4(a), 5(b) build S5 symbolication, 6(a). The `sentry` crate is approved. Build S1 to S5 in order.
 
 ### S1 results
 
@@ -39,6 +39,47 @@ Done: `report` and `report_ack` (`daemon/protocol.rs`, `site/src/protocol.md`, `
 - The device id goes in `user.id`, only with `pii`.
 - The frames are `[ra, pc]`, since Sentry reads the last frame as the crash site.
 - `device_sim` with Sentry on uses a loopback DSN with nothing listening. It shows the ack doesn't depend on the budget, not that an event arrives.
+
+### Live checks (2026-10-21)
+
+Run against `sentry.homelab.monster` (org `sentry`, project `watchdeck`), with `[sentry] dsn` and no `pii`, on a release build (`panic = "abort"`, `strip = true`). A temporary, uncommitted hook in `lib.rs` (`WATCHDECK_TEST_SENTRY`) logged a forced `error!` and then panicked. The build also turned on tauri's `devtools` feature temporarily. Both were reverted afterwards. The self-hosted instance took several minutes to show the events.
+
+- **Daemon `error!` (S1), passed.** WATCHDECK-4, two events. The message arrived as `home ~/x, ip <ip>, device <device>, quoted ""`, so the home dir, IP, `wd-` id and quoted text were all scrubbed. Release `watchdeck@0.1.0`, environment `production`. No `server_name` or user.
+- **Release-build panic (S1), passed.** WATCHDECK-5, `level=fatal`, `mechanism=panic`, message scrubbed the same way. It was delivered even though the abort followed. Its 12 frames are `<unknown>`, as expected with `strip = true` (open question 3(a)). The abort also wrote a 6 GB `core.<pid>` to the working directory, which was deleted.
+- **Webview (S2), passed for a throw and a `captureException`.**
+  - The window loaded under the release CSP with `window.Sentry` defined and no CSP errors. That settles the CSP point that was UNCONFIRMED.
+  - A thrown error (WATCHDECK-3, `mechanism=instrument`, message scrubbed to `~/x <ip>`) and `captureException` (WATCHDECK-2) arrived. Both were tagged `component=ui` with `platform` `other`, and had no `request`.
+  - `Promise.reject(...)` typed at the devtools console produced no event. The console may count it as handled, so this is not yet a defect.
+- WATCHDECK-1 is a hand-sent curl probe from the diagnosis made while the events were still delayed. It can be resolved.
+- **Board crash (S4), passed on 2026-10-21 with `app:dev` (debug daemon).** The firmware was built from main with `CONFIG_WATCHDECK_TEST_CRASH=y` set only in the generated `sdkconfig`, then flashed back to the normal build afterwards.
+  - The NULL store crashed the `esp_timer` task (`StoreAccessFault`). The dump took 14,944 bytes of the 512K partition, and the panic logged no space error.
+  - On reboot the board sent report `66cc138c`, the daemon logged its warn line and acked, and the board logged `acked`.
+  - WATCHDECK-6: `fatal`, `component=firmware`, tags `cause`, `elf` and `reset_reason=panic`, release `watchdeck-firmware@0.2.0` (`same_build` true), two frames (RA, PC), and no device id or daemon host contexts.
+  - The issue has two events. The daemon was restarted between them, and the per-device cap is in memory.
+- **No ack, then delivery, passed.** With the daemon stopped, the dump survived two power-on resets (`pending crash report 66cc138c` each boot), then went out and was acked within 0.3 s of the daemon's return. This stands in for "an older daemon". An actual pre-S3 daemon was not run.
+- **Forget pairing erases the dump, passed.** With report `66cc138c` pending and no daemon running, a 2 s hold on Forget pairing unpaired the board. The next reset found no core dump and nothing pending.
+- **Pairing survives the reflash, passed.** The Oct 16 build first added the coredump partition, and the board stayed paired across it and both flashes today.
+- **Not run on hardware: `kind=reset`.** A panic always writes a dump, there is no safe way to cause a brownout, and no test option causes an RTC watchdog reset.
+- **S5 experiment: a P4 PC resolves (2026-10-21).**
+  - A copy of `firmware/build/watchdeck.elf` was stamped with a non-ALLOC GNU build-id note and uploaded with the `sentry` CLI (`debug-files upload`). The server lists it as `project_debug_file/1` with debug info, symbols and unwind info.
+  - Two hand-made native events named PC `0x4001b650`, with `arch` omitted.
+  - Probe A (WATCHDECK-8) set `image_addr` to the lowest PT_LOAD (`0x30100000`) and `image_size` to cover every segment. It resolved to `crash_init` at `crash.c:146`, which matches `riscv32-esp-elf-addr2line` exactly. The event had no processing errors.
+  - Probe B (WATCHDECK-7) set `image_addr` to the `.flash.text` segment (`0x40000020`). The debug file was found, but the frame stayed unresolved. So the image must be described from the lowest load address.
+  - Probe A's event body, for S5 to reuse:
+
+    ```json
+    {"platform": "native", "level": "error", "message": "S5 symbolication probe A",
+     "exception": {"values": [{"type": "S5Probe", "value": "…",
+       "stacktrace": {"instruction_addr_adjustment": "none",
+                      "frames": [{"instruction_addr": "0x4001b650"}]}}]},
+     "debug_meta": {"images": [{"type": "elf",
+       "code_id": "868b6b30c9142abce6ed9d831d7334841c52c47a",
+       "debug_id": "306b8b86-14c9-bc2a-e6ed-9d831d733484",
+       "code_file": "watchdeck.elf", "image_addr": "0x30100000", "image_size": 536936448}]}}
+    ```
+
+    `debug_id` is the first 16 bytes of the build-id read as a little-endian GUID. `image_size` runs from the lowest PT_LOAD to the end of the highest one.
+  - S5 is therefore buildable. The device report needs the build-id (or the daemon has to map `elf` to it) plus the image address and size from the ELF, and CI needs a debug-files upload.
 
 ## Goal and definition of done
 

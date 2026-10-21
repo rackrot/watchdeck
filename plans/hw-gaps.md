@@ -247,6 +247,21 @@ Report Phase A and Phase B separately. Phase B mid-transfer is harness case I13b
 - `sudo nft delete table inet wdtest`
 - `sudo ip addr del NEW/24 dev enp11s0`
 
+### Results (2026-10-21)
+
+Run with the tray app in `app:dev`, the board on the Oct 16 00:31 build (the S4 and S5 fixes plus the coredump partition), board `192.168.0.56`, `NEW` = `192.168.0.250`. The ufw rule is `47820,47821/tcp ALLOW IN 192.168.0.0/24`, a source match. The times come from the sudo journal and the daemon log; board ticks were mapped to wall time through the clock tile. Serial capture: the scratchpad `ipchange.log` from that session.
+
+- **Phase A: passed in 5 s** (target 30 s).
+  - 15:15:13: address added, and avahi registered it at once.
+  - 15:15:30: reject rule added. The board's next ping got the reset (`read error -0x0050`, `link lost: connection closed`) within about 1 s.
+  - Discovery listed `.250` first and then `.80`. The board connected to `192.168.0.250` 399 ms after starting, and logged `welcome` at about 15:15:35. The daemon logged `reconnected, replacing its old session` at 15:15:35.
+  - Icons came from the cache and `layout_ack` was sent. A press at 15:16:19 returned its result in 11 ms. The user confirmed `ss` and a nft counter above 0.
+- **Phase B: passed in about 24 s** (target 90 s).
+  - 15:16:51: rule removed. 15:16:55: address deleted, and avahi withdrew it.
+  - About 15:17:14, 19 s after the delete: the board logged `read error -0x004C`, then `link lost`. That matches the S5 TCP keepalive (5 s idle + 3 × 5 s), well ahead of the 25 s ping timeout. The daemon dropped its half at 15:17:17 (`silent for 30s`).
+  - Discovery now listed only `.80`, with no stale candidate. `welcome` came at about 15:17:19, and tiles flowed again at once. A press at 15:22:45 returned `exit 0` in 11 ms over the `.80` session.
+- No reboot in either phase. The internal heap before connecting was the same both times (342611 free).
+
 ## Risks
 
 | Risk | Mitigation |
