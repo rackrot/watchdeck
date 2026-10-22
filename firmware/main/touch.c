@@ -15,6 +15,7 @@
 #define TOUCH_RST_GPIO 40 // active low
 #define TOUCH_INT_GPIO 42 // no pull-up fitted, so the GT911 is polled
 #define TOUCH_I2C_HZ 400000
+#define TOUCH_READ_MS 10 // a GT911 read is about 3 short I2C transfers at 400 kHz, roughly 1 to 2 ms
 #define TOUCH_H_RES 1024
 #define TOUCH_V_RES 600
 
@@ -94,7 +95,13 @@ esp_err_t touch_init(lv_display_t *disp)
     ESP_GOTO_ON_ERROR(esp_lcd_touch_new_i2c_gt911(io, &tp_cfg, &tp), err, TAG, "gt911");
 
     const lvgl_port_touch_cfg_t lv_cfg = {.disp = disp, .handle = tp};
-    ESP_GOTO_ON_FALSE(lvgl_port_add_touch(&lv_cfg), ESP_FAIL, err, TAG, "lvgl_port_add_touch failed");
+    lv_indev_t *indev = lvgl_port_add_touch(&lv_cfg);
+    ESP_GOTO_ON_FALSE(indev, ESP_FAIL, err, TAG, "lvgl_port_add_touch failed");
+    // The INT pin is not usable, so LVGL polls. Its default period is LV_DEF_REFR_PERIOD (33 ms), too slow to see a
+    // fast flick move between samples.
+    lvgl_port_lock(0);
+    lv_timer_set_period(lv_indev_get_read_timer(indev), TOUCH_READ_MS);
+    lvgl_port_unlock();
 
     ESP_LOGI(TAG, "GT911 at 0x%02x, %dx%d, swap_xy=%d mirror_x=%d mirror_y=%d, registered with LVGL", addr, TOUCH_H_RES,
              TOUCH_V_RES, TOUCH_SWAP_XY, TOUCH_MIRROR_X, TOUCH_MIRROR_Y);

@@ -30,7 +30,16 @@ _Static_assert(GRID_SCREEN_W == DISPLAY_H_RES && GRID_SCREEN_H == DISPLAY_V_RES,
 #define LICENSES_W 220
 #define LICENSES_H 34
 #define LICENSES_Y 72
-#define SWIPE_LOCK_WARN_MS 100     // a page build holding the model lock longer than this could cost a frame
+#define SWIPE_LOCK_WARN_MS 100 // a page build holding the model lock longer than this could cost a frame
+// A touch that moves further than this in either axis between press and release was a drag, not a tap. 20 px is under a
+// third of the smallest cell (8x5 grid, 119x65 px), well above finger jitter on a tap, and under the 50 px at which
+// LVGL itself calls a gesture.
+#define DRAG_PX 20
+// A drag that LVGL missed as a gesture (it zeroes its sum on any read that moves under 3 px) still turns the page when
+// it went this far sideways and mostly sideways. On the board (S8, 8x5 grid) short flicks came in at 24 to 50 px; 40 px
+// turns the longer of those into page turns and keeps a 20 to 39 px slide as "nothing", neither a press nor a page.
+#define DRAG_SWIPE_PX 40
+#define DRAG_SWIPE_RATIO 2         // |dx| must exceed this times |dy|
 #define ROW_W (DISPLAY_H_RES - 80) // labels and buttons of the pairing views
 #define ROW_H 76
 
@@ -345,10 +354,71 @@ static void expire_pending(void)
     }
 }
 
+static void swipe_page(void *user_data);
+
+// Where the one live touch began, where it was last seen, and its largest excursion from the start on each axis. Only
+// the LVGL task touches these. The release read can repeat a stale point, so the end comes from PRESSING reads.
+static lv_point_t s_touch_start, s_touch_end;
+static int s_touch_max_dx, s_touch_max_dy;
+static uint32_t s_touch_samples, s_touch_start_tick;
+
+static void touch_track(lv_event_t *e)
+{
+    lv_point_t p;
+    lv_indev_get_point(lv_indev_active(), &p);
+    if (lv_event_get_code(e) == LV_EVENT_PRESSED) {
+        s_touch_start = p;
+        s_touch_max_dx = s_touch_max_dy = 0;
+        s_touch_samples = 0;
+        s_touch_start_tick = lv_tick_get();
+    }
+    s_touch_samples++;
+    s_touch_end = p;
+    s_touch_max_dx = LV_MAX(s_touch_max_dx, LV_ABS(p.x - s_touch_start.x));
+    s_touch_max_dy = LV_MAX(s_touch_max_dy, LV_ABS(p.y - s_touch_start.y));
+}
+
+// Reads per touch show whether a fast flick is being sampled often enough to see it move.
+static void touch_log(const char *what)
+{
+    ESP_LOGI(TAG, "touch on %s: %u samples in %u ms, max %d,%d net %d,%d", what, (unsigned)s_touch_samples,
+             (unsigned)lv_tick_elaps(s_touch_start_tick), s_touch_max_dx, s_touch_max_dy,
+             s_touch_end.x - s_touch_start.x, s_touch_end.y - s_touch_start.y);
+}
+
+// Called where a click would act. Returns true when the touch was a drag, so no press may follow. A gesture LVGL
+// recognised never gets here: lv_indev_wait_release makes indev_proc_release skip RELEASED and CLICKED for that touch
+// (lv_indev.c:1518-1530, 1551-1575), so one touch steps at most once.
+static bool drag_consumed(const char *what)
+{
+    const int dx = s_touch_end.x - s_touch_start.x;
+    const int dy = s_touch_end.y - s_touch_start.y;
+    // The largest excursion, not the net move, so a slide that returns to its start is still no tap.
+    if (s_touch_max_dx <= DRAG_PX && s_touch_max_dy <= DRAG_PX) {
+        return false;
+    }
+    ESP_LOGI(TAG, "drag on %s ignored", what);
+    touch_log(what);
+    if (LV_ABS(dx) >= DRAG_SWIPE_PX && LV_ABS(dx) > DRAG_SWIPE_RATIO * LV_ABS(dy)) {
+        s_swipe_tick = lv_tick_get();
+        lv_async_call(swipe_page, (void *)(intptr_t)(dx < 0 ? 1 : -1));
+    }
+    return true;
+}
+
+static void grid_click(lv_event_t *e)
+{
+    (void)e;
+    drag_consumed("grid");
+}
+
 static void cell_event(lv_event_t *e)
 {
     const size_t i = (size_t)(intptr_t)lv_event_get_user_data(e);
     const char *id = s_ids[i];
+    if (drag_consumed(id)) {
+        return;
+    }
     if (!s_online) {
         ESP_LOGW(TAG, "tap on %s ignored, daemon offline", id);
         return;
@@ -365,6 +435,7 @@ static void cell_event(lv_event_t *e)
         p->sent_tick = lv_tick_get();
         strlcpy(p->name, s_labels[i][0] ? s_labels[i] : id, sizeof(p->name));
         ESP_LOGI(TAG, "press %s seq %u", id, (unsigned)seq);
+        touch_log(id);
     }
 }
 
@@ -388,8 +459,6 @@ esp_err_t ui_init(lv_display_t *disp)
     lvgl_port_unlock();
     return ESP_OK;
 }
-
-static void swipe_page(void *user_data);
 
 // A swipe anywhere on the grid, whatever it started on. The release must press nothing, an outward swipe at either end
 // included. The rebuild waits for lv_async_call, so the pressed widget isn't deleted inside its own event.
@@ -416,6 +485,9 @@ static void build_grid(const proto_layout_t *l, uint8_t pages)
     // Children bubble gestures by default (lv_obj.c), so a swipe that starts on a button lands here.
     lv_obj_set_gesture_bubble(s_grid, false);
     lv_obj_add_event_cb(s_grid, grid_gesture, LV_EVENT_GESTURE, NULL);
+    lv_obj_add_event_cb(s_grid, touch_track, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(s_grid, touch_track, LV_EVENT_PRESSING, NULL);
+    lv_obj_add_event_cb(s_grid, grid_click, LV_EVENT_CLICKED, NULL);
     lv_obj_set_size(s_grid, DISPLAY_H_RES, DISPLAY_V_RES - GRID_TOP);
     lv_obj_set_pos(s_grid, 0, GRID_TOP);
     lv_obj_set_scrollable(s_grid, false);
@@ -456,6 +528,8 @@ static void build_grid(const proto_layout_t *l, uint8_t pages)
         lv_obj_set_pos(btn, GRID_GAP + b->col * (cell_w + GRID_GAP), b->row * (cell_h + GRID_GAP));
         // A tile is grey until its first value arrives.
         lv_obj_set_style_bg_color(btn, b->tile ? tile_bg(PROTO_TILE_UNKNOWN, b->bg) : lv_color_hex(b->bg), 0);
+        lv_obj_add_event_cb(btn, touch_track, LV_EVENT_PRESSED, NULL);
+        lv_obj_add_event_cb(btn, touch_track, LV_EVENT_PRESSING, NULL);
         lv_obj_add_event_cb(btn, cell_event, LV_EVENT_CLICKED, (void *)(intptr_t)i);
         // The icon, once it arrives, goes above the label.
         lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_COLUMN);
