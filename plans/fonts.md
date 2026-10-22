@@ -310,7 +310,7 @@ Run with the tray app in `app:dev` and serial capture on. Don't edit under `app/
 
 - **Acceptance**: every step passes, and the plan records the measured image size, font total, heap lines and photos.
 
-#### S5 as run (2026-10-22, firmware and app at 23ad7ba)
+#### S5 as run (2026-10-22, firmware and app from the fonts S4 commit)
 
 - Step 1 was skipped: the board was flashed before a baseline was taken, so there are no before-flash heap lines to compare.
 - Step 2: the flash kept NVS and the pairing, and the board reconnected without pairing again. The image is 1,853,792 bytes (under 2.1 MB). The font total is 157,171 bytes (S2 note). After the first layout, LVGL used 18,036 of 62,604 bytes at most, and min free internal heap was 300,060.
