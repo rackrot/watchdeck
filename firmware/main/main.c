@@ -10,6 +10,7 @@
 #include "crash.h"
 #include "display.h"
 #include "link.h"
+#include "model.h"
 #include "sdcard.h"
 #include "touch.h"
 #include "ui.h"
@@ -80,11 +81,12 @@ void app_main(void)
         ESP_LOGE(TAG, "wifi_start: %s", esp_err_to_name(err));
     }
 
-    // The link waits for an IP itself, so it starts even if wifi_start failed.
+    // The link waits for an IP itself, so it starts even if wifi_start failed. It needs the model, which the UI reads.
     const link_cbs_t link_cbs = {
         .on_status = ui_set_daemon_text,
-        .on_layout = ui_apply_layout,
+        .on_set = ui_show_set,
         .on_icon = ui_set_icon,
+        .on_icons_settled = ui_icons_settled,
         .on_down = ui_link_down,
         .on_result = ui_show_result,
         .on_tile = ui_set_tile,
@@ -93,8 +95,10 @@ void app_main(void)
         .on_pair_code = ui_show_pair_code,
         .on_pair_confirm = ui_show_pair_confirm,
     };
-    err = link_start(&link_cbs);
+    err = model_init();
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "model_init: %s, so no link", esp_err_to_name(err));
+    } else if ((err = link_start(&link_cbs)) != ESP_OK) {
         ESP_LOGE(TAG, "link_start: %s", esp_err_to_name(err));
     }
 

@@ -11,7 +11,9 @@
 #include "font_licenses.h"
 #include "fonts.h"
 #include "grid.h"
+#include "icons.h"
 #include "link.h"
+#include "model.h"
 
 _Static_assert(GRID_SCREEN_W == DISPLAY_H_RES && GRID_SCREEN_H == DISPLAY_V_RES, "grid.h assumes the 1024x600 screen");
 
@@ -39,7 +41,7 @@ static lv_obj_t *s_usb_label;
 static lv_obj_t *s_touch_label;
 static lv_obj_t *s_daemon_label;
 
-static lv_obj_t *s_grid;      // NULL until the first layout
+static lv_obj_t *s_grid;      // the page on screen, NULL until the first set
 static lv_obj_t *s_pair_view; // unpaired: the daemon list, the pairing code, or its question
 static lv_obj_t *s_forget;    // shown while paired
 static lv_obj_t *s_licenses;  // the font license viewer on the top layer, NULL while closed
@@ -52,13 +54,15 @@ static lv_obj_t *s_result_summary;
 static lv_obj_t *s_result_text;
 static lv_timer_t *s_result_timer;
 
-// Written and read under the LVGL lock, which also covers the tap callbacks.
+// Written and read under the LVGL lock, which also covers the tap callbacks. The s_ids to s_cell_bgs arrays describe
+// the page on screen.
 static bool s_online;
 static bool s_heap_logged;
 static uint32_t s_seq;
 static struct {
     uint32_t seq;
     uint32_t sent_tick;
+    char name[PROTO_ID_MAX]; // the button's label, else its id, so the result names it after the page has changed
 } s_pending[MAX_PENDING];
 static size_t s_n_pending;
 static char s_ids[PROTO_MAX_BUTTONS][PROTO_ID_MAX];
@@ -203,22 +207,12 @@ static void copy_printable(char *dst, size_t dst_len, const char *src)
     dst[i] = '\0';
 }
 
-// The label of button `id` in the grid, or `id` itself if the grid no longer has it.
-static const char *button_name(const char *id)
-{
-    for (size_t i = 0; i < s_n_buttons; i++) {
-        if (strcmp(s_ids[i], id) == 0 && s_labels[i][0]) {
-            return s_labels[i];
-        }
-    }
-    return id;
-}
-
-static void show_result(const proto_result_t *r)
+// `button` names the pressed button: its label when it had one, else its id.
+static void show_result(const proto_result_t *r, const char *button)
 {
     const char *verdict = r->ok ? "OK" : "Failed";
-    char name[PROTO_ID_MAX]; // button_name falls back to the raw id
-    copy_printable(name, sizeof(name), button_name(r->btn));
+    char name[PROTO_ID_MAX];
+    copy_printable(name, sizeof(name), button);
     if (name[0]) {
         lv_label_set_text_fmt(s_result_title, "%s: %s", name, verdict);
     } else {
@@ -351,7 +345,8 @@ static void expire_pending(void)
 
 static void cell_event(lv_event_t *e)
 {
-    const char *id = s_ids[(intptr_t)lv_event_get_user_data(e)];
+    const size_t i = (size_t)(intptr_t)lv_event_get_user_data(e);
+    const char *id = s_ids[i];
     if (!s_online) {
         ESP_LOGW(TAG, "tap on %s ignored, daemon offline", id);
         return;
@@ -363,7 +358,10 @@ static void cell_event(lv_event_t *e)
     }
     uint32_t seq = ++s_seq;
     if (link_press(id, seq) == ESP_OK) {
-        s_pending[s_n_pending++] = (typeof(s_pending[0])){seq, lv_tick_get()};
+        typeof(s_pending[0]) *p = &s_pending[s_n_pending++];
+        p->seq = seq;
+        p->sent_tick = lv_tick_get();
+        strlcpy(p->name, s_labels[i][0] ? s_labels[i] : id, sizeof(p->name));
         ESP_LOGI(TAG, "press %s seq %u", id, (unsigned)seq);
     }
 }
@@ -389,7 +387,9 @@ esp_err_t ui_init(lv_display_t *disp)
     return ESP_OK;
 }
 
-static void build_grid(const proto_layout_t *l)
+// Replace the grid with page `l` of a set of `pages`. With 2 or more pages the cells give up a strip at the bottom for
+// "Page x of y". The grid keeps its full height either way, and never scrolls.
+static void build_grid(const proto_layout_t *l, uint8_t pages)
 {
     if (s_grid) {
         lv_obj_delete(s_grid);
@@ -398,9 +398,20 @@ static void build_grid(const proto_layout_t *l)
     lv_obj_remove_style_all(s_grid);
     lv_obj_set_size(s_grid, DISPLAY_H_RES, DISPLAY_V_RES - GRID_TOP);
     lv_obj_set_pos(s_grid, 0, GRID_TOP);
+    lv_obj_set_scrollable(s_grid, false);
 
     // The daemon sizes icons to what is left (icons.rs box_px), so both sides use grid_geometry.
-    const grid_geometry_t geo = grid_geometry(l->cols, l->rows, false);
+    const grid_geometry_t geo = grid_geometry(l->cols, l->rows, pages >= 2);
+    if (pages >= 2) {
+        // A child of the grid, so it dims with it and goes with it. Not clickable, so a press on it lands on the grid.
+        lv_obj_t *pager = lv_label_create(s_grid);
+        lv_obj_set_size(pager, DISPLAY_H_RES, SLOT24_H);
+        lv_obj_set_pos(pager, 0, geo.grid_h);
+        lv_obj_set_style_text_align(pager, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(pager, wd_font(l->font, WD_SLOT_24), 0);
+        lv_obj_set_style_text_color(pager, lv_palette_lighten(LV_PALETTE_GREY, 2), 0);
+        lv_label_set_text_fmt(pager, "Page %u of %u", (unsigned)l->page + 1, (unsigned)pages);
+    }
     const int cell_w = geo.cell_w;
     const int cell_h = geo.cell_h;
     const int line_h = SLOT32_H;
@@ -468,19 +479,85 @@ static void build_grid(const proto_layout_t *l)
     }
 }
 
-void ui_apply_layout(const proto_layout_t *layout)
+// Under the LVGL lock: show `dsc` above the label of button `i` on screen.
+static void show_icon(size_t i, const lv_image_dsc_t *dsc)
 {
-    lvgl_port_lock(0);
-    build_grid(layout);
-    s_online = true;
+    if (!s_cell_icons[i]) {
+        s_cell_icons[i] = lv_image_create(s_cells[i]);
+        lv_obj_move_to_index(s_cell_icons[i], 0);
+    }
+    lv_image_set_src(s_cell_icons[i], dsc);
+}
+
+// Under the LVGL lock: show a tile's value on tile button `i` on screen.
+static void show_tile(size_t i, const proto_tile_t *t)
+{
+    char text[PROTO_TILE_MAX];
+    copy_printable(text, sizeof(text), t->text);
+    for (char *c = text; *c; c++) {
+        if (*c == '\n') {
+            *c = ' '; // one line
+        }
+    }
+    lv_label_set_text(s_cell_values[i], text);
+    lv_obj_set_style_bg_color(s_cells[i], tile_bg(t->state, s_cell_bgs[i]), 0);
+}
+
+// Under the LVGL lock, then the model lock: build the page shown from the model's set, with the icons and tile values
+// the model already holds. Leaves s_online alone, and dims the page while the link is down. Returns its index.
+static uint8_t build_page(void)
+{
+    const uint8_t shown = model_shown();
+    build_grid(model_page(shown), model_pages());
+    for (size_t i = 0; i < s_n_buttons; i++) {
+        const lv_image_dsc_t *dsc = s_has_icon[i] ? icons_find(s_icon_ids[i]) : NULL;
+        if (dsc) {
+            show_icon(i, dsc);
+        }
+        const proto_tile_t *t = s_cell_values[i] ? model_tile(s_ids[i]) : NULL;
+        if (t) {
+            show_tile(i, t);
+        }
+    }
+    lv_obj_set_style_opa(s_grid, s_online ? LV_OPA_COVER : LV_OPA_30, 0);
+    return shown;
+}
+
+// One line to compare memory at the same point across runs: the LVGL pool, then the internal and PSRAM heaps.
+static void log_heap(const char *when)
+{
     lv_mem_monitor_t mem;
+    lvgl_port_lock(0);
     lv_mem_monitor(&mem);
     lvgl_port_unlock();
-    ESP_LOGI(TAG, "LVGL heap: %u of %u bytes used now, %u at most, %u%% fragmented",
-             (unsigned)(mem.total_size - mem.free_size), (unsigned)mem.total_size, (unsigned)mem.max_used,
-             (unsigned)mem.frag_pct);
-    ESP_LOGI(TAG, "layout rev %u applied: %ux%u, %u buttons", (unsigned)layout->rev, layout->cols, layout->rows,
-             (unsigned)layout->n_buttons);
+    ESP_LOGI(TAG,
+             "LVGL heap (%s): %u of %u bytes used now, %u at most, %u%% fragmented, largest free %u; internal free %u "
+             "min %u largest %u; PSRAM free %u min %u largest %u",
+             when, (unsigned)(mem.total_size - mem.free_size), (unsigned)mem.total_size, (unsigned)mem.max_used,
+             (unsigned)mem.frag_pct, (unsigned)mem.free_biggest_size,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+}
+
+void ui_show_set(void)
+{
+    lvgl_port_lock(0);
+    s_online = true; // the link applies a set only on a live session
+    model_lock();
+    const uint8_t shown = build_page();
+    const uint32_t rev = model_rev();
+    const uint8_t pages = model_pages();
+    const proto_layout_t *page = model_page(shown);
+    const unsigned cols = page->cols, rows = page->rows, buttons = page->n_buttons;
+    model_unlock();
+    lvgl_port_unlock();
+    ESP_LOGI(TAG, "layout rev %u: %u page%s applied, showing page %u (%ux%u, %u buttons)", (unsigned)rev, pages,
+             pages == 1 ? "" : "s", shown + 1, cols, rows, buttons);
+    log_heap("page built");
     if (!s_heap_logged) {
         s_heap_logged = true;
         ESP_LOGI(TAG, "first layout applied, min free internal heap %u bytes",
@@ -488,18 +565,18 @@ void ui_apply_layout(const proto_layout_t *layout)
     }
 }
 
+void ui_icons_settled(void)
+{
+    log_heap("icons settled");
+}
+
 void ui_set_icon(const uint8_t id[PROTO_ICON_ID_LEN], const lv_image_dsc_t *dsc)
 {
     lvgl_port_lock(0);
     for (size_t i = 0; i < s_n_buttons; i++) {
-        if (!s_has_icon[i] || memcmp(s_icon_ids[i], id, PROTO_ICON_ID_LEN) != 0) {
-            continue;
+        if (s_has_icon[i] && memcmp(s_icon_ids[i], id, PROTO_ICON_ID_LEN) == 0) {
+            show_icon(i, dsc);
         }
-        if (!s_cell_icons[i]) {
-            s_cell_icons[i] = lv_image_create(s_cells[i]);
-            lv_obj_move_to_index(s_cell_icons[i], 0);
-        }
-        lv_image_set_src(s_cell_icons[i], dsc);
     }
     lvgl_port_unlock();
 }
@@ -511,18 +588,10 @@ void ui_set_tile(const proto_tile_t *t)
     while (i < s_n_buttons && strcmp(s_ids[i], t->btn) != 0) {
         i++;
     }
-    if (i == s_n_buttons || !s_cell_values[i]) {
-        ESP_LOGW(TAG, "tile for %s ignored: no such tile button", t->btn);
+    if (i < s_n_buttons && s_cell_values[i]) {
+        show_tile(i, t);
     } else {
-        char text[PROTO_TILE_MAX];
-        copy_printable(text, sizeof(text), t->text);
-        for (char *c = text; *c; c++) {
-            if (*c == '\n') {
-                *c = ' '; // one line
-            }
-        }
-        lv_label_set_text(s_cell_values[i], text);
-        lv_obj_set_style_bg_color(s_cells[i], tile_bg(t->state, s_cell_bgs[i]), 0);
+        ESP_LOGD(TAG, "tile for %s stored, its page isn't on screen", t->btn);
     }
     lvgl_port_unlock();
 }
@@ -545,15 +614,19 @@ void ui_show_result(const proto_result_t *r)
     while (i < s_n_pending && s_pending[i].seq != r->seq) {
         i++;
     }
-    if (i == s_n_pending) {
+    const bool known = i < s_n_pending;
+    if (!known) {
         ESP_LOGW(TAG, "result for unknown seq %u ignored", (unsigned)r->seq);
     } else {
+        show_result(r, s_pending[i].name);
         s_pending[i] = s_pending[--s_n_pending];
-        show_result(r);
         ESP_LOGI(TAG, "result seq %u %s code %d in %u ms: %s", (unsigned)r->seq, r->ok ? "ok" : "fail", r->code,
                  (unsigned)r->ms, r->summary);
     }
     lvgl_port_unlock();
+    if (known) {
+        log_heap("result shown"); // the modal's widgets hold the most text right now
+    }
 }
 
 /* ---- Pairing views, all under the LVGL lock ---- */

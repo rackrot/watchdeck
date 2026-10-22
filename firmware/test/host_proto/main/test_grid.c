@@ -4,6 +4,7 @@
 #include <stdio.h>
 
 #include "grid.h"
+#include "proto.h"
 #include "unity.h"
 
 // Rows 1 to 5: { cell_h, label_lines, icon_side } on the full grid (396 px), then on the paged grid (365 px).
@@ -80,10 +81,33 @@ void test_grid_slots_fit_every_cell_of_every_grid(void)
     TEST_ASSERT_EQUAL_INT(83, 38 + ICON_GAP + SLOT32_H + 2 * ICON_PAD);       // 4 rows paged, tile with icon, of 83
 }
 
+// The board caches the icons of every page of a set (icons.h: ICONS_MAX entries, ICONS_MAX_BYTES of 8 MiB). A valid
+// set names at most one icon per cell per page, each at most icon_side square, so it never reaches either cap. icons.rs
+// pins the same bound on the daemon side.
+void test_grid_icon_cache_bound_holds_for_every_set(void)
+{
+    TEST_ASSERT_EQUAL_INT(160, PROTO_MAX_PAGES * PROTO_MAX_BUTTONS);
+    long worst = 0;
+    for (int cols = 1; cols <= PROTO_MAX_COLS; cols++) {
+        for (int rows = 1; rows <= PROTO_MAX_ROWS; rows++) {
+            const long cells = cols * rows;
+            const long paged_side = grid_geometry(cols, rows, true).icon_side;
+            const long full_side = grid_geometry(cols, rows, false).icon_side;
+            const long paged = PROTO_MAX_PAGES * cells * paged_side * paged_side * 4;
+            const long full = cells * full_side * full_side * 4;
+            worst = paged > worst ? paged : worst;
+            worst = full > worst ? full : worst;
+        }
+    }
+    TEST_ASSERT_LESS_OR_EQUAL_INT64(8 * 1024 * 1024, worst);
+    TEST_ASSERT_EQUAL_INT64(3625216, worst); // 4 pages of 4x1, 16 icons of 238 x 238
+}
+
 void test_grid_run(void)
 {
     RUN_TEST(test_grid_table_matches_the_plan_row_for_row);
     RUN_TEST(test_grid_width_cap_for_1_to_8_columns);
     RUN_TEST(test_grid_pager_is_a_slot_24_line_plus_4_px_of_margin);
     RUN_TEST(test_grid_slots_fit_every_cell_of_every_grid);
+    RUN_TEST(test_grid_icon_cache_bound_holds_for_every_set);
 }

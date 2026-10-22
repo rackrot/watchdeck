@@ -15,16 +15,22 @@ void ui_set_usb_text(const char *text);
 void ui_set_touch_text(const char *text);
 void ui_set_daemon_text(const char *text);
 
-/** Replace the grid with `layout` and accept presses. Every layout the daemon pushes lands here. Thread-safe. */
-void ui_apply_layout(const proto_layout_t *layout);
+/**
+ * The link applied a set of pages to the model: rebuild the page on screen from it (the home page if the set lacks
+ * it), and accept presses. Takes the LVGL lock, then the model lock. Thread-safe, but not under the model lock.
+ */
+void ui_show_set(void);
 
 /**
- * Show `dsc` above the label of every button whose layout icon id is `id`. `dsc` must outlive those buttons:
- * the link drops an icon only after ui_apply_layout has replaced the grid that showed it. Thread-safe.
+ * Show `dsc` above the label of every button on screen whose icon id is `id`. `dsc` must outlive those buttons:
+ * the link drops an icon only after ui_show_set has replaced the grid that showed it. Thread-safe.
  */
 void ui_set_icon(const uint8_t id[PROTO_ICON_ID_LEN], const lv_image_dsc_t *dsc);
 
-/** Grey out the grid and block presses until the next ui_apply_layout. Thread-safe. */
+/** Every icon of the set has come, or stopped coming: log a settled memory sample. Thread-safe. */
+void ui_icons_settled(void);
+
+/** Grey out the grid and block presses until the next ui_show_set. Thread-safe. */
 void ui_link_down(void);
 
 /**
@@ -35,7 +41,8 @@ void ui_show_result(const proto_result_t *result);
 
 /**
  * Show a tile's value on its button, in place, without rebuilding the grid: the text on one line and the button
- * red for a bad state. Ignored for a button the grid doesn't have or that has no tile. Thread-safe.
+ * red for a bad state. The model already holds the value, so a button on another page shows it when its page is
+ * built. Thread-safe.
  */
 void ui_set_tile(const proto_tile_t *tile);
 

@@ -18,17 +18,19 @@ typedef struct {
 } link_daemon_t;
 
 /**
- * Callbacks into the UI. All run on the link task, so they may block briefly (they take the
- * LVGL lock) but must not call back into link_*. Any may be NULL.
+ * Callbacks into the UI. All run on the link task, never with the model lock held, so they may
+ * block briefly (they take the LVGL lock, then maybe the model lock) but must not call back into
+ * link_*. Any may be NULL.
  */
 typedef struct {
-    void (*on_status)(const char *text);             // "searching", "connected to <name>", ...
-    void (*on_layout)(const proto_layout_t *layout); // valid only during the call
+    void (*on_status)(const char *text); // "searching", "connected to <name>", ...
+    void (*on_set)(void);                // a set of pages is in the model: rebuild the page on screen from it
     void (*on_icon)(const uint8_t id[PROTO_ICON_ID_LEN],
                     const lv_image_dsc_t *dsc);                    // show it on every button with `id`
+    void (*on_icons_settled)(void);                                // every icon_get of the set is answered or timed out
     void (*on_down)(void);                                         // session lost, grid must stop taking presses
     void (*on_result)(const proto_result_t *result);               // valid only during the call
-    void (*on_tile)(const proto_tile_t *tile);                     // valid only during the call
+    void (*on_tile)(const proto_tile_t *tile);                     // stored in the model already; valid during the call
     void (*on_paired)(bool paired);                                // at start and on every change
     void (*on_daemons)(const link_daemon_t *daemons, size_t n);    // unpaired: the pairable list changed
     void (*on_pair_code)(const char *code, const char *name);      // show the code, or NULL when the attempt ends

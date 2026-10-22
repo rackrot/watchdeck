@@ -14,6 +14,7 @@
 #include "esp_netif.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "esp_lvgl_port.h"
 #include "esp_websocket_client.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
@@ -23,6 +24,8 @@
 #include "mbedtls/x509.h"
 #include "mdns.h"
 #include "icons.h"
+#include "model.h"
+#include "pageset.h"
 #include "pairing.h"
 
 #define SERVICE "_watchdeck"
@@ -44,6 +47,10 @@
     500 // a full queue holds the websocket task this long before a frame is dropped; under SEND_TIMEOUT_MS
 #define WS_OP_TEXT 0x1
 #define WS_OP_BINARY 0x2
+// An icon_get with no frame of it for this long, since it went out or since its last frame, is given up: the next
+// goes out, and what didn't come is left out. A 238 px icon takes about 0.5 s, so 16 of them outlast a fixed 5 s.
+#define ICON_GET_TIMEOUT_MS 5000
+#define ICON_GET_BUF_LEN 2048 // 40 ids of 32 digits fit with room to spare
 
 static const char *TAG = "link";
 
@@ -123,12 +130,21 @@ static struct {
     int64_t browse_at_ms;
     link_daemon_t daemons[LINK_MAX_DAEMONS]; // the pairable list the UI shows
     size_t ndaemons;
-    bool listed;                                        // the UI has been given a list, even an empty one
-    link_daemon_t pair_with;                            // the daemon of the attempt
-    bool pair_up;                                       // that attempt's socket is connected
-    int64_t pair_deadline_ms;                           // the attempt, or its question in ST_CONFIRM, ends after this
-    uint8_t want[PROTO_MAX_BUTTONS][PROTO_ICON_ID_LEN]; // icons asked for and not yet received
+    bool listed;                          // the UI has been given a list, even an empty one
+    link_daemon_t pair_with;              // the daemon of the attempt
+    bool pair_up;                         // that attempt's socket is connected
+    int64_t pair_deadline_ms;             // the attempt, or its question in ST_CONFIRM, ends after this
+    pageset_t set;                        // the set arriving on this connection, staged in PSRAM
+    bool set_broke;                       // a set broke, so welcome keeps the backoff until a set completes
+    uint8_t (*icon_q)[PROTO_ICON_ID_LEN]; // in PSRAM: every icon the applied set names, page on screen first
+    size_t n_q;
+    size_t q_next;                                      // the next of icon_q to ask for, unless it's cached by then
+    bool settle_pending;                                // the set's icon_gets aren't all answered or timed out yet
+    size_t n_missed;                                    // ids of the set's icon_gets that timed out unanswered
+    uint8_t want[PROTO_MAX_BUTTONS][PROTO_ICON_ID_LEN]; // the outstanding icon_get's ids not yet received
     size_t n_want;
+    int64_t want_deadline_ms; // the outstanding icon_get is given up after this; each of its frames moves it on
+    char *icon_get_buf;       // in PSRAM, so a 40-id icon_get stays off the link task stack
 } s;
 
 // Reassembly state and connect measurements, touched only by the websocket event handler, which
@@ -570,6 +586,12 @@ static void drop_client(void)
         s.client = NULL;
     }
     s.welcomed = false;
+    // Sets, revs and icon requests belong to one connection. The page on screen (in the model) and set_broke don't.
+    pageset_reset(&s.set);
+    s.n_q = 0;
+    s.q_next = 0;
+    s.settle_pending = false;
+    s.n_missed = 0;
     s.n_want = 0;
 }
 
@@ -704,8 +726,9 @@ static void send_hello(void)
         lost("no MAC");
         return;
     }
-    // Only names this build fully supports: "fonts" means ui.c draws every font id in font_list.h.
-    static const char *const caps[] = {"fonts"};
+    // Only names this build fully supports: "fonts" means ui.c draws every font id in font_list.h, and "pages" that
+    // pageset.c assembles sets of up to PROTO_MAX_PAGES and ui.c lays out the paged grid.
+    static const char *const caps[] = {"fonts", "pages"};
     char buf[256];
     size_t len = proto_build_hello(buf, sizeof(buf), device, s.pairing->token, esp_app_get_description()->version,
                                    DISPLAY_H_RES, DISPLAY_V_RES, caps, sizeof(caps) / sizeof(caps[0]));
@@ -739,6 +762,7 @@ static void send_report(void)
 // Enter paired or unpaired mode and tell the UI. Paired, s.pairing holds the blob.
 static void set_paired(bool paired)
 {
+    bool was_paired = s.paired;
     s.paired = paired;
     if (paired) {
         if (proto_fp(s.pairing->cert_pem, s.fp) != ESP_OK) {
@@ -753,8 +777,13 @@ static void set_paired(bool paired)
     if (s.cbs.on_paired) {
         s.cbs.on_paired(paired);
     }
-    if (!paired) {
-        icons_clear(); // the UI has dropped the grid that showed them
+    if (was_paired && !paired) {
+        // The UI has dropped the grid that showed the set. LVGL first, since dropping an icon takes its lock.
+        lvgl_port_lock(0);
+        model_lock();
+        model_clear();
+        model_unlock();
+        lvgl_port_unlock();
     }
 }
 
@@ -921,45 +950,43 @@ static bool has_id(const uint8_t ids[][PROTO_ICON_ID_LEN], size_t n, const uint8
     return false;
 }
 
-// A layout arrived and the UI has rebuilt the grid from it. Free the icons it no longer names, give
-// the UI those already cached, and ask the daemon for the rest in one icon_get.
-static void sync_icons(const proto_layout_t *layout)
+// Send the next icon_get: up to 40 of the set's icons, in icon_q order, that aren't cached by now. This replaces any
+// request still outstanding, whose frames may still come. With nothing left to ask for, the set's icons have settled.
+static void request_icons(void)
 {
-    size_t dropped = icons_retain(layout);
-    uint8_t seen[PROTO_MAX_BUTTONS][PROTO_ICON_ID_LEN];
-    size_t n_seen = 0;
-    size_t cached = 0;
     s.n_want = 0;
-    for (size_t i = 0; i < layout->n_buttons; i++) {
-        const uint8_t *id = layout->buttons[i].icon;
-        if (!layout->buttons[i].has_icon || has_id(seen, n_seen, id)) {
-            continue;
-        }
-        memcpy(seen[n_seen++], id, PROTO_ICON_ID_LEN);
-        const lv_image_dsc_t *dsc = icons_find(id);
-        if (dsc) {
-            cached++;
-            ESP_LOGI(TAG, "icon %02x%02x%02x%02x from cache", ID4(id));
-            if (s.cbs.on_icon) {
-                s.cbs.on_icon(id, dsc);
-            }
-        } else {
+    model_lock();
+    while (s.q_next < s.n_q && s.n_want < PROTO_MAX_BUTTONS) {
+        const uint8_t *id = s.icon_q[s.q_next++];
+        if (!icons_find(id)) { // a frame of an earlier request may have brought it
             memcpy(s.want[s.n_want++], id, PROTO_ICON_ID_LEN);
         }
     }
-    ESP_LOGI(TAG, "layout names %u icon(s): %u cached, %u to request, %u dropped", (unsigned)n_seen, (unsigned)cached,
-             (unsigned)s.n_want, (unsigned)dropped);
+    model_unlock();
     if (s.n_want == 0) {
+        if (s.settle_pending && s.n_missed > 0) {
+            // Frames may still be coming, so this is no settled point to sample memory at.
+            s.settle_pending = false;
+            ESP_LOGW(TAG, "icons gave up waiting (%u missing)", (unsigned)s.n_missed);
+        } else if (s.settle_pending) {
+            s.settle_pending = false;
+            ESP_LOGI(TAG, "icons settled, link task stack %u bytes unused",
+                     (unsigned)uxTaskGetStackHighWaterMark(NULL));
+            if (s.cbs.on_icons_settled) {
+                s.cbs.on_icons_settled();
+            }
+        }
         return;
     }
-    char buf[2048]; // 40 ids of 32 digits fit with room to spare
-    size_t len = proto_build_icon_get(buf, sizeof(buf), s.want, s.n_want);
+    size_t len = proto_build_icon_get(s.icon_get_buf, ICON_GET_BUF_LEN, s.want, s.n_want);
     if (len == 0) {
         ESP_LOGE(TAG, "icon_get does not fit");
+        s.n_want = 0;
         return;
     }
-    ESP_LOGI(TAG, "requesting %u icon(s)", (unsigned)s.n_want);
-    send_text(buf, len, NULL);
+    ESP_LOGI(TAG, "requesting %u icon(s), %u more of the set to go", (unsigned)s.n_want, (unsigned)(s.n_q - s.q_next));
+    s.want_deadline_ms = now_ms() + ICON_GET_TIMEOUT_MS;
+    send_text(s.icon_get_buf, len, NULL);
 }
 
 // One binary frame. Returns true if the cache took the buffer, else the caller frees it.
@@ -973,28 +1000,127 @@ static bool handle_icon_frame(uint8_t *frame, size_t len)
     if (proto_parse_icon(frame, len, &icon) != ESP_OK) {
         return false; // proto_parse_icon says why
     }
-    if (icons_find(icon.id)) {
+    // Any icon the set names is taken, so a frame of a request a new set replaced isn't wasted.
+    model_lock();
+    const bool already = icons_find(icon.id) != NULL;
+    const bool named = !already && has_id(s.icon_q, s.n_q, icon.id);
+    const esp_err_t err = named ? icons_add(&icon, frame) : ESP_FAIL;
+    const lv_image_dsc_t *dsc = err == ESP_OK ? icons_find(icon.id) : NULL;
+    model_unlock();
+    if (already) {
         ESP_LOGI(TAG, "icon %02x%02x%02x%02x already cached, ignored", ID4(icon.id));
         return false;
+    }
+    if (!named) {
+        ESP_LOGW(TAG, "icon %02x%02x%02x%02x was not requested, dropped", ID4(icon.id));
+        return false;
+    }
+    if (err != ESP_OK) {
+        return false; // icons_add says why
     }
     size_t i = 0;
     while (i < s.n_want && memcmp(s.want[i], icon.id, PROTO_ICON_ID_LEN) != 0) {
         i++;
     }
-    if (i == s.n_want) {
-        ESP_LOGW(TAG, "icon %02x%02x%02x%02x was not requested, dropped", ID4(icon.id));
-        return false;
+    const bool outstanding = i < s.n_want;
+    if (outstanding) {
+        memcpy(s.want[i], s.want[--s.n_want], PROTO_ICON_ID_LEN);
+        s.want_deadline_ms = now_ms() + ICON_GET_TIMEOUT_MS; // frames still coming, so the request is alive
     }
-    if (icons_add(&icon, frame) != ESP_OK) {
-        return false; // icons_add says why
-    }
-    memcpy(s.want[i], s.want[--s.n_want], PROTO_ICON_ID_LEN);
     ESP_LOGI(TAG, "icon %02x%02x%02x%02x %ux%u received, validated and cached, %u still wanted", ID4(icon.id), icon.w,
              icon.h, (unsigned)s.n_want);
     if (s.cbs.on_icon) {
-        s.cbs.on_icon(icon.id, icons_find(icon.id));
+        s.cbs.on_icon(icon.id, dsc); // only this task frees icons, so dsc outlives the lock
+    }
+    if (outstanding && s.n_want == 0) {
+        request_icons(); // the request is answered, so the next goes out
     }
     return true;
+}
+
+// Drop the link over a broken set, so the next session sends a complete one. The backoff grows until a set completes.
+static void set_broken(const char *why)
+{
+    ESP_LOGW(TAG, "layout set broken: %s", why);
+    s.set_broke = true;
+    lost_as("layout set broken", "layout set broken");
+}
+
+// A set is complete. Apply it, have the UI build the page on screen, ack the set, then fetch the icons it lacks.
+static void apply_set(void)
+{
+    model_lock();
+    model_apply(&s.set);
+    model_unlock();
+    if (s.set_broke) {
+        s.set_broke = false;
+        s.backoff_idx = 0; // the welcome before this set left it as it was
+    }
+    if (s.cbs.on_set) {
+        s.cbs.on_set();
+    }
+    // Before any icon_get, so the ack doesn't wait behind icon frames. Pictures still to come fill in later, so the
+    // ack means the buttons are on screen.
+    char ack[48];
+    size_t ack_len = proto_build_layout_ack(ack, sizeof(ack), s.set.rev);
+    if (ack_len > 0) {
+        send_text(ack, ack_len, NULL);
+    }
+    if (!s.welcomed) {
+        return; // the send failed and dropped the link
+    }
+
+    // The UI has replaced the widgets of the last set, so free the icons no page names any more. LVGL first, since
+    // dropping an icon takes its lock.
+    lvgl_port_lock(0);
+    model_lock();
+    const size_t dropped = icons_retain(model_page(0), model_pages());
+    model_unlock();
+    lvgl_port_unlock();
+
+    // Every icon the set names, once each: the page on screen first, then the others in order.
+    size_t cached = 0;
+    s.n_q = 0;
+    s.q_next = 0;
+    model_lock();
+    const uint8_t n_pages = model_pages();
+    const uint8_t shown = model_shown();
+    for (uint8_t k = 0; k < n_pages; k++) {
+        const uint8_t p = k == 0 ? shown : (k - 1 < shown ? k - 1 : k);
+        const proto_layout_t *page = model_page(p);
+        for (size_t b = 0; b < page->n_buttons; b++) {
+            const uint8_t *id = page->buttons[b].icon;
+            if (!page->buttons[b].has_icon || has_id(s.icon_q, s.n_q, id)) {
+                continue;
+            }
+            memcpy(s.icon_q[s.n_q++], id, PROTO_ICON_ID_LEN);
+            cached += icons_find(id) != NULL;
+        }
+    }
+    model_unlock();
+    ESP_LOGI(TAG, "set names %u icon(s): %u cached, %u to request, %u dropped", (unsigned)s.n_q, (unsigned)cached,
+             (unsigned)(s.n_q - cached), (unsigned)dropped);
+    s.settle_pending = true;
+    s.n_missed = 0;
+    request_icons(); // what is left of the last set's requests is cancelled
+}
+
+static void handle_layout(const proto_layout_t *l)
+{
+    const char *why;
+    const pageset_result_t r = pageset_add(&s.set, l, now_ms(), &why);
+    if (r == PAGESET_BROKEN) {
+        set_broken(why);
+        return;
+    }
+    if (why) {
+        ESP_LOGW(TAG, "layout rev %u: %s", (unsigned)l->rev, why);
+    }
+    if (r == PAGESET_PENDING) {
+        ESP_LOGI(TAG, "layout rev %u: page %u of %u in", (unsigned)l->rev, l->page + 1, l->pages);
+        return;
+    }
+    apply_set();
 }
 
 static void handle_msg(const char *json, size_t len)
@@ -1002,13 +1128,25 @@ static void handle_msg(const char *json, size_t len)
     ESP_LOGI(TAG, "rx: %.*s", (int)(len > 160 ? 160 : len), json);
     proto_msg_t *m = s.msg;
     if (proto_parse(json, len, m) != ESP_OK) {
-        ESP_LOGW(TAG, "dropped unparsable message");
+        if (pageset_arriving(&s.set)) {
+            set_broken("a page that won't parse"); // nothing comes between the pages of a set
+        } else {
+            ESP_LOGW(TAG, "dropped unparsable message");
+        }
         return;
     }
     switch (m->type) {
     case PROTO_MSG_WELCOME:
         s.welcomed = true;
-        s.backoff_idx = 0;
+        if (s.set_broke) {
+            ESP_LOGW(TAG, "backoff kept until a layout set completes");
+        } else {
+            s.backoff_idx = 0;
+        }
+        // A new session resends every tile after its first set.
+        model_lock();
+        model_clear_tiles();
+        model_unlock();
         set_status("connected to %s", m->welcome_name);
         send_report();
         crash_test_arm();
@@ -1039,21 +1177,16 @@ static void handle_msg(const char *json, size_t len)
         if (!s.welcomed) {
             ESP_LOGW(TAG, "message before welcome, ignored");
         } else if (m->type == PROTO_MSG_LAYOUT) {
-            if (s.cbs.on_layout) {
-                s.cbs.on_layout(&m->layout);
-            }
-            sync_icons(&m->layout);
-            // ui_apply_layout has built the grid and the icon request is out. Pictures still to come
-            // fill in later, so the ack means the buttons are on screen.
-            char ack[48];
-            size_t ack_len = proto_build_layout_ack(ack, sizeof(ack), m->layout.rev);
-            if (ack_len > 0 && s.welcomed) { // a failed icon_get send has already dropped the link
-                send_text(ack, ack_len, NULL);
-            }
+            handle_layout(&m->layout);
         } else if (m->type == PROTO_MSG_RESULT && s.cbs.on_result) {
             s.cbs.on_result(&m->result);
-        } else if (m->type == PROTO_MSG_TILE && s.cbs.on_tile) {
-            s.cbs.on_tile(&m->tile);
+        } else if (m->type == PROTO_MSG_TILE) {
+            model_lock();
+            const bool stored = model_set_tile(&m->tile);
+            model_unlock();
+            if (stored && s.cbs.on_tile) {
+                s.cbs.on_tile(&m->tile);
+            }
         }
         break;
     case PROTO_MSG_UNKNOWN:
@@ -1070,7 +1203,9 @@ static void handle_event(link_ev_t *ev)
     bool current = ev->gen == s.gen;
     switch (ev->type) {
     case EV_GOT_IP:
-        s.backoff_idx = 0;
+        if (!s.set_broke) { // a broken set keeps the backoff until a set completes
+            s.backoff_idx = 0;
+        }
         if (s.state == ST_NO_IP || s.state == ST_BACKOFF || s.state == ST_BROWSE) {
             resume();
         }
@@ -1222,6 +1357,12 @@ static void link_task(void *arg)
         case ST_UP:
             if (!s.welcomed && now > s.connect_deadline_ms) {
                 candidate_failed("no welcome");
+            } else if (pageset_expired(&s.set, now)) {
+                set_broken("still incomplete 5 s after its first page");
+            } else if (s.n_want > 0 && now > s.want_deadline_ms) {
+                ESP_LOGW(TAG, "icon_get timed out with %u icon(s) not received", (unsigned)s.n_want);
+                s.n_missed += s.n_want;
+                request_icons();
             }
             break;
         case ST_BROWSE:
@@ -1254,8 +1395,12 @@ esp_err_t link_start(const link_cbs_t *cbs)
     s.msg = heap_caps_malloc(sizeof(*s.msg), MALLOC_CAP_SPIRAM);
     s.pairing = heap_caps_calloc(1, sizeof(*s.pairing), MALLOC_CAP_SPIRAM);
     s.session = heap_caps_calloc(1, sizeof(*s.session), MALLOC_CAP_SPIRAM);
+    s.set.pages = heap_caps_calloc(PROTO_MAX_PAGES, sizeof(*s.set.pages), MALLOC_CAP_SPIRAM);
+    s.icon_q = heap_caps_calloc(ICONS_MAX, sizeof(*s.icon_q), MALLOC_CAP_SPIRAM);
+    s.icon_get_buf = heap_caps_malloc(ICON_GET_BUF_LEN, MALLOC_CAP_SPIRAM);
     s.queue = xQueueCreate(QUEUE_LEN, sizeof(link_ev_t));
-    ESP_RETURN_ON_FALSE(s.msg && s.pairing && s.session && s.queue, ESP_ERR_NO_MEM, TAG, "alloc");
+    ESP_RETURN_ON_FALSE(s.msg && s.pairing && s.session && s.set.pages && s.icon_q && s.icon_get_buf && s.queue,
+                        ESP_ERR_NO_MEM, TAG, "alloc");
 
     esp_err_t err = pairing_load(s.pairing);
     if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
