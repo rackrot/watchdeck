@@ -1,0 +1,21 @@
+{
+  "t": "layout",
+  "rev": 7,
+  "page": 1,
+  "pages": 3,
+  "page_id": "media",
+  "cols": 5,
+  "rows": 3,
+  "font": "inter",
+  "buttons": [
+    {
+      "id": "plex",
+      "col": 0,
+      "row": 0,
+      "label": "Plex",
+      "bg": 2001125,
+      "fg": 16777215,
+      "label_font": "orbitron"
+    }
+  ]
+}

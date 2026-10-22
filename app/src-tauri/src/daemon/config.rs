@@ -182,6 +182,9 @@ impl Layout {
     pub fn message(&self, rev: u32) -> Message {
         Message::Layout {
             rev,
+            page: None,
+            pages: None,
+            page_id: None,
             cols: self.cols,
             rows: self.rows,
             font: self.font.clone(),

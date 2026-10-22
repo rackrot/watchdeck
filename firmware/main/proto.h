@@ -14,6 +14,7 @@
 #define PROTO_MAX_COLS 8
 #define PROTO_MAX_ROWS 5
 #define PROTO_MAX_BUTTONS (PROTO_MAX_COLS * PROTO_MAX_ROWS)
+#define PROTO_MAX_PAGES 4
 #define PROTO_ID_MAX 64
 #define PROTO_LABEL_MAX 48
 #define PROTO_NAME_MAX 48
@@ -61,6 +62,9 @@ typedef struct {
 
 typedef struct {
     uint32_t rev;
+    uint8_t page;               // 0-based, below pages. A layout without page fields is page 0 of 1
+    uint8_t pages;              // 1 to PROTO_MAX_PAGES
+    char page_id[PROTO_ID_MAX]; // empty for a layout without page fields
     uint8_t cols;
     uint8_t rows;
     wd_font_t font;    // the grid's default font

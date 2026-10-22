@@ -298,6 +298,24 @@ static esp_err_t parse_layout(const cJSON *root, proto_layout_t *out)
         cJSON_GetArraySize(buttons) > PROTO_MAX_BUTTONS) {
         return ESP_ERR_INVALID_ARG;
     }
+    // Page fields come together or not at all. No `page` is a set of one page with no id.
+    const cJSON *page_item = cJSON_GetObjectItemCaseSensitive(root, "page");
+    if (page_item) {
+        double page, pages;
+        if (!get_int(root, "page", 0, PROTO_MAX_PAGES - 1, &page) ||
+            !get_int(root, "pages", 1, PROTO_MAX_PAGES, &pages) || page >= pages ||
+            !get_str(root, "page_id", out->page_id, sizeof(out->page_id), true) || out->page_id[0] == '\0') {
+            return ESP_ERR_INVALID_ARG;
+        }
+        out->page = (uint8_t)page;
+        out->pages = (uint8_t)pages;
+    } else if (cJSON_GetObjectItemCaseSensitive(root, "pages") || cJSON_GetObjectItemCaseSensitive(root, "page_id")) {
+        return ESP_ERR_INVALID_ARG;
+    } else {
+        out->page = 0;
+        out->pages = 1;
+        out->page_id[0] = '\0';
+    }
     out->rev = (uint32_t)rev;
     out->cols = (uint8_t)cols;
     out->rows = (uint8_t)rows;

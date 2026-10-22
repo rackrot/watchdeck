@@ -2,7 +2,7 @@
 
 This page defines how the device and the desktop daemon talk. Both sides implement it, and the daemon's test fixtures use these exact examples.
 
-Status: **protocol v1.** Sessions run over TLS (`wss://`) pinned to the daemon's certificate, and every session needs the token the device made at pairing. See `plans/desktop-app-v1.md` for the full design.
+Status: **protocol v1.** Sessions run over TLS (`wss://`) pinned to the daemon's certificate, and every session needs the token the device made at pairing. See `plans/desktop-app-v1.md` for the full design. The [`pages`](#pages) capability is specified below; no daemon or device names it yet. Within it, `layout_ack` before `icon_get` is the contract for a device that names `pages`, from the firmware that adds the capability; earlier firmware acks after its `icon_get`.
 
 ## Ports
 
@@ -149,7 +149,7 @@ The daemon stores its side before the user answers, so a No leaves a token hash 
 - If the link drops, the device reconnects:
   1. It backs off 1, 2, 4, 8, 16 and then 30 s (cap), each with ±20% jitter.
   2. It re-runs mDNS discovery before every attempt, so a changed desktop IP is picked up.
-  3. Getting an IP or receiving a `welcome` resets the backoff.
+  3. Getting an IP or receiving a `welcome` resets the backoff, except after a broken layout set (see [Pages](#pages)).
 
 ## Session
 
@@ -158,7 +158,7 @@ device                      daemon
   |--- hello ---------------->|   within 5 s of connecting
   |<-- welcome ---------------|   or error, then close
   |<-- layout ----------------|   and again whenever the grid changes
-  |--- layout_ack ----------->|   once the grid is built
+  |--- layout_ack ----------->|   once the grid is built (before icon_get, with pages)
   |--- icon_get ------------->|   for icons the device doesn't have
   |<-- icon frame (binary) ---|   one per icon
   |--- press ---------------->|
@@ -199,6 +199,7 @@ device                      daemon
 | Capability | The device |
 |---|---|
 | `fonts` | Draws the seven fonts listed under [Fonts](#fonts), and reads the font fields of `layout` |
+| `pages` | Assembles a set of up to 4 `layout` pages, shows one at a time, and lays out the shorter grid when a set has 2 or more. See [Pages](#pages) |
 
 The daemon hashes `token` and compares the result in constant time with the hash it stored for `device`. A missing, malformed or wrong token and an unknown device all get the same `error`, then a close:
 
@@ -234,7 +235,7 @@ The daemon closes the connection after sending it. `code` is one of `version`, `
 
 | Field | Type | Meaning |
 |---|---|---|
-| `rev` | int | 1 for the session's first layout, then one more for each layout pushed on it |
+| `rev` | int | 1 for the session's first layout, then one more for each push (a set of pages counts as one) |
 | `cols`, `rows` | int | Grid size, 1 to 8 columns by 1 to 5 rows |
 | `buttons[].id` | string | Stable button id, used in `press`. At most 63 bytes |
 | `buttons[].col`, `row` | int | Zero-based cell |
@@ -243,6 +244,7 @@ The daemon closes the connection after sending it. `code` is one of `version`, `
 | `buttons[].icon` | string | Optional. The icon's id as 32 lowercase hex digits. Absent for a button without one. A layout with any other value, `null` included, is refused |
 | `buttons[].tile` | bool | Optional, default `false`. `true` for a button that shows a live value, which arrives as [`tile`](#tile-daemon--device) messages. Any other type is refused |
 | `font`, `buttons[].label_font`, `buttons[].value_font` | string | Optional, only to a session with the `fonts` capability. See [Fonts](#fonts) |
+| `page`, `pages`, `page_id` | int, int, string | Optional, only to a session with the `pages` capability. See [Pages](#pages) |
 
 The daemon sends `layout` after `welcome`. When the user's config changes the grid, a button, a label, a color or a position, the daemon pushes a new `layout` on the same session, and the device replaces its grid without reconnecting. An edit that changes only actions sends nothing. Empty cells have no button. A layout that turns a tile on or off for a button counts as a change to a button.
 
@@ -272,6 +274,34 @@ A device that names `fonts` in `hello.caps` draws button text in Montserrat (bui
 - **Fallback.** A device that gets a font id it doesn't know, or a value that isn't a string, draws that text in Montserrat, logs it, and still builds and acks the layout. A font is cosmetic, so the layout is never refused for one.
 - **Without the capability** a session gets none of these fields. Its layout is the one a config without fonts would produce, and a change to fonts alone sends it no new `layout`, so its `rev` doesn't move. With the capability, a change to fonts alone pushes a new `layout` with the next `rev`.
 
+#### Pages
+
+A device that names `pages` in `hello.caps` shows one page of buttons at a time. A config of 2 to 4 pages goes to it as a set of `layout` messages, one per page, sent back to back with the same `rev`:
+
+```json
+{"t":"layout","rev":7,"page":1,"pages":3,"page_id":"media","cols":5,"rows":3,"font":"inter","buttons":[
+  {"id":"plex","col":0,"row":0,"label":"Plex","bg":2001125,"fg":16777215,"label_font":"orbitron"}
+]}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `page` | int | This page's index, 0-based, below `pages`. Page 0 is the home page |
+| `pages` | int | How many pages the set has, 1 to 4 |
+| `page_id` | string | The page's id, 1 to 63 bytes. It names a page across pushes, so a device can stay on it when the set changes |
+
+- **Fields come together.** `page`, `pages` and `page_id` are all present or all absent. A message with `page` but not the other two, or with `pages` or `page_id` but no `page`, or with `page` not below `pages`, or with `pages` outside 1 to 4, or an empty or over-long `page_id`, or a field of the wrong type, is malformed. A lone malformed `layout` is dropped and the link stays up; a malformed page breaks its set, and the device reconnects (see below).
+- **At most 4 pages** is part of the capability. A later daemon that allows more must name that under a new capability.
+- **A page stands alone.** Each message is a whole layout under the usual rules: at most 40 buttons and 16 KB, the same `cols` and `rows` on every page, and the font fields of the [`fonts`](#fonts) capability on every page when the session has it. The daemon sends 2 to 4 pages; the device also accepts a set of 1.
+- **The daemon sends a set in order**, page 0 first, with no other message between its pages. All pages of a set carry one `rev`. A set counts as one push, so `rev` still goes up by one per push.
+- **A config of 0 or 1 page** goes out as today's single `layout`, without page fields, to every session. A `layout` without page fields is a set of one page with no id.
+- **A set never spans connections.** Every session starts again at `rev` 1, so a device discards any partly received set when its link drops.
+- **The device applies a set only when it is complete.** It collects pages until every page from 0 to `pages - 1` of one `rev` is in, and the `pages` counts agree. A page of a newer `rev` discards a set still arriving. A page out of order, counts that disagree, a page that won't parse, or a set still incomplete 5 s after its first page makes the device drop the link and reconnect, and the new session starts with a complete set. A device that does this repeatedly keeps its backoff until a set completes.
+- **Navigation is local.** The device moves between pages, and the page it shows never goes on the wire. It sends nothing to the daemon for a page switch, and a switch works while the link is down.
+- **Tiles and icons cover the whole set.** The daemon sends `tile` for every tile button on every page, and answers `icon_get` for an id named by any page of the session's set.
+- **Geometry.** A device lays out the shorter grid when `pages` is 2 or more, and the daemon renders that set's icons for it. A set of 1 page, or a `layout` without page fields, is laid out at full height. So a daemon that sent `page` 0 of `pages` 1 must render its icons for the full-height grid.
+- **Without the capability** a session gets today's `layout`: the home page only, without page fields. Its `tile` and `icon_get` answers cover that page only, and a change confined to other pages sends it nothing.
+
 ### `layout_ack` (device → daemon)
 
 ```json
@@ -280,9 +310,9 @@ A device that names `fonts` in `hello.caps` draws button text in Montserrat (bui
 
 | Field | Type | Meaning |
 |---|---|---|
-| `rev` | int | The `rev` of the `layout` whose grid the device has built |
+| `rev` | int | The `rev` of the `layout`, or of the set of pages, that the device has built |
 
-The device sends it for every `layout`, after it has built the grid and sent its `icon_get`. Icons still on the way don't hold it back, because a button shows its label until its picture arrives. The daemon tells the desktop window that the device applied the layout.
+The device sends it once per `layout`, or once per set of pages when it has applied the set and built the page it shows. A device that names `pages` sends it **before** any `icon_get` for that layout (earlier firmware sends it after), so the ack never waits behind icon frames: the daemon sends every frame of a request before it reads the next message. Icons still on the way don't hold it back, because a button shows its label until its picture arrives. The daemon tells the desktop window that the device applied the layout.
 
 - The daemon logs and ignores an ack for a `rev` it never sent on this session (0 or above the latest), and one no newer than the latest ack it already took.
 - A `rev` that is not a non-negative integer of at most 32 bits is refused like any malformed message: `error` `bad_request` and a close.
@@ -301,6 +331,12 @@ The device sends it for every `layout`, after it has built the grid and sent its
 The daemon answers each id that the session's current layout names with one [icon frame](#icon-frames), in the order asked, and sends nothing for any other id. A repeated id gets one frame, since the daemon drops duplicates. A list that is too long or has a malformed id gets `error` `bad_request` and a close.
 
 The device sends one `icon_get` per layout, listing every distinct id it doesn't hold, and sends none when it holds them all. It keeps the icons of the layout on screen only. A layout that drops an icon frees it, and a link that drops and returns keeps the rest, so a reconnect to an unchanged layout fetches nothing.
+
+With the [`pages`](#pages) capability the ids come from every page of the set, not only the one on screen:
+
+- The device keeps one request outstanding. Each takes up to 40 missing ids: the current page's first, then the other pages' in order. The next goes out when every frame of the last has arrived or 5 s have passed.
+- A new set cancels what is left and sends its own request at once, so frames of the old request may still be on the way.
+- It keeps the icons of every page of the set, so a page switch sends no `icon_get`.
 
 ### Icon frames
 

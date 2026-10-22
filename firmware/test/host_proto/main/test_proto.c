@@ -626,6 +626,114 @@ void test_font_fullest_layout_with_every_font_field_parses(void)
     TEST_ASSERT_FALSE(msg.layout.unknown_font);
 }
 
+// ---- Layout pages ----
+
+// A one-button 4x2 layout whose message also carries `page_fields` (a JSON fragment ending in a comma, or "").
+static esp_err_t parse_page(const char *page_fields)
+{
+    snprintf(json, sizeof(json), "{\"t\":\"layout\",\"rev\":7,%s\"cols\":4,\"rows\":2,\"buttons\":[{" BUTTON "}]}",
+             page_fields);
+    return proto_parse(json, strlen(json), &msg);
+}
+
+void test_page_none_given_is_page_0_of_1_with_an_empty_id(void)
+{
+    TEST_ASSERT_EQUAL(ESP_OK, parse_page(""));
+    TEST_ASSERT_EQUAL_UINT8(0, msg.layout.page);
+    TEST_ASSERT_EQUAL_UINT8(1, msg.layout.pages);
+    TEST_ASSERT_EQUAL_STRING("", msg.layout.page_id);
+    TEST_ASSERT_EQUAL_UINT32(7, msg.layout.rev);
+    TEST_ASSERT_EQUAL_size_t(1, msg.layout.n_buttons);
+}
+
+// The message buffer is reused, so a plain layout after a paged one must reset the page fields.
+void test_plain_layout_after_a_paged_one_resets_to_page_0_of_1(void)
+{
+    TEST_ASSERT_EQUAL(ESP_OK, parse_page("\"page\":2,\"pages\":3,\"page_id\":\"media\","));
+    TEST_ASSERT_EQUAL(ESP_OK, parse_page(""));
+    TEST_ASSERT_EQUAL_UINT8(0, msg.layout.page);
+    TEST_ASSERT_EQUAL_UINT8(1, msg.layout.pages);
+    TEST_ASSERT_EQUAL_STRING("", msg.layout.page_id);
+}
+
+void test_page_3_of_4_is_accepted(void)
+{
+    TEST_ASSERT_EQUAL(ESP_OK, parse_page("\"page\":3,\"pages\":4,\"page_id\":\"media\","));
+    TEST_ASSERT_EQUAL_UINT8(3, msg.layout.page);
+    TEST_ASSERT_EQUAL_UINT8(4, msg.layout.pages);
+    TEST_ASSERT_EQUAL_STRING("media", msg.layout.page_id);
+    TEST_ASSERT_EQUAL_size_t(1, msg.layout.n_buttons);
+}
+
+void test_page_0_of_1_is_accepted(void)
+{
+    TEST_ASSERT_EQUAL(ESP_OK, parse_page("\"page\":0,\"pages\":1,\"page_id\":\"main\","));
+    TEST_ASSERT_EQUAL_UINT8(0, msg.layout.page);
+    TEST_ASSERT_EQUAL_UINT8(1, msg.layout.pages);
+    TEST_ASSERT_EQUAL_STRING("main", msg.layout.page_id);
+}
+
+void test_page_equal_to_pages_is_refused(void)
+{
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_page("\"page\":3,\"pages\":3,\"page_id\":\"x\","));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_page("\"page\":4,\"pages\":4,\"page_id\":\"x\","));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_page("\"page\":-1,\"pages\":4,\"page_id\":\"x\","));
+}
+
+void test_pages_of_0_or_5_is_refused(void)
+{
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_page("\"page\":0,\"pages\":0,\"page_id\":\"x\","));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_page("\"page\":0,\"pages\":5,\"page_id\":\"x\","));
+}
+
+void test_page_without_pages_or_without_page_id_is_refused(void)
+{
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_page("\"page\":0,\"page_id\":\"x\","));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_page("\"page\":0,\"pages\":2,"));
+}
+
+void test_pages_or_page_id_without_page_is_refused(void)
+{
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_page("\"pages\":2,\"page_id\":\"x\","));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_page("\"pages\":2,"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_page("\"page_id\":\"x\","));
+}
+
+void test_page_id_must_be_1_to_63_bytes(void)
+{
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_page("\"page\":0,\"pages\":2,\"page_id\":\"\","));
+
+    char fields[128];
+    snprintf(fields, sizeof(fields), "\"page\":0,\"pages\":2,\"page_id\":\"%s\",", run_of('i', 63));
+    TEST_ASSERT_EQUAL(ESP_OK, parse_page(fields));
+    TEST_ASSERT_EQUAL_size_t(63, strlen(msg.layout.page_id));
+
+    snprintf(fields, sizeof(fields), "\"page\":0,\"pages\":2,\"page_id\":\"%s\",", run_of('i', 64));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_page(fields));
+}
+
+void test_page_fields_of_the_wrong_type_are_refused(void)
+{
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_page("\"page\":\"0\",\"pages\":2,\"page_id\":\"x\","));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_page("\"page\":0,\"pages\":\"2\",\"page_id\":\"x\","));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_page("\"page\":0,\"pages\":2,\"page_id\":7,"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_page("\"page\":0,\"pages\":2,\"page_id\":null,"));
+}
+
+// A page message resolves font and the per-button font fields exactly as a single layout does.
+void test_page_message_resolves_fonts_like_a_single_layout(void)
+{
+    snprintf(json, sizeof(json),
+             "{\"t\":\"layout\",\"rev\":7,\"page\":1,\"pages\":3,\"page_id\":\"media\",\"cols\":4,\"rows\":2,"
+             "\"font\":\"inter\",\"buttons\":[{" BUTTON ",\"tile\":true,\"label_font\":\"orbitron\"}]}");
+    TEST_ASSERT_EQUAL(ESP_OK, proto_parse(json, strlen(json), &msg));
+    TEST_ASSERT_EQUAL_UINT8(1, msg.layout.page);
+    TEST_ASSERT_EQUAL(WD_FONT_inter, msg.layout.font);
+    TEST_ASSERT_EQUAL(WD_FONT_orbitron, msg.layout.buttons[0].label_font);
+    TEST_ASSERT_EQUAL(WD_FONT_orbitron, msg.layout.buttons[0].value_font);
+    TEST_ASSERT_FALSE(msg.layout.unknown_font);
+}
+
 // ---- Hello ----
 
 static const uint8_t TOKEN[PROTO_TOKEN_LEN] = {0};
@@ -713,6 +821,17 @@ void app_main(void)
     RUN_TEST(test_font_unknown_or_mistyped_values_fall_back_to_montserrat_and_set_the_flag);
     RUN_TEST(test_font_flag_does_not_stick_to_the_next_layout);
     RUN_TEST(test_font_fullest_layout_with_every_font_field_parses);
+    RUN_TEST(test_page_none_given_is_page_0_of_1_with_an_empty_id);
+    RUN_TEST(test_plain_layout_after_a_paged_one_resets_to_page_0_of_1);
+    RUN_TEST(test_page_3_of_4_is_accepted);
+    RUN_TEST(test_page_0_of_1_is_accepted);
+    RUN_TEST(test_page_equal_to_pages_is_refused);
+    RUN_TEST(test_pages_of_0_or_5_is_refused);
+    RUN_TEST(test_page_without_pages_or_without_page_id_is_refused);
+    RUN_TEST(test_pages_or_page_id_without_page_is_refused);
+    RUN_TEST(test_page_id_must_be_1_to_63_bytes);
+    RUN_TEST(test_page_fields_of_the_wrong_type_are_refused);
+    RUN_TEST(test_page_message_resolves_fonts_like_a_single_layout);
     RUN_TEST(test_hello_without_caps_has_no_caps_key);
     RUN_TEST(test_hello_with_fonts_names_it_in_caps);
     RUN_TEST(test_hello_with_two_caps_and_a_32_character_fw_fits_256_bytes);

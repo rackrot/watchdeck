@@ -221,6 +221,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         self.rev += 1;
         let layout = Message::Layout {
             rev: self.rev,
+            page: None,
+            pages: None,
+            page_id: None,
             cols: 4,
             rows: 1,
             font: None,

@@ -12,6 +12,10 @@ pub const VERSION: u32 = 1;
 pub const CAPS: [&str; 1] = [CAP_FONTS];
 /// The device draws every font in `fonts_gen::FONT_IDS` and reads the layout's font fields.
 pub const CAP_FONTS: &str = "fonts";
+/// The device assembles a set of up to 4 `layout` pages and lays out the shorter grid for 2 or
+/// more. Not in [`CAPS`] until the daemon's sessions send pages.
+#[allow(dead_code)]
+pub const CAP_PAGES: &str = "pages";
 
 /// Largest message, and largest frame, in either direction.
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
@@ -122,6 +126,15 @@ pub enum Message {
     },
     Layout {
         rev: u32,
+        /// This page's index, 0-based, below `pages`. Needs the `pages` cap.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        page: Option<u32>,
+        /// How many pages the set has, 1 to 4. Needs the `pages` cap.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pages: Option<u32>,
+        /// This page's id, 1 to 63 bytes. Needs the `pages` cap.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        page_id: Option<String>,
         cols: u32,
         rows: u32,
         /// The grid's default font, absent for Montserrat. Needs the `fonts` cap.
@@ -485,12 +498,13 @@ mod tests {
     use serde_json::Value;
 
     // The fixtures are the JSON examples from site/src/protocol.md.
-    const FIXTURES: [&str; 17] = [
+    const FIXTURES: [&str; 18] = [
         include_str!("../../tests/fixtures/hello.json"),
         include_str!("../../tests/fixtures/welcome.json"),
         include_str!("../../tests/fixtures/error.json"),
         include_str!("../../tests/fixtures/layout.json"),
         include_str!("../../tests/fixtures/layout_fonts.json"),
+        include_str!("../../tests/fixtures/layout_page.json"),
         include_str!("../../tests/fixtures/layout_ack.json"),
         include_str!("../../tests/fixtures/icon_get.json"),
         include_str!("../../tests/fixtures/press.json"),
@@ -512,6 +526,42 @@ mod tests {
             assert_ne!(msg, Message::Unknown, "{fixture}");
             let expected: Value = serde_json::from_str(fixture).unwrap();
             assert_eq!(serde_json::to_value(&msg).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn a_layout_page_carries_its_set_fields_and_a_plain_layout_prints_none() {
+        let page = include_str!("../../tests/fixtures/layout_page.json");
+        let Message::Layout {
+            page,
+            pages,
+            page_id,
+            font,
+            ..
+        } = serde_json::from_str(page).unwrap()
+        else {
+            panic!("expected a layout")
+        };
+        assert_eq!(
+            (page, pages, page_id.as_deref(), font.as_deref()),
+            (Some(1), Some(3), Some("media"), Some("inter"))
+        );
+
+        let plain = include_str!("../../tests/fixtures/layout.json");
+        let Message::Layout {
+            page,
+            pages,
+            page_id,
+            ..
+        } = serde_json::from_str(plain).unwrap()
+        else {
+            panic!("expected a layout")
+        };
+        assert_eq!((page, pages, page_id), (None, None, None));
+        let printed =
+            serde_json::to_value(serde_json::from_str::<Message>(plain).unwrap()).unwrap();
+        for key in ["page", "pages", "page_id"] {
+            assert!(printed.get(key).is_none(), "{key}");
         }
     }
 
