@@ -66,12 +66,11 @@ _Static_assert(GRID_SCREEN_W == DISPLAY_H_RES && GRID_SCREEN_H == DISPLAY_V_RES,
 #define ROW_TEXT_MAX 128
 
 // The status bar, 1024 px wide, in Roboto Mono Regular 20 so that every text of a group has a fixed width. Left to
-// right: CPU, RAM, GPU, NET, then the date and time flush against the right edge. The four groups are spaced evenly
-// from the left edge to the clock's area. bar_create measures each group's worst case (the CPU and GPU ones with room
-// for the temperature a later plan adds) and computes the gap.
-#define BAR_TEXT_Y ((BAR_H - SLOT24_H) / 2) // 4: the line sits in the middle of the bar
-#define BAR_MARGIN 4                        // px between the clock and the right edge, and the status text and the left
-#define BAR_CLOCK_SLACK 4                   // px added to the clock's width
+// right: CPU, RAM, GPU, NET, then the date and time. CPU starts BAR_MARGIN from the left edge and the clock ends
+// BAR_MARGIN from the right one. The gaps between CPU, RAM, GPU, NET and the clock's area are equal. bar_create
+// measures each group's worst case (the CPU and GPU ones with room for the temperature a later plan adds) and computes
+// them.
+#define BAR_MARGIN 12 // px between the first group and the left edge, and between the clock and the right edge
 #define BAR_REFRESH_MS 1000
 
 static const char *TAG = "ui";
@@ -1096,7 +1095,7 @@ static void bar_refresh(void)
         strlcpy(a, "--", sizeof(a));
         strlcpy(b, "--", sizeof(b));
     }
-    snprintf(text, sizeof(text), LV_SYMBOL_DOWN "%*s " LV_SYMBOL_UP "%*s", HOSTSTAT_RATE_W, a, HOSTSTAT_RATE_W, b);
+    snprintf(text, sizeof(text), LV_SYMBOL_DOWN " %*s " LV_SYMBOL_UP " %*s", HOSTSTAT_RATE_W, a, HOSTSTAT_RATE_W, b);
     bar_set(BAR_NET, text);
 }
 
@@ -1132,30 +1131,37 @@ static void bar_create(void)
     }
     // Each group's worst case. The CPU and GPU ones include the temperature a later plan adds.
     int w[BAR_COUNT] = {0};
-    w[BAR_CLOCK] = bar_text_w("Wed 24 May 04:44") + BAR_CLOCK_SLACK;
+    w[BAR_CLOCK] = bar_text_w("Wed 24 May 04:44");
     w[BAR_CPU] = bar_text_w("CPU 100% 100\xC2\xB0");
     w[BAR_RAM] = bar_text_w("RAM 100%");
     w[BAR_GPU] = bar_text_w("GPU 100% 100\xC2\xB0");
-    w[BAR_NET] = bar_text_w(LV_SYMBOL_DOWN "999.9M " LV_SYMBOL_UP "999.9M");
-    // The clock sits flush right, BAR_MARGIN from the edge. The four groups are spread over the rest of the bar with
-    // five equal gaps: screen edge, between each pair of groups, and the clock's area.
+    w[BAR_NET] = bar_text_w(LV_SYMBOL_DOWN " 999.9M " LV_SYMBOL_UP " 999.9M");
+    // CPU starts at BAR_MARGIN and the clock ends BAR_MARGIN from the right edge. The four gaps between CPU, RAM, GPU,
+    // NET and the clock's area are equal, within 1 px: the remainder goes one px each to the first gaps.
     const int clock_x = DISPLAY_H_RES - BAR_MARGIN - w[BAR_CLOCK];
-    const int free_px = clock_x - w[BAR_CPU] - w[BAR_RAM] - w[BAR_GPU] - w[BAR_NET];
+    const int free_px = clock_x - BAR_MARGIN - w[BAR_CPU] - w[BAR_RAM] - w[BAR_GPU] - w[BAR_NET];
     if (free_px < 0) {
         ESP_LOGW(TAG, "bar slot overflow: the groups need %d px more than the bar has", -free_px);
     }
-    const int gap = free_px > 0 ? free_px / 5 : 0;
+    const int gap = free_px > 0 ? free_px / 4 : 0;
+    const int spare = free_px > 0 ? free_px % 4 : 0;
     int x[BAR_COUNT] = {0};
     x[BAR_STATUS] = BAR_MARGIN;
     x[BAR_CLOCK] = clock_x;
-    x[BAR_CPU] = gap;
-    x[BAR_RAM] = x[BAR_CPU] + w[BAR_CPU] + gap;
-    x[BAR_GPU] = x[BAR_RAM] + w[BAR_RAM] + gap;
-    x[BAR_NET] = x[BAR_GPU] + w[BAR_GPU] + gap;
+    x[BAR_CPU] = BAR_MARGIN;
+    x[BAR_RAM] = x[BAR_CPU] + w[BAR_CPU] + gap + (0 < spare);
+    x[BAR_GPU] = x[BAR_RAM] + w[BAR_RAM] + gap + (1 < spare);
+    x[BAR_NET] = x[BAR_GPU] + w[BAR_GPU] + gap + (2 < spare);
     w[BAR_STATUS] = clock_x - 2 * BAR_MARGIN; // the link status text spans the group area
-    ESP_LOGI(TAG, "bar groups (x/width): cpu %d/%d ram %d/%d gpu %d/%d net %d/%d clock %d/%d, gap %d", x[BAR_CPU],
-             w[BAR_CPU], x[BAR_RAM], w[BAR_RAM], x[BAR_GPU], w[BAR_GPU], x[BAR_NET], w[BAR_NET], x[BAR_CLOCK],
-             w[BAR_CLOCK], gap);
+    // The text is as tall as the bar font's line, centered in the bar.
+    const int text_h = s_bar_font.line_height;
+    const int text_y = (BAR_H - text_h) / 2;
+    ESP_LOGI(TAG,
+             "bar groups (x/width): cpu %d/%d ram %d/%d gpu %d/%d net %d/%d clock %d/%d, gap %d (+%d spare), margins "
+             "%d left %d right, text y %d h %d",
+             x[BAR_CPU], w[BAR_CPU], x[BAR_RAM], w[BAR_RAM], x[BAR_GPU], w[BAR_GPU], x[BAR_NET], w[BAR_NET],
+             x[BAR_CLOCK], w[BAR_CLOCK], gap, spare, x[BAR_CPU], DISPLAY_H_RES - x[BAR_CLOCK] - w[BAR_CLOCK], text_y,
+             text_h);
 
     s_bar = lv_obj_create(lv_screen_active());
     lv_obj_remove_style_all(s_bar);
@@ -1170,8 +1176,8 @@ static void bar_create(void)
     for (bar_slot_t slot = 0; slot < BAR_COUNT; slot++) {
         lv_obj_t *label = lv_label_create(s_bar);
         s_bar_labels[slot] = label;
-        lv_obj_set_size(label, w[slot], SLOT24_H);
-        lv_obj_set_pos(label, x[slot], BAR_TEXT_Y);
+        lv_obj_set_size(label, w[slot], text_h);
+        lv_obj_set_pos(label, x[slot], text_y);
         lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
         if (slot == BAR_CLOCK) {
             lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_RIGHT, 0);

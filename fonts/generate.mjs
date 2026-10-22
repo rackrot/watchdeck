@@ -110,7 +110,16 @@ function loadManifest() {
         );
     }
   }
-  for (const c of manifest.chrome) {
+  for (const [i, c] of manifest.chrome.entries()) {
+    if (manifest.chrome.findIndex((o) => o.id === c.id) !== i)
+      die(`chrome font ${c.id}: duplicate id`);
+    if (manifest.chrome.findIndex((o) => o.file === c.file) !== i)
+      die(`chrome font ${c.id}: duplicate file ${c.file}`);
+    const codes = chromeCodes(c.range);
+    if (codes.length === 0 || codes.some((code) => !Number.isInteger(code)))
+      die(
+        `chrome font ${c.id}: range "${c.range}" is not a list of codepoints`,
+      );
     c.family = manifest.fonts.find((f) => f.id === c.family);
     if (!c.family)
       die(`chrome font ${c.id}: its family is not in the manifest`);
@@ -414,6 +423,10 @@ function generate(manifest) {
   for (const chrome of manifest.chrome) {
     const c = convertChrome(chrome);
     const p = parse(c, `chrome ${chrome.id}`);
+    if (p.lineHeight < SLOTS[24].min)
+      die(
+        `chrome ${chrome.id}: line_height ${p.lineHeight} is below the ${SLOTS[24].min} px minimum`,
+      );
     if (p.lineHeight > SLOTS[24].box)
       die(
         `chrome ${chrome.id}: line_height ${p.lineHeight} is above the ${SLOTS[24].box} px line box`,
@@ -436,11 +449,16 @@ function generate(manifest) {
 }
 
 // "0x20-0x7E,0xB0" as the codepoints it names.
+// Returns [] when any part is not `0xLO` or `0xLO-0xHI` with LO <= HI.
 function chromeCodes(range) {
-  return range.split(",").flatMap((part) => {
+  const codes = [];
+  for (const part of String(range).split(",")) {
+    if (!/^0x[0-9a-fA-F]+(-0x[0-9a-fA-F]+)?$/.test(part)) return [];
     const [lo, hi = lo] = part.split("-").map(Number);
-    return Array.from({ length: hi - lo + 1 }, (_, i) => lo + i);
-  });
+    if (hi < lo) return [];
+    for (let code = lo; code <= hi; code++) codes.push(code);
+  }
+  return codes;
 }
 
 function probe(manifest) {
