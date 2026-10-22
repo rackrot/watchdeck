@@ -29,6 +29,11 @@ pub const MAX_ROWS: u32 = 5;
 /// The device keeps an id in 64 bytes and a label in 48, each with its NUL.
 pub const MAX_ID_BYTES: usize = 63;
 pub const MAX_LABEL_BYTES: usize = 47;
+/// The device holds this many pages, and polls at most this many tiles across all of them.
+pub const MAX_PAGES: usize = 4;
+pub const MAX_TILES: usize = 40;
+/// A page's editor label, in characters.
+pub const MAX_PAGE_LABEL: usize = 24;
 pub const MAX_TIMEOUT_S: u64 = 600;
 /// A tile polls at most this often, and at least this rarely (a day).
 pub const MIN_EVERY_S: u64 = 2;
@@ -70,8 +75,21 @@ action = { kind = "shell", argv = ["notify-send", "watchdeck", "Hello from watch
 pub struct Config {
     pub version: u32,
     pub layout: Grid,
+    /// Absent: one page, and no button may name one. With tables, the first is the home page.
+    #[serde(default, rename = "page", skip_serializing_if = "Vec::is_empty")]
+    pub pages: Vec<PageConfig>,
     #[serde(default, rename = "button")]
     pub buttons: Vec<ButtonConfig>,
+}
+
+/// A page of the grid. Buttons name theirs with `page`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PageConfig {
+    pub id: String,
+    /// What the editor's tab shows instead of the id. It never reaches a device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +120,9 @@ pub struct ButtonConfig {
     /// grid's font.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font: Option<String>,
+    /// The `[[page]]` id this button sits on. Absent: the first page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<String>,
     pub action: Action,
     /// Makes the button show a live value, polled from `source`. The tile table goes last
     /// because TOML wants tables after plain values.
@@ -173,32 +194,63 @@ pub struct Layout {
     pub rows: u32,
     /// The grid's default font, absent for Montserrat.
     pub font: Option<String>,
-    pub buttons: Vec<Button>,
-    /// The pictures the buttons name, for answering `icon_get`.
+    /// At least one. A config without `[[page]]` tables has one page with an empty id.
+    pub pages: Vec<LayoutPage>,
+    /// The pictures the buttons of every page name, for answering `icon_get`.
     pub icons: Vec<Arc<IconFrame>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayoutPage {
+    pub id: String,
+    pub buttons: Vec<Button>,
+}
+
 impl Layout {
-    pub fn message(&self, rev: u32) -> Message {
-        Message::Layout {
-            rev,
-            page: None,
-            pages: None,
-            page_id: None,
-            cols: self.cols,
-            rows: self.rows,
-            font: self.font.clone(),
-            buttons: self.buttons.clone(),
-        }
+    /// Every button of every page, in page order.
+    pub fn buttons(&self) -> impl Iterator<Item = &Button> {
+        self.pages.iter().flat_map(|page| &page.buttons)
+    }
+
+    /// The messages that put this layout on a device, in order, all under `rev`. One page is
+    /// today's plain `layout`. Several are one message each, numbered.
+    pub fn messages(&self, rev: u32) -> Vec<Message> {
+        let count = self.pages.len();
+        let paged = count > 1;
+        self.pages
+            .iter()
+            .enumerate()
+            .map(|(i, page)| Message::Layout {
+                rev,
+                page: paged.then_some(i as u32),
+                pages: paged.then_some(count as u32),
+                page_id: paged.then(|| page.id.clone()),
+                cols: self.cols,
+                rows: self.rows,
+                font: self.font.clone(),
+                buttons: page.buttons.clone(),
+            })
+            .collect()
     }
 
     /// What a device without the `fonts` capability is sent: no font fields at all.
     pub fn without_fonts(mut self) -> Self {
         self.font = None;
-        for button in &mut self.buttons {
+        for button in self.pages.iter_mut().flat_map(|page| &mut page.buttons) {
             button.label_font = None;
             button.value_font = None;
         }
+        self
+    }
+
+    /// What a device without the `pages` capability is sent: the first page, and the icons it
+    /// names. A one-page view has no page id, so renaming page 0 changes nothing it sees.
+    pub fn home_only(mut self) -> Self {
+        self.pages.truncate(1);
+        self.pages[0].id.clear();
+        let named: HashSet<String> = self.buttons().filter_map(|b| b.icon.clone()).collect();
+        self.icons
+            .retain(|icon| named.contains(&encode_hex(&icon.id)));
         self
     }
 }
@@ -219,6 +271,15 @@ fn color(text: &str) -> Option<u32> {
         return None;
     }
     u32::from_str_radix(hex, 16).ok()
+}
+
+/// Whether `id` is a button or page id: 1 to 63 letters, digits, `_`, `-` or `.`.
+fn id_ok(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_ID_BYTES
+        && id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
 }
 
 fn printable_ascii(text: &str) -> bool {
@@ -268,41 +329,54 @@ impl Live {
         let rgb = |text: &str| color(text).expect("colors are checked before a config goes live");
         let mut icons = Vec::new();
         let grid_font = self.config.layout.font.as_deref().unwrap_or(DEFAULT_FONT);
-        let buttons = self
-            .config
-            .buttons
-            .iter()
-            .map(|b| {
-                // The wire carries only what differs from what a font inherits, so the device
-                // needs two fallbacks and none of the config's rules.
-                let label = b.font.as_deref().unwrap_or(grid_font);
-                let value = b.tile.as_ref().map(|t| t.font.as_deref().unwrap_or(label));
-                Button {
-                    id: b.id.clone(),
-                    col: b.pos[0],
-                    row: b.pos[1],
-                    label: b.label.clone(),
-                    bg: rgb(&b.bg),
-                    fg: rgb(&b.fg),
-                    tile: b.tile.is_some(),
-                    icon: b.icon.as_ref().map(|name| {
-                        let icon = self
-                            .icons
-                            .get(name)
-                            .expect("icons are rendered before a config goes live");
-                        icons.push(icon.clone());
-                        encode_hex(&icon.id)
-                    }),
-                    label_font: (label != grid_font).then(|| label.to_string()),
-                    value_font: value.filter(|value| *value != label).map(str::to_string),
-                }
-            })
-            .collect();
+        let mut button = |b: &ButtonConfig| {
+            // The wire carries only what differs from what a font inherits, so the device
+            // needs two fallbacks and none of the config's rules.
+            let label = b.font.as_deref().unwrap_or(grid_font);
+            let value = b.tile.as_ref().map(|t| t.font.as_deref().unwrap_or(label));
+            Button {
+                id: b.id.clone(),
+                col: b.pos[0],
+                row: b.pos[1],
+                label: b.label.clone(),
+                bg: rgb(&b.bg),
+                fg: rgb(&b.fg),
+                tile: b.tile.is_some(),
+                icon: b.icon.as_ref().map(|name| {
+                    let icon = self
+                        .icons
+                        .get(name)
+                        .expect("icons are rendered before a config goes live");
+                    icons.push(icon.clone());
+                    encode_hex(&icon.id)
+                }),
+                label_font: (label != grid_font).then(|| label.to_string()),
+                value_font: value.filter(|value| *value != label).map(str::to_string),
+            }
+        };
+        // One page, from no table or from a single one, has no id: it goes out as a plain
+        // layout, and renaming it must not look like a change.
+        let pages = if self.config.pages.len() < 2 {
+            vec![LayoutPage {
+                id: String::new(),
+                buttons: self.config.buttons.iter().map(&mut button).collect(),
+            }]
+        } else {
+            (self.config.pages.iter().enumerate())
+                .map(|(i, page)| LayoutPage {
+                    id: page.id.clone(),
+                    buttons: (self.config.buttons.iter())
+                        .filter(|b| self.config.page_index(b) == Some(i))
+                        .map(&mut button)
+                        .collect(),
+                })
+                .collect()
+        };
         Layout {
             cols: self.config.layout.cols,
             rows: self.config.layout.rows,
             font: (grid_font != DEFAULT_FONT).then(|| grid_font.to_string()),
-            buttons,
+            pages,
             icons,
         }
     }
@@ -318,7 +392,17 @@ impl Config {
                 rows: 3,
                 font: None,
             },
+            pages: Vec::new(),
             buttons: Vec::new(),
+        }
+    }
+
+    /// Where `button` sits among the pages: the one it names, else the first. `None` if it names
+    /// a page that doesn't exist.
+    fn page_index(&self, button: &ButtonConfig) -> Option<usize> {
+        match &button.page {
+            Some(id) => self.pages.iter().position(|p| p.id == *id),
+            None => Some(0),
         }
     }
 
@@ -360,17 +444,41 @@ impl Config {
             errors.push(problem);
         }
 
+        if self.pages.len() > MAX_PAGES {
+            errors.push(format!("{} pages, at most {MAX_PAGES}", self.pages.len()));
+        }
+        let mut page_ids = HashSet::new();
+        for p in &self.pages {
+            let mut error = |problem: String| errors.push(format!("page {:?}: {problem}", p.id));
+            if !id_ok(&p.id) {
+                error(format!(
+                    "id must be 1 to {MAX_ID_BYTES} letters, digits, '_', '-' or '.'"
+                ));
+            }
+            if !page_ids.insert(p.id.as_str()) {
+                error("another page has this id".into());
+            }
+            if let Some(label) = &p.label {
+                if label.is_empty() {
+                    error("label is empty; leave it out to show the id".into());
+                }
+                if label.chars().count() > MAX_PAGE_LABEL {
+                    error(format!(
+                        "label is {} characters, at most {MAX_PAGE_LABEL}",
+                        label.chars().count()
+                    ));
+                }
+                if !printable_ascii(label) {
+                    error("label must be printable ASCII".into());
+                }
+            }
+        }
+
         let mut ids = HashSet::new();
         let mut cells = HashMap::new();
         for b in &self.buttons {
             let mut error = |problem: String| errors.push(format!("button {:?}: {problem}", b.id));
-            if b.id.is_empty()
-                || b.id.len() > MAX_ID_BYTES
-                || !b
-                    .id
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
-            {
+            if !id_ok(&b.id) {
                 error(format!(
                     "id must be 1 to {MAX_ID_BYTES} letters, digits, '_', '-' or '.'"
                 ));
@@ -378,12 +486,22 @@ impl Config {
             if !ids.insert(b.id.as_str()) {
                 error("another button has this id".into());
             }
+            let page = self.page_index(b);
+            match (&b.page, page) {
+                (Some(id), _) if self.pages.is_empty() => error(format!(
+                    "page {id:?} is set, but the file has no [[page]] tables"
+                )),
+                (Some(id), None) => error(format!("page {id:?} is not one of the [[page]] ids")),
+                _ => {}
+            }
             let [col, row] = b.pos;
             if grid_ok && (col >= cols || row >= rows) {
                 error(format!(
                     "pos [{col}, {row}] is outside the {cols}x{rows} grid"
                 ));
-            } else if let Some(other) = cells.insert((col, row), b.id.as_str()) {
+            } else if let Some(other) =
+                page.and_then(|page| cells.insert((page, col, row), b.id.as_str()))
+            {
                 error(format!("pos [{col}, {row}] is taken by button {other:?}"));
             }
             if b.label.len() > MAX_LABEL_BYTES {
@@ -416,6 +534,12 @@ impl Config {
                     error(problem);
                 }
             }
+        }
+        let tiles = self.buttons.iter().filter(|b| b.tile.is_some()).count();
+        if tiles > MAX_TILES {
+            errors.push(format!(
+                "{tiles} tiles across all pages, at most {MAX_TILES}"
+            ));
         }
         errors
     }
@@ -1123,7 +1247,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
         let layout = live(config).layout();
         assert_eq!((layout.cols, layout.rows), (5, 3));
         assert_eq!(
-            (layout.buttons[0].bg, layout.buttons[0].fg),
+            (layout.pages[0].buttons[0].bg, layout.pages[0].buttons[0].fg),
             (0x1e88e5, 0xffffff)
         );
 
@@ -1192,7 +1316,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
 
         let layout = live(config).layout();
         assert_eq!(
-            layout.buttons.iter().map(|b| b.tile).collect::<Vec<_>>(),
+            layout.buttons().map(|b| b.tile).collect::<Vec<_>>(),
             [true, false]
         );
     }
@@ -1617,6 +1741,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
                 fg: "#ffffff".into(),
                 icon: Some("i.png".into()),
                 font: Some("fira-code".into()),
+                page: None,
                 action: Action::Shell {
                     argv: vec!["true".into()],
                     timeout_s: 1,
@@ -1638,7 +1763,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
             .insert("i.png".into(), Arc::new(IconFrame::new(1, 1, vec![0; 4])));
         let mut layout = live.layout();
         let size = |layout: &Layout| {
-            serde_json::to_string(&layout.message(u32::MAX))
+            serde_json::to_string(&layout.messages(u32::MAX)[0])
                 .unwrap()
                 .len()
         };
@@ -1649,7 +1774,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
         // Every font field at its longest, which resolution can't produce (a value font equal to
         // its label font is never sent), so it bounds anything the daemon can send.
         assert_eq!(layout.font.as_deref(), Some(longest));
-        for button in &mut layout.buttons {
+        for button in &mut layout.pages[0].buttons {
             button.label_font = Some(longest.into());
             button.value_font = Some(longest.into());
         }
@@ -1658,6 +1783,431 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
             "fullest layout, every font field at {longest}: {bound} bytes of {MAX_MESSAGE_BYTES}"
         );
         assert!(bound <= MAX_MESSAGE_BYTES, "{bound} bytes");
+    }
+
+    // ---- Pages ----
+
+    /// Two pages on a 5x3 grid. `a` sits on the first page without naming it, `b` on `media`.
+    const PAGED: &str = r##"
+version = 1
+[layout]
+cols = 5
+rows = 3
+
+[[page]]
+id = "main"
+
+[[page]]
+id = "media"
+label = "Media"
+
+[[button]]
+id = "a"
+pos = [0, 0]
+label = "A"
+action = { kind = "shell", argv = ["true"] }
+
+[[button]]
+id = "b"
+page = "media"
+pos = [0, 0]
+label = "B"
+action = { kind = "shell", argv = ["true"] }
+"##;
+
+    fn paged_with(from: &str, to: &str) -> String {
+        assert!(PAGED.contains(from), "{from}");
+        PAGED.replacen(from, to, 1)
+    }
+
+    fn shell() -> Action {
+        Action::Shell {
+            argv: vec!["true".into()],
+            timeout_s: 1,
+        }
+    }
+
+    /// A button at cell `i` of an 8x5 grid, on page `page`, with a tile if `tile`.
+    fn spread_button(id: String, i: u32, page: Option<String>, tile: bool) -> ButtonConfig {
+        ButtonConfig {
+            id,
+            pos: [i % MAX_COLS, i / MAX_COLS],
+            label: "x".into(),
+            bg: "#ffffff".into(),
+            fg: "#ffffff".into(),
+            icon: None,
+            font: None,
+            page,
+            action: shell(),
+            tile: tile.then(|| TileConfig {
+                every_s: MIN_EVERY_S,
+                json_pointer: None,
+                font: None,
+                source: shell(),
+            }),
+        }
+    }
+
+    /// `pages` pages on an 8x5 grid with `per_page` buttons each, `tiles` of them with a tile,
+    /// taken in page order.
+    fn spread(pages: usize, per_page: u32, tiles: usize) -> Config {
+        let mut config = Config::empty();
+        config.layout = Grid {
+            cols: MAX_COLS,
+            rows: MAX_ROWS,
+            font: None,
+        };
+        for p in 0..pages {
+            config.pages.push(PageConfig {
+                id: format!("p{p}"),
+                label: None,
+            });
+            for i in 0..per_page {
+                let n = config.buttons.len();
+                config.buttons.push(spread_button(
+                    format!("b{n}"),
+                    i,
+                    Some(format!("p{p}")),
+                    n < tiles,
+                ));
+            }
+        }
+        config
+    }
+
+    #[test]
+    fn a_file_without_pages_saves_without_page_keys_and_parses_back_equal() {
+        for text in [EXAMPLE, DEFAULT] {
+            let config = parse(text, &names()).unwrap();
+            assert!(config.pages.is_empty());
+            let saved = toml::to_string(&config).unwrap();
+            assert!(!saved.contains("page"), "{saved}");
+            assert_eq!(parse(&saved, &names()).unwrap(), config);
+        }
+    }
+
+    #[test]
+    fn a_config_with_pages_survives_a_save_and_parse() {
+        let text = format!(
+            "{}\n[[button]]\nid = \"c\"\npage = \"main\"\npos = [1, 0]\nlabel = \"C\"\nfont = \"orbitron\"\n\
+             action = {{ kind = \"http\", method = \"POST\", url = \"https://ha.lan/x\", \
+             headers = {{ \"X-A\" = \"1\" }}, secret_headers = {{ Authorization = \"ha\" }} }}\n\
+             [button.tile]\nevery_s = 30\nfont = \"fira-code\"\njson_pointer = \"/state\"\n\
+             source = {{ kind = \"shell\", argv = [\"true\"] }}\n",
+            paged_with("cols = 5", "cols = 5\nfont = \"inter\"")
+        );
+        let config = parse(&text, &names()).unwrap();
+        assert_eq!(config.pages.len(), 2);
+        assert_eq!(config.pages[1].label.as_deref(), Some("Media"));
+        assert_eq!(config.buttons[0].page, None, "implicit membership");
+        assert_eq!(config.buttons[1].page.as_deref(), Some("media"));
+        assert_eq!(config.buttons[2].page.as_deref(), Some("main"), "explicit");
+        let saved = toml::to_string(&config).unwrap();
+        assert_eq!(parse(&saved, &names()).unwrap(), config, "{saved}");
+        assert_eq!(saved.matches("[[page]]").count(), 2, "{saved}");
+    }
+
+    #[test]
+    fn a_page_needs_a_page_table_to_name() {
+        assert_refused(
+            &example_with("label = \"Plex\"", "label = \"Plex\"\npage = \"main\""),
+            "button \"plex\": page \"main\" is set, but the file has no [[page]] tables",
+        );
+        assert_refused(
+            &paged_with("page = \"media\"", "page = \"music\""),
+            "button \"b\": page \"music\" is not one of the [[page]] ids",
+        );
+    }
+
+    #[test]
+    fn page_ids_follow_the_button_rule_and_are_unique() {
+        let id = "id must be 1 to 63 letters, digits, '_', '-' or '.'";
+        let long = "a".repeat(64);
+        for bad in ["", "has space", &long] {
+            assert_refused(
+                &paged_with("id = \"media\"", &format!("id = {bad:?}")),
+                &format!("page {bad:?}: {id}"),
+            );
+        }
+        // 63 bytes is the longest that passes.
+        let longest = "a".repeat(63);
+        parse(&PAGED.replace("media", &longest), &names()).unwrap();
+        assert_refused(
+            &paged_with("id = \"media\"", "id = \"main\""),
+            "page \"main\": another page has this id",
+        );
+    }
+
+    #[test]
+    fn a_page_label_is_printable_ascii_of_at_most_24_characters() {
+        let label = |text: &str| paged_with("label = \"Media\"", &format!("label = {text:?}"));
+        parse(&label(&"m".repeat(24)), &names()).unwrap();
+        assert_refused(
+            &label(&"m".repeat(25)),
+            "page \"media\": label is 25 characters, at most 24",
+        );
+        assert_refused(
+            &label("M\u{e9}dia"),
+            "page \"media\": label must be printable ASCII",
+        );
+        assert_refused(
+            &label("a\nb"),
+            "page \"media\": label must be printable ASCII",
+        );
+    }
+
+    #[test]
+    fn at_most_four_pages() {
+        let mut config = spread(4, 1, 0);
+        assert!(config.check(&names()).is_empty());
+        config.pages.push(PageConfig {
+            id: "p4".into(),
+            label: None,
+        });
+        assert_eq!(config.check(&names()), ["5 pages, at most 4"]);
+    }
+
+    #[test]
+    fn a_cell_is_taken_once_per_page() {
+        // The same cell on two pages passes: PAGED puts `a` and `b` at [0, 0].
+        parse(PAGED, &names()).unwrap();
+        // `b` joins `a` on the first page, a button that names no page.
+        assert_refused(
+            &paged_with("page = \"media\"", "page = \"main\""),
+            "button \"b\": pos [0, 0] is taken by button \"a\"",
+        );
+        assert_refused(
+            &paged_with(
+                "page = \"media\"\npos = [0, 0]",
+                "page = \"media\"\npos = [5, 0]",
+            ),
+            "button \"b\": pos [5, 0] is outside the 5x3 grid",
+        );
+        // Two buttons on the second page.
+        let text = format!(
+            "{PAGED}\n[[button]]\nid = \"c\"\npage = \"media\"\npos = [0, 0]\nlabel = \"C\"\n\
+             action = {{ kind = \"shell\", argv = [\"true\"] }}\n"
+        );
+        assert_refused(&text, "button \"c\": pos [0, 0] is taken by button \"b\"");
+        // An unknown page is reported once, without a made-up collision.
+        let errors = errors(&paged_with("page = \"media\"", "page = \"nope\""));
+        assert_eq!(errors.len(), 1, "{errors:?}");
+    }
+
+    #[test]
+    fn at_most_forty_tiles_across_all_pages() {
+        let config = spread(4, 10, 40);
+        assert!(config.check(&names()).is_empty());
+        let config = spread(4, 11, 41);
+        assert_eq!(
+            config.check(&names()),
+            ["41 tiles across all pages, at most 40"]
+        );
+        // The same count on one page of the 8x5 grid is the old ceiling, and passes.
+        let mut one = spread(1, 40, 40);
+        one.pages.clear();
+        for b in &mut one.buttons {
+            b.page = None;
+        }
+        assert!(one.check(&names()).is_empty());
+    }
+
+    #[test]
+    fn layout_builds_pages_from_membership_and_keeps_labels_off_it() {
+        let layout = live(parse(PAGED, &names()).unwrap()).layout();
+        let ids: Vec<_> = layout
+            .pages
+            .iter()
+            .map(|p| {
+                (
+                    p.id.as_str(),
+                    p.buttons.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        assert_eq!(ids, [("main", vec!["a"]), ("media", vec!["b"])]);
+
+        let messages = layout.messages(7);
+        assert_eq!(messages.len(), 2);
+        let json: Vec<_> = messages
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
+        for (i, (id, json)) in [("main", &json[0]), ("media", &json[1])]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(json["rev"], 7);
+            assert_eq!(json["page"], i);
+            assert_eq!(json["pages"], 2);
+            assert_eq!(json["page_id"], id);
+            assert_eq!(json["buttons"].as_array().unwrap().len(), 1);
+        }
+        assert!(!json.iter().any(|m| m.to_string().contains("Media")));
+        // A label edit changes nothing a device sees.
+        let relabeled = parse(
+            &paged_with("label = \"Media\"", "label = \"Films\""),
+            &names(),
+        )
+        .unwrap();
+        assert_eq!(live(relabeled).layout(), layout);
+    }
+
+    #[test]
+    fn a_config_without_pages_sends_todays_layout_bytes_with_and_without_fonts() {
+        let text = font_config(None, None, None);
+        let layout = live(parse(&text, &names()).unwrap()).layout();
+        assert_eq!(layout.pages.len(), 1);
+        let json = |layout: &Layout| {
+            let messages = layout.messages(1);
+            assert_eq!(messages.len(), 1);
+            serde_json::to_string(&messages[0]).unwrap()
+        };
+        let plain = r#"{"t":"layout","rev":1,"cols":5,"rows":3,"buttons":[{"id":"b","col":0,"row":0,"label":"B","bg":2001125,"fg":16777215}]}"#;
+        assert_eq!(json(&layout), plain);
+        assert_eq!(json(&layout.clone().without_fonts()), plain);
+        assert_eq!(json(&layout.clone().home_only()), plain);
+
+        let text = font_config(Some("inter"), Some("orbitron"), Some(Some("fira-code")));
+        let fonted = live(parse(&text, &names()).unwrap()).layout();
+        let with = json(&fonted);
+        assert_eq!(
+            with,
+            r#"{"t":"layout","rev":1,"cols":5,"rows":3,"font":"inter","buttons":[{"id":"b","col":0,"row":0,"label":"B","bg":2001125,"fg":16777215,"tile":true,"label_font":"orbitron","value_font":"fira-code"}]}"#
+        );
+        let without = json(&fonted.without_fonts());
+        assert!(!without.contains("font"), "{without}");
+    }
+
+    #[test]
+    fn a_page_table_or_a_page_rename_leaves_the_one_page_view_equal() {
+        let view = |text: &str| live(parse(text, &names()).unwrap()).layout().home_only();
+        // Adding a single [[page]] to a file without pages.
+        assert_eq!(
+            view(EXAMPLE),
+            view(&format!("{EXAMPLE}\n[[page]]\nid = \"main\"\n"))
+        );
+        let single = live(parse(EXAMPLE, &names()).unwrap()).layout();
+        let one = format!(
+            "version = 1\n[[page]]\nid = \"solo\"\n{}",
+            &EXAMPLE["\nversion = 1\n".len()..]
+        );
+        assert_eq!(live(parse(&one, &names()).unwrap()).layout(), single);
+        // Renaming page 0 of two.
+        assert_eq!(
+            view(PAGED),
+            view(&paged_with("id = \"main\"", "id = \"home\""))
+        );
+    }
+
+    #[test]
+    fn an_empty_page_label_is_refused() {
+        assert_refused(
+            &paged_with("label = \"Media\"", "label = \"\""),
+            "page \"media\": label is empty",
+        );
+    }
+
+    #[test]
+    fn without_fonts_strips_every_page() {
+        let mut config = parse(PAGED, &names()).unwrap();
+        config.layout.font = Some("inter".into());
+        config.buttons[1].font = Some("orbitron".into());
+        let layout = live(config).layout();
+        assert_eq!(layout.font.as_deref(), Some("inter"));
+        assert_eq!(
+            layout.pages[1].buttons[0].label_font.as_deref(),
+            Some("orbitron")
+        );
+        let stripped = layout.without_fonts();
+        assert_eq!(stripped.font, None);
+        assert!(stripped
+            .buttons()
+            .all(|b| b.label_font.is_none() && b.value_font.is_none()));
+        assert_eq!(stripped.pages.len(), 2);
+    }
+
+    #[test]
+    fn home_only_keeps_page_zero_and_only_the_icons_it_names() {
+        let mut config = parse(PAGED, &names()).unwrap();
+        config.buttons[0].icon = Some("home.png".into());
+        config.buttons[1].icon = Some("away.png".into());
+        let mut live = live(config);
+        for (name, shade) in [("home.png", 1), ("away.png", 2)] {
+            live.icons
+                .insert(name.into(), Arc::new(IconFrame::new(1, 1, vec![shade; 4])));
+        }
+        let layout = live.layout();
+        assert_eq!(layout.icons.len(), 2);
+
+        let home = layout.clone().home_only();
+        assert_eq!(home.pages.len(), 1);
+        assert_eq!(home.pages[0].id, "", "a one-page view has no page id");
+        assert_eq!(home.icons, [live.icons["home.png"].clone()]);
+        // One page is today's plain message.
+        let messages = home.messages(1);
+        assert_eq!(messages.len(), 1);
+        let json = serde_json::to_string(&messages[0]).unwrap();
+        assert!(!json.contains("page"), "{json}");
+        // The paged view still has both pictures.
+        assert_eq!(layout.icons.len(), 2);
+    }
+
+    #[test]
+    fn the_fullest_page_fits_in_one_message() {
+        let longest = "roboto-mono";
+        let mut config = spread(MAX_PAGES, MAX_COLS * MAX_ROWS, MAX_TILES);
+        // The last page holds no tiles above, so give it all 40 and the others none.
+        for (n, button) in config.buttons.iter_mut().enumerate() {
+            let on_last = n >= 3 * (MAX_COLS * MAX_ROWS) as usize;
+            button.tile = on_last.then(|| TileConfig {
+                every_s: MIN_EVERY_S,
+                json_pointer: None,
+                font: Some(longest.into()),
+                source: shell(),
+            });
+            button.id = format!("{n:0>63}");
+            button.label = "\"\\".repeat(MAX_LABEL_BYTES / 2) + "\"";
+            button.icon = Some("i.png".into());
+            button.font = Some("fira-code".into());
+        }
+        for (p, page) in config.pages.iter_mut().enumerate() {
+            page.id = format!("{p:0>63}");
+        }
+        for button in &mut config.buttons {
+            let p: usize = button.page.as_deref().unwrap()[1..].parse().unwrap();
+            button.page = Some(format!("{p:0>63}"));
+        }
+        config.layout.font = Some(longest.into());
+        assert!(config.check(&Ok(Vec::new())).is_empty());
+        let mut live = live(config);
+        live.icons
+            .insert("i.png".into(), Arc::new(IconFrame::new(1, 1, vec![0; 4])));
+        let mut layout = live.layout();
+        assert_eq!(layout.pages.len(), MAX_PAGES);
+        for button in &mut layout.pages[MAX_PAGES - 1].buttons {
+            button.label_font = Some(longest.into());
+            button.value_font = Some(longest.into());
+        }
+        let message = &layout.messages(u32::MAX)[MAX_PAGES - 1];
+        let Message::Layout {
+            page,
+            pages,
+            page_id,
+            buttons,
+            ..
+        } = message
+        else {
+            panic!("not a layout");
+        };
+        assert_eq!((*page, *pages), (Some(3), Some(4)));
+        assert_eq!(page_id.as_ref().map(String::len), Some(63));
+        assert_eq!(buttons.len(), 40);
+        let size = serde_json::to_string(message).unwrap().len();
+        println!(
+            "fullest page, 40 buttons, 63-byte ids, every font field at {longest}: {size} bytes of {MAX_MESSAGE_BYTES}"
+        );
+        assert!(size <= MAX_MESSAGE_BYTES, "{size} bytes");
     }
 
     // ---- Fonts ----
@@ -1682,7 +2232,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
     /// The font fields a layout of `text` puts on the wire: the message's, then the one button's.
     fn wire_fonts(text: &str) -> (Option<String>, Option<String>, Option<String>) {
         let layout = live(parse(text, &names()).unwrap()).layout();
-        let button = &layout.buttons[0];
+        let button = &layout.pages[0].buttons[0];
         (
             layout.font.clone(),
             button.label_font.clone(),
@@ -1815,7 +2365,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
     #[test]
     fn a_config_without_font_keys_sends_the_same_layout_bytes_with_and_without_the_cap() {
         let layout = live(parse(EXAMPLE, &names()).unwrap()).layout();
-        let json = |layout: &Layout| serde_json::to_string(&layout.message(1)).unwrap();
+        let json = |layout: &Layout| serde_json::to_string(&layout.messages(1)[0]).unwrap();
         assert!(!json(&layout).contains("font"), "{}", json(&layout));
         assert_eq!(json(&layout), json(&layout.clone().without_fonts()));
         assert_eq!(layout, layout.clone().without_fonts());
@@ -1834,10 +2384,13 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
                 Some("fira-code".into())
             )
         );
-        let json = serde_json::to_string(&stripped.message(1)).unwrap();
+        let json = serde_json::to_string(&stripped.messages(1)[0]).unwrap();
         assert!(!json.contains("font"), "{json}");
-        assert_eq!(stripped.buttons[0].label, layout.buttons[0].label);
-        assert!(stripped.buttons[0].tile);
+        assert_eq!(
+            stripped.pages[0].buttons[0].label,
+            layout.pages[0].buttons[0].label
+        );
+        assert!(stripped.pages[0].buttons[0].tile);
     }
 
     #[test]
@@ -2365,7 +2918,10 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
             .expect("the new icon was not picked up")
             .unwrap();
         let layout = configs.current().layout();
-        assert_eq!(layout.buttons[0].icon.as_ref().map(String::len), Some(32));
+        assert_eq!(
+            layout.pages[0].buttons[0].icon.as_ref().map(String::len),
+            Some(32)
+        );
         assert_eq!((layout.icons[0].w, layout.icons[0].h), (4, 4));
     }
 
@@ -2449,6 +3005,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
             fg: "#ffffff".into(),
             icon: None,
             font: None,
+            page: None,
             action,
             tile,
         };
@@ -2536,6 +3093,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
             fg: "#ffffff".into(),
             icon: None,
             font: None,
+            page: None,
             tile: None,
             action: Action::Http {
                 method: "POST".into(),

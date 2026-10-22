@@ -246,7 +246,8 @@ impl Icons {
     /// Every file that fails is reported. The cache lock is held only to look up and to store,
     /// never while decoding.
     pub fn load(&self, config: &Config) -> Result<IconSet, Vec<String>> {
-        let side = box_px(config.layout.cols, config.layout.rows, false);
+        let paged = config.pages.len() >= 2;
+        let side = box_px(config.layout.cols, config.layout.rows, paged);
         let mut icons = IconSet::new();
         let mut errors = Vec::new();
         for button in &config.buttons {
@@ -1318,6 +1319,32 @@ mod tests {
             );
         }
         crate::daemon::config::parse(&text, &Ok(Vec::new())).unwrap()
+    }
+
+    #[test]
+    fn load_renders_for_the_shorter_grid_only_with_two_or_more_pages() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("a.png"),
+            encoded(&quadrants(200), ImageFormat::Png),
+        )
+        .unwrap();
+        let store = Icons::new(tmp.path().to_path_buf());
+        let mut config = config_with_icons(&[("one", "a.png")]);
+        let side = |config: &Config| {
+            let icons = store.load(config).unwrap();
+            (icons["a.png"].w, icons["a.png"].h)
+        };
+        assert_eq!(side(&config), (44, 44));
+
+        let page = |id: &str| crate::daemon::config::PageConfig {
+            id: id.into(),
+            label: None,
+        };
+        config.pages = vec![page("main")];
+        assert_eq!(side(&config), (44, 44), "a single page keeps the full grid");
+        config.pages.push(page("media"));
+        assert_eq!(side(&config), (33, 33));
     }
 
     #[test]

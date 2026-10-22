@@ -674,7 +674,7 @@ impl TileFeed {
     {
         // A copy, because a watch guard held across a send would stall the poller's next update.
         let values = self.values.borrow_and_update().clone();
-        for button in layout.buttons.iter().filter(|b| b.tile) {
+        for button in layout.buttons().filter(|b| b.tile) {
             let Some(reading) = values.get(&button.id) else {
                 continue;
             };
@@ -727,17 +727,21 @@ where
         },
     )
     .await?;
+    // No session names `pages` yet, so every one sees the home page alone.
     let view = |live: &Live| {
         let layout = live.layout();
-        if fonts {
+        let layout = if fonts {
             layout
         } else {
             layout.without_fonts()
-        }
+        };
+        layout.home_only()
     };
     let mut layout = view(&config.borrow_and_update());
     let mut rev = 1;
-    send(tx, &layout.message(rev)).await?;
+    for message in layout.messages(rev) {
+        send(tx, &message).await?;
+    }
     let mut tiles = TileFeed {
         values: shared.tiles.values(),
         sent: Sent::new(),
@@ -769,7 +773,9 @@ where
                     layout = next;
                     rev += 1;
                     log::info!("{device}: pushing layout rev {rev}");
-                    send(tx, &layout.message(rev)).await?;
+                    for message in layout.messages(rev) {
+                        send(tx, &message).await?;
+                    }
                     shared.emit(DaemonEvent::LayoutPushed(device.to_string(), rev));
                     tiles.reset();
                     if let Some(kicked) = tiles.push(tx, &mut kick, &layout, &live).await? {

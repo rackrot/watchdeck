@@ -88,16 +88,56 @@ Each `[[button]]` table is one cell.
 | Key | Required | Rule |
 |---|---|---|
 | `id` | yes | 1 to 63 letters, digits, `_`, `-` or `.`, unique |
-| `pos` | yes | `[column, row]`, counted from 0 at the top left. Inside the grid, one button per cell |
+| `pos` | yes | `[column, row]`, counted from 0 at the top left. Inside the grid, one button per cell of its page |
 | `label` | yes | Printable ASCII, at most 47 characters. The device's fonts have no other characters |
 | `bg` | no | Background as `#rrggbb`. Default `#1e88e5` |
 | `fg` | no | Label color as `#rrggbb`. Default `#ffffff` |
 | `icon` | no | A picture in the `icons/` folder, such as `"3f2a9c1d0e44.png"`; see [Icons](#icons) |
 | `font` | no | The font of the label, and of a tile's value unless the tile sets its own; see [Fonts](#fonts). Default: the grid's font |
+| `page` | no | The `id` of a `[[page]]` table; see [Pages](#pages). Default: the first page |
 | `action` | yes | A shell or HTTP action, below |
 | `tile` | no | Makes the button show a live value; see [Tiles](#tiles) |
 
 Unknown keys are errors, so a misspelled key is caught rather than ignored.
+
+## Pages
+
+A grid can have up to 4 pages, and the device shows one at a time. Declare them with `[[page]]` tables, and put each button on one with its `page` key:
+
+```toml
+[[page]]
+id = "main"
+
+[[page]]
+id = "media"
+label = "Media"
+
+[[button]]
+id = "plex"
+page = "media"
+pos = [0, 0]
+label = "Plex"
+action = { kind = "shell", argv = ["ssh", "nas", "docker", "restart", "plex"] }
+```
+
+| Key | Required | Rule |
+|---|---|---|
+| `id` | yes | 1 to 63 letters, digits, `_`, `-` or `.`, unique among pages |
+| `label` | no | Printable ASCII, at most 24 characters. The config editor's tab shows it instead of the id. It is never sent to a device, and changing it changes nothing on one |
+
+- With no `[[page]]` table the grid has one page, as before, and a button may not set `page`.
+- With `[[page]]` tables there are 1 to 4 pages, in file order. The first is the home page, and a button without `page` goes on it.
+- One button per cell *of a page*: the same `pos` on two pages is fine. A button without `page` counts as being on the first page, so it collides with a button that names that page.
+- Button ids stay unique across all pages.
+- At most 40 buttons across all pages have a `tile`, which keeps the polling load where it was. Every page's tiles poll, whether or not the page is on screen.
+- The grid is the same size on every page (`layout.cols` by `layout.rows`).
+- A layout of 2 or more pages gives the grid 31 px less height, for a "Page x of y" label under it, so icon boxes get smaller; see [Icons](#icons). Going from one page to two makes every icon a new size, so the device fetches them again. A single `[[page]]` table keeps the full-height grid.
+- An error names the page, as `page "media": another page has this id`, or the button, as `button "plex": page "music" is not one of the [[page]] ids`. Other counts read `5 pages, at most 4` and `41 tiles across all pages, at most 40`.
+
+### Older firmware and older apps (pages)
+
+- A device on firmware without pages shows the first page only, whatever the config holds, and gets nothing for edits to the other pages. With 2 or more pages the icons are rendered for the shorter paged grid, so such a device shows them smaller than its full-height box (see the paged sizes under [Icons](#icons)).
+- An app from before pages refuses a `config.toml` with a `[[page]]` table or a `page` key, because it rejects keys it doesn't know, and keeps its last good config (an empty grid on a fresh start). Before going back to an older app, remove the `[[page]]` tables and every `page` key, and keep the buttons you want on the first page.
 
 ## Icons
 
