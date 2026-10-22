@@ -44,6 +44,12 @@ void ui_set_icon(const uint8_t id[PROTO_ICON_ID_LEN], const lv_image_dsc_t *dsc)
 /** Every icon of the set has come, or stopped coming: log a settled memory sample. Thread-safe. */
 void ui_icons_settled(void);
 
+/**
+ * A `stats` frame from the daemon: keep it for the status bar (and its clock), and show it if the bar is on screen. The
+ * bar shows `--` for host values once the frame is over 5 s old. Thread-safe.
+ */
+void ui_set_stats(const proto_stats_t *stats);
+
 /** Grey out the grid and block presses until the next ui_show_set. Thread-safe. */
 void ui_link_down(void);
 

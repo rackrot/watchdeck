@@ -18,15 +18,20 @@ The user answered the open questions of the first draft:
 - **Clock** (was D): 24-hour, shown as `Wed 22 Oct 14:32`.
 - **Long swipe** (was E): 200 px up, more than twice as far up as sideways, anywhere on the grid, tuned on the board in S6.
 - **Auto-close** (was F): settings closes after 60 s without a touch.
-- **Rates** (was G): bytes per second with SI prefixes (`1.2 MB/s`).
-- **Daemon name in the bar** (was H): yes, while the link is up.
+- **Bar layout, as built in S7** (replaces G and H):
+  - Rates are compact: bytes per second with an SI suffix and no unit, truncated (`▼1.2M ▲340k`, `999k`, never `1000k`).
+  - No daemon name in the bar, since settings shows it. While the link is down the link status text takes the place of the four host slots, and the clock stays.
+  - Memory is a percent, `MEM 45%` (used over total).
+  - Left to right: `CPU 12%`, `MEM 45%`, the clock centered on the 1024 px screen (`Wed 22 Oct 14:32`, worst case `Wed 24 May 04:44`), `GPU --` (reserved, always `--`; sized for `GPU 100% 100°`), then the net rates.
+  - The CPU slot is also sized for a later temperature (`CPU 100% 100°`).
+  - Slots, x and width: CPU 4/184, MEM 204/136, clock 396/232, GPU 636/184, net 828/192. The bar logs `bar slot overflow` at creation if a worst case is wider than its slot.
 
 ## Goal and done
 
 - **Grid mode** (paired, and a layout set applied since boot): the bar on top, then the grid from y 44. No status lines, Licenses or Forget pairing on screen.
 - **Status mode** (booting, unpaired, or paired with no set yet): today's screen. The five status lines at y 4 to 156, Licenses on the USB line, Forget pairing on the Touch line while paired, and the pairing views from y 204. A board that can't reach its daemon (wrong cert, daemon gone) stays here and can still be unpaired.
 - **Settings** opens on a long swipe up in grid mode: at least 200 px up, more than twice as far up as sideways, starting on the grid. It never presses a button or turns a page. It closes with Close, a swipe down, 60 s without a touch, or an unpair. While it is open the grid's widgets are deleted; closing rebuilds the page from the model. Opening and closing it 10 times leaves the LVGL pool where it was.
-- **The bar** shows the daemon's host name (or the link status while down), CPU %, memory used of total, receive and send rates, and `Wed 22 Oct 14:32`. Host values come from the daemon once a second. The clock keeps ticking on the board between frames and while the link is down. Without stats (never connected since boot, or more than 5 s since the last frame) the host values show `--`, and the clock shows `--:--` until the first frame since boot.
+- **The bar** shows CPU %, memory percent used, a reserved GPU slot, receive and send rates, and `Wed 22 Oct 14:32` (or the link status in place of the host values while down). Host values come from the daemon once a second. The clock keeps ticking on the board between frames and while the link is down. Without stats (never connected since boot, or more than 5 s since the last frame) the host values show `--`, and the clock shows `--:--` until the first frame since boot.
 - **Contract**: `GRID_TOP` is 44 on the board, in the daemon's `box_px` and in the preview. A session whose hello names `status_bar` gets a `stats` frame once a second.
 - `cargo test`, `pnpm test` and `mise run fw:test` cover the new rules. The hardware run (S8) passes on the board with serial-log evidence.
 - `site/src/protocol.md`, `site/src/config.md`, `site/src/wifi.md`, `README.md` and `CLAUDE.md` are updated.

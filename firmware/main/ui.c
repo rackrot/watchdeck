@@ -13,6 +13,7 @@
 #include "font_licenses.h"
 #include "fonts.h"
 #include "grid.h"
+#include "hoststat.h"
 #include "icons.h"
 #include "link.h"
 #include "model.h"
@@ -56,9 +57,30 @@ _Static_assert(GRID_SCREEN_W == DISPLAY_H_RES && GRID_SCREEN_H == DISPLAY_V_RES,
 #define RSSI_FRESH_MS 15000 // an older RSSI shows as "--": the link refreshes it every 5 s while settings is open
 #define SETTINGS_PAD 16
 #define SETTINGS_LINE 31 // a row: Montserrat 24's 27 px line and 4 px
-#define SETTINGS_LEFT_W 420
+// The columns hold 976 px between the pads. The left one's widest row is "PSRAM 32768 KiB free, min 32768" (410 px) and
+// the right one's "connected 192.168.100.200 (watchdeck.local)" (537 px), so 412 and 564 leave a pixel or two. Rows
+// that echo a name or an error (SSID, desktop name, "SD: not mounted (ESP_ERR_...)") have no bound and end in dots.
+#define SETTINGS_LEFT_W 412
 #define SETTINGS_BTN_W 300
 #define SETTINGS_BTN_H 56
+#define ROW_TEXT_MAX 128
+
+// The status bar, 1024 px wide, as x and width of each slot. Montserrat 24 widths of the worst case in each: CPU and
+// GPU "CPU 100% 100°" (179 px), MEM "MEM 100%" (130), the clock "Wed 24 May 04:44" (228), the net rates
+// "▼999M ▲999M" (183), so a slot's spare is under 10 px. The CPU and GPU slots hold the temperature a later plan adds.
+#define BAR_TEXT_Y ((BAR_H - SLOT24_H) / 2) // 4: the line sits in the middle of the bar
+#define BAR_CPU_X 4
+#define BAR_CPU_W 184
+#define BAR_MEM_X 204
+#define BAR_MEM_W 136
+#define BAR_CLOCK_X 396
+#define BAR_CLOCK_W 232
+#define BAR_GPU_X 636
+#define BAR_GPU_W 184
+#define BAR_NET_X 828
+#define BAR_NET_W 192
+#define BAR_REFRESH_MS 1000
+#define STATS_STALE_US (5 * 1000000LL) // host values show "--" once the latest frame is older than this
 
 static const char *TAG = "ui";
 
@@ -74,6 +96,7 @@ typedef enum {
 // The settings rows: this device on the left, its connections on the right.
 typedef enum {
     ROW_FIRMWARE,
+    ROW_IDF,
     ROW_DEVICE,
     ROW_UPTIME,
     ROW_INTERNAL,
@@ -109,7 +132,27 @@ static lv_obj_t *s_licenses;  // the font license viewer on the top layer, NULL 
 static lv_obj_t *s_settings;  // the settings page in place of the grid, NULL while closed
 static lv_timer_t *s_settings_timer;
 static lv_obj_t *s_rows[ROW_COUNT];
-static uint32_t s_settings_tick; // when the long swipe that opens settings was recognized
+static char s_row_text[ROW_COUNT][ROW_TEXT_MAX]; // what each row was last given: LONG_DOT edits the label's own text
+static uint32_t s_settings_tick;                 // when the long swipe that opens settings was recognized
+
+// The status bar of grid mode, NULL in status mode. Its slots, left to right.
+typedef enum {
+    BAR_STATUS, // the link status text, in place of the four host slots while the link is down
+    BAR_CPU,
+    BAR_MEM,
+    BAR_CLOCK,
+    BAR_GPU,
+    BAR_NET,
+    BAR_COUNT,
+} bar_slot_t;
+static lv_obj_t *s_bar;
+static lv_timer_t *s_bar_timer;
+static lv_obj_t *s_bar_labels[BAR_COUNT];
+static char s_bar_text[BAR_COUNT][STATUS_TEXT_MAX]; // what each slot was last given, as for the settings rows
+// The latest `stats` frame and when it came, kept whether or not the bar exists. The clock runs on from it.
+static proto_stats_t s_stats;
+static int64_t s_stats_at_us;
+static bool s_have_stats;
 static lv_obj_t *s_toast;
 static lv_timer_t *s_toast_timer;
 static lv_obj_t *s_result;      // a press's result, on the top layer: a backdrop over the grid
@@ -680,7 +723,7 @@ static void build_grid(const proto_layout_t *l, uint8_t pages)
 
         if (b->tile) {
             // The label shrinks to one line of 24 pt and the value goes under it. With an icon on a grid of
-            // 4 or 5 rows there is room for the icon and the value only, so the label goes.
+            // 5 rows (one label line) there is room for the icon and the value only, so the label goes.
             lv_obj_set_style_text_font(label, wd_font(b->label_font, WD_SLOT_24), 0);
             lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
             lv_obj_set_height(label, SLOT24_H);
@@ -788,11 +831,19 @@ static void log_heap(const char *when)
 
 /* ---- Settings, all in the LVGL task or under the LVGL lock ---- */
 
+// Put `text` on `label` unless `cache` says it already shows it. The cache is the source string: a LONG_DOT label edits
+// the text it holds, so comparing against lv_label_get_text would reset an overflowing row on every refresh.
+static void set_label(lv_obj_t *label, char *cache, size_t cache_size, const char *text)
+{
+    if (strcmp(cache, text) != 0) {
+        strlcpy(cache, text, cache_size);
+        lv_label_set_text(label, text);
+    }
+}
+
 static void set_row(row_t r, const char *text)
 {
-    if (strcmp(lv_label_get_text(s_rows[r]), text) != 0) {
-        lv_label_set_text(s_rows[r], text);
-    }
+    set_label(s_rows[r], s_row_text[r], ROW_TEXT_MAX, text);
 }
 
 // Fill every row. Takes the model lock after the LVGL lock, and nothing here blocks: the RSSI is the link task's cached
@@ -801,8 +852,10 @@ static void settings_fill(void)
 {
     char text[128];
     const esp_app_desc_t *app = esp_app_get_description();
-    snprintf(text, sizeof(text), "Firmware %s, IDF %s", app->version, app->idf_ver);
+    snprintf(text, sizeof(text), "Firmware %s", app->version);
     set_row(ROW_FIRMWARE, text);
+    snprintf(text, sizeof(text), "IDF %s", app->idf_ver);
+    set_row(ROW_IDF, text);
     snprintf(text, sizeof(text), "Device %s", link_device_id()[0] ? link_device_id() : "--");
     set_row(ROW_DEVICE, text);
     const uint32_t up_s = (uint32_t)(esp_timer_get_time() / 1000000);
@@ -819,8 +872,8 @@ static void settings_fill(void)
     set_row(ROW_PSRAM, text);
     lv_mem_monitor_t mem;
     lv_mem_monitor(&mem);
-    snprintf(text, sizeof(text), "LVGL %u of %u B, largest free %u", (unsigned)(mem.total_size - mem.free_size),
-             (unsigned)mem.total_size, (unsigned)mem.free_biggest_size);
+    snprintf(text, sizeof(text), "LVGL %u of %u B, max %u", (unsigned)(mem.total_size - mem.free_size),
+             (unsigned)mem.total_size, (unsigned)mem.free_biggest_size); // max: the largest free block
     set_row(ROW_LVGL, text);
 
     size_t icons, icon_bytes;
@@ -835,9 +888,9 @@ static void settings_fill(void)
     snprintf(text, sizeof(text), "Layout rev %u, page %u of %u", (unsigned)rev, shown + 1u, (unsigned)pages);
     set_row(ROW_LAYOUT, text);
 
-    // wifi.c's texts carry no prefix, unlike the SD, USB and Touch ones.
-    snprintf(text, sizeof(text), "Wi-Fi: %s", s_texts[STATUS_WIFI]);
-    set_row(ROW_WIFI, text);
+    // wifi.c's texts carry no prefix, unlike the SD, USB and Touch ones. A "Wi-Fi: " one would not fit the column
+    // beside an IP and the host name, and the texts name Wi-Fi themselves ("connected 192.168.0.5 (watchdeck.local)").
+    set_row(ROW_WIFI, s_texts[STATUS_WIFI]);
     snprintf(text, sizeof(text), "SSID %s", wifi_ssid()[0] ? wifi_ssid() : "--");
     set_row(ROW_SSID, text);
     int dbm;
@@ -943,6 +996,7 @@ static void settings_build(void)
     lv_obj_set_style_text_font(s_settings, &lv_font_montserrat_24, 0);
     lv_obj_set_style_text_color(s_settings, lv_palette_lighten(LV_PALETTE_GREY, 3), 0);
 
+    memset(s_row_text, 0, sizeof(s_row_text)); // every label starts as ""
     for (row_t r = 0; r < ROW_COUNT; r++) {
         const bool left = r < ROW_LEFT_COUNT;
         lv_obj_t *label = lv_label_create(s_settings);
@@ -985,11 +1039,175 @@ static void settings_open(void *user_data)
     log_heap("settings open");
 }
 
+/* ---- Status bar, all in the LVGL task or under the LVGL lock ---- */
+
+static void bar_set(bar_slot_t slot, const char *text)
+{
+    set_label(s_bar_labels[slot], s_bar_text[slot], STATUS_TEXT_MAX, text);
+}
+
+// Show the latest stats in the slots. While the link is down the status text takes the four host slots' place and the
+// clock stays. The host values show "--" once the latest frame is over STATS_STALE_US old, or when it lacked them.
+static void bar_refresh(void)
+{
+    if (!s_bar) {
+        return;
+    }
+    const int64_t now = esp_timer_get_time();
+    char text[2 * HOSTSTAT_TEXT_MAX + 8];
+    if (s_have_stats) {
+        // time and utc_offset are the frame's, and the crystal carries the clock on from there.
+        const int64_t local =
+            (int64_t)s_stats.time + (s_stats.has_utc_offset ? s_stats.utc_offset : 0) + (now - s_stats_at_us) / 1000000;
+        hoststat_clock(text, sizeof(text), local);
+    } else {
+        strlcpy(text, "--:--", sizeof(text));
+    }
+    bar_set(BAR_CLOCK, text);
+
+    if (!s_online) {
+        bar_set(BAR_STATUS, s_texts[STATUS_DAEMON]);
+        bar_set(BAR_CPU, "");
+        bar_set(BAR_MEM, "");
+        bar_set(BAR_GPU, "");
+        bar_set(BAR_NET, "");
+        return;
+    }
+    bar_set(BAR_STATUS, "");
+    const bool fresh = s_have_stats && now - s_stats_at_us <= STATS_STALE_US;
+    char a[HOSTSTAT_TEXT_MAX], b[HOSTSTAT_TEXT_MAX];
+
+    if (fresh && s_stats.has_cpu) {
+        hoststat_cpu(a, sizeof(a), s_stats.cpu);
+    } else {
+        strlcpy(a, "--", sizeof(a));
+    }
+    snprintf(text, sizeof(text), "CPU %s", a);
+    bar_set(BAR_CPU, text);
+
+    if (fresh && s_stats.has_mem) {
+        hoststat_mem(a, sizeof(a), s_stats.mem_used, s_stats.mem_total);
+    } else {
+        strlcpy(a, "--", sizeof(a));
+    }
+    snprintf(text, sizeof(text), "MEM %s", a);
+    bar_set(BAR_MEM, text);
+
+    bar_set(BAR_GPU, "GPU --"); // a later plan fills it
+
+    if (fresh && s_stats.has_net) {
+        hoststat_rate(a, sizeof(a), s_stats.net_rx);
+        hoststat_rate(b, sizeof(b), s_stats.net_tx);
+    } else {
+        strlcpy(a, "--", sizeof(a));
+        strlcpy(b, "--", sizeof(b));
+    }
+    snprintf(text, sizeof(text), LV_SYMBOL_DOWN "%s " LV_SYMBOL_UP "%s", a, b);
+    bar_set(BAR_NET, text);
+}
+
+static void bar_tick(lv_timer_t *timer)
+{
+    (void)timer;
+    bar_refresh();
+}
+
+// Warn for every slot whose worst-case text is wider than the slot, so a font or format change can't clip silently.
+static void bar_check_widths(void)
+{
+    static const struct {
+        const char *text;
+        int slot_w;
+    } worst[] = {
+        {"CPU 100% 100\xC2\xB0", BAR_CPU_W}, // the temperature a later plan adds
+        {"MEM 100%", BAR_MEM_W},
+        {"Wed 24 May 04:44", BAR_CLOCK_W},
+        {"GPU 100% 100\xC2\xB0", BAR_GPU_W},
+        {LV_SYMBOL_DOWN "999M " LV_SYMBOL_UP "999M", BAR_NET_W}, // M is the widest suffix
+    };
+    for (size_t i = 0; i < sizeof(worst) / sizeof(worst[0]); i++) {
+        lv_point_t size;
+        lv_text_get_size(&size, worst[i].text, &lv_font_montserrat_24, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+        if (size.x > worst[i].slot_w) {
+            ESP_LOGW(TAG, "bar slot overflow: \"%s\" needs %d of %d px", worst[i].text, (int)size.x, worst[i].slot_w);
+        }
+    }
+}
+
+// Grid mode starts: the bar on top, drawn from the stats and status already kept.
+static void bar_create(void)
+{
+    if (s_bar) {
+        return;
+    }
+    static const struct {
+        int x, w;
+        lv_text_align_t align;
+    } geo[BAR_COUNT] = {
+        [BAR_STATUS] = {BAR_CPU_X, BAR_CLOCK_X - 2 * BAR_CPU_X, LV_TEXT_ALIGN_LEFT}, // up to the clock
+        [BAR_CPU] = {BAR_CPU_X, BAR_CPU_W, LV_TEXT_ALIGN_LEFT},
+        [BAR_MEM] = {BAR_MEM_X, BAR_MEM_W, LV_TEXT_ALIGN_LEFT},
+        [BAR_CLOCK] = {BAR_CLOCK_X, BAR_CLOCK_W, LV_TEXT_ALIGN_CENTER},
+        [BAR_GPU] = {BAR_GPU_X, BAR_GPU_W, LV_TEXT_ALIGN_LEFT},
+        [BAR_NET] = {BAR_NET_X, BAR_NET_W, LV_TEXT_ALIGN_LEFT},
+    };
+    s_bar = lv_obj_create(lv_screen_active());
+    lv_obj_remove_style_all(s_bar);
+    lv_obj_set_size(s_bar, DISPLAY_H_RES, BAR_H);
+    lv_obj_set_pos(s_bar, 0, 0);
+    lv_obj_set_scrollable(s_bar, false);
+    lv_obj_set_clickable(s_bar, false);
+    // Set once here and inherited, so the labels add no style memory of their own.
+    lv_obj_set_style_text_font(s_bar, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(s_bar, lv_palette_lighten(LV_PALETTE_GREY, 2), 0);
+    memset(s_bar_text, 0, sizeof(s_bar_text)); // every label starts as ""
+    for (bar_slot_t slot = 0; slot < BAR_COUNT; slot++) {
+        lv_obj_t *label = lv_label_create(s_bar);
+        s_bar_labels[slot] = label;
+        lv_obj_set_size(label, geo[slot].w, SLOT24_H);
+        lv_obj_set_pos(label, geo[slot].x, BAR_TEXT_Y);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_align(label, geo[slot].align, 0);
+        lv_label_set_text(label, "");
+    }
+    s_bar_timer = lv_timer_create(bar_tick, BAR_REFRESH_MS, NULL);
+    bar_check_widths();
+    bar_refresh();
+}
+
+// Status mode returns.
+static void bar_delete(void)
+{
+    if (!s_bar) {
+        return;
+    }
+    lv_timer_delete(s_bar_timer);
+    s_bar_timer = NULL;
+    lv_obj_delete(s_bar);
+    s_bar = NULL;
+    memset(s_bar_labels, 0, sizeof(s_bar_labels));
+}
+
+void ui_set_stats(const proto_stats_t *stats)
+{
+    if (!s_ready) {
+        return;
+    }
+    lvgl_port_lock(0);
+    s_stats = *stats;
+    s_stats_at_us = esp_timer_get_time();
+    s_have_stats = true;
+    bar_refresh();
+    lvgl_port_unlock();
+}
+
 void ui_show_set(void)
 {
     lvgl_port_lock(0);
     s_online = true; // the link applies a set only on a live session
     status_mode_end();
+    bar_create();
+    bar_refresh();
     // With settings open, the model holds the set and settings_close builds its page.
     const bool in_settings = s_settings != NULL;
     model_lock();
@@ -1049,6 +1267,7 @@ void ui_link_down(void)
     if (s_grid) {
         lv_obj_set_style_opa(s_grid, LV_OPA_30, 0);
     }
+    bar_refresh();
     lvgl_port_unlock();
 }
 
@@ -1213,6 +1432,7 @@ void ui_set_paired(bool paired)
         s_n_buttons = 0;
         s_n_daemons = 0;
         s_daemon_name[0] = '\0';
+        bar_delete();
         status_mode_start();
         lv_obj_set_hidden(s_forget, true);
         show_daemon_list();
@@ -1277,6 +1497,9 @@ static void set_text(status_t i, const char *text)
         strlcpy(s_texts[i], text, STATUS_TEXT_MAX);
     }
     show_status(i);
+    if (i == STATUS_DAEMON) {
+        bar_refresh(); // the bar's left slot shows it while the link is down
+    }
     lvgl_port_unlock();
 }
 

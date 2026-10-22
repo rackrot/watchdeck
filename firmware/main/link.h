@@ -33,6 +33,7 @@ typedef struct {
     void (*on_down)(void);                                         // session lost, grid must stop taking presses
     void (*on_result)(const proto_result_t *result);               // valid only during the call
     void (*on_tile)(const proto_tile_t *tile);                     // stored in the model already; valid during the call
+    void (*on_stats)(const proto_stats_t *stats);                  // about once a second; valid only during the call
     void (*on_paired)(bool paired);                                // at start and on every change
     void (*on_daemons)(const link_daemon_t *daemons, size_t n);    // unpaired: the pairable list changed
     void (*on_pair_code)(const char *code, const char *name);      // show the code, or NULL when the attempt ends

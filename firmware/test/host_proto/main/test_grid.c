@@ -113,8 +113,23 @@ void test_grid_icon_cache_bound_holds_for_every_set(void)
     TEST_ASSERT_EQUAL_INT64(4844160, worst); // 4 pages of 5x2, 40 icons of 174 x 174
 }
 
+// ui.c gives a tile's value the 32 pt font in every cell. Its 24 pt branch is dead while every cell is this tall.
+void test_grid_every_cell_is_at_least_tile_big_min_h(void)
+{
+    for (int paged = 0; paged <= 1; paged++) {
+        for (int cols = 1; cols <= 8; cols++) {
+            for (int rows = 1; rows <= 5; rows++) {
+                char msg[64];
+                snprintf(msg, sizeof(msg), "%dx%d paged %d", cols, rows, paged);
+                TEST_ASSERT_GREATER_OR_EQUAL_INT_MESSAGE(TILE_BIG_MIN_H, grid_geometry(cols, rows, paged).cell_h, msg);
+            }
+        }
+    }
+}
+
 void test_grid_run(void)
 {
+    RUN_TEST(test_grid_every_cell_is_at_least_tile_big_min_h);
     RUN_TEST(test_grid_table_matches_the_plan_row_for_row);
     RUN_TEST(test_grid_width_cap_for_1_to_8_columns);
     RUN_TEST(test_grid_pager_is_a_slot_24_line_plus_4_px_of_margin);

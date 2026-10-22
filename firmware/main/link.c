@@ -738,8 +738,9 @@ static void send_hello(void)
         return;
     }
     // Only names this build fully supports: "fonts" means ui.c draws every font id in font_list.h, and "pages" that
-    // pageset.c assembles sets of up to PROTO_MAX_PAGES and ui.c lays out the paged grid.
-    static const char *const caps[] = {"fonts", "pages"};
+    // pageset.c assembles sets of up to PROTO_MAX_PAGES and ui.c lays out the paged grid, and "status_bar" that ui.c
+    // reads `stats` frames.
+    static const char *const caps[] = {"fonts", "pages", "status_bar"};
     char buf[256];
     size_t len = proto_build_hello(buf, sizeof(buf), device, s.pairing->token, esp_app_get_description()->version,
                                    DISPLAY_H_RES, DISPLAY_V_RES, caps, sizeof(caps) / sizeof(caps[0]));
@@ -1136,9 +1137,13 @@ static void handle_layout(const proto_layout_t *l)
 
 static void handle_msg(const char *json, size_t len)
 {
-    ESP_LOGI(TAG, "rx: %.*s", (int)(len > 160 ? 160 : len), json);
     proto_msg_t *m = s.msg;
-    if (proto_parse(json, len, m) != ESP_OK) {
+    const esp_err_t parsed = proto_parse(json, len, m);
+    // A stats frame comes every second, so it gets a debug line below instead of an INFO one.
+    if (parsed != ESP_OK || m->type != PROTO_MSG_STATS) {
+        ESP_LOGI(TAG, "rx: %.*s", (int)(len > 160 ? 160 : len), json);
+    }
+    if (parsed != ESP_OK) {
         if (pageset_arriving(&s.set)) {
             set_broken("a page that won't parse"); // nothing comes between the pages of a set
         } else {
@@ -1200,6 +1205,21 @@ static void handle_msg(const char *json, size_t len)
             model_unlock();
             if (stored && s.cbs.on_tile) {
                 s.cbs.on_tile(&m->tile);
+            }
+        }
+        break;
+    case PROTO_MSG_STATS:
+        if (!s.welcomed) {
+            ESP_LOGW(TAG, "message before welcome, ignored");
+        } else {
+            ESP_LOGD(TAG, "stats: time %llu cpu %s%u mem %s%llu/%llu net %s%llu/%llu",
+                     (unsigned long long)m->stats.time, m->stats.has_cpu ? "" : "(none) ",
+                     m->stats.has_cpu ? m->stats.cpu : 0u, m->stats.has_mem ? "" : "(none) ",
+                     (unsigned long long)m->stats.mem_used, (unsigned long long)m->stats.mem_total,
+                     m->stats.has_net ? "" : "(none) ", (unsigned long long)m->stats.net_rx,
+                     (unsigned long long)m->stats.net_tx);
+            if (s.cbs.on_stats) {
+                s.cbs.on_stats(&m->stats);
             }
         }
         break;

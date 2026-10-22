@@ -11,8 +11,9 @@
 #include "psa/crypto.h"
 #include "unity.h"
 
-void test_grid_run(void);    // test_grid.c
-void test_pageset_run(void); // test_pageset.c
+void test_grid_run(void);     // test_grid.c
+void test_pageset_run(void);  // test_pageset.c
+void test_hoststat_run(void); // test_hoststat.c
 
 static uint8_t frame[PROTO_MAX_ICON_FRAME];
 static char json[8192];
@@ -972,6 +973,7 @@ void app_main(void)
     RUN_TEST(test_stats_unknown_fields_are_ignored);
     test_grid_run();
     test_pageset_run();
+    test_hoststat_run();
 
     // Returning from app_main does not end a linux-target process, so the failure count becomes the exit status.
     exit(UNITY_END());
