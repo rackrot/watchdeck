@@ -310,6 +310,16 @@ Run with the tray app in `app:dev` and serial capture on. Don't edit under `app/
 
 - **Acceptance**: every step passes, and the plan records the measured image size, font total, heap lines and photos.
 
+#### S5 as run (2026-10-22, firmware and app at 23ad7ba)
+
+- Step 1 was skipped: the board was flashed before a baseline was taken, so there are no before-flash heap lines to compare.
+- Step 2: the flash kept NVS and the pairing, and the board reconnected without pairing again. The image is 1,853,792 bytes (under 2.1 MB). The font total is 157,171 bytes (S2 note). After the first layout, LVGL used 18,036 of 62,604 bytes at most, and min free internal heap was 300,060.
+- Steps 3 and 4 passed, by eye and in the serial log:
+  - Every font was shown on 5×3 and 5×5, and a button-level font and a value font were set on one tile button. The user says line breaks and dots match the editor preview.
+  - The log covers layout revs 1 to 8, all in one session. The only `icon_get` came after the 5×3 → 5×5 change, which is expected because the icon box shrinks from 44 to 26 px. Font-only revs fetched no icons.
+  - LVGL heap at most was 20,032 bytes, and the log had no errors from link or ui.
+- Not run: step 5 (old firmware with the new daemon; covered by `device_sim` tests on the daemon side only) and step 6 (optional).
+
 ## Flash estimate
 
 - Montserrat's 4 bpp bitmaps (F12) hold 95 ASCII glyphs plus 63 others, of which the 61 FontAwesome icons are the largest. ASCII-only works out to about 35-60% of those: roughly 9-14 KB at slot 24 and 15-25 KB at slot 32, plus about 4 KB of descriptors, class maps and kerning per font. Medium weights and Orbitron's width push some fonts up to 1.5×.
