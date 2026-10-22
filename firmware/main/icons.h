@@ -34,3 +34,6 @@ size_t icons_retain(const proto_layout_t *pages, size_t n);
 
 /** Free every cached icon. Call after the UI dropped the grid. */
 void icons_clear(void);
+
+/** How many icons are cached, and their pixel bytes. */
+void icons_usage(size_t *count, size_t *bytes);

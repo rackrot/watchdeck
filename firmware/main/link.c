@@ -27,6 +27,7 @@
 #include "model.h"
 #include "pageset.h"
 #include "pairing.h"
+#include "wifi.h"
 
 #define SERVICE "_watchdeck"
 #define SERVICE_PROTO "_tcp"
@@ -51,6 +52,7 @@
 // goes out, and what didn't come is left out. A 238 px icon takes about 0.5 s, so 16 of them outlast a fixed 5 s.
 #define ICON_GET_TIMEOUT_MS 5000
 #define ICON_GET_BUF_LEN 2048 // 40 ids of 32 digits fit with room to spare
+#define RSSI_REFRESH_MS 5000  // while the UI watches the RSSI: an SDIO RPC to the C6 at most this often
 
 static const char *TAG = "link";
 
@@ -145,7 +147,13 @@ static struct {
     size_t n_want;
     int64_t want_deadline_ms; // the outstanding icon_get is given up after this; each of its frames moves it on
     char *icon_get_buf;       // in PSRAM, so a 40-id icon_get stays off the link task stack
+    int64_t rssi_due_ms;      // while the RSSI is watched, the next refresh is due at this time
+    bool rssi_timed;          // the first refresh's duration has been logged
 } s;
+
+// Read by other tasks. The id is written once, before the first hello, and never changes.
+static char s_device_id[PROTO_DEVICE_ID_LEN];
+static volatile bool s_rssi_watched;
 
 // Reassembly state and connect measurements, touched only by the websocket event handler, which
 // the client runs under its lock.
@@ -701,6 +709,9 @@ static esp_err_t device_id(char out[PROTO_DEVICE_ID_LEN])
         return err;
     }
     proto_device_id(out, mac);
+    if (!s_device_id[0]) {
+        memcpy(s_device_id, out, PROTO_DEVICE_ID_LEN);
+    }
     return ESP_OK;
 }
 
@@ -1147,6 +1158,9 @@ static void handle_msg(const char *json, size_t len)
         model_lock();
         model_clear_tiles();
         model_unlock();
+        if (s.cbs.on_welcome) {
+            s.cbs.on_welcome(m->welcome_name);
+        }
         set_status("connected to %s", m->welcome_name);
         send_report();
         crash_test_arm();
@@ -1327,6 +1341,30 @@ static void handle_event(link_ev_t *ev)
     }
 }
 
+// Refresh the cached RSSI when the UI watches it and a refresh is due. Here, not on the LVGL task, since it is an RPC
+// to the C6. A slow mDNS pass in this task only makes the value older.
+static void refresh_rssi(void)
+{
+    if (!s_rssi_watched) {
+        s.rssi_due_ms = 0; // the next watch refreshes at once
+        return;
+    }
+    if (s.state == ST_NO_IP || now_ms() < s.rssi_due_ms) {
+        return;
+    }
+    const int64_t start_us = esp_timer_get_time();
+    const esp_err_t err = wifi_refresh_rssi();
+    const int64_t took_us = esp_timer_get_time() - start_us;
+    s.rssi_due_ms = now_ms() + RSSI_REFRESH_MS;
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "RSSI read: %s", esp_err_to_name(err));
+    } else if (!s.rssi_timed) {
+        // Once per boot. Over 20 ms, the refresh belongs on a timer task of its own (device-ui S6).
+        s.rssi_timed = true;
+        ESP_LOGI(TAG, "RSSI read took %d us", (int)took_us);
+    }
+}
+
 static void link_task(void *arg)
 {
     for (;;) {
@@ -1385,6 +1423,7 @@ static void link_task(void *arg)
         default:
             break;
         }
+        refresh_rssi();
     }
 }
 
@@ -1468,4 +1507,14 @@ esp_err_t link_pair_confirm(void)
 esp_err_t link_forget(void)
 {
     return post_type(EV_FORGET);
+}
+
+const char *link_device_id(void)
+{
+    return s_device_id;
+}
+
+void link_watch_rssi(bool on)
+{
+    s_rssi_watched = on;
 }

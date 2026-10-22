@@ -125,3 +125,13 @@ void icons_clear(void)
         }
     }
 }
+
+void icons_usage(size_t *count, size_t *bytes)
+{
+    size_t n = 0;
+    for (int i = 0; i < ICONS_MAX; i++) {
+        n += s_icons[i].used;
+    }
+    *count = n;
+    *bytes = s_bytes;
+}

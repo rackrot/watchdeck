@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -20,11 +21,12 @@ typedef struct {
 /**
  * Callbacks into the UI. All run on the link task, never with the model lock held, so they may
  * block briefly (they take the LVGL lock, then maybe the model lock) but must not call back into
- * link_*. Any may be NULL.
+ * link_*, except link_watch_rssi, which only sets a flag. Any may be NULL.
  */
 typedef struct {
-    void (*on_status)(const char *text); // "searching", "connected to <name>", ...
-    void (*on_set)(void);                // a set of pages is in the model: rebuild the page on screen from it
+    void (*on_status)(const char *text);  // "searching", "connected to <name>", ...
+    void (*on_welcome)(const char *name); // the daemon's host name, at each welcome; valid during the call
+    void (*on_set)(void);                 // a set of pages is in the model: rebuild the page on screen from it
     void (*on_icon)(const uint8_t id[PROTO_ICON_ID_LEN],
                     const lv_image_dsc_t *dsc);                    // show it on every button with `id`
     void (*on_icons_settled)(void);                                // every icon_get of the set is answered or timed out
@@ -58,3 +60,15 @@ esp_err_t link_pair_confirm(void);
 
 /** Forget the pairing and go back to the unpaired list. Safe from any task. */
 esp_err_t link_forget(void);
+
+/**
+ * This device's id ("wd-" and the C6's MAC), or "" before the link first read it. The link reads it before its first
+ * hello, so it is set by the time a set applies. Safe from any task.
+ */
+const char *link_device_id(void);
+
+/**
+ * While `on`, the link task refreshes the cached RSSI (wifi_rssi) at once and then every few seconds, so a reader on
+ * the LVGL task never makes the RPC itself. Safe from any task.
+ */
+void link_watch_rssi(bool on);

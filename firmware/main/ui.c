@@ -3,10 +3,12 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "esp_app_desc.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
+#include "esp_timer.h"
 #include "display.h"
 #include "font_licenses.h"
 #include "fonts.h"
@@ -14,6 +16,7 @@
 #include "icons.h"
 #include "link.h"
 #include "model.h"
+#include "wifi.h"
 
 _Static_assert(GRID_SCREEN_W == DISPLAY_H_RES && GRID_SCREEN_H == DISPLAY_V_RES, "grid.h assumes the 1024x600 screen");
 
@@ -42,20 +45,71 @@ _Static_assert(GRID_SCREEN_W == DISPLAY_H_RES && GRID_SCREEN_H == DISPLAY_V_RES,
 #define DRAG_SWIPE_RATIO 2         // |dx| must exceed this times |dy|
 #define ROW_W (DISPLAY_H_RES - 80) // labels and buttons of the pairing views
 #define ROW_H 76
-#define PAIR_TOP 204 // the pairing views start below the five status lines, which keep their own place
+#define PAIR_TOP 204       // the pairing views start below the five status lines, which keep their own place
+#define STATUS_TEXT_MAX 96 // the longest status text link.c, wifi.c and usb.c build, and its NUL
+#define STATUS_H 200       // status mode's band of status lines (y 4 to 191), above the pairing views
+// A touch that goes this far up, and more than DRAG_SWIPE_RATIO times as far up as sideways, opens settings: a third of
+// the screen, 4x DRAG_SWIPE_PX and LVGL's 50 px gesture, so no flick, page turn or tap comes near it.
+#define SETTINGS_SWIPE_PX 200
+#define SETTINGS_IDLE_MS 60000 // settings closes after this long without a touch
+#define SETTINGS_REFRESH_MS 1000
+#define RSSI_FRESH_MS 15000 // an older RSSI shows as "--": the link refreshes it every 5 s while settings is open
+#define SETTINGS_PAD 16
+#define SETTINGS_LINE 31 // a row: Montserrat 24's 27 px line and 4 px
+#define SETTINGS_LEFT_W 420
+#define SETTINGS_BTN_W 300
+#define SETTINGS_BTN_H 56
 
 static const char *TAG = "ui";
 
-static lv_obj_t *s_wifi_label;
-static lv_obj_t *s_sd_label;
-static lv_obj_t *s_usb_label;
-static lv_obj_t *s_touch_label;
-static lv_obj_t *s_daemon_label;
+typedef enum {
+    STATUS_WIFI,
+    STATUS_SD,
+    STATUS_USB,
+    STATUS_TOUCH,
+    STATUS_DAEMON,
+    STATUS_COUNT,
+} status_t;
 
-static lv_obj_t *s_grid;      // the page on screen, NULL until the first set
+// The settings rows: this device on the left, its connections on the right.
+typedef enum {
+    ROW_FIRMWARE,
+    ROW_DEVICE,
+    ROW_UPTIME,
+    ROW_INTERNAL,
+    ROW_PSRAM,
+    ROW_LVGL,
+    ROW_ICONS,
+    ROW_LEFT_COUNT,
+    ROW_WIFI = ROW_LEFT_COUNT,
+    ROW_SSID,
+    ROW_RSSI,
+    ROW_DAEMON,
+    ROW_DESKTOP,
+    ROW_SD,
+    ROW_USB,
+    ROW_TOUCH,
+    ROW_LAYOUT,
+    ROW_COUNT,
+} row_t;
+
+static bool s_ready; // ui_init succeeded, so the setters and pairing views may take the LVGL lock
+
+// The status texts, kept for status mode and settings. The daemon's has no "Daemon: " and only printable ASCII.
+static char s_texts[STATUS_COUNT][STATUS_TEXT_MAX];
+static char s_daemon_name[PROTO_NAME_MAX]; // from the last welcome, "" until then and after an unpair
+
+static lv_obj_t *s_status_view; // status mode's lines and buttons, NULL in grid mode
+static lv_obj_t *s_status_labels[STATUS_COUNT];
+static lv_obj_t *s_forget; // status mode's Forget pairing, shown while paired
+
+static lv_obj_t *s_grid;      // the page on screen, NULL in status mode and while settings is open
 static lv_obj_t *s_pair_view; // unpaired: the daemon list, the pairing code, or its question
-static lv_obj_t *s_forget;    // shown while paired
 static lv_obj_t *s_licenses;  // the font license viewer on the top layer, NULL while closed
+static lv_obj_t *s_settings;  // the settings page in place of the grid, NULL while closed
+static lv_timer_t *s_settings_timer;
+static lv_obj_t *s_rows[ROW_COUNT];
+static uint32_t s_settings_tick; // when the long swipe that opens settings was recognized
 static lv_obj_t *s_toast;
 static lv_timer_t *s_toast_timer;
 static lv_obj_t *s_result;      // a press's result, on the top layer: a backdrop over the grid
@@ -105,15 +159,30 @@ static lv_color_t tile_bg(proto_tile_state_t state, uint32_t ok_bg)
     }
 }
 
-static lv_obj_t *add_status(lv_palette_t palette, int y, const char *text)
+// Under the LVGL lock: show status text `i` on its status line, if status mode is on screen.
+static void show_status(status_t i)
 {
-    lv_obj_t *label = lv_label_create(lv_screen_active());
+    lv_obj_t *label = s_status_labels[i];
+    if (!label) {
+        return;
+    }
+    if (i == STATUS_DAEMON) {
+        lv_label_set_text_fmt(label, "Daemon: %s", s_texts[i]);
+    } else {
+        lv_label_set_text(label, s_texts[i]);
+    }
+}
+
+static lv_obj_t *add_status(lv_obj_t *parent, status_t i, lv_palette_t palette, int y)
+{
+    lv_obj_t *label = lv_label_create(parent);
+    s_status_labels[i] = label;
     lv_obj_set_style_text_font(label, &lv_font_montserrat_32, 0);
     lv_obj_set_style_text_color(label, lv_palette_lighten(palette, 2), 0);
     lv_obj_set_width(label, DISPLAY_H_RES - 40);
     lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
     lv_obj_align(label, LV_ALIGN_TOP_LEFT, 20, y);
-    lv_label_set_text(label, text);
+    show_status(i);
     return label;
 }
 
@@ -265,19 +334,18 @@ static void forget_event(lv_event_t *e)
     }
 }
 
-static void create_forget(void)
+static lv_obj_t *add_forget(lv_obj_t *parent)
 {
-    s_forget = lv_button_create(lv_screen_active());
-    lv_obj_set_size(s_forget, FORGET_W, FORGET_H);
-    lv_obj_align(s_forget, LV_ALIGN_TOP_RIGHT, -20, 114);
-    lv_obj_set_style_bg_color(s_forget, lv_palette_darken(LV_PALETTE_RED, 2), 0);
-    lv_obj_add_event_cb(s_forget, forget_event, LV_EVENT_PRESSED, NULL);
-    lv_obj_add_event_cb(s_forget, forget_event, LV_EVENT_RELEASED, NULL);
-    lv_obj_t *label = lv_label_create(s_forget);
+    lv_obj_t *btn = lv_button_create(parent);
+    lv_obj_set_size(btn, FORGET_W, FORGET_H);
+    lv_obj_set_style_bg_color(btn, lv_palette_darken(LV_PALETTE_RED, 2), 0);
+    lv_obj_add_event_cb(btn, forget_event, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(btn, forget_event, LV_EVENT_RELEASED, NULL);
+    lv_obj_t *label = lv_label_create(btn);
     lv_obj_set_style_text_font(label, &lv_font_montserrat_32, 0);
     lv_label_set_text(label, "Forget pairing");
     lv_obj_center(label);
-    lv_obj_set_hidden(s_forget, true);
+    return btn;
 }
 
 /* ---- Font license viewer, all under the LVGL lock ---- */
@@ -329,17 +397,56 @@ static void licenses_open(lv_event_t *e)
     lv_label_set_text_static(text, font_licenses_text()); // lives in flash, no copy
 }
 
-static void create_licenses_button(void)
+static lv_obj_t *add_licenses_button(lv_obj_t *parent)
 {
-    lv_obj_t *btn = lv_button_create(lv_screen_active());
+    lv_obj_t *btn = lv_button_create(parent);
     lv_obj_set_size(btn, LICENSES_W, LICENSES_H);
-    lv_obj_align(btn, LV_ALIGN_TOP_RIGHT, -20, LICENSES_Y);
     lv_obj_set_style_bg_color(btn, lv_palette_darken(LV_PALETTE_GREY, 2), 0);
     lv_obj_add_event_cb(btn, licenses_open, LV_EVENT_CLICKED, NULL);
     lv_obj_t *label = lv_label_create(btn);
     lv_obj_set_style_text_font(label, &lv_font_montserrat_24, 0);
     lv_label_set_text(label, "Licenses");
     lv_obj_center(label);
+    return btn;
+}
+
+/* ---- Status mode, all under the LVGL lock ---- */
+
+// Build status mode's widgets from the kept texts, unless they are on screen already.
+static void status_mode_start(void)
+{
+    if (s_status_view) {
+        return;
+    }
+    s_status_view = lv_obj_create(lv_screen_active());
+    lv_obj_remove_style_all(s_status_view);
+    lv_obj_set_size(s_status_view, DISPLAY_H_RES, STATUS_H);
+    lv_obj_set_scrollable(s_status_view, false);
+    lv_obj_set_clickable(s_status_view, false);
+    add_status(s_status_view, STATUS_WIFI, LV_PALETTE_CYAN, 4);
+    add_status(s_status_view, STATUS_SD, LV_PALETTE_LIGHT_GREEN, 42);
+    lv_obj_t *usb = add_status(s_status_view, STATUS_USB, LV_PALETTE_AMBER, 80);
+    lv_obj_set_width(usb, DISPLAY_H_RES - 60 - LICENSES_W); // "USB: error (ESP_ERR_NOT_SUPPORTED)" is 655 px of 744
+    lv_obj_t *touch = add_status(s_status_view, STATUS_TOUCH, LV_PALETTE_PINK, 118);
+    lv_obj_set_width(touch, DISPLAY_H_RES - 60 - FORGET_W); // the touch text is short
+    add_status(s_status_view, STATUS_DAEMON, LV_PALETTE_PURPLE, 156);
+    s_forget = add_forget(s_status_view);
+    lv_obj_align(s_forget, LV_ALIGN_TOP_RIGHT, -20, 114);
+    lv_obj_set_hidden(s_forget, !s_paired);
+    lv_obj_align(add_licenses_button(s_status_view), LV_ALIGN_TOP_RIGHT, -20, LICENSES_Y);
+}
+
+// The first set applied: delete status mode's widgets, so grid mode doesn't carry them in the LVGL pool. A hold on its
+// Forget pairing ends here; LVGL waits for that touch's release.
+static void status_mode_end(void)
+{
+    if (!s_status_view) {
+        return;
+    }
+    lv_obj_delete(s_status_view);
+    s_status_view = NULL;
+    memset(s_status_labels, 0, sizeof(s_status_labels));
+    s_forget = NULL;
 }
 
 // Drop presses whose result never came, so they cannot fill the table forever.
@@ -356,6 +463,7 @@ static void expire_pending(void)
 }
 
 static void swipe_page(void *user_data);
+static void settings_open(void *user_data);
 
 // Where the one live touch began, where it was last seen, and its largest excursion from the start on each axis. Only
 // the LVGL task touches these. The release read can repeat a stale point, so the end comes from PRESSING reads.
@@ -363,11 +471,25 @@ static lv_point_t s_touch_start, s_touch_end;
 static int s_touch_max_dx, s_touch_max_dy;
 static uint32_t s_touch_samples, s_touch_start_tick;
 
+// Reads per touch show whether a fast flick is being sampled often enough to see it move. Debug level: at 115200 baud
+// an INFO line costs about 10 ms in the LVGL task on every press.
+static void touch_log(const char *what)
+{
+    ESP_LOGD(TAG, "touch on %s: %u samples in %u ms, max %d,%d net %d,%d", what, (unsigned)s_touch_samples,
+             (unsigned)lv_tick_elaps(s_touch_start_tick), s_touch_max_dx, s_touch_max_dy,
+             s_touch_end.x - s_touch_start.x, s_touch_end.y - s_touch_start.y);
+}
+
+// On the grid and each of its cells. A long swipe up opens settings the moment it crosses SETTINGS_SWIPE_PX, before the
+// finger lifts. The wait for release stops PRESSING for this touch and makes its release press nothing, and the grid
+// goes from lv_async_call, outside the event of the widget being pressed.
 static void touch_track(lv_event_t *e)
 {
+    lv_indev_t *indev = lv_indev_active();
     lv_point_t p;
-    lv_indev_get_point(lv_indev_active(), &p);
-    if (lv_event_get_code(e) == LV_EVENT_PRESSED) {
+    lv_indev_get_point(indev, &p);
+    const lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_PRESSED) {
         s_touch_start = p;
         s_touch_max_dx = s_touch_max_dy = 0;
         s_touch_samples = 0;
@@ -377,15 +499,14 @@ static void touch_track(lv_event_t *e)
     s_touch_end = p;
     s_touch_max_dx = LV_MAX(s_touch_max_dx, LV_ABS(p.x - s_touch_start.x));
     s_touch_max_dy = LV_MAX(s_touch_max_dy, LV_ABS(p.y - s_touch_start.y));
-}
 
-// Reads per touch show whether a fast flick is being sampled often enough to see it move. Debug level: at 115200 baud
-// an INFO line costs about 10 ms in the LVGL task on every press.
-static void touch_log(const char *what)
-{
-    ESP_LOGD(TAG, "touch on %s: %u samples in %u ms, max %d,%d net %d,%d", what, (unsigned)s_touch_samples,
-             (unsigned)lv_tick_elaps(s_touch_start_tick), s_touch_max_dx, s_touch_max_dy,
-             s_touch_end.x - s_touch_start.x, s_touch_end.y - s_touch_start.y);
+    const int up = s_touch_start.y - p.y;
+    if (code == LV_EVENT_PRESSING && up >= SETTINGS_SWIPE_PX && up > DRAG_SWIPE_RATIO * LV_ABS(p.x - s_touch_start.x)) {
+        lv_indev_wait_release(indev);
+        touch_log("long swipe up");
+        s_settings_tick = lv_tick_get();
+        lv_async_call(settings_open, NULL);
+    }
 }
 
 // Called where a click would act. Returns true when the touch was a drag, so no press may follow. A gesture LVGL
@@ -446,29 +567,31 @@ esp_err_t ui_init(lv_display_t *disp)
     ESP_RETURN_ON_FALSE(disp, ESP_ERR_INVALID_ARG, TAG, "no display");
     lvgl_port_lock(0);
     lv_obj_set_style_bg_color(lv_screen_active(), lv_color_black(), 0);
-    s_wifi_label = add_status(LV_PALETTE_CYAN, 4, "Wi-Fi: starting");
-    s_sd_label = add_status(LV_PALETTE_LIGHT_GREEN, 42, "SD: checking");
-    s_usb_label = add_status(LV_PALETTE_AMBER, 80, "USB: starting");
-    s_touch_label = add_status(LV_PALETTE_PINK, 118, "Touch: starting");
-    lv_obj_set_width(s_touch_label, DISPLAY_H_RES - 60 - FORGET_W); // the touch text is short
-    lv_obj_set_width(s_usb_label,
-                     DISPLAY_H_RES - 60 - LICENSES_W); // "USB: error (ESP_ERR_NOT_SUPPORTED)" is 655 px of 744
-    s_daemon_label = add_status(LV_PALETTE_PURPLE, 156, "Daemon: waiting for Wi-Fi");
-    create_forget();
-    create_licenses_button();
+    strlcpy(s_texts[STATUS_WIFI], "Wi-Fi: starting", STATUS_TEXT_MAX);
+    strlcpy(s_texts[STATUS_SD], "SD: checking", STATUS_TEXT_MAX);
+    strlcpy(s_texts[STATUS_USB], "USB: starting", STATUS_TEXT_MAX);
+    strlcpy(s_texts[STATUS_TOUCH], "Touch: starting", STATUS_TEXT_MAX);
+    strlcpy(s_texts[STATUS_DAEMON], "waiting for Wi-Fi", STATUS_TEXT_MAX);
+    status_mode_start();
     create_toast();
     create_result();
+    s_ready = true;
     lvgl_port_unlock();
     return ESP_OK;
 }
 
 // A swipe anywhere on the grid, whatever it started on. The release must press nothing, an outward swipe at either end
-// included. The rebuild waits for lv_async_call, so the pressed widget isn't deleted inside its own event.
+// included. The rebuild waits for lv_async_call, so the pressed widget isn't deleted inside its own event. An upward
+// gesture doesn't wait, since that would end PRESSING (lv_indev.c:1293) at LVGL's 50 px, before touch_track can see a
+// long swipe up. Its release still presses nothing, because drag_consumed refuses any touch that moved over DRAG_PX.
 static void grid_gesture(lv_event_t *e)
 {
     lv_indev_t *indev = lv_indev_active();
-    lv_indev_wait_release(indev);
     const lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+    if (dir == LV_DIR_TOP) {
+        return;
+    }
+    lv_indev_wait_release(indev);
     if (dir == LV_DIR_LEFT || dir == LV_DIR_RIGHT) {
         s_swipe_tick = lv_tick_get();
         lv_async_call(swipe_page, (void *)(intptr_t)(dir == LV_DIR_LEFT ? 1 : -1));
@@ -528,6 +651,9 @@ static void build_grid(const proto_layout_t *l, uint8_t pages)
         s_cells[i] = btn;
         lv_obj_set_size(btn, cell_w, cell_h);
         lv_obj_set_pos(btn, GRID_GAP + b->col * (cell_w + GRID_GAP), b->row * (cell_h + GRID_GAP));
+        // A cell whose icon and label overflow it by a pixel would scroll on a vertical drag instead of sending
+        // CLICKED.
+        lv_obj_set_scrollable(btn, false);
         // A tile is grey until its first value arrives.
         lv_obj_set_style_bg_color(btn, b->tile ? tile_bg(PROTO_TILE_UNKNOWN, b->bg) : lv_color_hex(b->bg), 0);
         lv_obj_add_event_cb(btn, touch_track, LV_EVENT_PRESSED, NULL);
@@ -660,21 +786,223 @@ static void log_heap(const char *when)
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
 }
 
+/* ---- Settings, all in the LVGL task or under the LVGL lock ---- */
+
+static void set_row(row_t r, const char *text)
+{
+    if (strcmp(lv_label_get_text(s_rows[r]), text) != 0) {
+        lv_label_set_text(s_rows[r], text);
+    }
+}
+
+// Fill every row. Takes the model lock after the LVGL lock, and nothing here blocks: the RSSI is the link task's cached
+// read, and the device id was read before the first hello.
+static void settings_fill(void)
+{
+    char text[128];
+    const esp_app_desc_t *app = esp_app_get_description();
+    snprintf(text, sizeof(text), "Firmware %s, IDF %s", app->version, app->idf_ver);
+    set_row(ROW_FIRMWARE, text);
+    snprintf(text, sizeof(text), "Device %s", link_device_id()[0] ? link_device_id() : "--");
+    set_row(ROW_DEVICE, text);
+    const uint32_t up_s = (uint32_t)(esp_timer_get_time() / 1000000);
+    snprintf(text, sizeof(text), "Uptime %u d %02u:%02u:%02u", (unsigned)(up_s / 86400), (unsigned)(up_s / 3600 % 24),
+             (unsigned)(up_s / 60 % 60), (unsigned)(up_s % 60));
+    set_row(ROW_UPTIME, text);
+    snprintf(text, sizeof(text), "Internal %u KiB free, min %u",
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024));
+    set_row(ROW_INTERNAL, text);
+    snprintf(text, sizeof(text), "PSRAM %u KiB free, min %u",
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+             (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM) / 1024));
+    set_row(ROW_PSRAM, text);
+    lv_mem_monitor_t mem;
+    lv_mem_monitor(&mem);
+    snprintf(text, sizeof(text), "LVGL %u of %u B, largest free %u", (unsigned)(mem.total_size - mem.free_size),
+             (unsigned)mem.total_size, (unsigned)mem.free_biggest_size);
+    set_row(ROW_LVGL, text);
+
+    size_t icons, icon_bytes;
+    model_lock();
+    icons_usage(&icons, &icon_bytes);
+    const uint32_t rev = model_rev();
+    const uint8_t pages = model_pages();
+    const uint8_t shown = pages > 0 ? model_shown() : 0;
+    model_unlock();
+    snprintf(text, sizeof(text), "Icons %u, %u KiB", (unsigned)icons, (unsigned)(icon_bytes / 1024));
+    set_row(ROW_ICONS, text);
+    snprintf(text, sizeof(text), "Layout rev %u, page %u of %u", (unsigned)rev, shown + 1u, (unsigned)pages);
+    set_row(ROW_LAYOUT, text);
+
+    // wifi.c's texts carry no prefix, unlike the SD, USB and Touch ones.
+    snprintf(text, sizeof(text), "Wi-Fi: %s", s_texts[STATUS_WIFI]);
+    set_row(ROW_WIFI, text);
+    snprintf(text, sizeof(text), "SSID %s", wifi_ssid()[0] ? wifi_ssid() : "--");
+    set_row(ROW_SSID, text);
+    int dbm;
+    uint32_t age_ms;
+    if (wifi_rssi(&dbm, &age_ms) && age_ms <= RSSI_FRESH_MS) {
+        snprintf(text, sizeof(text), "RSSI %d dBm, %u s ago", dbm, (unsigned)(age_ms / 1000));
+    } else {
+        strlcpy(text, "RSSI --", sizeof(text));
+    }
+    set_row(ROW_RSSI, text);
+    snprintf(text, sizeof(text), "Daemon: %s", s_texts[STATUS_DAEMON]);
+    set_row(ROW_DAEMON, text);
+    snprintf(text, sizeof(text), "Desktop %s", s_daemon_name[0] ? s_daemon_name : "--");
+    set_row(ROW_DESKTOP, text);
+    set_row(ROW_SD, s_texts[STATUS_SD]);
+    set_row(ROW_USB, s_texts[STATUS_USB]);
+    set_row(ROW_TOUCH, s_texts[STATUS_TOUCH]);
+}
+
+// Delete the page and its timer, without rebuilding the grid.
+static void settings_delete(void)
+{
+    if (!s_settings) {
+        return;
+    }
+    lv_timer_delete(s_settings_timer);
+    s_settings_timer = NULL;
+    lv_obj_delete(s_settings);
+    s_settings = NULL;
+    memset(s_rows, 0, sizeof(s_rows));
+    link_watch_rssi(false);
+}
+
+// Runs from lv_async_call, outside the event of any widget it deletes. Deletes the page before building the grid, so
+// the two are never in the LVGL pool together. A Close tap and the idle timer may both queue it, so a second call finds
+// nothing to close.
+static void settings_close(void *user_data)
+{
+    (void)user_data;
+    if (!s_settings) {
+        return;
+    }
+    const uint32_t start = lv_tick_get();
+    settings_delete();
+    model_lock();
+    if (model_pages() > 0) {
+        build_page(); // dimmed while the link is down
+    }
+    model_unlock();
+    ESP_LOGI(TAG, "settings closed, page rebuilt in %u ms", (unsigned)lv_tick_elaps(start));
+    log_heap("page built");
+}
+
+static void settings_close_event(lv_event_t *e)
+{
+    (void)e;
+    lv_async_call(settings_close, NULL);
+}
+
+// Every gesture on the page waits for release, so a swipe that starts on Forget pairing never forgets. A swipe down
+// closes.
+static void settings_gesture(lv_event_t *e)
+{
+    (void)e;
+    lv_indev_t *indev = lv_indev_active();
+    lv_indev_wait_release(indev);
+    if (lv_indev_get_gesture_dir(indev) == LV_DIR_BOTTOM) {
+        lv_async_call(settings_close, NULL);
+    }
+}
+
+static void settings_tick(lv_timer_t *timer)
+{
+    (void)timer;
+    // Not under the license viewer, which a person may be reading without a touch.
+    if (!s_licenses && lv_display_get_inactive_time(NULL) >= SETTINGS_IDLE_MS) {
+        ESP_LOGI(TAG, "settings idle for %d s, closing", SETTINGS_IDLE_MS / 1000);
+        lv_async_call(settings_close, NULL);
+        return;
+    }
+    settings_fill();
+}
+
+static lv_obj_t *add_settings_button(lv_obj_t *btn, lv_align_t align, int x)
+{
+    lv_obj_set_size(btn, SETTINGS_BTN_W, SETTINGS_BTN_H);
+    lv_obj_align(btn, align, x, -SETTINGS_PAD);
+    return btn;
+}
+
+// The page in place of the grid, on the active screen so the toast and the result modal on the top layer show over it.
+// Montserrat 24 rows in two columns, then Licenses, Forget pairing and Close. Every row fits, so it never scrolls. The
+// text style is set once on the page and inherited, so the rows add no style memory of their own.
+static void settings_build(void)
+{
+    s_settings = lv_obj_create(lv_screen_active());
+    lv_obj_remove_style_all(s_settings);
+    lv_obj_set_size(s_settings, DISPLAY_H_RES, DISPLAY_V_RES - GRID_TOP);
+    lv_obj_set_pos(s_settings, 0, GRID_TOP);
+    lv_obj_set_scrollable(s_settings, false);
+    lv_obj_set_gesture_bubble(s_settings, false);
+    lv_obj_add_event_cb(s_settings, settings_gesture, LV_EVENT_GESTURE, NULL);
+    lv_obj_set_style_text_font(s_settings, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(s_settings, lv_palette_lighten(LV_PALETTE_GREY, 3), 0);
+
+    for (row_t r = 0; r < ROW_COUNT; r++) {
+        const bool left = r < ROW_LEFT_COUNT;
+        lv_obj_t *label = lv_label_create(s_settings);
+        s_rows[r] = label;
+        lv_obj_set_width(label, left ? SETTINGS_LEFT_W : DISPLAY_H_RES - 3 * SETTINGS_PAD - SETTINGS_LEFT_W);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+        lv_obj_set_height(label, SLOT24_H); // one line, ending in dots
+        lv_obj_set_pos(label, left ? SETTINGS_PAD : 2 * SETTINGS_PAD + SETTINGS_LEFT_W,
+                       SETTINGS_PAD + (int)(left ? r : r - ROW_LEFT_COUNT) * SETTINGS_LINE);
+        lv_label_set_text(label, "");
+    }
+
+    add_settings_button(add_licenses_button(s_settings), LV_ALIGN_BOTTOM_LEFT, SETTINGS_PAD);
+    add_settings_button(add_forget(s_settings), LV_ALIGN_BOTTOM_MID, 0);
+    lv_obj_t *close = add_settings_button(lv_button_create(s_settings), LV_ALIGN_BOTTOM_RIGHT, -SETTINGS_PAD);
+    lv_obj_add_event_cb(close, settings_close_event, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *close_label = lv_label_create(close);
+    lv_obj_set_style_text_font(close_label, &lv_font_montserrat_32, 0);
+    lv_label_set_text(close_label, "Close");
+    lv_obj_center(close_label);
+
+    settings_fill();
+    s_settings_timer = lv_timer_create(settings_tick, SETTINGS_REFRESH_MS, NULL);
+}
+
+// Runs from lv_async_call after a long swipe up, outside the event of the cell being pressed. Deletes the grid before
+// building the page, so the two are never in the LVGL pool together. An unpair since the swipe left no grid to replace.
+static void settings_open(void *user_data)
+{
+    (void)user_data;
+    if (!s_grid || s_settings) {
+        return;
+    }
+    lv_obj_delete(s_grid);
+    s_grid = NULL;
+    s_n_buttons = 0; // so ui_set_icon and ui_set_tile find no cells while the grid is gone
+    settings_build();
+    link_watch_rssi(true);
+    ESP_LOGI(TAG, "settings open %u ms after the swipe", (unsigned)lv_tick_elaps(s_settings_tick));
+    log_heap("settings open");
+}
+
 void ui_show_set(void)
 {
     lvgl_port_lock(0);
     s_online = true; // the link applies a set only on a live session
+    status_mode_end();
+    // With settings open, the model holds the set and settings_close builds its page.
+    const bool in_settings = s_settings != NULL;
     model_lock();
-    const uint8_t shown = build_page();
+    const uint8_t shown = in_settings ? model_shown() : build_page();
     const uint32_t rev = model_rev();
     const uint8_t pages = model_pages();
     const proto_layout_t *page = model_page(shown);
     const unsigned cols = page->cols, rows = page->rows, buttons = page->n_buttons;
     model_unlock();
     lvgl_port_unlock();
-    ESP_LOGI(TAG, "layout rev %u: %u page%s applied, showing page %u (%ux%u, %u buttons)", (unsigned)rev, pages,
-             pages == 1 ? "" : "s", shown + 1, cols, rows, buttons);
-    log_heap("page built");
+    ESP_LOGI(TAG, "layout rev %u: %u page%s applied, showing page %u (%ux%u, %u buttons)%s", (unsigned)rev, pages,
+             pages == 1 ? "" : "s", shown + 1, cols, rows, buttons, in_settings ? ", built when settings closes" : "");
+    log_heap(in_settings ? "set applied under settings" : "page built");
     if (!s_heap_logged) {
         s_heap_logged = true;
         ESP_LOGI(TAG, "first layout applied, min free internal heap %u bytes",
@@ -861,16 +1189,20 @@ static void show_confirm(const char *device, const char *daemon)
 
 void ui_set_paired(bool paired)
 {
-    if (!s_forget) {
+    if (!s_ready) {
         return;
     }
     lvgl_port_lock(0);
     s_paired = paired;
     s_attempt_shown = false;
-    lv_obj_set_hidden(s_forget, !paired);
     if (paired) {
         clear_pair_view();
+        if (s_forget) {
+            lv_obj_set_hidden(s_forget, false);
+        }
     } else {
+        // Synchronously, since the link frees every icon once this returns.
+        settings_delete();
         if (s_grid) {
             lv_obj_delete(s_grid);
             s_grid = NULL;
@@ -880,6 +1212,9 @@ void ui_set_paired(bool paired)
         s_n_pending = 0;
         s_n_buttons = 0;
         s_n_daemons = 0;
+        s_daemon_name[0] = '\0';
+        status_mode_start();
+        lv_obj_set_hidden(s_forget, true);
         show_daemon_list();
     }
     lvgl_port_unlock();
@@ -887,7 +1222,7 @@ void ui_set_paired(bool paired)
 
 void ui_show_daemons(const link_daemon_t *daemons, size_t n)
 {
-    if (!s_forget) {
+    if (!s_ready) {
         return;
     }
     lvgl_port_lock(0);
@@ -904,7 +1239,7 @@ void ui_show_daemons(const link_daemon_t *daemons, size_t n)
 
 void ui_show_pair_code(const char *code, const char *name)
 {
-    if (!s_forget) {
+    if (!s_ready) {
         return;
     }
     lvgl_port_lock(0);
@@ -919,7 +1254,7 @@ void ui_show_pair_code(const char *code, const char *name)
 
 void ui_show_pair_confirm(const char *device, const char *name)
 {
-    if (!s_forget) {
+    if (!s_ready) {
         return;
     }
     lvgl_port_lock(0);
@@ -928,44 +1263,54 @@ void ui_show_pair_confirm(const char *device, const char *name)
     lvgl_port_unlock();
 }
 
-static void set_text(lv_obj_t *label, const char *text)
+// Keep the text for status mode and settings, and show it if its status line is on screen. Settings reads it at its
+// next refresh.
+static void set_text(status_t i, const char *text)
 {
-    if (!label) {
+    if (!s_ready) {
         return;
     }
     lvgl_port_lock(0);
-    lv_label_set_text(label, text);
+    if (i == STATUS_DAEMON) {
+        copy_printable(s_texts[i], STATUS_TEXT_MAX, text);
+    } else {
+        strlcpy(s_texts[i], text, STATUS_TEXT_MAX);
+    }
+    show_status(i);
     lvgl_port_unlock();
 }
 
 void ui_set_wifi_text(const char *text)
 {
-    set_text(s_wifi_label, text);
+    set_text(STATUS_WIFI, text);
 }
 
 void ui_set_sd_text(const char *text)
 {
-    set_text(s_sd_label, text);
+    set_text(STATUS_SD, text);
 }
 
 void ui_set_usb_text(const char *text)
 {
-    set_text(s_usb_label, text);
+    set_text(STATUS_USB, text);
 }
 
 void ui_set_touch_text(const char *text)
 {
-    set_text(s_touch_label, text);
+    set_text(STATUS_TOUCH, text);
 }
 
 void ui_set_daemon_text(const char *text)
 {
-    if (!s_daemon_label) {
+    set_text(STATUS_DAEMON, text);
+}
+
+void ui_set_daemon_name(const char *name)
+{
+    if (!s_ready) {
         return;
     }
-    char printable[96]; // the longest status link.c builds
-    copy_printable(printable, sizeof(printable), text);
     lvgl_port_lock(0);
-    lv_label_set_text_fmt(s_daemon_label, "Daemon: %s", printable);
+    copy_printable(s_daemon_name, sizeof(s_daemon_name), name);
     lvgl_port_unlock();
 }

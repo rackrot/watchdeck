@@ -9,6 +9,7 @@
 #include "esp_netif.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "freertos/FreeRTOS.h"
 #include "mdns.h"
 #include "sdcard.h"
 
@@ -21,6 +22,11 @@ static const char *TAG = "wifi";
 static wifi_status_cb_t s_status_cb;
 static esp_timer_handle_t s_reconnect_timer;
 static char s_ssid[33];
+// The last RSSI read and when, written by the link task and read by the LVGL task.
+static portMUX_TYPE s_rssi_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool s_rssi_valid;
+static int s_rssi_dbm;
+static int64_t s_rssi_at_us;
 
 static void report(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
@@ -186,4 +192,36 @@ esp_err_t wifi_start(wifi_status_cb_t status_cb)
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &cfg), TAG, "set_config");
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "esp_wifi_start");
     return ESP_OK;
+}
+
+const char *wifi_ssid(void)
+{
+    return s_ssid;
+}
+
+esp_err_t wifi_refresh_rssi(void)
+{
+    int dbm;
+    esp_err_t err = esp_wifi_sta_get_rssi(&dbm);
+    if (err != ESP_OK) {
+        return err;
+    }
+    const int64_t now = esp_timer_get_time();
+    taskENTER_CRITICAL(&s_rssi_mux);
+    s_rssi_valid = true;
+    s_rssi_dbm = dbm;
+    s_rssi_at_us = now;
+    taskEXIT_CRITICAL(&s_rssi_mux);
+    return ESP_OK;
+}
+
+bool wifi_rssi(int *dbm, uint32_t *age_ms)
+{
+    taskENTER_CRITICAL(&s_rssi_mux);
+    const bool valid = s_rssi_valid;
+    *dbm = s_rssi_dbm;
+    const int64_t at_us = s_rssi_at_us;
+    taskEXIT_CRITICAL(&s_rssi_mux);
+    *age_ms = (uint32_t)((esp_timer_get_time() - at_us) / 1000);
+    return valid;
 }

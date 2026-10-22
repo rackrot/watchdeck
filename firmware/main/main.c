@@ -84,6 +84,7 @@ void app_main(void)
     // The link waits for an IP itself, so it starts even if wifi_start failed. It needs the model, which the UI reads.
     const link_cbs_t link_cbs = {
         .on_status = ui_set_daemon_text,
+        .on_welcome = ui_set_daemon_name,
         .on_set = ui_show_set,
         .on_icon = ui_set_icon,
         .on_icons_settled = ui_icons_settled,

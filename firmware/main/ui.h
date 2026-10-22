@@ -5,19 +5,33 @@
 #include "lvgl.h"
 #include "proto.h"
 
-/** Build the status lines, the toast and the result modal on `disp`. The grid comes from the daemon. */
+/*
+ * Screen modes. Status mode, from boot until the first set applies and again after every unpair, shows the status
+ * lines, Licenses, Forget pairing while paired, and the pairing views while unpaired. Grid mode, from the first set
+ * until an unpair, shows only the grid. A long swipe up on the grid opens settings, which replaces the grid until it
+ * closes and shows the status texts, device info, Licenses and Forget pairing.
+ */
+
+/** Build status mode, the toast and the result modal on `disp`. The grid comes from the daemon. */
 esp_err_t ui_init(lv_display_t *disp);
 
-/** Thread-safe status line updates. Ignored before ui_init succeeds. */
+/**
+ * Thread-safe status text updates, kept for status mode and settings. Ignored before ui_init succeeds. Each text is
+ * at most 95 characters.
+ */
 void ui_set_wifi_text(const char *text);
 void ui_set_sd_text(const char *text);
 void ui_set_usb_text(const char *text);
 void ui_set_touch_text(const char *text);
 void ui_set_daemon_text(const char *text);
 
+/** The daemon's host name from its welcome, for settings. Thread-safe. */
+void ui_set_daemon_name(const char *name);
+
 /**
- * The link applied a set of pages to the model: rebuild the page on screen from it (the home page if the set lacks
- * it), and accept presses. Takes the LVGL lock, then the model lock. Thread-safe, but not under the model lock.
+ * The link applied a set of pages to the model: leave status mode, and rebuild the page on screen from it (the home
+ * page if the set lacks it), or with settings open, when settings closes. Accept presses. Takes the LVGL lock, then
+ * the model lock. Thread-safe, but not under the model lock.
  */
 void ui_show_set(void);
 
@@ -48,7 +62,10 @@ void ui_set_tile(const proto_tile_t *tile);
 
 /* The pairing views below are thread-safe and ignored before ui_init succeeds. */
 
-/** Paired: show the grid area and Forget pairing. Unpaired: show the pairable daemons. */
+/**
+ * Paired: show Forget pairing in status mode. Unpaired: close settings, drop the grid, and show status mode with the
+ * pairable daemons. Every image widget is gone when it returns, so the caller may then free the icons.
+ */
 void ui_set_paired(bool paired);
 
 /** Replace the list of daemons open for pairing (unpaired only). */
