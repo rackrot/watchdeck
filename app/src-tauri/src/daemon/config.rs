@@ -1945,9 +1945,11 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
         let configs = open(tmp.path());
         let mut live = configs.subscribe();
         live.mark_unchanged();
+        // The new label changes the file's size, so the stamp differs even where both writes
+        // land in one coarse mtime tick (seen on CI). The poller only compares stamps.
         fs::write(
             tmp.path().join(FILE),
-            DEFAULT.replacen("label = \"Hello\"", "label = \"Early\"", 1),
+            DEFAULT.replacen("label = \"Hello\"", "label = \"Early bird\"", 1),
         )
         .unwrap();
 
@@ -1956,7 +1958,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
             .await
             .expect("the edit was lost")
             .unwrap();
-        assert_eq!(configs.current().buttons[0].label, "Early");
+        assert_eq!(configs.current().buttons[0].label, "Early bird");
     }
 
     /// A 4x4 PNG, drawn as is on any grid.

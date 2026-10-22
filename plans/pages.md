@@ -332,10 +332,11 @@ Run on the board with the dev daemon unless a step says otherwise. Evidence is t
 7. **Old firmware, new daemon.** Flash the build at the commit before S1. Record its hash here; don't rely on "`main` before". The board shows page 1 only, with no page-link buttons. The daemon logs `firmware without pages`, and the Devices tab shows the note. Then flash the new build back. The pairing survives both flashes, since NVS is untouched.
 8. **New firmware, old daemon.** Build the app at the commit before S2 (record its hash) in a worktree.
    - Quit the tray app, then copy the config dir to a temp dir with `/usr/bin/cp -a` (`cp` is aliased to `-i`). The copy keeps `identity.pem`, `identity.key` and `state.json`, so the board's pin and token still match.
-  - Check that the copied `identity.key` is still 0600 and owned by you. The daemon refuses to start otherwise (`plans/desktop-app-v1.md:312`).
+   - Check that the copied `identity.key` is still 0600 and owned by you. The daemon refuses to start otherwise (`plans/desktop-app-v1.md:312`).
    - Replace the copy's `config.toml` with one that has no pages, and run the old daemon with `XDG_CONFIG_HOME` pointing at the temp dir. The new board shows one page with no bar.
    - Then put a paged `config.toml` in the copy and restart the old daemon. It serves an empty grid and logs the unknown field. That's the downgrade case.
    - The real config dir is never touched. Restart the tray app afterwards.
+
 - **Docs**: `plans/desktop-app-v1.md` status and backlog, the Assumptions line at `:57`, `site/src/protocol.md` and `site/src/config.md` finished, and a results section in this plan.
 - **Acceptance**: every step passes, or its failure is recorded with a decision.
 
@@ -357,6 +358,7 @@ Run on the board with the dev daemon unless a step says otherwise. Evidence is t
 | A board on old firmware silently shows one page | Daemon log, plus the Devices tab note |
 
 **Rollback.**
+
 - Each slice is its own commit, so `git revert` undoes one.
 - The firmware rolls back by flashing the previous build. The partition table and NVS don't change, so the pairing survives.
 - The daemon rolls back with a config that has no pages.
