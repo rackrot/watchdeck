@@ -65,10 +65,10 @@ _Static_assert(GRID_SCREEN_W == DISPLAY_H_RES && GRID_SCREEN_H == DISPLAY_V_RES,
 #define SETTINGS_BTN_H 56
 #define ROW_TEXT_MAX 128
 
-// The status bar, 1024 px wide, in Roboto Mono 24 so that every text of a group has a fixed width. Left to right: CPU,
-// RAM, GPU, NET, then the date and time flush against the right edge. The four groups are spaced evenly from the left
-// edge to the clock's area. bar_create measures each group's worst case (the CPU and GPU ones with room for the
-// temperature a later plan adds) and computes the gap.
+// The status bar, 1024 px wide, in Roboto Mono Regular 20 so that every text of a group has a fixed width. Left to
+// right: CPU, RAM, GPU, NET, then the date and time flush against the right edge. The four groups are spaced evenly
+// from the left edge to the clock's area. bar_create measures each group's worst case (the CPU and GPU ones with room
+// for the temperature a later plan adds) and computes the gap.
 #define BAR_TEXT_Y ((BAR_H - SLOT24_H) / 2) // 4: the line sits in the middle of the bar
 #define BAR_MARGIN 4                        // px between the clock and the right edge, and the status text and the left
 #define BAR_CLOCK_SLACK 4                   // px added to the clock's width
@@ -140,7 +140,8 @@ typedef enum {
 static lv_obj_t *s_bar;
 static lv_timer_t *s_bar_timer;
 static lv_obj_t *s_bar_labels[BAR_COUNT];
-static lv_font_t s_bar_font; // Roboto Mono 24 with Montserrat 24 behind it for the degree sign and the arrows
+LV_FONT_DECLARE(wd_font_bar)                        // Roboto Mono Regular 20, generated from fonts/fonts.json
+static lv_font_t s_bar_font;                        // a RAM copy of it with Montserrat 20 behind it for the arrows
 static char s_bar_text[BAR_COUNT][STATUS_TEXT_MAX]; // what each slot was last given, as for the settings rows
 // The latest `stats` frame and when it came, kept whether or not the bar exists. The clock runs on from it.
 static proto_stats_t s_stats;
@@ -1118,9 +1119,10 @@ static void bar_create(void)
     if (s_bar) {
         return;
     }
-    // Roboto Mono has only 0x20-0x7E, so the degree sign and the arrows come from Montserrat.
-    s_bar_font = *wd_font(WD_FONT_roboto_mono, WD_SLOT_24);
-    s_bar_font.fallback = &lv_font_montserrat_24;
+    // The bar font (fonts.json, chrome) has ASCII and the degree sign. The arrows come from Montserrat 20, the size
+    // nearest its digits.
+    s_bar_font = wd_font_bar;
+    s_bar_font.fallback = &lv_font_montserrat_20;
 
     // In a monospace font every ASCII character is as wide as the widest, so a worst case is its longest string. Only
     // the degree sign and the arrows come from Montserrat, and the strings below contain both arrows and the sign.

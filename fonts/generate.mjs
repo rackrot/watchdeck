@@ -52,6 +52,7 @@ const HEADER =
 const sha256 = (buf) => createHash("sha256").update(buf).digest("hex");
 const ident = (id) => id.replaceAll("-", "_");
 const cName = (font, slot) => `wd_font_${ident(font.id)}_${slot}`;
+const chromeName = (chrome) => `wd_font_${ident(chrome.id)}`;
 
 function die(msg) {
   console.error(`fonts: ${msg}`);
@@ -84,9 +85,13 @@ function loadManifest() {
           `${font.id}: fallback font ${font.fallback.font} is not in the manifest`,
         );
     }
-    // Nothing but the pinned font and license may sit in a font's directory.
+    // Nothing but the pinned font and license, and the chrome weights of its family, may sit in a font's directory.
     const have = readdirSync(join(FONTS_DIR, font.id)).sort();
-    const expected = [font.file, font.license.file].sort();
+    const expected = [
+      font.file,
+      font.license.file,
+      ...manifest.chrome.filter((c) => c.family === font.id).map((c) => c.file),
+    ].sort();
     if (have.join() !== expected.join())
       die(`fonts/${font.id}/ holds [${have}], expected [${expected}]`);
     for (const [what, path, want] of [
@@ -104,6 +109,18 @@ function loadManifest() {
           `${relative(ROOT, path)}: ${what} sha256 is ${got}, manifest says ${want}`,
         );
     }
+  }
+  for (const c of manifest.chrome) {
+    c.family = manifest.fonts.find((f) => f.id === c.family);
+    if (!c.family)
+      die(`chrome font ${c.id}: its family is not in the manifest`);
+    const path = join(FONTS_DIR, c.family.id, c.file);
+    if (!existsSync(path)) die(`${relative(ROOT, path)} is missing`);
+    const got = sha256(readFileSync(path));
+    if (got !== c.sha256)
+      die(
+        `${relative(ROOT, path)}: font sha256 is ${got}, manifest says ${c.sha256}`,
+      );
   }
   const known = new Set([
     "node_modules",
@@ -135,30 +152,53 @@ function convert(font, slot, size) {
       );
       fonts.push(["--font", fb.source.file, "-r", fb.range]);
     }
-    execFileSync(
-      process.execPath,
-      [
-        LV_FONT_CONV,
-        ...fonts.flat(),
-        "--size",
-        String(size),
-        "--bpp",
-        "4",
-        "--no-compress",
-        "--no-prefilter",
-        "--force-fast-kern-format",
-        "--format",
-        "lvgl",
-        "--lv-include",
-        "lvgl.h",
-        "--lv-font-name",
-        name,
-        "-o",
-        `${name}.c`,
-      ],
-      { cwd: work, stdio: ["ignore", "ignore", "inherit"] },
+    return runConv(work, fonts, name, size);
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+  }
+}
+
+function runConv(work, fonts, name, size) {
+  execFileSync(
+    process.execPath,
+    [
+      LV_FONT_CONV,
+      ...fonts.flat(),
+      "--size",
+      String(size),
+      "--bpp",
+      "4",
+      "--no-compress",
+      "--no-prefilter",
+      "--force-fast-kern-format",
+      "--format",
+      "lvgl",
+      "--lv-include",
+      "lvgl.h",
+      "--lv-font-name",
+      name,
+      "-o",
+      `${name}.c`,
+    ],
+    { cwd: work, stdio: ["ignore", "ignore", "inherit"] },
+  );
+  return readFileSync(join(work, `${name}.c`), "utf8");
+}
+
+// A chrome font: one weight of a family, one size, its own range.
+function convertChrome(chrome) {
+  const work = mkdtempSync(join(tmpdir(), "wd-font-"));
+  try {
+    copyFileSync(
+      join(FONTS_DIR, chrome.family.id, chrome.file),
+      join(work, chrome.file),
     );
-    return readFileSync(join(work, `${name}.c`), "utf8");
+    return runConv(
+      work,
+      [["--font", chrome.file, "-r", chrome.range]],
+      chromeName(chrome),
+      chrome.size,
+    );
   } finally {
     rmSync(work, { recursive: true, force: true });
   }
@@ -210,7 +250,7 @@ function parse(c, name) {
     kern_class_values: count("kern_class_values[] =", true),
   };
   if (!lineHeight) die("no line_height in generated C");
-  return { lineHeight, adv, bytes };
+  return { lineHeight, adv, bytes, codes: new Set(codes) };
 }
 
 function checkSlot(font, slot, nominal, size, lineHeight) {
@@ -255,6 +295,25 @@ function finishC(font, slot, c) {
   return `${body}\n`;
 }
 
+function finishChromeC(chrome, c) {
+  const f = chrome.family;
+  const note = [
+    `/* ${HEADER}`,
+    ` * ${f.name} ${chrome.file.replace(/^.*-(\w+)\.ttf$/, "$1")}, size ${chrome.size}, range ${chrome.range}: the device's bar.`,
+    ` * ${f.copyright}`,
+    ` * SPDX-License-Identifier: ${f.license.spdx}`,
+    ` * License text: fonts/${f.id}/${f.license.file}`,
+    " */",
+    "",
+  ].join("\n");
+  const body = `${note}\n${c}`
+    .split("\n")
+    .map((line) => line.replace(/[ \t]+$/, ""))
+    .join("\n")
+    .replace(/\n+$/, "");
+  return `${body}\n`;
+}
+
 function pipe(cmd, args, input, cwd) {
   return execFileSync(cmd, args, { input, cwd, encoding: "utf8" });
 }
@@ -274,10 +333,13 @@ function fontListH(fonts) {
   return pipe("clang-format", ["--assume-filename=font_list.h"], src, ROOT);
 }
 
-function fontsCmake(fonts) {
-  const files = fonts.flatMap((f) =>
-    Object.keys(SLOTS).map((slot) => `    fonts/${cName(f, slot)}.c`),
-  );
+function fontsCmake(fonts, chrome) {
+  const files = [
+    ...fonts.flatMap((f) =>
+      Object.keys(SLOTS).map((slot) => `    fonts/${cName(f, slot)}.c`),
+    ),
+    ...chrome.map((c) => `    fonts/${chromeName(c)}.c`),
+  ];
   return `# ${HEADER}\nset(WD_FONT_SRCS\n${files.join("\n")}\n)\n`;
 }
 
@@ -349,11 +411,36 @@ function generate(manifest) {
       outputs.set(`${OUT_C}/${cName(font, slot)}.c`, finishC(font, slot, c));
     }
   }
-  outputs.set(`${OUT_C}/fonts.cmake`, fontsCmake(manifest.fonts));
+  for (const chrome of manifest.chrome) {
+    const c = convertChrome(chrome);
+    const p = parse(c, `chrome ${chrome.id}`);
+    if (p.lineHeight > SLOTS[24].box)
+      die(
+        `chrome ${chrome.id}: line_height ${p.lineHeight} is above the ${SLOTS[24].box} px line box`,
+      );
+    // The range may add codepoints beyond ASCII (the bar's degree sign); each must have a glyph.
+    for (const code of chromeCodes(chrome.range))
+      if (!p.codes.has(code))
+        die(`chrome ${chrome.id} lacks U+${code.toString(16)}`);
+    parsed.set(`chrome/${chrome.id}`, p);
+    outputs.set(`${OUT_C}/${chromeName(chrome)}.c`, finishChromeC(chrome, c));
+  }
+  outputs.set(
+    `${OUT_C}/fonts.cmake`,
+    fontsCmake(manifest.fonts, manifest.chrome),
+  );
   outputs.set(OUT_LIST, fontListH(manifest.fonts));
   outputs.set(OUT_TS, fontsTs(manifest.fonts, parsed));
   outputs.set(OUT_RS, fontsRs(manifest.fonts));
   return { outputs, parsed };
+}
+
+// "0x20-0x7E,0xB0" as the codepoints it names.
+function chromeCodes(range) {
+  return range.split(",").flatMap((part) => {
+    const [lo, hi = lo] = part.split("-").map(Number);
+    return Array.from({ length: hi - lo + 1 }, (_, i) => lo + i);
+  });
 }
 
 function probe(manifest) {

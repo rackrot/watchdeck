@@ -12,4 +12,5 @@ set(WD_FONT_SRCS
     fonts/wd_font_orbitron_32.c
     fonts/wd_font_oxanium_24.c
     fonts/wd_font_oxanium_32.c
+    fonts/wd_font_bar.c
 )

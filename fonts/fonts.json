@@ -131,5 +131,19 @@
       "copyright": "Copyright 2019 The Oxanium Project Authors (https://github.com/sevmeyer/oxanium)",
       "sizes": { "24": 24, "32": 32 }
     }
+  ],
+  "chrome_comment": "Fonts for the device's own chrome, not selectable in config.toml and absent from the app's font picker. Each is another weight of a `fonts` family: it sits in that family's directory, takes its copyright and license (listed once), and is converted at one `size` over `range`. The C name is wd_font_<id>.",
+  "chrome": [
+    {
+      "id": "bar",
+      "family": "roboto-mono",
+      "file": "RobotoMono-Regular.ttf",
+      "sha256": "af0bff7599c3df3831755c16e39b3c496df74b8c8d8a1161b14dc8461be17cb4",
+      "source": {
+        "url": "https://raw.githubusercontent.com/googlefonts/RobotoMono/895ec691990d041dd727c7b5afa3ce56525d98e6/fonts/ttf/RobotoMono-Regular.ttf"
+      },
+      "size": 20,
+      "range": "0x20-0x7E,0xB0"
+    }
   ]
 }
