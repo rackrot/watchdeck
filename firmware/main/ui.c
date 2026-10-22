@@ -378,10 +378,11 @@ static void touch_track(lv_event_t *e)
     s_touch_max_dy = LV_MAX(s_touch_max_dy, LV_ABS(p.y - s_touch_start.y));
 }
 
-// Reads per touch show whether a fast flick is being sampled often enough to see it move.
+// Reads per touch show whether a fast flick is being sampled often enough to see it move. Debug level: at 115200 baud
+// an INFO line costs about 10 ms in the LVGL task on every press.
 static void touch_log(const char *what)
 {
-    ESP_LOGI(TAG, "touch on %s: %u samples in %u ms, max %d,%d net %d,%d", what, (unsigned)s_touch_samples,
+    ESP_LOGD(TAG, "touch on %s: %u samples in %u ms, max %d,%d net %d,%d", what, (unsigned)s_touch_samples,
              (unsigned)lv_tick_elaps(s_touch_start_tick), s_touch_max_dx, s_touch_max_dy,
              s_touch_end.x - s_touch_start.x, s_touch_end.y - s_touch_start.y);
 }

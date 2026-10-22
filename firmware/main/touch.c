@@ -98,7 +98,9 @@ esp_err_t touch_init(lv_display_t *disp)
     lv_indev_t *indev = lvgl_port_add_touch(&lv_cfg);
     ESP_GOTO_ON_FALSE(indev, ESP_FAIL, err, TAG, "lvgl_port_add_touch failed");
     // The INT pin is not usable, so LVGL polls. Its default period is LV_DEF_REFR_PERIOD (33 ms), too slow to see a
-    // fast flick move between samples.
+    // fast flick move between samples. With the 100 Hz FreeRTOS tick the esp_lvgl_port loop can't hit 10 ms exactly;
+    // the board measured about 10 to 15 ms per read (S8). Smaller per-read steps also make LVGL's gesture check (3 px
+    // per read) miss more flicks, which ui.c's drag fallback turns into page turns.
     lvgl_port_lock(0);
     lv_timer_set_period(lv_indev_get_read_timer(indev), TOUCH_READ_MS);
     lvgl_port_unlock();
