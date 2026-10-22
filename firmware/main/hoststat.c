@@ -6,6 +6,16 @@
 // gmtime_r on a 32-bit time_t would fail after 2038.
 _Static_assert(sizeof(time_t) == 8, "the clock must reach past 2038");
 
+bool hoststat_fresh(bool have_frame, int64_t elapsed_us)
+{
+    return have_frame && elapsed_us <= HOSTSTAT_STALE_US;
+}
+
+int64_t hoststat_local_time(uint64_t frame_time, int32_t utc_offset, int64_t elapsed_us)
+{
+    return (int64_t)frame_time + utc_offset + (elapsed_us > 0 ? elapsed_us / 1000000 : 0);
+}
+
 void hoststat_cpu(char *buf, size_t size, unsigned cpu)
 {
     snprintf(buf, size, "%u%%", cpu > 100 ? 100u : cpu);
