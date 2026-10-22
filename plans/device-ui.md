@@ -19,12 +19,13 @@ The user answered the open questions of the first draft:
 - **Long swipe** (was E): 200 px up, more than twice as far up as sideways, anywhere on the grid, tuned on the board in S6.
 - **Auto-close** (was F): settings closes after 60 s without a touch.
 - **Bar layout, as built in S7** (replaces G and H):
-  - Rates are compact: bytes per second with an SI suffix and no unit, truncated (`▼1.2M ▲340k`, `999k`, never `1000k`).
-  - No daemon name in the bar, since settings shows it. While the link is down the link status text takes the place of the four host slots, and the clock stays.
-  - Memory is a percent, `MEM 45%` (used over total).
-  - Left to right: `CPU 12%`, `MEM 45%`, the clock centered on the 1024 px screen (`Wed 22 Oct 14:32`, worst case `Wed 24 May 04:44`), `GPU --` (reserved, always `--`; sized for `GPU 100% 100°`), then the net rates.
-  - The CPU slot is also sized for a later temperature (`CPU 100% 100°`).
-  - Slots, x and width: CPU 4/184, MEM 204/136, clock 396/232, GPU 636/184, net 828/192. The bar logs `bar slot overflow` at creation if a worst case is wider than its slot.
+  - The bar is Roboto Mono 24 (Montserrat 24 behind it for `°` and the arrows), so every group has a fixed width.
+  - Rates are compact: bytes per second with one decimal and an SI suffix, truncated (`▼  1.2M ▲340.0k`, `999.9k`, never `1000.0k`; under 1000 a whole number), right-aligned in 6 cells.
+  - No daemon name in the bar, since settings shows it. While the link is down the link status text takes the place of the four host groups, and the clock stays.
+  - Memory is a percent, `RAM 45%` (used over total).
+  - Left to right: `CPU 12%`, `RAM 45%`, `GPU --` (reserved, always `--`; sized for `GPU 100% 100°`), the net rates, then the date and time flush right (`Wed 22 Oct 14:32`, worst case `Wed 24 May 04:44`).
+  - The CPU group is also sized for a later temperature (`CPU 100% 100°`).
+  - The four groups are spread with equal gaps from the left edge to the clock's area. `bar_create` measures them and computes the gap, and logs `bar slot overflow` if they do not fit.
 
 ## Goal and done
 

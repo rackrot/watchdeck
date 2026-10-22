@@ -56,13 +56,9 @@ void hoststat_rate(char *buf, size_t size, uint64_t bytes_per_s)
     }
     uint64_t tenths = bytes_per_s / (scale / 10); // truncated
     if (tenths > 9999) {
-        tenths = 9999; // "999G"
+        tenths = 9999; // "999.9G"
     }
-    if (tenths < 100) {
-        snprintf(buf, size, "%u.%u%c", (unsigned)(tenths / 10), (unsigned)(tenths % 10), units[unit]);
-    } else {
-        snprintf(buf, size, "%u%c", (unsigned)(tenths / 10), units[unit]);
-    }
+    snprintf(buf, size, "%u.%u%c", (unsigned)(tenths / 10), (unsigned)(tenths % 10), units[unit]);
 }
 
 void hoststat_clock(char *buf, size_t size, int64_t local_unix)

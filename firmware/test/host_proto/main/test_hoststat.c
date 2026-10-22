@@ -57,13 +57,14 @@ void test_hoststat_rate_si_prefix_truncates(void)
     rate_is(999, "999");
     rate_is(1000, "1.0k");
     rate_is(1234, "1.2k");
-    rate_is(340000, "340k");
-    rate_is(999999, "999k");
+    rate_is(340000, "340.0k");
+    rate_is(999999, "999.9k"); // truncated, never "1000.0k"
     rate_is(1000000, "1.0M");
-    rate_is(12345678, "12M");
+    rate_is(12345678, "12.3M");
+    rate_is(999999999, "999.9M");
     rate_is(2500000000ULL, "2.5G");
-    rate_is(999999999999ULL, "999G");
-    rate_is(UINT64_MAX, "999G");
+    rate_is(999999999999ULL, "999.9G");
+    rate_is(UINT64_MAX, "999.9G");
 }
 
 void test_hoststat_clock_from_gmtime(void)
@@ -77,7 +78,7 @@ void test_hoststat_clock_from_gmtime(void)
     clock_is(INT64_MAX, "--:--");
 }
 
-// The bar pads every value to HOSTSTAT_VALUE_W cells, so none may be longer.
+// The bar pads every percent to HOSTSTAT_VALUE_W cells and every rate to HOSTSTAT_RATE_W, so none may be longer.
 void test_hoststat_values_fit_the_bar_cells(void)
 {
     for (unsigned cpu = 0; cpu <= 100; cpu++) {
@@ -90,10 +91,10 @@ void test_hoststat_values_fit_the_bar_cells(void)
     }
     for (uint64_t bps = 1; bps < UINT64_MAX / 3; bps *= 3) {
         hoststat_rate(out, sizeof(out), bps);
-        TEST_ASSERT_LESS_OR_EQUAL_INT(HOSTSTAT_VALUE_W, (int)strlen(out));
+        TEST_ASSERT_LESS_OR_EQUAL_INT(HOSTSTAT_RATE_W, (int)strlen(out));
     }
     hoststat_rate(out, sizeof(out), UINT64_MAX);
-    TEST_ASSERT_LESS_OR_EQUAL_INT(HOSTSTAT_VALUE_W, (int)strlen(out));
+    TEST_ASSERT_LESS_OR_EQUAL_INT(HOSTSTAT_RATE_W, (int)strlen(out));
 }
 
 void test_hoststat_fresh_until_5_s(void)
