@@ -578,12 +578,15 @@ Rollback: each slice is its own commit on `main` (see the status table), so `git
 | 2 | UI design direction (look, references, palette, type) | Settled 2026-10-11 by the user: a dark control-room look (always dark, dense, monospace accents, status colors), a live device-accurate preview, palette left to Claude. Built in S7 |
 | 3 | Desktop environment | KDE or another StatusNotifierItem tray. GNOME needs an extension |
 | 4 | Desktop firewall active? | Yes, ufw on the dev desktop. The user added `ufw allow from 192.168.0.0/24 to any port 47820,47821 proto tcp`. The daemon can't add rules itself without root |
-| 5 | HTTPS to self-signed services (e.g. Home Assistant) | Unsupported in v1. A per-action `insecure_tls` opt-in later |
-| 6 | SVG icons | PNG, JPEG and WebP only. SVG via resvg later |
-| 7 | Non-ASCII labels | Rejected; the built-in fonts lack the glyphs |
+| 5 | HTTPS to self-signed services (e.g. Home Assistant) | Unsupported in v1. Decided 2026-10-21 by the user: a per-action `insecure_tls` opt-in. Built in d2468c2 |
+| 6 | SVG icons | PNG, JPEG and WebP only in v1. Decided 2026-10-21 by the user: SVG via resvg, a strict subset under limits. Built in 4437fd4 |
+| 7 | Non-ASCII labels | Rejected; the built-in fonts lack the glyphs. Confirmed 2026-10-21 by the user: keep rejecting |
 | 8 | Tile polling | Settled in S6: only while a device is connected, as built |
 | 9 | Plain HTTP headers such as `Content-Type` | Settled in S4 by the user: a per-action `headers` table beside `secret_headers`. A name appears once across both, ignoring case |
 
 ## Backlog
 
 - ~~**Sentry error reporting.**~~ Dropped 2026-10-21 by the user, and the code is removed. See `plans/sentry.md`.
+- **Pages (protocol v2).** Decided 2026-10-21 by the user: plan next. Several button pages with navigation, across firmware, daemon, config and the config UI. Needs its own plan.
+- **`insecure_tls` for HTTP actions.** A per-action opt-in that skips certificate checks, for self-signed services (open question 5).
+- **SVG icons via resvg.** The daemon rasterizes SVG to the button size, like the other formats (open question 6).
