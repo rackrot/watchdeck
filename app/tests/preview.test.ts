@@ -9,6 +9,7 @@ import {
   cellAt,
   cellRect,
   cellSize,
+  GRID_H,
   iconBox,
   labelLines,
   layoutButton,
@@ -16,36 +17,37 @@ import {
   pagerLabel,
 } from "../src/preview.ts";
 
-test("the preview of a 5x3 grid is 44 px icons and no label, and with 2 pages 33 px and the label", () => {
+test("the preview of a 5x3 grid is 97 px icons and no label, and with 2 pages 87 px and the label", () => {
   const preview = (pages: number, page: number) => ({
     icon: iconBox(5, 3, pages >= 2),
     label: pagerLabel(page, pages),
   });
-  assert.deepEqual(preview(1, 0), { icon: 44, label: null });
-  assert.deepEqual(preview(2, 0), { icon: 33, label: "Page 1 of 2" });
+  assert.deepEqual(preview(1, 0), { icon: 97, label: null });
+  assert.deepEqual(preview(2, 0), { icon: 87, label: "Page 1 of 2" });
   assert.equal(pagerLabel(2, 4), "Page 3 of 4");
 });
 
 test("cells match build_grid on the grids the firmware was checked with", () => {
-  assert.deepEqual(cellSize(5, 3), { w: 195, h: 124 });
+  assert.equal(GRID_H, 556); // the editor's stage at scale 1: 600 less GRID_TOP 44
+  assert.deepEqual(cellSize(5, 3), { w: 195, h: 177 });
   assert.deepEqual(cellRect(0, 0, cellSize(5, 3)), {
     w: 195,
-    h: 124,
+    h: 177,
     x: 8,
     y: 0,
   });
   assert.deepEqual(cellRect(4, 2, cellSize(5, 3)), {
     w: 195,
-    h: 124,
+    h: 177,
     x: 820,
-    y: 264,
+    y: 370,
   });
 });
 
 test("icon boxes are what icons.rs pins in `the_box_follows_the_firmware_button`", () => {
   // Cell width less padding, by column count; the rows decide the height.
   const widths = [1000, 492, 322, 238, 187, 153, 129, 111];
-  const heights = [256, 110, 44, 46, 26];
+  const heights = [256, 190, 97, 51, 58];
   for (let cols = 1; cols <= 8; cols++) {
     heights.forEach((high, i) => {
       assert.equal(
@@ -60,20 +62,20 @@ test("icon boxes are what icons.rs pins in `the_box_follows_the_firmware_button`
 test("the paged geometry table is the one firmware test_grid.c and icons.rs pin", () => {
   assert.equal(PAGER_H, 31);
   const widths = [1000, 492, 322, 238, 187, 153, 129, 111];
-  // [rows, cell height, label lines, icon box] for the full grid, then for the grid less PAGER_H
+  // [rows, cell height, label lines, icon box] for the full grid (556 px), then for the grid less PAGER_H (525 px)
   const full = [
-    [1, 388, 2, 256],
-    [2, 190, 2, 110],
-    [3, 124, 2, 44],
-    [4, 91, 1, 46],
-    [5, 71, 1, 26],
+    [1, 548, 2, 256],
+    [2, 270, 2, 190],
+    [3, 177, 2, 97],
+    [4, 131, 2, 51],
+    [5, 103, 1, 58],
   ];
   const paged = [
-    [1, 357, 2, 256],
-    [2, 174, 2, 94],
-    [3, 113, 2, 33],
-    [4, 83, 1, 38],
-    [5, 65, 1, 20],
+    [1, 517, 2, 256],
+    [2, 254, 2, 174],
+    [3, 167, 2, 87],
+    [4, 123, 2, 43],
+    [5, 97, 1, 52],
   ];
   for (const [isPaged, table] of [
     [false, full],
@@ -94,25 +96,25 @@ test("the paged geometry table is the one firmware test_grid.c and icons.rs pin"
   }
   // Omitting the flag is the unpaged grid.
   assert.deepEqual(cellSize(5, 3), cellSize(5, 3, false));
-  assert.equal(iconBox(5, 3), 44);
-  assert.equal(iconBox(5, 3, true), 33);
+  assert.equal(iconBox(5, 3), 97);
+  assert.equal(iconBox(5, 3, true), 87);
 });
 
 test("a paged grid maps points on its shorter cells, and layoutButton follows it", () => {
   const cell = cellSize(5, 3, true);
-  assert.deepEqual(cell, { w: 195, h: 113 });
+  assert.deepEqual(cell, { w: 195, h: 167 });
   const rect = cellRect(2, 2, cell);
   assert.deepEqual(cellAt(rect.x + 5, rect.y + 5, 5, 3, true), [2, 2]);
   assert.equal(cellAt(rect.x + 5, rect.y + cell.h, 5, 3, true), null);
   const button = { label: "x", hasIcon: true, isTile: false };
-  assert.equal(layoutButton(button, 5, 3).icon, 44);
-  assert.equal(layoutButton(button, 5, 3, "", undefined, true).icon, 33);
+  assert.equal(layoutButton(button, 5, 3).icon, 97);
+  assert.equal(layoutButton(button, 5, 3, "", undefined, true).icon, 87);
 });
 
 test("a button has two label lines until that would leave its icon under 24 px", () => {
   assert.deepEqual(
     [1, 2, 3, 4, 5].map((rows) => labelLines(cellSize(5, rows))),
-    [2, 2, 2, 1, 1],
+    [2, 2, 2, 2, 1],
   );
 });
 
@@ -130,7 +132,11 @@ test("a point maps to its cell, and a gap or the outside to none", () => {
     "the gap after it",
   );
   assert.equal(cellAt(-5, 10, 5, 3), null);
-  assert.equal(cellAt(500, 400, 5, 3), null, "below the last row");
+  assert.equal(
+    cellAt(500, 560, 5, 3),
+    null,
+    "below the last row, under the 556 px grid",
+  );
 });
 
 test("glyph widths are LVGL's advances rounded to whole pixels", () => {
@@ -245,7 +251,7 @@ test("a button lays out as build_grid does", () => {
   assert.equal(plain.icon, null);
   assert.equal(plain.value, null);
 
-  // With an icon: a fixed two lines on 3 rows, one on 4.
+  // With an icon: a fixed two lines on 3 and 4 rows, one on 5.
   assert.equal(
     layoutButton({ label: "x", hasIcon: true, isTile: false }, 5, 3).label
       ?.height,
@@ -254,10 +260,16 @@ test("a button lays out as build_grid does", () => {
   assert.equal(
     layoutButton({ label: "x", hasIcon: true, isTile: false }, 5, 4).label
       ?.height,
+    70,
+  );
+  assert.equal(
+    layoutButton({ label: "x", hasIcon: true, isTile: false }, 5, 5).label
+      ?.height,
     35,
   );
 
-  // A tile: 24 pt label on one line, the value under it in 32 pt in tall cells, 24 pt in short ones.
+  // A tile: 24 pt label on one line, the value under it in 32 pt. Every grid of up to 5 rows is at
+  // least 80 px tall per cell (97 paged), so the value is 32 pt on all of them.
   const tile = layoutButton(
     { label: "Load", hasIcon: false, isTile: true },
     5,
@@ -274,10 +286,14 @@ test("a button lays out as build_grid does", () => {
     5,
     "0.42",
   );
-  assert.equal(short.value?.size, 24);
+  assert.equal(short.value?.size, 32);
 
-  // With an icon on 4 or 5 rows there is room for the icon and the value only.
+  // With an icon on 5 rows there is room for the icon and the value only; 4 rows keep a label.
   assert.equal(
+    layoutButton({ label: "Load", hasIcon: true, isTile: true }, 5, 5).label,
+    null,
+  );
+  assert.notEqual(
     layoutButton({ label: "Load", hasIcon: true, isTile: true }, 5, 4).label,
     null,
   );

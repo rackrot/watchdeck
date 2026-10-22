@@ -16,7 +16,7 @@ import { dotLines, wrapLines } from "./lvtext.ts";
 
 export const SCREEN_W = 1024;
 export const SCREEN_H = 600;
-export const GRID_TOP = 204;
+export const GRID_TOP = 44;
 export const GRID_GAP = 8;
 /** The stage height. A paged layout's cells divide `GRID_H - PAGER_H`. */
 export const GRID_H = SCREEN_H - GRID_TOP;
@@ -123,7 +123,7 @@ export type TextBox = {
 export type ButtonFonts = { label: string; value: string };
 
 export type ButtonLayout = {
-  /** Null when there is no room for the label: a tile with an icon on a grid of 4 or 5 rows. */
+  /** Null when there is no room for the label: a tile with an icon on a grid of 5 rows. */
   label: TextBox | null;
   /** A tile's value, under the label. */
   value: TextBox | null;

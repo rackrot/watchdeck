@@ -10,7 +10,9 @@
 
 #define GRID_SCREEN_W 1024 // checked against DISPLAY_H_RES in ui.c
 #define GRID_SCREEN_H 600  // checked against DISPLAY_V_RES in ui.c
-#define GRID_TOP 204
+// The status bar above the grid in grid mode. The grid starts one GRID_GAP under it (test_grid.c pins that).
+#define BAR_H 36
+#define GRID_TOP 44
 #define GRID_GAP 8
 #define PAGER_H 31 // the "Page x of y" strip under a paged grid: SLOT24_H plus 4 px of margin
 #define ICON_PAD 4 // a button with an icon is a column: the icon, a gap, and a label of fixed height

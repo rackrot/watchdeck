@@ -12,7 +12,7 @@
    the LVGL lock. The UI reads the image descriptors under the model lock and holds them in image widgets. */
 
 #define ICONS_MAX (PROTO_MAX_PAGES * PROTO_MAX_BUTTONS) // one per cell of every page, since a set never names more
-#define ICONS_MAX_BYTES (8 * 1024 * 1024) // a valid set needs at most 3,625,216 bytes (test_grid.c pins it)
+#define ICONS_MAX_BYTES (8 * 1024 * 1024) // a valid set needs at most 4,844,160 bytes (test_grid.c pins it)
 
 /** Allocate the table in PSRAM. model_init calls it once. */
 esp_err_t icons_init(void);

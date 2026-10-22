@@ -42,6 +42,7 @@ _Static_assert(GRID_SCREEN_W == DISPLAY_H_RES && GRID_SCREEN_H == DISPLAY_V_RES,
 #define DRAG_SWIPE_RATIO 2         // |dx| must exceed this times |dy|
 #define ROW_W (DISPLAY_H_RES - 80) // labels and buttons of the pairing views
 #define ROW_H 76
+#define PAIR_TOP 204 // the pairing views start below the five status lines, which keep their own place
 
 static const char *TAG = "ui";
 
@@ -761,8 +762,8 @@ static lv_obj_t *new_pair_view(void)
     clear_pair_view();
     lv_obj_t *view = lv_obj_create(lv_screen_active());
     lv_obj_remove_style_all(view);
-    lv_obj_set_size(view, DISPLAY_H_RES, DISPLAY_V_RES - GRID_TOP);
-    lv_obj_set_pos(view, 0, GRID_TOP);
+    lv_obj_set_size(view, DISPLAY_H_RES, DISPLAY_V_RES - PAIR_TOP);
+    lv_obj_set_pos(view, 0, PAIR_TOP);
     lv_obj_set_flex_flow(view, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(view, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_row(view, GRID_GAP, 0);

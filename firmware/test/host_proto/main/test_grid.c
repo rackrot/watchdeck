@@ -1,4 +1,4 @@
-// Host tests for grid.c: the Geometry table of plans/pages.md, row for row. icons.rs
+// Host tests for grid.c: the Geometry table of plans/device-ui.md, row for row. icons.rs
 // `the_box_follows_the_firmware_button` and app/tests/preview.test.ts pin the same table on the daemon and preview
 // sides.
 #include <stdio.h>
@@ -7,14 +7,14 @@
 #include "proto.h"
 #include "unity.h"
 
-// Rows 1 to 5: { cell_h, label_lines, icon_side } on the full grid (396 px), then on the paged grid (365 px).
+// Rows 1 to 5: { cell_h, label_lines, icon_side } on the full grid (556 px), then on the paged grid (525 px).
 // The width cap (cols = 1) is 1000 px, so no row here is bound by width.
 static const struct {
     int cell_h, label_lines, icon_side;
-} FULL[5] = {{388, 2, 256}, {190, 2, 110}, {124, 2, 44}, {91, 1, 46}, {71, 1, 26}};
+} FULL[5] = {{548, 2, 256}, {270, 2, 190}, {177, 2, 97}, {131, 2, 51}, {103, 1, 58}};
 static const struct {
     int cell_h, label_lines, icon_side;
-} PAGED[5] = {{357, 2, 256}, {174, 2, 94}, {113, 2, 33}, {83, 1, 38}, {65, 1, 20}};
+} PAGED[5] = {{517, 2, 256}, {254, 2, 174}, {167, 2, 87}, {123, 2, 43}, {97, 1, 52}};
 
 // cell width less 2 * ICON_PAD, for 1 to 8 columns
 static const int WIDTH_CAP[8] = {1000, 492, 322, 238, 187, 153, 129, 111};
@@ -23,13 +23,13 @@ void test_grid_table_matches_the_plan_row_for_row(void)
 {
     for (int rows = 1; rows <= 5; rows++) {
         const grid_geometry_t f = grid_geometry(1, rows, false);
-        TEST_ASSERT_EQUAL_INT_MESSAGE(396, f.grid_h, "full grid height");
+        TEST_ASSERT_EQUAL_INT_MESSAGE(556, f.grid_h, "full grid height");
         TEST_ASSERT_EQUAL_INT_MESSAGE(FULL[rows - 1].cell_h, f.cell_h, "full cell_h");
         TEST_ASSERT_EQUAL_INT_MESSAGE(FULL[rows - 1].label_lines, f.label_lines, "full label_lines");
         TEST_ASSERT_EQUAL_INT_MESSAGE(FULL[rows - 1].icon_side, f.icon_side, "full icon_side");
 
         const grid_geometry_t p = grid_geometry(1, rows, true);
-        TEST_ASSERT_EQUAL_INT_MESSAGE(365, p.grid_h, "paged grid height");
+        TEST_ASSERT_EQUAL_INT_MESSAGE(525, p.grid_h, "paged grid height");
         TEST_ASSERT_EQUAL_INT_MESSAGE(PAGED[rows - 1].cell_h, p.cell_h, "paged cell_h");
         TEST_ASSERT_EQUAL_INT_MESSAGE(PAGED[rows - 1].label_lines, p.label_lines, "paged label_lines");
         TEST_ASSERT_EQUAL_INT_MESSAGE(PAGED[rows - 1].icon_side, p.icon_side, "paged icon_side");
@@ -76,9 +76,19 @@ void test_grid_slots_fit_every_cell_of_every_grid(void)
             }
         }
     }
-    // The exact fits named in the plan.
-    TEST_ASSERT_EQUAL_INT(64, SLOT24_H + ICON_GAP + SLOT24_H + 2 * ICON_PAD); // 5 rows paged, no icon, of 65
-    TEST_ASSERT_EQUAL_INT(83, 38 + ICON_GAP + SLOT32_H + 2 * ICON_PAD);       // 4 rows paged, tile with icon, of 83
+    // The tightest fit in the table: a tile with an icon on 5 rows has one label line and a 32 pt value, so its
+    // icon side plus the rest fills the cell exactly, on the full grid and the paged one.
+    for (int paged = 0; paged <= 1; paged++) {
+        const grid_geometry_t g = grid_geometry(1, 5, paged);
+        TEST_ASSERT_EQUAL_INT(g.cell_h, g.icon_side + ICON_GAP + SLOT32_H + 2 * ICON_PAD);
+    }
+}
+
+void test_grid_bar_and_gap_fill_the_top_of_the_grid(void)
+{
+    TEST_ASSERT_EQUAL_INT(36, BAR_H);
+    TEST_ASSERT_EQUAL_INT(44, GRID_TOP);
+    TEST_ASSERT_EQUAL_INT(GRID_TOP, BAR_H + GRID_GAP);
 }
 
 // The board caches the icons of every page of a set (icons.h: ICONS_MAX entries, ICONS_MAX_BYTES of 8 MiB). A valid
@@ -100,7 +110,7 @@ void test_grid_icon_cache_bound_holds_for_every_set(void)
         }
     }
     TEST_ASSERT_LESS_OR_EQUAL_INT64(8 * 1024 * 1024, worst);
-    TEST_ASSERT_EQUAL_INT64(3625216, worst); // 4 pages of 4x1, 16 icons of 238 x 238
+    TEST_ASSERT_EQUAL_INT64(4844160, worst); // 4 pages of 5x2, 40 icons of 174 x 174
 }
 
 void test_grid_run(void)
@@ -110,4 +120,5 @@ void test_grid_run(void)
     RUN_TEST(test_grid_pager_is_a_slot_24_line_plus_4_px_of_margin);
     RUN_TEST(test_grid_slots_fit_every_cell_of_every_grid);
     RUN_TEST(test_grid_icon_cache_bound_holds_for_every_set);
+    RUN_TEST(test_grid_bar_and_gap_fill_the_top_of_the_grid);
 }

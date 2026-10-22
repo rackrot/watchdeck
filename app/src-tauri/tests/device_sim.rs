@@ -1809,16 +1809,17 @@ async fn icon_get_answers_with_the_frame_the_layout_named() {
     c.send(icon_get(&[&id])).await.unwrap();
     let icon = recv_icon(&mut c).await;
     assert_eq!(encode_hex(&icon.id), id);
-    // 5x3 buttons leave 116 px inside the padding, less a two-line label and a gap: 44.
-    assert_eq!((icon.w, icon.h), (44, 44));
+    // 5x3 buttons leave 169 px inside the padding, less a two-line label and a gap: 97.
+    assert_eq!((icon.w, icon.h), (97, 97));
+    let side = 97;
     let pixel = |x: usize, y: usize| {
-        let at = (y * 44 + x) * 4;
+        let at = (y * side + x) * 4;
         icon.pixels[at..at + 4].to_vec()
     };
     assert_eq!(pixel(8, 8), [0, 0, 255, 255], "red, as B, G, R, A");
-    assert_eq!(pixel(35, 8), [0, 255, 0, 255]);
-    assert_eq!(pixel(8, 35), [255, 0, 0, 255]);
-    assert_eq!(pixel(35, 35), [0, 0, 0, 0], "the transparent quadrant");
+    assert_eq!(pixel(80, 8), [0, 255, 0, 255]);
+    assert_eq!(pixel(8, 80), [255, 0, 0, 255]);
+    assert_eq!(pixel(80, 80), [0, 0, 0, 0], "the transparent quadrant");
 
     // A repeated id gets one frame, and asking again later gets it again.
     c.send(icon_get(&[&id, &id])).await.unwrap();
@@ -2414,7 +2415,8 @@ fn solid_png(side: u32, rgba: [u8; 4]) -> Vec<u8> {
 async fn start_paged() -> Daemon {
     let daemon = start().await;
     put_icon(&daemon, "a.png", &quadrants_png(200));
-    put_icon(&daemon, "b.png", &solid_png(64, [1, 2, 3, 255]));
+    // Bigger than the 87 px paged box, so that it is shrunk to fit and not left at its own size.
+    put_icon(&daemon, "b.png", &solid_png(128, [1, 2, 3, 255]));
     assert_eq!(daemon.reconfigure(PAGED_CONFIG), Ok(true));
     daemon
         .devices
@@ -2642,7 +2644,7 @@ async fn the_fonts_and_pages_caps_get_every_page_as_one_set_then_every_tile() {
     let plex_icon = buttons_of(&set[1])[0].icon.clone().unwrap();
     c.send(icon_get(&[&plex_icon])).await.unwrap();
     let icon = recv_icon(&mut c).await;
-    assert_eq!((encode_hex(&icon.id), icon.w, icon.h), (plex_icon, 33, 33));
+    assert_eq!((encode_hex(&icon.id), icon.w, icon.h), (plex_icon, 87, 87));
 }
 
 #[tokio::test]
@@ -2808,7 +2810,7 @@ async fn a_config_without_pages_goes_out_unchanged_and_a_second_page_reaches_bot
     // The old board gets the icon drawn for the shorter grid too.
     old.send(icon_get(&[&moved])).await.unwrap();
     let frame = recv_icon(&mut old).await;
-    assert_eq!((encode_hex(&frame.id), frame.w, frame.h), (moved, 33, 33));
+    assert_eq!((encode_hex(&frame.id), frame.w, frame.h), (moved, 87, 87));
 }
 
 #[tokio::test]

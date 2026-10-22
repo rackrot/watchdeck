@@ -160,7 +160,7 @@ const MAX_NAME_BYTES: usize = 63;
 // by the font.
 const SCREEN_W: u32 = 1024;
 const SCREEN_H: u32 = 600;
-const GRID_TOP: u32 = 204;
+const GRID_TOP: u32 = 44;
 const GRID_GAP: u32 = 8;
 /// The strip under the grid for "Page x of y", which a layout of 2 or more pages takes from the grid.
 pub const PAGER_H: u32 = 31;
@@ -189,10 +189,10 @@ fn cell_geometry(cols: u32, rows: u32, paged: bool) -> (u32, u32, u32) {
 
 /// The side of the square an icon must fit in on a `cols` x `rows` grid, in pixels: what is left
 /// of the button after its padding and a label of two lines, or of one where two would leave the
-/// icon under 24 px. That is 256 with one row, 110 with two, 44 with three, 46 with four and 26
-/// with five, or less where a cell is narrower than that. `paged` is a layout of 2 or more pages,
-/// whose grid is `PAGER_H` shorter: 256, 94, 33, 38 and 20. The grid must already be valid, so both
-/// are at least 1.
+/// icon under 24 px. That is 256 with one row, 190 with two, 97 with three, 51 with four and 58 with
+/// five, or less where a cell is narrower than that. `paged` is a layout of 2 or more pages, whose
+/// grid is `PAGER_H` shorter: 256, 174, 87, 43 and 52. The grid must already be valid, so both are
+/// at least 1.
 pub fn box_px(cols: u32, rows: u32, paged: bool) -> u32 {
     let (cell_w, cell_h, lines) = cell_geometry(cols, rows, paged);
     let room = cell_h - 2 * ICON_PAD;
@@ -1221,10 +1221,10 @@ mod tests {
         // 4 columns on, where a cell is narrower than 256 px plus its padding.
         let widths = [1000, 492, 322, 238, 187, 153, 129, 111]; // cell width less the padding
         for (cols, width) in (1..=8).zip(widths) {
-            for (rows, high) in [(1, 256), (2, 110), (3, 44), (4, 46), (5, 26)] {
+            for (rows, high) in [(1, 256), (2, 190), (3, 97), (4, 51), (5, 58)] {
                 assert_eq!(box_px(cols, rows, false), high.min(width), "{cols}x{rows}");
             }
-            for (rows, high) in [(1, 256), (2, 94), (3, 33), (4, 38), (5, 20)] {
+            for (rows, high) in [(1, 256), (2, 174), (3, 87), (4, 43), (5, 52)] {
                 assert_eq!(
                     box_px(cols, rows, true),
                     high.min(width),
@@ -1232,28 +1232,28 @@ mod tests {
                 );
             }
         }
-        // 5x3 cells are 195x124 px: 116 inside the padding, 116 - 70 - 2 = 44. Paged: 195x113.
-        assert_eq!(box_px(5, 3, false), 44);
-        assert_eq!(box_px(5, 3, true), 33);
+        // 5x3 cells are 195x177 px: 169 inside the padding, 169 - 70 - 2 = 97. Paged: 195x167, 87.
+        assert_eq!(box_px(5, 3, false), 97);
+        assert_eq!(box_px(5, 3, true), 87);
     }
 
     #[test]
     fn the_cells_follow_the_geometry_table() {
-        // plans/pages.md, Geometry: (rows, cell height, label lines), full grid then paged. The
+        // plans/device-ui.md, Geometry: (rows, cell height, label lines), full grid then paged. The
         // firmware (test_grid.c) and the preview (preview.test.ts) pin the same table.
         let full = [
-            (1, 388, 2),
-            (2, 190, 2),
-            (3, 124, 2),
-            (4, 91, 1),
-            (5, 71, 1),
+            (1, 548, 2),
+            (2, 270, 2),
+            (3, 177, 2),
+            (4, 131, 2),
+            (5, 103, 1),
         ];
         let paged = [
-            (1, 357, 2),
-            (2, 174, 2),
-            (3, 113, 2),
-            (4, 83, 1),
-            (5, 65, 1),
+            (1, 517, 2),
+            (2, 254, 2),
+            (3, 167, 2),
+            (4, 123, 2),
+            (5, 97, 1),
         ];
         for (is_paged, table) in [(false, full), (true, paged)] {
             for (rows, height, lines) in table {
@@ -1262,6 +1262,10 @@ mod tests {
             }
         }
         assert_eq!(PAGER_H, 27 + 4); // a slot-24 line box plus 4 px of margin
+
+        // The status bar's height (firmware/main/grid.h BAR_H) and the gap under it fill the top.
+        const BAR_H: u32 = 36;
+        assert_eq!(BAR_H + GRID_GAP, GRID_TOP);
     }
 
     #[test]
@@ -1283,7 +1287,8 @@ mod tests {
             }
         }
         println!("worst icon cache: {worst} bytes");
-        assert_eq!(worst, 3_625_216);
+        // 4 pages of 5x2 at 174 px: 4 * 10 * 174 * 174 * 4.
+        assert_eq!(worst, 4_844_160);
     }
 
     #[test]
@@ -1335,16 +1340,16 @@ mod tests {
             let icons = store.load(config).unwrap();
             (icons["a.png"].w, icons["a.png"].h)
         };
-        assert_eq!(side(&config), (44, 44));
+        assert_eq!(side(&config), (97, 97));
 
         let page = |id: &str| crate::daemon::config::PageConfig {
             id: id.into(),
             label: None,
         };
         config.pages = vec![page("main")];
-        assert_eq!(side(&config), (44, 44), "a single page keeps the full grid");
+        assert_eq!(side(&config), (97, 97), "a single page keeps the full grid");
         config.pages.push(page("media"));
-        assert_eq!(side(&config), (33, 33));
+        assert_eq!(side(&config), (87, 87));
     }
 
     #[test]
@@ -1365,7 +1370,7 @@ mod tests {
             .load(&config_with_icons(&[("one", "a.png"), ("two", "a.png")]))
             .unwrap();
         assert_eq!(icons.len(), 1);
-        assert_eq!((icons["a.png"].w, icons["a.png"].h), (44, 44));
+        assert_eq!((icons["a.png"].w, icons["a.png"].h), (97, 97));
 
         let errors = store
             .load(&config_with_icons(&[
@@ -1491,7 +1496,11 @@ mod tests {
         let config = config_with_icons(&[("one", "a.png"), ("two", "b.png")]);
         let first = store.load(&config).unwrap();
 
-        fs::write(dir.join("b.png"), encoded(&quadrants(60), ImageFormat::Png)).unwrap();
+        fs::write(
+            dir.join("b.png"),
+            encoded(&quadrants(120), ImageFormat::Png),
+        )
+        .unwrap();
         let second = store.load(&config).unwrap();
         assert!(
             Arc::ptr_eq(&first["a.png"], &second["a.png"]),
@@ -1501,14 +1510,14 @@ mod tests {
             !Arc::ptr_eq(&first["b.png"], &second["b.png"]),
             "b.png was overwritten"
         );
-        assert_eq!(second["b.png"].w, 44);
+        assert_eq!(second["b.png"].w, 97);
 
         // A different grid has a different box, so every icon is rendered again.
         let mut other = config.clone();
         other.layout.rows = 5;
         let third = store.load(&other).unwrap();
         assert!(!Arc::ptr_eq(&second["a.png"], &third["a.png"]));
-        assert_eq!(third["a.png"].w, 26);
+        assert_eq!(third["a.png"].w, 58);
 
         // A name no config uses any more is forgotten.
         store.load(&config_with_icons(&[("one", "a.png")])).unwrap();
