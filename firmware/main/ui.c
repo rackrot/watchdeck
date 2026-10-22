@@ -1095,7 +1095,7 @@ static void bar_refresh(void)
         strlcpy(a, "--", sizeof(a));
         strlcpy(b, "--", sizeof(b));
     }
-    snprintf(text, sizeof(text), LV_SYMBOL_DOWN " %*s " LV_SYMBOL_UP " %*s", HOSTSTAT_RATE_W, a, HOSTSTAT_RATE_W, b);
+    snprintf(text, sizeof(text), LV_SYMBOL_DOWN "%*s " LV_SYMBOL_UP "%*s", HOSTSTAT_RATE_W, a, HOSTSTAT_RATE_W, b);
     bar_set(BAR_NET, text);
 }
 
@@ -1135,7 +1135,7 @@ static void bar_create(void)
     w[BAR_CPU] = bar_text_w("CPU 100% 100\xC2\xB0");
     w[BAR_RAM] = bar_text_w("RAM 100%");
     w[BAR_GPU] = bar_text_w("GPU 100% 100\xC2\xB0");
-    w[BAR_NET] = bar_text_w(LV_SYMBOL_DOWN " 999.9M " LV_SYMBOL_UP " 999.9M");
+    w[BAR_NET] = bar_text_w(LV_SYMBOL_DOWN "999.9M " LV_SYMBOL_UP "999.9M");
     // CPU starts at BAR_MARGIN and the clock ends BAR_MARGIN from the right edge. The four gaps between CPU, RAM, GPU,
     // NET and the clock's area are equal, within 1 px: the remainder goes one px each to the first gaps.
     const int clock_x = DISPLAY_H_RES - BAR_MARGIN - w[BAR_CLOCK];
