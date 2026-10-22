@@ -368,6 +368,24 @@ Behavior-neutral: every caller passes "not paged" until S3, S5 and S7.
 - **Acceptance**: every existing `device_sim` test passes unchanged. The new tests fail on the S3 build, so they tell the two apart.
 - **Cheapest check**: `cargo test --manifest-path app/src-tauri/Cargo.toml --test device_sim`.
 
+#### S4 as built (2026-10-22)
+
+- `protocol.rs`: `CAPS` is `[CAP_FONTS, CAP_PAGES]`, which supersedes the S1 and S3 notes that `pages` is left out.
+- `server.rs`:
+  - `converse` copies the session's caps before `shared.authenticate`, and `serve` takes `&[String]`.
+  - The view is `without_fonts()` without `fonts`, then `home_only()` without `pages`.
+  - A session without `pages` logs `<device>: firmware without pages, showing page 1 of N` once, when it first sees a config of 2 or more pages.
+  - Pushes, `icon_get` and `TileFeed` already worked from the view and from `messages(rev)` since S3.
+- `protocol.md`: the status line no longer says no daemon names `pages`.
+- `device_sim`: six new tests, all failing on the S3 build. They cover:
+  - the old board's home-only view and its single log line
+  - a 3-page set with fonts and one without them
+  - an edit on page 2 reaching only the `pages` session
+  - unchanged bytes for a config without pages, then going from 1 page to 2 changing the home icon id for both
+  - `LayoutApplied` before 40 icon frames. That one pins the daemon's read order only. The board's ack order is S8's to check.
+- Not covered: a page label edit or a page-0 rename on a live session. S3's config tests cover those through `Layout` equality.
+- Tests: 199 lib tests and 65 device_sim tests pass.
+
 ### S5 Board data path and page label
 
 - **Files**: `firmware/main/model.c` and `model.h` (new), `pageset.c` and `pageset.h` (new), `link.c`, `link.h`, `icons.c`, `icons.h`, `ui.c`, `ui.h`, `main.c`, `CMakeLists.txt`, the host test build (`pageset.c`), and `sdkconfig.defaults` only if the memory step calls for it.
@@ -456,6 +474,18 @@ The firmware was the f75bf5c build, already on the board, so no flash. The daemo
   - The label: "Page 2 of 3" in the grid's font with `layout.font` set to the widest font (Orbitron), nothing clipped, and the bottom row of buttons doesn't touch it.
 - **Cheapest check**: the board, with `mise run fw:monitor` and the daemon log side by side.
 
+#### S6 as built (2026-10-22)
+
+Code, host tests and build only. The swipe acceptance items above wait for S8 on the board.
+
+- `ui.c`: `build_grid` calls `lv_obj_set_gesture_bubble(s_grid, false)` and handles `LV_EVENT_GESTURE` in `grid_gesture`.
+  - Every child bubbles gestures by default (`lv_obj.c:1507`), so swipes that start on a button, in a gap or on the label all reach `s_grid`.
+  - `lv_indev_wait_release` runs for every gesture. Left or right also queues `lv_async_call(swipe_page, ±1)`.
+  - `swipe_page` runs in the LVGL task. It takes the model lock, steps the page, builds it, and logs `page N/M shown in X ms`. If the lock was held for over 100 ms it logs a warning.
+- `model_step` calls the new pure `pageset_step(pages, n, shown_id, dir)`. That returns the new index, or -1 at either end or with one page, and treats an unknown id as page 0. Four host cases cover it, 82 in all.
+- Departure: a quick flick in any direction, vertical included, no longer presses the button under it. Before S6 a vertical flick on a button pressed it on release. A slow drag isn't a gesture, so it behaves as before.
+- The image is 1,888,512 bytes.
+
 ### S7 Config UI
 
 - **Files**: `app/src/config.ts`, `ConfigPage.tsx`, `GridEditor.tsx`, `ButtonForm.tsx`, `ButtonPreview.tsx` (if the strip is drawn there), `preview.ts` (the label), `edit.ts`, `saveflow.ts`, `errors.ts`, `Devices.tsx`, and `app/tests/*.test.ts`.
@@ -467,6 +497,26 @@ The firmware was the f75bf5c build, already on the board, so no flash. The daemo
   - The save bar still reaches "applied" on the board, and doesn't wait on a board without `pages` for an edit it won't get.
   - TS tests cover `layoutChanged` with pages, `layoutTargets` (an edit on page 2 targets only `pages` devices; a home-page edit targets both; going from 1 to 2 pages targets both; a font-only edit on page 2 targets only devices with both caps), the error routing, and the page-to-implicit round trip.
 - **Cheapest check**: `pnpm test`, `pnpm build`, then `mise run app:dev`. The window check needs the user, as desktop-app-v1 S7 and S9 did.
+
+#### S7 as built (2026-10-22)
+
+The window check with the user is still open.
+
+- **Page tabs** (`PageTabs.tsx`, new).
+  - With one page there are no tabs, only an "Add page" button.
+  - From 2 pages on there are tabs plus Add page (off at 4), a name input (24 characters at most, and an empty name removes the label), move left and right, and Delete page.
+  - Delete is confirmed in an inline banner that names the buttons it removes.
+  - New pages get ids `page-N`. The first add creates `main` and `page-2`.
+  - Moving the first page writes a `page` key on the buttons that had none, so they stay on their page.
+  - Deleting back to one page strips every page table and key.
+- **Editor**:
+  - `GridEditor` shows the selected page with the paged geometry and the "Page x of y" strip.
+  - `ButtonForm` has a page select. A move onto a taken cell is refused with a message naming the button already there.
+  - `errors.ts` routes each page error to its place, and `replaceNotice` says "on N pages".
+  - The Devices tab shows "shows page 1 only. Update its firmware" for a connected board without `pages`.
+- **`layoutTargets` correction.** "Going from 1 to 2 pages targets both" was too broad. The daemon has no `paged` field: the paged flag only changes icon ids, through `box_px`. So `viewKey` counts it only when the pages sent to that device name an icon. Going from 1 page to 2 with no icon on the home page targets only `pages` devices. With an icon on the home page it targets every device.
+  - Still left over: a raster already smaller than its box keeps its id, so the daemon may push nothing while the UI waits. The config can't show that case.
+- **Tests**: 59 TS tests. The window check is still open.
 
 ### S8 Hardware run, compatibility, docs
 
