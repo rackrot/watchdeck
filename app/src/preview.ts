@@ -1,13 +1,14 @@
 // How the device draws the button grid, so the editor can show the same thing. These numbers
 // mirror two files and must change with them:
-//   firmware/main/ui.c    GRID_TOP, GRID_GAP, ICON_PAD, ICON_GAP, ICON_MIN, TILE_BIG_MIN_H and
-//                         build_grid (cell sizes, label and tile layout, tile colors)
+//   firmware/main/grid.h, grid.c  GRID_TOP, GRID_GAP, PAGER_H, ICON_PAD, ICON_GAP, ICON_MIN,
+//                         TILE_BIG_MIN_H and grid_geometry (cell sizes, label lines, icon box)
+//   firmware/main/ui.c    build_grid (label and tile layout, tile colors)
 //   firmware/main/display.h  the 1024x600 screen
 // `iconBox` is `box_px` in app/src-tauri/src/daemon/icons.rs, which sizes the icons the daemon
 // sends. Lines break as in `lvtext.ts`.
 //
 // Text sits in two slots, named by their Montserrat size, with line boxes of 27 and 35 px (ui.c
-// SLOT24_H and SLOT32_H). Every fixed height below is a slot's box, whatever the font's own
+// SLOT24_H and SLOT32_H in grid.h). Every fixed height below is a slot's box, whatever the font's own
 // line height is, so a font change never moves an icon box.
 
 import { DEFAULT_FONT, fontInfo, type Slot, slotFont } from "./fonts.ts";
@@ -17,7 +18,10 @@ export const SCREEN_W = 1024;
 export const SCREEN_H = 600;
 export const GRID_TOP = 204;
 export const GRID_GAP = 8;
+/** The stage height. A paged layout's cells divide `GRID_H - PAGER_H`. */
 export const GRID_H = SCREEN_H - GRID_TOP;
+/** The strip under a grid of 2 or more pages for "Page x of y": a slot-24 line box plus 4 px. */
+export const PAGER_H = 31;
 const ICON_PAD = 4;
 const ICON_GAP = 2;
 const ICON_MIN = 24;
@@ -34,10 +38,12 @@ export const MAX_ROWS = 5;
 export type Cell = { w: number; h: number };
 export type Rect = Cell & { x: number; y: number };
 
-export function cellSize(cols: number, rows: number): Cell {
+/** `paged` is a layout of 2 or more pages: its grid is `PAGER_H` shorter, for the "Page x of y" strip. */
+export function cellSize(cols: number, rows: number, paged = false): Cell {
+  const gridH = GRID_H - (paged ? PAGER_H : 0);
   return {
     w: Math.trunc((SCREEN_W - (cols + 1) * GRID_GAP) / cols),
-    h: Math.trunc((GRID_H - rows * GRID_GAP) / rows),
+    h: Math.trunc((gridH - rows * GRID_GAP) / rows),
   };
 }
 
@@ -56,8 +62,9 @@ export function cellAt(
   y: number,
   cols: number,
   rows: number,
+  paged = false,
 ): [number, number] | null {
-  const cell = cellSize(cols, rows);
+  const cell = cellSize(cols, rows, paged);
   const col = Math.floor((x - GRID_GAP) / (cell.w + GRID_GAP));
   const row = Math.floor(y / (cell.h + GRID_GAP));
   if (col < 0 || col >= cols || row < 0 || row >= rows) {
@@ -69,7 +76,10 @@ export function cellAt(
   return inside ? [col, row] : null;
 }
 
-/** How many lines of label an icon button has room for: 2 unless that leaves the icon under 24 px. */
+/**
+ * How many lines of label an icon button has room for: 2 unless that leaves the icon under 24 px.
+ * The cell already carries `paged` in its height, so this takes no flag of its own.
+ */
 export function labelLines(cell: Cell): 1 | 2 {
   const room = cell.h - 2 * ICON_PAD;
   const line = SLOT_H[32];
@@ -77,8 +87,8 @@ export function labelLines(cell: Cell): 1 | 2 {
 }
 
 /** The side of the square an icon fits in, as `box_px` in icons.rs. */
-export function iconBox(cols: number, rows: number): number {
-  const cell = cellSize(cols, rows);
+export function iconBox(cols: number, rows: number, paged = false): number {
+  const cell = cellSize(cols, rows, paged);
   const room = cell.h - 2 * ICON_PAD;
   const label = labelLines(cell) * SLOT_H[32];
   return Math.min(cell.w - 2 * ICON_PAD, room - label - ICON_GAP, ICON_MAX);
@@ -148,11 +158,12 @@ export function layoutButton(
   rows: number,
   tileText = "",
   fonts: ButtonFonts = { label: DEFAULT_FONT, value: DEFAULT_FONT },
+  paged = false,
 ): ButtonLayout {
-  const cell = cellSize(cols, rows);
+  const cell = cellSize(cols, rows, paged);
   const width = cell.w - LABEL_INSET;
   const lines = labelLines(cell);
-  const icon = button.hasIcon ? iconBox(cols, rows) : null;
+  const icon = button.hasIcon ? iconBox(cols, rows, paged) : null;
   if (!button.isTile) {
     if (button.hasIcon) {
       return {

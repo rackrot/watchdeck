@@ -12,6 +12,7 @@ import {
   iconBox,
   labelLines,
   layoutButton,
+  PAGER_H,
 } from "../src/preview.ts";
 
 test("cells match build_grid on the grids the firmware was checked with", () => {
@@ -43,6 +44,58 @@ test("icon boxes are what icons.rs pins in `the_box_follows_the_firmware_button`
       );
     });
   }
+});
+
+test("the paged geometry table is the one firmware test_grid.c and icons.rs pin", () => {
+  assert.equal(PAGER_H, 31);
+  const widths = [1000, 492, 322, 238, 187, 153, 129, 111];
+  // [rows, cell height, label lines, icon box] for the full grid, then for the grid less PAGER_H
+  const full = [
+    [1, 388, 2, 256],
+    [2, 190, 2, 110],
+    [3, 124, 2, 44],
+    [4, 91, 1, 46],
+    [5, 71, 1, 26],
+  ];
+  const paged = [
+    [1, 357, 2, 256],
+    [2, 174, 2, 94],
+    [3, 113, 2, 33],
+    [4, 83, 1, 38],
+    [5, 65, 1, 20],
+  ];
+  for (const [isPaged, table] of [
+    [false, full],
+    [true, paged],
+  ] as const) {
+    for (const [rows, h, lines, box] of table) {
+      const cell = cellSize(1, rows, isPaged);
+      assert.equal(cell.h, h, `${rows} rows paged ${isPaged}`);
+      assert.equal(labelLines(cell), lines, `${rows} rows paged ${isPaged}`);
+      for (let cols = 1; cols <= 8; cols++) {
+        assert.equal(
+          iconBox(cols, rows, isPaged),
+          Math.min(box, widths[cols - 1]),
+          `${cols}x${rows} paged ${isPaged}`,
+        );
+      }
+    }
+  }
+  // Omitting the flag is the unpaged grid.
+  assert.deepEqual(cellSize(5, 3), cellSize(5, 3, false));
+  assert.equal(iconBox(5, 3), 44);
+  assert.equal(iconBox(5, 3, true), 33);
+});
+
+test("a paged grid maps points on its shorter cells, and layoutButton follows it", () => {
+  const cell = cellSize(5, 3, true);
+  assert.deepEqual(cell, { w: 195, h: 113 });
+  const rect = cellRect(2, 2, cell);
+  assert.deepEqual(cellAt(rect.x + 5, rect.y + 5, 5, 3, true), [2, 2]);
+  assert.equal(cellAt(rect.x + 5, rect.y + cell.h, 5, 3, true), null);
+  const button = { label: "x", hasIcon: true, isTile: false };
+  assert.equal(layoutButton(button, 5, 3).icon, 44);
+  assert.equal(layoutButton(button, 5, 3, "", undefined, true).icon, 33);
 });
 
 test("a button has two label lines until that would leave its icon under 24 px", () => {

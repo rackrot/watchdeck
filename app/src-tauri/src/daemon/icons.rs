@@ -153,14 +153,17 @@ const SVG_ATTRIBUTES: &[&str] = &[
 ];
 const MAX_NAME_BYTES: usize = 63;
 
-// The device's button geometry, from `firmware/main/ui.c` (GRID_TOP, GRID_GAP, ICON_PAD,
-// ICON_GAP) and `display.h`. A button with an icon is a column: the icon, then a label of fixed
-// height, with padding around them. LABEL_LINE is the line box of text slot 32 (Montserrat 32's
-// line height), the same for every font: the firmware lays out by the slot, never by the font.
+// The device's button geometry, from `firmware/main/grid.c` (`grid_geometry`; GRID_TOP, GRID_GAP,
+// ICON_PAD, ICON_GAP, PAGER_H) and `display.h`. A button with an icon is a column: the icon, then a
+// label of fixed height, with padding around them. LABEL_LINE is the line box of text slot 32
+// (Montserrat 32's line height), the same for every font: the firmware lays out by the slot, never
+// by the font.
 const SCREEN_W: u32 = 1024;
 const SCREEN_H: u32 = 600;
 const GRID_TOP: u32 = 204;
 const GRID_GAP: u32 = 8;
+/// The strip under the grid for "Page x of y", which a layout of 2 or more pages takes from the grid.
+pub const PAGER_H: u32 = 31;
 const ICON_PAD: u32 = 4;
 const ICON_GAP: u32 = 2;
 const LABEL_LINE: u32 = 35;
@@ -170,19 +173,29 @@ const MIN_ICON_SIDE: u32 = 24;
 /// The icons of a config by file name. A name that several buttons share appears once.
 pub type IconSet = HashMap<String, Arc<IconFrame>>;
 
-/// The side of the square an icon must fit in on a `cols` x `rows` grid, in pixels: what is left
-/// of the button after its padding and a label of two lines, or of one where two would leave the
-/// icon under 24 px. That is 256 with one row, 110 with two, 44 with three, 46 with four and 26
-/// with five, or less where a cell is narrower than that. The grid must already be valid, so both are at least 1.
-pub fn box_px(cols: u32, rows: u32) -> u32 {
+/// A cell's width and height, and the lines of label an icon button has room for.
+fn cell_geometry(cols: u32, rows: u32, paged: bool) -> (u32, u32, u32) {
+    let grid_h = SCREEN_H - GRID_TOP - if paged { PAGER_H } else { 0 };
     let cell_w = (SCREEN_W - (cols + 1) * GRID_GAP) / cols;
-    let cell_h = (SCREEN_H - GRID_TOP - rows * GRID_GAP) / rows;
+    let cell_h = (grid_h - rows * GRID_GAP) / rows;
     let room = cell_h - 2 * ICON_PAD;
     let lines = if room >= 2 * LABEL_LINE + ICON_GAP + MIN_ICON_SIDE {
         2
     } else {
         1
     };
+    (cell_w, cell_h, lines)
+}
+
+/// The side of the square an icon must fit in on a `cols` x `rows` grid, in pixels: what is left
+/// of the button after its padding and a label of two lines, or of one where two would leave the
+/// icon under 24 px. That is 256 with one row, 110 with two, 44 with three, 46 with four and 26
+/// with five, or less where a cell is narrower than that. `paged` is a layout of 2 or more pages,
+/// whose grid is `PAGER_H` shorter: 256, 94, 33, 38 and 20. The grid must already be valid, so both
+/// are at least 1.
+pub fn box_px(cols: u32, rows: u32, paged: bool) -> u32 {
+    let (cell_w, cell_h, lines) = cell_geometry(cols, rows, paged);
+    let room = cell_h - 2 * ICON_PAD;
     (cell_w - 2 * ICON_PAD)
         .min(room - lines * LABEL_LINE - ICON_GAP)
         .min(ICON_MAX_SIDE as u32)
@@ -233,7 +246,7 @@ impl Icons {
     /// Every file that fails is reported. The cache lock is held only to look up and to store,
     /// never while decoding.
     pub fn load(&self, config: &Config) -> Result<IconSet, Vec<String>> {
-        let side = box_px(config.layout.cols, config.layout.rows);
+        let side = box_px(config.layout.cols, config.layout.rows, false);
         let mut icons = IconSet::new();
         let mut errors = Vec::new();
         for button in &config.buttons {
@@ -1208,11 +1221,68 @@ mod tests {
         let widths = [1000, 492, 322, 238, 187, 153, 129, 111]; // cell width less the padding
         for (cols, width) in (1..=8).zip(widths) {
             for (rows, high) in [(1, 256), (2, 110), (3, 44), (4, 46), (5, 26)] {
-                assert_eq!(box_px(cols, rows), high.min(width), "{cols}x{rows}");
+                assert_eq!(box_px(cols, rows, false), high.min(width), "{cols}x{rows}");
+            }
+            for (rows, high) in [(1, 256), (2, 94), (3, 33), (4, 38), (5, 20)] {
+                assert_eq!(
+                    box_px(cols, rows, true),
+                    high.min(width),
+                    "{cols}x{rows} paged"
+                );
             }
         }
-        // 5x3 cells are 195x124 px: 116 inside the padding, 116 - 70 - 2 = 44.
-        assert_eq!(box_px(5, 3), 44);
+        // 5x3 cells are 195x124 px: 116 inside the padding, 116 - 70 - 2 = 44. Paged: 195x113.
+        assert_eq!(box_px(5, 3, false), 44);
+        assert_eq!(box_px(5, 3, true), 33);
+    }
+
+    #[test]
+    fn the_cells_follow_the_geometry_table() {
+        // plans/pages.md, Geometry: (rows, cell height, label lines), full grid then paged. The
+        // firmware (test_grid.c) and the preview (preview.test.ts) pin the same table.
+        let full = [
+            (1, 388, 2),
+            (2, 190, 2),
+            (3, 124, 2),
+            (4, 91, 1),
+            (5, 71, 1),
+        ];
+        let paged = [
+            (1, 357, 2),
+            (2, 174, 2),
+            (3, 113, 2),
+            (4, 83, 1),
+            (5, 65, 1),
+        ];
+        for (is_paged, table) in [(false, full), (true, paged)] {
+            for (rows, height, lines) in table {
+                let (_, h, l) = cell_geometry(1, rows, is_paged);
+                assert_eq!((h, l), (height, lines), "{rows} rows, paged {is_paged}");
+            }
+        }
+        assert_eq!(PAGER_H, 27 + 4); // a slot-24 line box plus 4 px of margin
+    }
+
+    #[test]
+    fn the_worst_icon_cache_fits_the_boards_cap() {
+        // The board (icons.h ICONS_MAX_BYTES, 8 MiB) holds the icons of a whole layout of up to
+        // PROTO_MAX_PAGES (4) pages at once, one per cell, each box_px squared in 4-byte pixels.
+        const CAP: u32 = 8 * 1024 * 1024;
+        const PAGES: u32 = 4;
+        let mut worst = 0;
+        for cols in 1..=8 {
+            for rows in 1..=5 {
+                let cells = cols * rows;
+                for (pages, paged) in [(PAGES, true), (1, false)] {
+                    let side = box_px(cols, rows, paged);
+                    let bytes = pages * cells * side * side * 4;
+                    assert!(bytes <= CAP, "{cols}x{rows} paged {paged}: {bytes} bytes");
+                    worst = worst.max(bytes);
+                }
+            }
+        }
+        println!("worst icon cache: {worst} bytes");
+        assert_eq!(worst, 3_625_216);
     }
 
     #[test]

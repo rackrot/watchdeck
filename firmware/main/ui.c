@@ -10,10 +10,11 @@
 #include "display.h"
 #include "font_licenses.h"
 #include "fonts.h"
+#include "grid.h"
 #include "link.h"
 
-#define GRID_TOP 204
-#define GRID_GAP 8
+_Static_assert(GRID_SCREEN_W == DISPLAY_H_RES && GRID_SCREEN_H == DISPLAY_V_RES, "grid.h assumes the 1024x600 screen");
+
 #define TOAST_MS 2000
 #define RESULT_OK_MS 4000 // a result closes itself after this, or at a tap
 #define RESULT_FAIL_MS 10000
@@ -29,10 +30,6 @@
 #define LICENSES_Y 72
 #define ROW_W (DISPLAY_H_RES - 80) // labels and buttons of the pairing views
 #define ROW_H 76
-#define ICON_PAD 4 // a button with an icon is a column: the icon, a gap, and a label of fixed height
-#define ICON_GAP 2
-#define ICON_MIN 24       // the label gets two lines unless that leaves the icon less than this
-#define TILE_BIG_MIN_H 80 // a tile's value uses the 32 pt font in cells at least this tall, else 24 pt
 
 static const char *TAG = "ui";
 
@@ -402,20 +399,13 @@ static void build_grid(const proto_layout_t *l)
     lv_obj_set_size(s_grid, DISPLAY_H_RES, DISPLAY_V_RES - GRID_TOP);
     lv_obj_set_pos(s_grid, 0, GRID_TOP);
 
-    const int cell_w = (DISPLAY_H_RES - (l->cols + 1) * GRID_GAP) / l->cols;
-    const int cell_h = (DISPLAY_V_RES - GRID_TOP - l->rows * GRID_GAP) / l->rows;
-    // The daemon sizes icons to what is left (icons.rs box_px), so both sides use these numbers.
-    // Slot line boxes, never a font's own line height, so that no font moves the geometry.
+    // The daemon sizes icons to what is left (icons.rs box_px), so both sides use grid_geometry.
+    const grid_geometry_t geo = grid_geometry(l->cols, l->rows, false);
+    const int cell_w = geo.cell_w;
+    const int cell_h = geo.cell_h;
     const int line_h = SLOT32_H;
-    const int room = cell_h - 2 * ICON_PAD;
-    const int label_lines = room >= 2 * line_h + ICON_GAP + ICON_MIN ? 2 : 1;
-    int icon_side = room - label_lines * line_h - ICON_GAP;
-    if (icon_side > cell_w - 2 * ICON_PAD) {
-        icon_side = cell_w - 2 * ICON_PAD;
-    }
-    if (icon_side > PROTO_ICON_MAX_SIDE) {
-        icon_side = PROTO_ICON_MAX_SIDE;
-    }
+    const int label_lines = geo.label_lines;
+    const int icon_side = geo.icon_side;
     ESP_LOGI(TAG, "cells %dx%d, icon box %d px, labels %d line(s)", cell_w, cell_h, icon_side, label_lines);
     s_n_buttons = l->n_buttons;
     for (size_t i = 0; i < l->n_buttons; i++) {
