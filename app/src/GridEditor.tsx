@@ -9,9 +9,10 @@ import {
 import type { TileReading } from "./api";
 import ButtonPreview from "./ButtonPreview";
 import type { Config } from "./config";
-import { canon, moveButton } from "./edit";
+import { canon, moveButton, withGridFont } from "./edit";
 import type { FieldErrors } from "./errors";
-import { Field, NumberField, Problems } from "./fields";
+import { Field, FontSelect, NumberField, Problems } from "./fields";
+import { DEFAULT_FONT, resolveFonts } from "./fonts";
 import {
   cellAt,
   cellRect,
@@ -197,6 +198,14 @@ export default function GridEditor({
               }
             />
           </Field>
+          <Field label="Font">
+            <FontSelect
+              value={config.layout.font ?? DEFAULT_FONT}
+              onChange={(font) =>
+                onChange(withGridFont(config, font ?? DEFAULT_FONT))
+              }
+            />
+          </Field>
         </div>
       </div>
       <Problems list={gridProblems} />
@@ -246,6 +255,7 @@ export default function GridEditor({
                     cols,
                     rows,
                     found?.text,
+                    resolveFonts(config.layout, b),
                   )}
                   tile={tile}
                   iconSrc={b.icon ? iconUrl(b.icon) : null}

@@ -2,8 +2,8 @@
 // lv_text_get_next_line) and lv_label.c (the DOTS long mode, centered), with the firmware's
 // settings: break characters " ,.;:-_)]}" (CONFIG_LV_TXT_BREAK_CHARS), no long-word splitting
 // (CONFIG_LV_TXT_LINE_BREAK_LONG_LEN=0), no letter or line spacing. Labels are printable ASCII,
-// so there are no newlines or multibyte letters to handle. Widths come from `montserrat.ts`
-// without kerning.
+// so there are no newlines or multibyte letters to handle. Widths come from `montserrat.ts` and
+// `fonts.gen.ts`, without kerning.
 
 import type { Font } from "./montserrat";
 
@@ -106,14 +106,15 @@ function nextLine(
 }
 
 /**
- * Where each line starts and ends. In DOTS mode (`dotsLines` set) the last visible line, and any
- * after it, may break inside a word.
+ * Where each line starts and ends. In DOTS mode (`boxHeight` set) the last visible line, and any
+ * after it, may break inside a word. LVGL decides that from the box height, not a line count: a
+ * line is the last when `y + 2 * line_height > max_h` (lv_label.c).
  */
 function lineSpans(
   text: string,
   font: Font,
   width: number,
-  dotsLines?: number,
+  boxHeight?: number,
 ): [number, number][] {
   const spans: [number, number][] = [];
   const { lineHeight } = font;
@@ -121,8 +122,8 @@ function lineSpans(
   let start = 0;
   while (start < text.length) {
     if (
-      dotsLines !== undefined &&
-      spans.length * lineHeight + 2 * lineHeight > dotsLines * lineHeight
+      boxHeight !== undefined &&
+      spans.length * lineHeight + 2 * lineHeight > boxHeight
     ) {
       breakAll = true;
     }
@@ -142,20 +143,21 @@ export function wrapLines(text: string, font: Font, width: number): string[] {
 }
 
 /**
- * The lines of a label of fixed height, `maxLines` lines tall (`LV_LABEL_LONG_DOT`). Text that
- * needs more lines ends in "...", which replaces the three letters at the right edge of the
- * last visible line.
+ * The lines of a label of fixed height, `boxHeight` pixels (`LV_LABEL_LONG_DOT`). The box shows as
+ * many whole lines of the font as fit. Text that needs more ends in "...", which replaces the
+ * three letters at the right edge of the last visible line.
  */
 export function dotLines(
   text: string,
   font: Font,
   width: number,
-  maxLines: number,
+  boxHeight: number,
 ): string[] {
+  const maxLines = Math.floor(boxHeight / font.lineHeight);
   const needed = lineSpans(text, font, width).length;
   let label = text;
   if (needed > maxLines && needed > 1 && text.length > 3) {
-    const spans = lineSpans(text, font, width, maxLines);
+    const spans = lineSpans(text, font, width, boxHeight);
     const [start, end] = spans[Math.min(maxLines, spans.length) - 1];
     // The letter under x = width - 3 dots, on the last visible line.
     const target = width - 3 * glyphWidth(font, ".");
@@ -174,7 +176,7 @@ export function dotLines(
     at = Math.min(at, text.length - 3);
     label = `${text.slice(0, at)}...`;
   }
-  return lineSpans(label, font, width, maxLines)
+  return lineSpans(label, font, width, boxHeight)
     .slice(0, maxLines)
     .map((span) => shown(label, span));
 }

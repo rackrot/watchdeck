@@ -3,12 +3,15 @@ import ActionForm from "./ActionForm";
 import { type ActionResult, testAction } from "./api";
 import { type ButtonConfig, newShell } from "./config";
 import type { ActionField, FieldErrors } from "./errors";
-import { Field, NumberField, Problems } from "./fields";
+import { Field, FontSelect, NumberField, Problems } from "./fields";
+import { DEFAULT_FONT, resolveFonts } from "./fonts";
 
 const MAX_LABEL_BYTES = 47;
 
 type Props = {
   button: ButtonConfig;
+  /** The grid's font id (`layout.font`), which a button without its own font inherits. */
+  gridFont: string | undefined;
   onChange: (button: ButtonConfig) => void;
   onDelete: () => void;
   /** Rust's complaints about this button, from the last save. */
@@ -59,6 +62,7 @@ function ColorField({
 
 export default function ButtonForm({
   button,
+  gridFont,
   onChange,
   onDelete,
   errors,
@@ -106,6 +110,11 @@ export default function ButtonForm({
   const tile = button.tile;
   const labelBytes = new TextEncoder().encode(button.label).length;
   const iconSrc = button.icon ? iconUrl(button.icon) : null;
+  // The tile value's picker inherits the button's font, which itself may be inherited.
+  const buttonFont = resolveFonts(
+    { font: gridFont },
+    { font: button.font },
+  ).label;
 
   return (
     <div className="button-form">
@@ -164,6 +173,16 @@ export default function ButtonForm({
             problems={errors.fg}
             onChange={(fg) => set({ fg })}
           />
+          <Field label="Font" problems={errors.font}>
+            <FontSelect
+              value={button.font}
+              inherit={{
+                label: "Grid font",
+                font: gridFont ?? DEFAULT_FONT,
+              }}
+              onChange={(font) => set({ font })}
+            />
+          </Field>
           <Field label="Icon" problems={errors.icon}>
             <span className="icon-pick">
               <select
@@ -273,6 +292,13 @@ export default function ButtonForm({
                       },
                     })
                   }
+                />
+              </Field>
+              <Field label="Value font" problems={errors["tile.font"]}>
+                <FontSelect
+                  value={tile.font}
+                  inherit={{ label: "Button font", font: buttonFont }}
+                  onChange={(font) => set({ tile: { ...tile, font } })}
                 />
               </Field>
             </div>

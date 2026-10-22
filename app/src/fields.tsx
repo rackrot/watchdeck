@@ -1,5 +1,6 @@
 import { type ReactNode, useEffect, useState } from "react";
 import { parseWhole } from "./edit";
+import { DEFAULT_FONT, FONTS, fontInfo } from "./fonts";
 
 /** Rust's complaints about one field, under it. */
 export function Problems({ list }: { list?: string[] }) {
@@ -39,6 +40,52 @@ export function Field({
       {children}
       <Problems list={problems} />
     </label>
+  );
+}
+
+/**
+ * A font picker with a sample in the chosen font beside it (WebKitGTK doesn't style `<option>`).
+ * With `inherit`, an extra first option means "no font of its own", labelled with the font it
+ * inherits, and `value` is undefined while it is chosen.
+ */
+export function FontSelect({
+  value,
+  onChange,
+  inherit,
+}: {
+  value: string | undefined;
+  onChange: (font: string | undefined) => void;
+  inherit?: { label: string; font: string };
+}) {
+  const shown = value ?? inherit?.font ?? DEFAULT_FONT;
+  return (
+    <span className="font-pick">
+      <select
+        value={value ?? ""}
+        onChange={(e) => onChange(e.currentTarget.value || undefined)}
+      >
+        {inherit && (
+          <option value="">
+            {inherit.label} ({fontInfo(inherit.font).name})
+          </option>
+        )}
+        {value && !FONTS.some((f) => f.id === value) && (
+          <option value={value}>{value} (unknown)</option>
+        )}
+        {FONTS.map((f) => (
+          <option key={f.id} value={f.id}>
+            {f.name}
+          </option>
+        ))}
+      </select>
+      <span
+        className="font-sample"
+        style={{ fontFamily: fontInfo(shown).family }}
+        aria-hidden="true"
+      >
+        Aa 0123
+      </span>
+    </span>
   );
 }
 

@@ -9,7 +9,8 @@ function Text({ box, width }: { box: TextBox; width: number }) {
       style={{
         width,
         height: box.height,
-        fontSize: box.size,
+        fontFamily: box.family,
+        fontSize: box.px,
         lineHeight: `${box.lineHeight}px`,
       }}
     >

@@ -326,6 +326,21 @@ button.chip.selected {
   width: 90px;
 }
 
+.font-pick {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.font-sample {
+  font-size: 18px;
+  white-space: nowrap;
+}
+
+.size-controls .field:has(.font-pick) {
+  width: auto;
+}
+
 .name-list {
   list-style: none;
   padding: 0;

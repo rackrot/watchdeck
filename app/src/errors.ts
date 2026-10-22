@@ -22,6 +22,8 @@ export type Field =
   | "bg"
   | "fg"
   | "icon"
+  | "font"
+  | "tile.font"
   | "tile.every_s"
   | "tile.json_pointer"
   | `action.${ActionField}`
@@ -32,7 +34,7 @@ export type Field =
 export type FieldErrors = Partial<Record<Field, string[]>>;
 
 export type ErrorMap = {
-  /** Messages for the layout section: the grid size and the version. */
+  /** Messages for the layout section: the grid size, its font and the version. */
   grid: string[];
   /** Messages about the file or the save itself, not about a button. */
   general: string[];
@@ -87,6 +89,8 @@ function fieldOf(problem: string): Field {
     [/^pos /, "pos"],
     [/^label /, "label"],
     [/^icon/, "icon"],
+    [/^font /, "font"],
+    [/^tile\.font /, "tile.font"],
     [/^bg /, "bg"],
     [/^fg /, "fg"],
     [/^tile\.every_s/, "tile.every_s"],
@@ -174,7 +178,7 @@ export function mapErrors(messages: string[], ids?: string[]): ErrorMap {
       for (const field of fieldsOf(button[2])) {
         addButtonError(map, id, field, button[2]);
       }
-    } else if (/^(layout\.(cols|rows)|version) /.test(message)) {
+    } else if (/^(layout\.(cols|rows|font)|version) /.test(message)) {
       map.grid.push(message);
     } else {
       map.general.push(message);

@@ -1,6 +1,8 @@
 // Run with `pnpm test`. Node strips the types, so these import with the .ts extension.
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
+import { FONTS, fontInfo, slotFont } from "../src/fonts.ts";
 import { dotLines, textWidth, wrapLines } from "../src/lvtext.ts";
 import { MONTSERRAT_24, MONTSERRAT_32 } from "../src/montserrat.ts";
 import {
@@ -116,10 +118,10 @@ test("a line can break after a hyphen, a dot or an underscore", () => {
 
 test("a fixed-height label ends in dots when its text needs more lines", () => {
   const long = "Home Assistant Garage Door Lights";
-  const two = dotLines(long, MONTSERRAT_32, 179, 2);
+  const two = dotLines(long, MONTSERRAT_32, 179, 70);
   assert.equal(two.length, 2);
   assert.ok(two[1].endsWith("..."), two.join("|"));
-  const one = dotLines("Restart Plex", MONTSERRAT_32, 179, 1);
+  const one = dotLines("Restart Plex", MONTSERRAT_32, 179, 35);
   assert.equal(one.length, 1);
   assert.ok(one[0].endsWith("..."), one[0]);
   assert.ok(textWidth(MONTSERRAT_32, one[0]) <= 179);
@@ -128,11 +130,11 @@ test("a fixed-height label ends in dots when its text needs more lines", () => {
 });
 
 test("a label that fits is left alone, in two lines or one", () => {
-  assert.deepEqual(dotLines("Restart Plex", MONTSERRAT_32, 179, 2), [
+  assert.deepEqual(dotLines("Restart Plex", MONTSERRAT_32, 179, 70), [
     "Restart",
     "Plex",
   ]);
-  assert.deepEqual(dotLines("Plex", MONTSERRAT_32, 179, 1), ["Plex"]);
+  assert.deepEqual(dotLines("Plex", MONTSERRAT_32, 179, 35), ["Plex"]);
 });
 
 test("dotted labels never exceed their lines or their width", () => {
@@ -149,13 +151,13 @@ test("dotted labels never exceed their lines or their width", () => {
       { length },
       () => alphabet[next() % alphabet.length],
     ).join("");
-    for (const [font, width, max] of [
-      [MONTSERRAT_32, 179, 2],
-      [MONTSERRAT_32, 179, 1],
-      [MONTSERRAT_32, 103, 1],
-      [MONTSERRAT_24, 103, 1],
+    for (const [font, width, box, max] of [
+      [MONTSERRAT_32, 179, 70, 2],
+      [MONTSERRAT_32, 179, 35, 1],
+      [MONTSERRAT_32, 103, 35, 1],
+      [MONTSERRAT_24, 103, 27, 1],
     ] as const) {
-      const lines = dotLines(text, font, width, max);
+      const lines = dotLines(text, font, width, box);
       assert.ok(lines.length <= max, `${text} -> ${lines.join("|")}`);
       for (const line of lines) {
         assert.ok(
@@ -228,4 +230,113 @@ test("a button lays out as build_grid does", () => {
     "a b\nc ".repeat(20),
   );
   assert.equal(wide.value?.lines.length, 1);
+});
+
+const LONG = "Home Assistant Garage Door Lights Dashboard Server Room Cameras";
+
+test("every generated slot's line height fits its line box and keeps its line count", () => {
+  for (const font of FONTS) {
+    const { slot24, slot32 } = font;
+    // 2 lines in the 70 px icon label, 1 in 35 px, 1 in 27 px (ui.c SLOT*_H).
+    assert.ok(slot32.lineHeight <= 35, `${font.id} slot 32`);
+    assert.ok(slot24.lineHeight <= 27, `${font.id} slot 24`);
+    assert.equal(Math.floor(70 / slot32.lineHeight), 2, `${font.id} slot 32`);
+    assert.equal(Math.floor(35 / slot32.lineHeight), 1, `${font.id} slot 32`);
+    assert.equal(Math.floor(27 / slot24.lineHeight), 1, `${font.id} slot 24`);
+  }
+});
+
+test("iconBox and labelLines, and every fixed box, are the same for every font on every grid size", () => {
+  for (let cols = 1; cols <= 8; cols++) {
+    for (let rows = 1; rows <= 5; rows++) {
+      const plain = { label: "x", hasIcon: true, isTile: false };
+      const tile = { label: "x", hasIcon: false, isTile: true };
+      const box = (b: typeof plain, id: string) => {
+        const l = layoutButton(b, cols, rows, "1", { label: id, value: id });
+        return [l.icon, l.label?.height ?? null, l.value?.height ?? null];
+      };
+      for (const { id } of FONTS) {
+        assert.deepEqual(
+          box(plain, id),
+          box(plain, "montserrat"),
+          `${id} icon ${cols}x${rows}`,
+        );
+        assert.deepEqual(
+          box(tile, id),
+          box(tile, "montserrat"),
+          `${id} tile ${cols}x${rows}`,
+        );
+      }
+    }
+  }
+});
+
+test("the fonts with the smallest and largest line height cut a long label where the box ends", () => {
+  const byHeight = (slot: 24 | 32) =>
+    FONTS.map((f) => f.id).sort(
+      (a, b) =>
+        slotFont(a, slot).lineHeight - slotFont(b, slot).lineHeight ||
+        a.localeCompare(b),
+    );
+  const ends = (slot: 24 | 32) => {
+    const sorted = byHeight(slot);
+    return [sorted[0], sorted[sorted.length - 1]];
+  };
+  const [small, large] = ends(32);
+  const [small24, large24] = ends(24);
+  assert.notEqual(
+    slotFont(small, 32).lineHeight,
+    slotFont(large, 32).lineHeight,
+  );
+  for (const id of [small, large]) {
+    const two = dotLines(LONG, slotFont(id, 32), 179, 70);
+    assert.equal(two.length, 2, `${id} 70 px`);
+    assert.ok(two[1].endsWith("..."), `${id}: ${two.join("|")}`);
+    const one = dotLines(LONG, slotFont(id, 32), 179, 35);
+    assert.equal(one.length, 1, `${id} 35 px`);
+    assert.ok(one[0].endsWith("..."), `${id}: ${one[0]}`);
+  }
+  for (const id of [small24, large24]) {
+    const one = dotLines(LONG, slotFont(id, 24), 179, 27);
+    assert.equal(one.length, 1, `${id} 27 px`);
+    assert.ok(one[0].endsWith("..."), `${id}: ${one[0]}`);
+  }
+});
+
+test("the same text breaks differently in Orbitron and Inter", () => {
+  const text = "Garage Door Opener Lights";
+  const orbitron = wrapLines(text, slotFont("orbitron", 32), 179);
+  const inter = wrapLines(text, slotFont("inter", 32), 179);
+  assert.notDeepEqual(orbitron, inter);
+  assert.ok(orbitron.length > inter.length, `${orbitron} / ${inter}`);
+});
+
+test("fonts.css declares a face for every generated font", () => {
+  const css = readFileSync(
+    new URL("../src/fonts.css", import.meta.url),
+    "utf8",
+  );
+  for (const { id, name } of FONTS) {
+    if (id !== "montserrat") {
+      assert.ok(css.includes(`font-family: "${name}";`), name);
+    }
+  }
+});
+
+test("a laid out button carries its font's family and size", () => {
+  const button = { label: "Load", hasIcon: false, isTile: true };
+  const l = layoutButton(button, 5, 3, "0.42", {
+    label: "orbitron",
+    value: "fira-code",
+  });
+  assert.equal(l.label?.family, fontInfo("orbitron").family);
+  assert.equal(l.label?.px, slotFont("orbitron", 24).px);
+  assert.equal(l.value?.family, fontInfo("fira-code").family);
+  assert.equal(l.value?.px, slotFont("fira-code", 32).px);
+  // A font the table lacks draws as Montserrat, as the board does.
+  const odd = layoutButton(button, 5, 3, "0.42", {
+    label: "nope",
+    value: "nope",
+  });
+  assert.equal(odd.label?.family, fontInfo("montserrat").family);
 });

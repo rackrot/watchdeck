@@ -5,12 +5,15 @@ import {
   canon,
   duplicateNames,
   layoutChanged,
+  layoutTargets,
   moveButton,
   parseWhole,
   recordToRows,
   rowsToRecord,
+  withGridFont,
 } from "../src/edit.ts";
 import { mapErrors, numberErrors, unquote } from "../src/errors.ts";
+import { resolveFonts } from "../src/fonts.ts";
 
 const button = (id: string, pos: [number, number]): ButtonConfig => ({
   id,
@@ -135,6 +138,199 @@ test("canon ignores key order", () => {
     canon({ b: { d: [3], c: 2 }, a: 1 }),
   );
   assert.notEqual(canon({ a: 1 }), canon({ a: 2 }));
+});
+
+test("a font change at any of the three levels is a layout change", () => {
+  const tiled = (tile?: string): Config => ({
+    ...config,
+    button: [
+      {
+        ...config.button[0],
+        tile: { every_s: 5, source: config.button[0].action, font: tile },
+      },
+      config.button[1],
+    ],
+  });
+  const withFont = (c: Config, font?: string): Config => ({
+    ...c,
+    layout: { ...c.layout, font },
+  });
+  // The grid's font: even with no button to show it, the message carries it.
+  assert.equal(layoutChanged(config, withFont(config, "inter")), true, "grid");
+  // A button's font.
+  assert.equal(
+    layoutChanged(config, {
+      ...config,
+      button: [{ ...config.button[0], font: "orbitron" }, config.button[1]],
+    }),
+    true,
+    "button",
+  );
+  // A tile's value font.
+  assert.equal(layoutChanged(tiled(), tiled("fira-code")), true, "tile");
+  assert.equal(
+    layoutChanged(
+      withFont(tiled(), "inter"),
+      withFont(tiled("inter"), "inter"),
+    ),
+    false,
+    "a pinned value font that equals what it inherits draws the same",
+  );
+  assert.equal(
+    layoutChanged(config, withFont(config, "montserrat")),
+    false,
+    "Montserrat is the default",
+  );
+  // An action-only edit, with fonts set, is still not one.
+  const fonty = withFont(tiled("fira-code"), "inter");
+  assert.equal(
+    layoutChanged(fonty, {
+      ...fonty,
+      button: [
+        {
+          ...fonty.button[0],
+          action: { kind: "shell", argv: ["false"], timeout_s: 30 },
+        },
+        fonty.button[1],
+      ],
+    }),
+    false,
+  );
+});
+
+test("a font-only save reaches only the devices that have the fonts capability", () => {
+  const devices = [
+    { id: "new", connected: true, caps: ["fonts"] },
+    { id: "old", connected: true, caps: [] },
+    { id: "gone", connected: false, caps: ["fonts"] },
+  ];
+  const withTile = (font?: string): Config => ({
+    ...config,
+    button: [
+      {
+        ...config.button[0],
+        tile: { every_s: 5, source: config.button[0].action, font },
+      },
+      config.button[1],
+    ],
+  });
+  // Font changes at the grid, button and tile levels.
+  for (const after of [
+    withGridFont(config, "inter"),
+    {
+      ...config,
+      button: [{ ...config.button[0], font: "orbitron" }, config.button[1]],
+    },
+  ]) {
+    assert.deepEqual(layoutTargets(config, after, devices), ["new"]);
+  }
+  assert.deepEqual(layoutTargets(withTile(), withTile("fira-code"), devices), [
+    "new",
+  ]);
+  // Any other change still goes to every connected device, even with a font change in it.
+  const moved = withGridFont(
+    { ...config, layout: { ...config.layout, cols: 4 } },
+    "inter",
+  );
+  assert.deepEqual(layoutTargets(config, moved, devices), ["new", "old"]);
+  // No layout change, no targets.
+  assert.deepEqual(layoutTargets(config, config, devices), []);
+});
+
+test("picking Montserrat for the grid removes layout.font and keeps the rest", () => {
+  const inter = withGridFont(config, "inter");
+  assert.deepEqual(inter.layout, { cols: 5, rows: 3, font: "inter" });
+  assert.deepEqual(withGridFont(inter, "montserrat").layout, {
+    cols: 5,
+    rows: 3,
+  });
+  assert.equal("font" in withGridFont(inter, "montserrat").layout, false);
+});
+
+// The rows of `fonts_go_on_the_wire_only_where_they_differ_from_what_they_inherit` in config.rs:
+// (grid, button font, tile (null: none; else its font or undefined), message font, label_font,
+// value_font). The board resolves label = label_font ?? message font ?? montserrat and
+// value = value_font ?? label, so resolveFonts must give back exactly that.
+test("resolveFonts matches the daemon's wire matrix", () => {
+  const U = undefined;
+  const rows: [
+    string | undefined,
+    string | undefined,
+    { font: string | undefined } | null,
+    string | undefined,
+    string | undefined,
+    string | undefined,
+  ][] = [
+    [U, U, null, U, U, U],
+    [U, U, { font: U }, U, U, U],
+    ["inter", U, { font: U }, "inter", U, U],
+    [U, "orbitron", { font: U }, U, "orbitron", U],
+    [U, U, { font: "fira-code" }, U, U, "fira-code"],
+    [
+      "inter",
+      "orbitron",
+      { font: "fira-code" },
+      "inter",
+      "orbitron",
+      "fira-code",
+    ],
+    ["inter", "montserrat", null, "inter", "montserrat", U],
+    [U, "montserrat", null, U, U, U],
+    ["montserrat", U, null, U, U, U],
+    ["inter", "inter", { font: "inter" }, "inter", U, U],
+    [U, "orbitron", { font: "orbitron" }, U, "orbitron", U],
+  ];
+  for (const [grid, font, tile, message, labelFont, valueFont] of rows) {
+    const got = resolveFonts(
+      { font: grid },
+      {
+        font,
+        tile: tile
+          ? { every_s: 5, source: config.button[0].action, font: tile.font }
+          : undefined,
+      },
+    );
+    const label = labelFont ?? message ?? "montserrat";
+    assert.equal(got.label, label, `grid ${grid} font ${font}`);
+    if (tile) {
+      assert.equal(got.value, valueFont ?? label, `grid ${grid} font ${font}`);
+    }
+  }
+  // `a_tile_value_in_montserrat_under_another_label_font_is_sent`: the label is the grid's Inter,
+  // the value the tile's pinned Montserrat.
+  assert.deepEqual(
+    resolveFonts(
+      { font: "inter" },
+      {
+        tile: {
+          every_s: 5,
+          source: config.button[0].action,
+          font: "montserrat",
+        },
+      },
+    ),
+    { label: "inter", value: "montserrat" },
+  );
+  // Nothing set is Montserrat; a lone tile font moves only the value.
+  assert.deepEqual(resolveFonts({}, {}), {
+    label: "montserrat",
+    value: "montserrat",
+  });
+});
+
+test("font problems land on the font fields and the grid", () => {
+  const list = "montserrat, inter";
+  const map = mapErrors([
+    `layout.font "x" is not one of ${list}`,
+    `button "a": font "x" is not one of ${list}`,
+    `button "a": tile.font "x" is not one of ${list}`,
+  ]);
+  assert.equal(map.grid.length, 1);
+  assert.equal(map.general.length, 0);
+  const a = map.buttons.get("a") ?? {};
+  assert.equal(a.font?.length, 1);
+  assert.equal(a["tile.font"]?.length, 1);
+  assert.equal(a.button, undefined);
 });
 
 // The messages below are the ones Config::check and Configs::save build in config.rs.

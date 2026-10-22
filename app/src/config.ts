@@ -27,6 +27,8 @@ export type Action = ShellAction | HttpAction;
 export type TileConfig = {
   every_s: number;
   json_pointer?: string;
+  /** The value's font id. Absent: the button's font. */
+  font?: string;
   source: Action;
 };
 
@@ -38,13 +40,16 @@ export type ButtonConfig = {
   bg: string;
   fg: string;
   icon?: string;
+  /** A font id for the label, and for the tile value unless `tile.font` says otherwise. Absent: the grid's font. */
+  font?: string;
   action: Action;
   tile?: TileConfig;
 };
 
 export type Config = {
   version: number;
-  layout: { cols: number; rows: number };
+  /** `font` is the grid's default font id. Absent: Montserrat. */
+  layout: { cols: number; rows: number; font?: string };
   /** The TOML array of tables is `[[button]]`. */
   button: ButtonConfig[];
 };

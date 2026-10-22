@@ -1,0 +1,44 @@
+/* The fonts the device can draw, unmodified, so the preview shows what the board does. Medium (500)
+   like the firmware's. The family names are `name` in fonts/fonts.json and fonts.gen.ts. */
+
+@font-face {
+  font-family: "Inter";
+  font-weight: 500;
+  font-style: normal;
+  src: url("../../fonts/inter/Inter-Medium.ttf") format("truetype");
+}
+
+@font-face {
+  font-family: "Roboto";
+  font-weight: 500;
+  font-style: normal;
+  src: url("../../fonts/roboto/Roboto-Medium.ttf") format("truetype");
+}
+
+@font-face {
+  font-family: "Fira Code";
+  font-weight: 500;
+  font-style: normal;
+  src: url("../../fonts/fira-code/FiraCode-Medium.ttf") format("truetype");
+}
+
+@font-face {
+  font-family: "Roboto Mono";
+  font-weight: 500;
+  font-style: normal;
+  src: url("../../fonts/roboto-mono/RobotoMono-Medium.ttf") format("truetype");
+}
+
+@font-face {
+  font-family: "Orbitron";
+  font-weight: 500;
+  font-style: normal;
+  src: url("../../fonts/orbitron/Orbitron-Medium.ttf") format("truetype");
+}
+
+@font-face {
+  font-family: "Oxanium";
+  font-weight: 500;
+  font-style: normal;
+  src: url("../../fonts/oxanium/Oxanium-Medium.ttf") format("truetype");
+}

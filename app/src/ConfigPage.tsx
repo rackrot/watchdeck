@@ -14,7 +14,7 @@ import {
   type ConfigView,
   newButton,
 } from "./config";
-import { layoutChanged } from "./edit";
+import { layoutTargets } from "./edit";
 import {
   type ErrorMap,
   emptyErrors,
@@ -203,9 +203,9 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
     save$.current = { inFlight: true, revision: null };
     setSaved(null);
     try {
-      const connected = (await listDevices())
-        .filter((d) => d.connected)
-        .map((d) => d.id);
+      const devices = await listDevices();
+      const connected = devices.filter((d) => d.connected);
+      const targets = layoutTargets(view.config, draft, devices);
       // Before the call: the push can be announced before the call returns.
       const t0 = Date.now();
       const revision = await saveConfig(draft, view.revision);
@@ -217,7 +217,7 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
       setSaved({
         t0,
         connected: connected.length,
-        targets: layoutChanged(view.config, draft) ? connected : [],
+        targets,
       });
     } catch (e) {
       const messages = Array.isArray(e) ? (e as string[]) : [String(e)];
@@ -375,6 +375,7 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
           // A fresh form per button, and after the draft is replaced, so its rows start from it.
           key={`${formKey}:${selected}`}
           button={button}
+          gridFont={draft.layout.font}
           errors={errors.buttons.get(button.id) ?? {}}
           secrets={secrets}
           icons={icons}

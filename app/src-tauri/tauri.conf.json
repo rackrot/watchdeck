@@ -20,8 +20,8 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' asset: http://asset.localhost; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'",
-      "devCsp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost; connect-src 'self' ipc: http://ipc.localhost ws://localhost:1420; object-src 'none'; base-uri 'none'",
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' asset: http://asset.localhost; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'",
+      "devCsp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' asset: http://asset.localhost; connect-src 'self' ipc: http://ipc.localhost ws://localhost:1420; object-src 'none'; base-uri 'none'",
       "assetProtocol": {
         "enable": true,
         "scope": []
@@ -31,6 +31,14 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": {
+      "../../fonts/inter/LICENSE.txt": "fonts/licenses/inter.txt",
+      "../../fonts/roboto/OFL.txt": "fonts/licenses/roboto.txt",
+      "../../fonts/fira-code/LICENSE": "fonts/licenses/fira-code.txt",
+      "../../fonts/roboto-mono/OFL.txt": "fonts/licenses/roboto-mono.txt",
+      "../../fonts/orbitron/OFL.txt": "fonts/licenses/orbitron.txt",
+      "../../fonts/oxanium/OFL.txt": "fonts/licenses/oxanium.txt"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

@@ -17,6 +17,8 @@ export default defineConfig(() => ({
   server: {
     port: 1420,
     strictPort: true,
+    // fonts.css reaches the repo-root fonts/ directory, outside this project.
+    fs: { allow: [".", "../fonts"] },
     host: host || false,
     hmr: host
       ? {

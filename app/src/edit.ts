@@ -2,6 +2,7 @@
 // telling a change the device draws from one it doesn't.
 
 import type { ButtonConfig, Config } from "./config";
+import { DEFAULT_FONT, resolveFonts } from "./fonts.ts";
 
 export type Row = { name: string; value: string };
 
@@ -73,7 +74,8 @@ export function canon(value: unknown): string {
 }
 
 /** What a device draws for a button, which is all of it except the action (`Live::layout`). */
-function drawn(b: ButtonConfig) {
+function drawn(b: ButtonConfig, layout: Config["layout"]) {
+  const fonts = resolveFonts(layout, b);
   return [
     b.id,
     b.pos,
@@ -82,12 +84,66 @@ function drawn(b: ButtonConfig) {
     b.fg,
     b.icon ?? null,
     b.tile !== undefined,
+    fonts.label,
+    b.tile ? fonts.value : null,
   ];
 }
 
 /** Whether going from `a` to `b` changes the layout a device is sent. An action edit doesn't. */
 export function layoutChanged(a: Config, b: Config): boolean {
   const key = (c: Config) =>
-    JSON.stringify([c.layout.cols, c.layout.rows, c.button.map(drawn)]);
+    JSON.stringify([
+      c.layout.cols,
+      c.layout.rows,
+      // The message carries the grid's font even when no button shows it.
+      c.layout.font ?? DEFAULT_FONT,
+      c.button.map((button) => drawn(button, c.layout)),
+    ]);
   return key(a) !== key(b);
+}
+
+/** `config` with every font key removed, to tell a font-only change from the rest. */
+function withoutFonts(config: Config): Config {
+  const { font: _, ...layout } = config.layout;
+  return {
+    ...config,
+    layout,
+    button: config.button.map(({ font: _b, tile, ...b }) => {
+      if (!tile) {
+        return b;
+      }
+      const { font: _t, ...rest } = tile;
+      return { ...b, tile: rest };
+    }),
+  };
+}
+
+/**
+ * The devices a save pushes a layout to. A change to fonts alone reaches only those that have the
+ * "fonts" capability: the daemon sends the others nothing, so waiting for them would fail.
+ */
+export function layoutTargets(
+  before: Config,
+  after: Config,
+  devices: { id: string; connected: boolean; caps: string[] }[],
+): string[] {
+  if (!layoutChanged(before, after)) {
+    return [];
+  }
+  const fontOnly = !layoutChanged(withoutFonts(before), withoutFonts(after));
+  return devices
+    .filter((d) => d.connected && (!fontOnly || d.caps.includes("fonts")))
+    .map((d) => d.id);
+}
+
+/**
+ * `config` with the grid's font set to `font`. Montserrat is the default, so picking it removes the
+ * key. The rest of the layout stays.
+ */
+export function withGridFont(config: Config, font: string): Config {
+  const { font: _, ...rest } = config.layout;
+  return {
+    ...config,
+    layout: font === DEFAULT_FONT ? rest : { ...rest, font },
+  };
 }
