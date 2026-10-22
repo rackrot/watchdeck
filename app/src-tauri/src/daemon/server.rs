@@ -26,7 +26,7 @@ use super::actions::{ActionResult, Actions, Run, MAX_RUNNING};
 use super::config::{Action, Layout, Live, MAX_COLS, MAX_ROWS};
 use super::protocol::{
     decode_hex, encode_hex, valid_device_id, ErrorCode, Message, Report, Token, CAPS, CAP_FONTS,
-    ICON_ID_BYTES, MAX_MESSAGE_BYTES, MAX_REPORTS_PER_SESSION, TOKEN_BYTES, VERSION,
+    CAP_PAGES, ICON_ID_BYTES, MAX_MESSAGE_BYTES, MAX_REPORTS_PER_SESSION, TOKEN_BYTES, VERSION,
 };
 use super::store::Store;
 use super::tiles::{self, Sent, Tiles, Values};
@@ -39,7 +39,8 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a closing session waits for the device to close too.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_BUTTON_ID_BYTES: usize = 64;
-/// Ids in one `icon_get`: a layout never names more icons than it has cells.
+/// Ids in one `icon_get`: one page never names more icons than it has cells, and a device asks
+/// for the icons of a set of pages in several requests.
 const MAX_ICON_IDS: usize = (MAX_COLS * MAX_ROWS) as usize;
 /// Concurrent connections, handshaking or live. Beyond this the listener drops new sockets.
 const MAX_CONNECTIONS: usize = 64;
@@ -609,7 +610,8 @@ where
     };
 
     let token = token.and_then(|Token(hex)| decode_hex::<TOKEN_BYTES>(&hex));
-    let fonts = caps.iter().any(|cap| cap == CAP_FONTS);
+    // The registry keeps the caps for the Devices tab, and the session its own copy.
+    let session_caps = caps.clone();
     let Some((id, kick)) = token.and_then(|token| shared.authenticate(&device, &token, caps))
     else {
         log::warn!("{peer}: refused {device}: not paired, or a missing or wrong token");
@@ -620,7 +622,7 @@ where
         screen[0],
         screen[1]
     );
-    let outcome = serve(tx, rx, kick, shared, &device, fonts).await;
+    let outcome = serve(tx, rx, kick, shared, &device, &session_caps).await;
     shared.unregister(&device, id);
     outcome
 }
@@ -706,14 +708,15 @@ impl TileFeed {
 /// reading (and answering pings) and pushing layouts and tiles while actions run. A run whose
 /// session has ended still finishes, and its result is dropped. A session without the `fonts`
 /// capability sees the layout with its font fields stripped, so a font-only edit changes nothing
-/// it sees and pushes nothing.
+/// it sees and pushes nothing. One without `pages` sees the home page alone, so an edit to the
+/// other pages pushes it nothing either. Tiles and icons come from what the session sees.
 async fn serve<S>(
     tx: &mut WsSink<S>,
     rx: &mut WsRead<S>,
     mut kick: oneshot::Receiver<Kick>,
     shared: &Shared,
     device: &str,
-    fonts: bool,
+    caps: &[String],
 ) -> Result<(), WsError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -727,14 +730,24 @@ where
         },
     )
     .await?;
-    // No session names `pages` yet, so every one sees the home page alone.
-    let view = |live: &Live| {
+    let fonts = caps.iter().any(|cap| cap == CAP_FONTS);
+    let pages = caps.iter().any(|cap| cap == CAP_PAGES);
+    let mut told_home_only = false;
+    let mut view = |live: &Live| {
         let layout = live.layout();
         let layout = if fonts {
             layout
         } else {
             layout.without_fonts()
         };
+        if pages {
+            return layout;
+        }
+        let count = live.pages.len();
+        if count >= 2 && !told_home_only {
+            log::info!("{device}: firmware without pages, showing page 1 of {count}");
+            told_home_only = true;
+        }
         layout.home_only()
     };
     let mut layout = view(&config.borrow_and_update());

@@ -33,7 +33,8 @@ use watchdeck_lib::daemon::actions::{ActionResult, Actions};
 use watchdeck_lib::daemon::config::{self, Configs};
 use watchdeck_lib::daemon::pairing::{Pairing, PairingState};
 use watchdeck_lib::daemon::protocol::{
-    decode_hex, encode_hex, pairing_code, ErrorCode, IconFrame, Message, Report, TileState, Token,
+    decode_hex, encode_hex, pairing_code, Button, ErrorCode, IconFrame, Message, Report, TileState,
+    Token,
 };
 use watchdeck_lib::daemon::secrets::Secrets;
 use watchdeck_lib::daemon::server::{DaemonEvent, DeviceInfo, Devices, Server};
@@ -1451,6 +1452,8 @@ static LOG_LEAKS: AtomicUsize = AtomicUsize::new(0);
 static LOG_INSECURE: AtomicUsize = AtomicUsize::new(0);
 /// Every warning about a device report that was accepted.
 static LOG_REPORTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Every line that says a device can't show pages.
+static LOG_NO_PAGES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Installs [`LeakCheck`] as the process's logger, once, whichever test gets here first.
 fn install_logger() {
@@ -1462,7 +1465,8 @@ fn install_logger() {
 }
 
 /// Counts every log record at every level, those that contain [`SECRET`], the warnings about
-/// secrets sent over plain http, and the warnings that accept a device report.
+/// secrets sent over plain http, the warnings that accept a device report, and the lines about
+/// firmware without pages.
 struct LeakCheck;
 
 impl log::Log for LeakCheck {
@@ -1481,6 +1485,8 @@ impl log::Log for LeakCheck {
         }
         if record.level() == log::Level::Warn && text.contains(": device report ") {
             LOG_REPORTS.lock().unwrap().push(text);
+        } else if text.contains("firmware without pages") {
+            LOG_NO_PAGES.lock().unwrap().push(text);
         }
     }
 
@@ -2342,4 +2348,506 @@ tile = { every_s = 2, source = { kind = "shell", argv = ["echo", "same"] } }
         heard.is_err(),
         "an unchanged tile was sent again: {heard:?}"
     );
+}
+
+// ---- Pages ----
+
+/// Three pages of a 5x3 grid in Inter. The home page has `home`, with `a.png` and a tile. "media"
+/// has `plex`, in Orbitron with `b.png`, and "lab" has `lab`, with a tile. Tiles poll once a day,
+/// so each sends one value.
+const PAGED_CONFIG: &str = r##"
+version = 1
+[layout]
+cols = 5
+rows = 3
+font = "inter"
+
+[[page]]
+id = "main"
+
+[[page]]
+id = "media"
+
+[[page]]
+id = "lab"
+
+[[button]]
+id = "home"
+pos = [0, 0]
+label = "Home"
+icon = "a.png"
+action = { kind = "shell", argv = ["true"] }
+tile = { every_s = 86400, source = { kind = "shell", argv = ["echo", "h"] } }
+
+[[button]]
+id = "plex"
+page = "media"
+pos = [0, 0]
+label = "Plex"
+font = "orbitron"
+icon = "b.png"
+action = { kind = "shell", argv = ["true"] }
+
+[[button]]
+id = "lab"
+page = "lab"
+pos = [1, 1]
+label = "Lab"
+action = { kind = "shell", argv = ["true"] }
+tile = { every_s = 86400, source = { kind = "shell", argv = ["echo", "l"] } }
+"##;
+
+fn paged_with(from: &str, to: &str) -> String {
+    assert!(PAGED_CONFIG.contains(from), "{from}");
+    PAGED_CONFIG.replacen(from, to, 1)
+}
+
+/// A square of one color, `side` pixels wide, as PNG bytes.
+fn solid_png(side: u32, rgba: [u8; 4]) -> Vec<u8> {
+    let picture = image::RgbaImage::from_pixel(side, side, image::Rgba(rgba));
+    let mut out = std::io::Cursor::new(Vec::new());
+    picture.write_to(&mut out, image::ImageFormat::Png).unwrap();
+    out.into_inner()
+}
+
+/// A daemon serving `PAGED_CONFIG`, with `OTHER` paired beside `DEVICE`.
+async fn start_paged() -> Daemon {
+    let daemon = start().await;
+    put_icon(&daemon, "a.png", &quadrants_png(200));
+    put_icon(&daemon, "b.png", &solid_png(64, [1, 2, 3, 255]));
+    assert_eq!(daemon.reconfigure(PAGED_CONFIG), Ok(true));
+    daemon
+        .devices
+        .pair(OTHER, Sha256::digest(OTHER_TOKEN).into())
+        .unwrap();
+    daemon
+}
+
+/// A device that sent `caps` in its hello and has the `welcome`.
+async fn session_with_caps(
+    addr: SocketAddr,
+    device: &str,
+    token: &[u8; 32],
+    caps: &[&str],
+) -> Client {
+    let mut c = connect(addr).await;
+    c.send(hello_with_caps(1, device, Some(token), caps))
+        .await
+        .unwrap();
+    assert!(matches!(recv(&mut c).await, Message::Welcome { .. }));
+    c
+}
+
+/// The next set of `layout` pages, skipping the tiles before it. Nothing may come between its
+/// pages, and they must share one `rev` and one count.
+async fn recv_set(c: &mut Client) -> Vec<Message> {
+    let first = loop {
+        match recv_within(c, 5).await {
+            Message::Tile { .. } => {}
+            layout @ Message::Layout { .. } => break layout,
+            other => panic!("expected a layout, got {other:?}"),
+        }
+    };
+    let Message::Layout { rev, pages, .. } = first else {
+        unreachable!()
+    };
+    let mut set = vec![first];
+    while set.len() < pages.unwrap_or(1) as usize {
+        let next = recv_within(c, 5).await;
+        assert!(
+            matches!(&next, Message::Layout { rev: r, pages: p, .. } if *r == rev && *p == pages),
+            "a page of rev {rev} of {pages:?} pages, got {next:?}"
+        );
+        set.push(next);
+    }
+    set
+}
+
+/// A layout's rev, page, pages, page_id and font.
+fn header(m: &Message) -> (u32, Option<u32>, Option<u32>, Option<&str>, Option<&str>) {
+    let Message::Layout {
+        rev,
+        page,
+        pages,
+        page_id,
+        font,
+        ..
+    } = m
+    else {
+        panic!("expected a layout, got {m:?}")
+    };
+    (*rev, *page, *pages, page_id.as_deref(), font.as_deref())
+}
+
+fn buttons_of(m: &Message) -> &[Button] {
+    let Message::Layout { buttons, .. } = m else {
+        panic!("expected a layout, got {m:?}")
+    };
+    buttons
+}
+
+fn ids_of(m: &Message) -> Vec<&str> {
+    buttons_of(m).iter().map(|b| b.id.as_str()).collect()
+}
+
+/// The next message that isn't a tile.
+async fn recv_skipping_tiles(c: &mut Client) -> Message {
+    loop {
+        match recv_within(c, 5).await {
+            Message::Tile { .. } => {}
+            other => return other,
+        }
+    }
+}
+
+/// The next frame, which must be text, as the daemon sent it.
+async fn recv_text(c: &mut Client) -> String {
+    loop {
+        match c.next().await.expect("stream ended").unwrap() {
+            Ws::Text(t) => return t.as_str().to_owned(),
+            Ws::Ping(_) | Ws::Pong(_) => {}
+            other => panic!("unexpected frame {other:?}"),
+        }
+    }
+}
+
+/// Waits for every event in `want`, in any order, skipping the others.
+async fn expect_events(daemon: &mut Daemon, want: &[DaemonEvent]) {
+    let mut missing = want.to_vec();
+    while !missing.is_empty() {
+        let event = tokio::time::timeout(Duration::from_secs(5), daemon.events.recv())
+            .await
+            .unwrap_or_else(|_| panic!("still waiting for {missing:?}"))
+            .unwrap();
+        missing.retain(|w| *w != event);
+    }
+}
+
+fn caps_of(daemon: &Daemon, device: &str) -> Vec<String> {
+    let list = daemon.devices.list();
+    let info = list.iter().find(|d| d.id == device).expect("paired");
+    info.caps.clone()
+}
+
+#[tokio::test]
+async fn a_hello_without_pages_gets_the_home_page_alone_and_one_log_line() {
+    install_logger();
+    // A device id of this test's own, since the log is shared by every test in the process.
+    const OLD: &str = "wd-0000000000a4";
+    const OLD_TOKEN: [u8; 32] = [9; 32];
+    let daemon = start_paged().await;
+    daemon
+        .devices
+        .pair(OLD, Sha256::digest(OLD_TOKEN).into())
+        .unwrap();
+
+    // A board with pages learns the ids and lets both tiles poll.
+    let mut paged = session_with_caps(daemon.addr, DEVICE, &TOKEN, &["fonts", "pages"]).await;
+    let set = recv_set(&mut paged).await;
+    let home_icon = buttons_of(&set[0])[0].icon.clone().unwrap();
+    let plex_icon = buttons_of(&set[1])[0].icon.clone().unwrap();
+    let mut first = vec![
+        recv_tile(&mut paged, 5).await,
+        recv_tile(&mut paged, 5).await,
+    ];
+    first.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        first,
+        [
+            tile("home", "h", TileState::Ok),
+            tile("lab", "l", TileState::Ok)
+        ]
+    );
+
+    let mut old = session_with_caps(daemon.addr, OLD, &OLD_TOKEN, &[]).await;
+    let layout = recv(&mut old).await;
+    assert_eq!(
+        header(&layout),
+        (1, None, None, None, None),
+        "today's shape"
+    );
+    assert_eq!(ids_of(&layout), ["home"]);
+    assert_eq!(
+        buttons_of(&layout)[0].icon.as_deref(),
+        Some(home_icon.as_str())
+    );
+    assert_eq!(
+        recv_tile(&mut old, 5).await,
+        tile("home", "h", TileState::Ok)
+    );
+
+    // The home page's icon comes, a page-2 icon doesn't, and the lab tile never does.
+    old.send(icon_get(&[&plex_icon, &home_icon])).await.unwrap();
+    assert_eq!(encode_hex(&recv_icon(&mut old).await.id), home_icon);
+    old.send(icon_get(&[&plex_icon])).await.unwrap();
+    old.send(press("home", 1)).await.unwrap();
+    assert!(matches!(
+        recv(&mut old).await,
+        Message::Result { seq: 1, .. }
+    ));
+
+    // An edit the board can see is pushed as today, and the line isn't logged again.
+    assert_eq!(
+        daemon.reconfigure(&paged_with("label = \"Home\"", "label = \"House\"")),
+        Ok(true)
+    );
+    let layout = recv_skipping_tiles(&mut old).await;
+    assert_eq!(header(&layout), (2, None, None, None, None));
+    assert_eq!(buttons_of(&layout)[0].label, "House");
+    let lines: Vec<_> = (LOG_NO_PAGES.lock().unwrap().iter())
+        .filter(|line| line.contains(OLD))
+        .cloned()
+        .collect();
+    assert_eq!(
+        lines,
+        [format!(
+            "{OLD}: firmware without pages, showing page 1 of 3"
+        )]
+    );
+}
+
+#[tokio::test]
+async fn the_fonts_and_pages_caps_get_every_page_as_one_set_then_every_tile() {
+    let daemon = start_paged().await;
+    let mut c = session_with_caps(daemon.addr, DEVICE, &TOKEN, &["fonts", "pages"]).await;
+    let set = recv_set(&mut c).await;
+    let headers: Vec<_> = set.iter().map(header).collect();
+    assert_eq!(
+        headers,
+        [
+            (1, Some(0), Some(3), Some("main"), Some("inter")),
+            (1, Some(1), Some(3), Some("media"), Some("inter")),
+            (1, Some(2), Some(3), Some("lab"), Some("inter")),
+        ]
+    );
+    let ids: Vec<_> = set.iter().map(ids_of).collect();
+    assert_eq!(ids, [["home"], ["plex"], ["lab"]]);
+    assert_eq!(
+        buttons_of(&set[1])[0].label_font.as_deref(),
+        Some("orbitron")
+    );
+    assert_eq!(caps_of(&daemon, DEVICE), ["fonts", "pages"]);
+
+    let mut tiles = vec![recv_tile(&mut c, 5).await, recv_tile(&mut c, 5).await];
+    tiles.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        tiles,
+        [
+            tile("home", "h", TileState::Ok),
+            tile("lab", "l", TileState::Ok)
+        ]
+    );
+
+    // A page-2 icon is served, drawn for the shorter grid of a set of pages.
+    let plex_icon = buttons_of(&set[1])[0].icon.clone().unwrap();
+    c.send(icon_get(&[&plex_icon])).await.unwrap();
+    let icon = recv_icon(&mut c).await;
+    assert_eq!((encode_hex(&icon.id), icon.w, icon.h), (plex_icon, 33, 33));
+}
+
+#[tokio::test]
+async fn the_pages_cap_alone_gets_the_set_without_font_fields() {
+    let daemon = start_paged().await;
+    let mut c = session_with_caps(daemon.addr, DEVICE, &TOKEN, &["pages"]).await;
+    let set = recv_set(&mut c).await;
+    let headers: Vec<_> = set.iter().map(header).collect();
+    assert_eq!(
+        headers,
+        [
+            (1, Some(0), Some(3), Some("main"), None),
+            (1, Some(1), Some(3), Some("media"), None),
+            (1, Some(2), Some(3), Some("lab"), None),
+        ]
+    );
+    assert!(set
+        .iter()
+        .flat_map(buttons_of)
+        .all(|b| b.label_font.is_none() && b.value_font.is_none()));
+    assert_eq!(caps_of(&daemon, DEVICE), ["pages"]);
+}
+
+#[tokio::test]
+async fn an_edit_to_another_page_pushes_only_to_the_session_with_pages() {
+    let mut daemon = start_paged().await;
+    let mut paged = session_with_caps(daemon.addr, DEVICE, &TOKEN, &["fonts", "pages"]).await;
+    assert_eq!(recv_set(&mut paged).await.len(), 3);
+    let mut old = session_with_caps(daemon.addr, OTHER, &OTHER_TOKEN, &[]).await;
+    assert_eq!(recv_set(&mut old).await.len(), 1);
+    expect_events(
+        &mut daemon,
+        &[
+            DaemonEvent::DeviceConnected(DEVICE.into()),
+            DaemonEvent::DeviceConnected(OTHER.into()),
+        ],
+    )
+    .await;
+
+    assert_eq!(
+        daemon.reconfigure(&paged_with("label = \"Plex\"", "label = \"Films\"")),
+        Ok(true)
+    );
+    let set = recv_set(&mut paged).await;
+    assert_eq!(
+        header(&set[0]),
+        (2, Some(0), Some(3), Some("main"), Some("inter"))
+    );
+    assert_eq!(buttons_of(&set[1])[0].label, "Films");
+    // One ack covers the whole set.
+    paged.send(layout_ack(2)).await.unwrap();
+    expect_events(
+        &mut daemon,
+        &[
+            DaemonEvent::LayoutPushed(DEVICE.into(), 2),
+            DaemonEvent::LayoutApplied(DEVICE.into(), 2),
+        ],
+    )
+    .await;
+
+    // A pushed layout would come before this press's result.
+    old.send(press("home", 1)).await.unwrap();
+    assert!(matches!(
+        recv_skipping_tiles(&mut old).await,
+        Message::Result { seq: 1, .. }
+    ));
+    while let Ok(event) = daemon.events.try_recv() {
+        assert!(
+            !matches!(&event, DaemonEvent::LayoutPushed(d, _) if d == OTHER),
+            "{event:?}"
+        );
+    }
+
+    // The old board stayed on rev 1, so an edit it can see is its rev 2.
+    assert_eq!(
+        daemon.reconfigure(&paged_with("label = \"Home\"", "label = \"House\"")),
+        Ok(true)
+    );
+    let layout = recv_skipping_tiles(&mut old).await;
+    assert_eq!(header(&layout), (2, None, None, None, None));
+    assert_eq!(header(&recv_set(&mut paged).await[0]).0, 3);
+}
+
+/// One page without `[[page]]` tables, in Inter with an Orbitron label and an icon.
+const ONE_PAGE: &str = r##"
+version = 1
+[layout]
+cols = 5
+rows = 3
+font = "inter"
+
+[[button]]
+id = "hello"
+pos = [0, 0]
+label = "Hello"
+font = "orbitron"
+icon = "a.png"
+action = { kind = "shell", argv = ["true"] }
+"##;
+
+#[tokio::test]
+async fn a_config_without_pages_goes_out_unchanged_and_a_second_page_reaches_both_sessions() {
+    let mut daemon = start().await;
+    put_icon(&daemon, "a.png", &quadrants_png(200));
+    assert_eq!(daemon.reconfigure(ONE_PAGE), Ok(true));
+    daemon
+        .devices
+        .pair(OTHER, Sha256::digest(OTHER_TOKEN).into())
+        .unwrap();
+
+    // The bytes the daemon sent before pages, to a board with pages and to one without.
+    let mut paged = session_with_caps(daemon.addr, DEVICE, &TOKEN, &["fonts", "pages"]).await;
+    let text = recv_text(&mut paged).await;
+    let Message::Layout { buttons, .. } = serde_json::from_str(&text).unwrap() else {
+        panic!("expected a layout, got {text}")
+    };
+    let icon = buttons[0].icon.clone().unwrap();
+    assert_eq!(
+        text,
+        format!(
+            r#"{{"t":"layout","rev":1,"cols":5,"rows":3,"font":"inter","buttons":[{{"id":"hello","col":0,"row":0,"label":"Hello","bg":2001125,"fg":16777215,"icon":"{icon}","label_font":"orbitron"}}]}}"#
+        )
+    );
+    assert_eq!(caps_of(&daemon, DEVICE), ["fonts", "pages"]);
+    let mut old = session_with_caps(daemon.addr, OTHER, &OTHER_TOKEN, &[]).await;
+    assert_eq!(
+        recv_text(&mut old).await,
+        format!(
+            r#"{{"t":"layout","rev":1,"cols":5,"rows":3,"buttons":[{{"id":"hello","col":0,"row":0,"label":"Hello","bg":2001125,"fg":16777215,"icon":"{icon}"}}]}}"#
+        )
+    );
+
+    // A second page shrinks the grid, so the home icon gets a new id on both boards.
+    let two = ONE_PAGE.replacen(
+        "[[button]]",
+        "[[page]]\nid = \"main\"\n\n[[page]]\nid = \"more\"\n\n[[button]]",
+        1,
+    ) + "\n[[button]]\nid = \"more\"\npage = \"more\"\npos = [0, 0]\nlabel = \"More\"\naction = { kind = \"shell\", argv = [\"true\"] }\n";
+    assert_eq!(daemon.reconfigure(&two), Ok(true));
+    let set = recv_set(&mut paged).await;
+    let headers: Vec<_> = set.iter().map(header).collect();
+    assert_eq!(
+        headers,
+        [
+            (2, Some(0), Some(2), Some("main"), Some("inter")),
+            (2, Some(1), Some(2), Some("more"), Some("inter")),
+        ]
+    );
+    let moved = buttons_of(&set[0])[0].icon.clone().unwrap();
+    assert_ne!(moved, icon);
+    let layout = recv(&mut old).await;
+    assert_eq!(header(&layout), (2, None, None, None, None));
+    assert_eq!(ids_of(&layout), ["hello"]);
+    assert_eq!(buttons_of(&layout)[0].icon.as_deref(), Some(moved.as_str()));
+    expect_events(
+        &mut daemon,
+        &[
+            DaemonEvent::LayoutPushed(DEVICE.into(), 2),
+            DaemonEvent::LayoutPushed(OTHER.into(), 2),
+        ],
+    )
+    .await;
+    // The old board gets the icon drawn for the shorter grid too.
+    old.send(icon_get(&[&moved])).await.unwrap();
+    let frame = recv_icon(&mut old).await;
+    assert_eq!((encode_hex(&frame.id), frame.w, frame.h), (moved, 33, 33));
+}
+
+#[tokio::test]
+async fn a_layout_ack_sent_before_an_icon_get_of_forty_ids_is_announced_before_the_frames_finish() {
+    let mut daemon = start().await;
+    let mut config = "version = 1\n[layout]\ncols = 5\nrows = 4\n\n[[page]]\nid = \"one\"\n\n[[page]]\nid = \"two\"\n".to_string();
+    for i in 0..40u8 {
+        put_icon(&daemon, &format!("i{i}.png"), &solid_png(8, [i, 2, 3, 255]));
+        let page = if i < 20 { "one" } else { "two" };
+        let (col, row) = (i % 5, (i % 20) / 5);
+        config += &format!(
+            "\n[[button]]\nid = \"b{i}\"\npage = \"{page}\"\npos = [{col}, {row}]\nlabel = \"B{i}\"\nicon = \"i{i}.png\"\naction = {{ kind = \"shell\", argv = [\"true\"] }}\n"
+        );
+    }
+    assert_eq!(daemon.reconfigure(&config), Ok(true));
+
+    let mut c = session_with_caps(daemon.addr, DEVICE, &TOKEN, &["pages"]).await;
+    let set = recv_set(&mut c).await;
+    assert_eq!(set.len(), 2);
+    let ids: Vec<String> = (set.iter().flat_map(buttons_of))
+        .map(|b| b.icon.clone().unwrap())
+        .collect();
+    let mut unique = ids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), 40, "every icon is its own");
+    expect_events(&mut daemon, &[DaemonEvent::DeviceConnected(DEVICE.into())]).await;
+
+    c.send(layout_ack(1)).await.unwrap();
+    let wanted: Vec<&str> = ids.iter().map(String::as_str).collect();
+    c.send(icon_get(&wanted)).await.unwrap();
+    let mut got = vec![encode_hex(&recv_icon(&mut c).await.id)];
+    // The daemon read the ack before the icon_get, so the event is out with the first frame.
+    assert_eq!(
+        daemon.events.try_recv(),
+        Ok(DaemonEvent::LayoutApplied(DEVICE.into(), 1))
+    );
+    for _ in 1..40 {
+        got.push(encode_hex(&recv_icon(&mut c).await.id));
+    }
+    assert_eq!(got, ids, "every frame, in the order asked");
 }

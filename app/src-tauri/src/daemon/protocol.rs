@@ -9,12 +9,11 @@ use sha2::{Digest, Sha256};
 pub const VERSION: u32 = 1;
 
 /// The capabilities a session keeps from `hello.caps`; any other name is dropped.
-pub const CAPS: [&str; 1] = [CAP_FONTS];
+pub const CAPS: [&str; 2] = [CAP_FONTS, CAP_PAGES];
 /// The device draws every font in `fonts_gen::FONT_IDS` and reads the layout's font fields.
 pub const CAP_FONTS: &str = "fonts";
 /// The device assembles a set of up to 4 `layout` pages and lays out the shorter grid for 2 or
-/// more. Not in [`CAPS`] until the daemon's sessions send pages.
-#[allow(dead_code)]
+/// more.
 pub const CAP_PAGES: &str = "pages";
 
 /// Largest message, and largest frame, in either direction.

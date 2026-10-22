@@ -2,7 +2,7 @@
 
 This page defines how the device and the desktop daemon talk. Both sides implement it, and the daemon's test fixtures use these exact examples.
 
-Status: **protocol v1.** Sessions run over TLS (`wss://`) pinned to the daemon's certificate, and every session needs the token the device made at pairing. See `plans/desktop-app-v1.md` for the full design. The [`pages`](#pages) capability is specified below; no daemon or device names it yet. Within it, `layout_ack` before `icon_get` is the contract for a device that names `pages`, from the firmware that adds the capability; earlier firmware acks after its `icon_get`.
+Status: **protocol v1.** Sessions run over TLS (`wss://`) pinned to the daemon's certificate, and every session needs the token the device made at pairing. See `plans/desktop-app-v1.md` for the full design. The [`pages`](#pages) capability is specified below. Within it, `layout_ack` before `icon_get` is the contract for a device that names `pages`, from the firmware that adds the capability; earlier firmware acks after its `icon_get`.
 
 ## Ports
 
