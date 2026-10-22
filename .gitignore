@@ -2,4 +2,3 @@
 site/book/
 .claude/worktrees/
 **/*.log
-mise.local.toml
