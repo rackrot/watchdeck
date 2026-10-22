@@ -926,8 +926,8 @@ impl Configs {
         let watched = self.watched.lock().expect("watched icons poisoned");
         Stamps {
             files: (
-                stamp(&self.path),
-                stamp(&self.secrets.path()),
+                hashed_stamp(&self.path),
+                hashed_stamp(&self.secrets.path()),
                 stamp(&self.icons_dir),
             ),
             icons: watched
@@ -987,12 +987,15 @@ impl Configs {
 /// often save by renaming a new file into place, then mode and owner, so the chmod or chown that
 /// makes `secrets.toml` readable takes effect at once.
 type Stamp = (SystemTime, u64, u64, u32, u32);
+/// A [`Stamp`] plus the SHA-256 of the file's bytes (`None` if they can't be read or are over the
+/// cap), because an edit of the same length inside one coarse mtime tick leaves the stamp alone.
+type HashedStamp = (Stamp, Option<String>);
 /// What the poller watches.
 #[derive(Clone, Default, PartialEq)]
 struct Stamps {
     /// `config.toml`, `secrets.toml`, then the `icons/` directory, whose stamp changes when a
     /// file is added, renamed or removed.
-    files: (Option<Stamp>, Option<Stamp>, Option<Stamp>),
+    files: (Option<HashedStamp>, Option<HashedStamp>, Option<Stamp>),
     /// The icon files `config.toml` names, which also change when one is overwritten in place or
     /// is still being written.
     icons: Vec<Option<Stamp>>,
@@ -1006,6 +1009,16 @@ fn stamp(path: &Path) -> Option<Stamp> {
         meta.ino(),
         meta.mode(),
         meta.uid(),
+    ))
+}
+
+/// The stamp, then the bytes read once and hashed. Metadata comes first, so a write between the
+/// two shows up as a stamp that differs from the next poll's.
+fn hashed_stamp(path: &Path) -> Option<HashedStamp> {
+    let stamp = stamp(path)?;
+    Some((
+        stamp,
+        read_capped(path).ok().map(|bytes| sha256_hex(&bytes)),
     ))
 }
 
@@ -2247,6 +2260,70 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
             .expect("the edit was lost")
             .unwrap();
         assert_eq!(configs.current().buttons[0].label, "Early bird");
+    }
+
+    /// Rewrites `path` in place with `text` and puts the old mtime back, so mtime, size, inode,
+    /// mode and owner all match what the poller last saw.
+    fn rewrite_keeping_metadata(path: &Path, text: &str) {
+        let before = fs::metadata(path).unwrap();
+        assert_eq!(
+            text.len() as u64,
+            before.len(),
+            "the test needs equal sizes"
+        );
+        fs::write(path, text).unwrap();
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(before.modified().unwrap())
+            .unwrap();
+        let after = fs::metadata(path).unwrap();
+        assert_eq!(
+            (after.modified().unwrap(), after.len(), after.ino()),
+            (before.modified().unwrap(), before.len(), before.ino())
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_same_size_edit_in_the_same_mtime_tick_is_still_applied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(FILE);
+        let configs = open(tmp.path());
+        let mut live = configs.subscribe();
+        live.mark_unchanged();
+        tokio::spawn(configs.clone().watch_files());
+        tokio::time::sleep(POLL / 2).await;
+
+        // "Hello" to "Howdy": five bytes each way.
+        rewrite_keeping_metadata(&path, &DEFAULT.replacen("\"Hello\"", "\"Howdy\"", 1));
+        tokio::time::timeout(4 * POLL, live.changed())
+            .await
+            .expect("the same-size edit was lost")
+            .unwrap();
+        assert_eq!(configs.current().buttons[0].label, "Howdy");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_same_size_secrets_edit_in_the_same_mtime_tick_is_still_noticed() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join(FILE), EXAMPLE).unwrap();
+        let secrets_path = tmp.path().join(crate::daemon::secrets::FILE);
+        write_private(&secrets_path, b"ha = \"Bearer x\"\n").unwrap();
+        let configs = open(tmp.path());
+        assert!(configs.status().borrow().errors.is_empty());
+        let mut status = configs.status();
+        status.mark_unchanged();
+        tokio::spawn(configs.clone().watch_files());
+        tokio::time::sleep(POLL / 2).await;
+
+        // The button needs secret "ha"; renaming it to "hb" keeps the size and breaks the config.
+        rewrite_keeping_metadata(&secrets_path, "hb = \"Bearer x\"\n");
+        tokio::time::timeout(4 * POLL, status.changed())
+            .await
+            .expect("the same-size secrets edit was lost")
+            .unwrap();
+        assert!(!configs.status().borrow().errors.is_empty());
     }
 
     /// A 4x4 PNG, drawn as is on any grid.
