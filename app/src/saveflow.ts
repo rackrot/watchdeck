@@ -6,7 +6,7 @@ import type {
   ConfigStatus,
   ConfigView,
 } from "./config.ts";
-import { canon } from "./edit.ts";
+import { canon, pageCount } from "./edit.ts";
 
 /** Whether the draft differs from what was loaded or last saved. */
 export const isDirty = (draft: Config, view: ConfigView): boolean =>
@@ -46,7 +46,9 @@ export const shouldFollowDisk = (
 
 /** What a save needs confirming first: it replaces a file that isn't live. */
 export function replaceNotice(view: ConfigView, draft: Config): string {
-  const grid = `${draft.layout.cols}x${draft.layout.rows} grid with ${draft.button.length} button${draft.button.length === 1 ? "" : "s"}`;
+  const pages = pageCount(draft);
+  const onPages = pages >= 2 ? ` on ${pages} pages` : "";
+  const grid = `${draft.layout.cols}x${draft.layout.rows} grid with ${draft.button.length} button${draft.button.length === 1 ? "" : "s"}${onPages}`;
   const what = view.loaded
     ? `the last good config, a ${grid}`
     : `an empty ${grid}. The app has not loaded your file since it started, so this is not your file`;

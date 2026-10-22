@@ -14,7 +14,13 @@ import {
   type ConfigView,
   newButton,
 } from "./config";
-import { layoutTargets } from "./edit";
+import {
+  buttonAt,
+  layoutTargets,
+  pageCount,
+  pageIndexOf,
+  pageName,
+} from "./edit";
 import {
   type ErrorMap,
   emptyErrors,
@@ -24,6 +30,7 @@ import {
 } from "./errors";
 import GridEditor from "./GridEditor";
 import { useIconUrls, useTileReadings } from "./hooks";
+import PageTabs from "./PageTabs";
 import SaveBar from "./SaveBar";
 import {
   diskChanged as diskMoved,
@@ -53,6 +60,8 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
   const [view, setView] = useState<ConfigView | null>(null);
   const [draft, setDraft] = useState<Config | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
+  // The page the grid shows, from 0. Clamped below, since the draft can lose pages.
+  const [pageIdx, setPageIdx] = useState(0);
   const [errors, setErrors] = useState<ErrorMap>(emptyErrors);
   const [loadError, setLoadError] = useState("");
   const [saving, setSaving] = useState(false);
@@ -92,6 +101,7 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
       setView(next);
       setDraft(structuredClone(next.config));
       setSelected(null);
+      setPageIdx(0);
       setErrors(emptyErrors());
       setOnDisk(null);
       setSaved(null);
@@ -172,6 +182,21 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
 
   const set = (next: Config) => setDraft(next);
   const repair = view.errors.length > 0;
+  const pages = pageCount(draft);
+  const page = Math.min(pageIdx, pages - 1);
+
+  /** Applies a change to the pages, and shows page `to`. A selection that isn't on it is dropped. */
+  function changePages(next: Config, to: number) {
+    const keep =
+      selected !== null &&
+      next.button.length === draft?.button.length &&
+      pageIndexOf(next, next.button[selected]) === to;
+    set(next);
+    setPageIdx(to);
+    if (!keep) {
+      setSelected(null);
+    }
+  }
 
   async function save(confirmed = false) {
     if (!draft || !view) {
@@ -225,6 +250,7 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
         mapErrors(
           messages,
           draft.button.map((b) => b.id),
+          (draft.page ?? []).map((p) => p.id),
         ),
       );
       setRefused(messages);
@@ -270,6 +296,7 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
         onRevert={() => {
           setDraft(structuredClone(view.config));
           setSelected(null);
+          setPageIdx(0);
           setErrors(emptyErrors());
           setRefused([]);
           setLocal([]);
@@ -355,8 +382,17 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
         </div>
       )}
 
+      <PageTabs
+        config={draft}
+        page={page}
+        errors={errors.pages}
+        onChange={changePages}
+        onSelect={(to) => changePages(draft, to)}
+      />
+
       <GridEditor
         config={draft}
+        page={page}
         selected={selected}
         errors={errors.buttons}
         gridProblems={errors.grid}
@@ -365,7 +401,11 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
         onSelect={setSelected}
         onChange={set}
         onAdd={(pos) => {
-          set({ ...draft, button: [...draft.button, newButton(draft, pos)] });
+          const home = draft.page?.[page]?.id;
+          set({
+            ...draft,
+            button: [...draft.button, newButton(draft, pos, home)],
+          });
           setSelected(draft.button.length);
         }}
       />
@@ -376,6 +416,19 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
           key={`${formKey}:${selected}`}
           button={button}
           gridFont={draft.layout.font}
+          pages={(draft.page ?? []).map((p) => ({
+            id: p.id,
+            name: pageName(p),
+          }))}
+          pageId={draft.page?.[pageIndexOf(draft, button)]?.id ?? ""}
+          occupant={(id) =>
+            buttonAt(
+              draft,
+              draft.page?.findIndex((p) => p.id === id) ?? 0,
+              button.pos,
+              selected ?? undefined,
+            )?.id
+          }
           errors={errors.buttons.get(button.id) ?? {}}
           secrets={secrets}
           icons={icons}
@@ -384,12 +437,19 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
           testBlock={testBlock(button, view.config, diskChanged)}
           onImportIcon={pickIcon}
           onLocalProblems={setLocal}
-          onChange={(next) =>
+          onChange={(next) => {
             set({
               ...draft,
               button: draft.button.map((b, i) => (i === selected ? next : b)),
-            })
-          }
+            });
+            // A button moved to another page takes the grid with it.
+            if (next.page !== button.page) {
+              const to = draft.page?.findIndex((p) => p.id === next.page) ?? -1;
+              if (to >= 0) {
+                setPageIdx(to);
+              }
+            }
+          }}
           onDelete={() => {
             set({
               ...draft,

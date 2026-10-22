@@ -22,6 +22,10 @@ export const GRID_GAP = 8;
 export const GRID_H = SCREEN_H - GRID_TOP;
 /** The strip under a grid of 2 or more pages for "Page x of y": a slot-24 line box plus 4 px. */
 export const PAGER_H = 31;
+/** The strip's text, "Page 2 of 3" (`page` counts from 0), or null with fewer than 2 pages. */
+export const pagerLabel = (page: number, pages: number): string | null =>
+  pages >= 2 ? `Page ${page + 1} of ${pages}` : null;
+
 const ICON_PAD = 4;
 const ICON_GAP = 2;
 const ICON_MIN = 24;

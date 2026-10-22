@@ -23,6 +23,7 @@ export type Field =
   | "fg"
   | "icon"
   | "font"
+  | "page"
   | "tile.font"
   | "tile.every_s"
   | "tile.json_pointer"
@@ -34,22 +35,28 @@ export type Field =
 export type FieldErrors = Partial<Record<Field, string[]>>;
 
 export type ErrorMap = {
-  /** Messages for the layout section: the grid size, its font and the version. */
+  /** Messages for the layout section: the grid size, its font, the version and the page and tile counts. */
   grid: string[];
   /** Messages about the file or the save itself, not about a button. */
   general: string[];
   /** By button id. Every button with that id gets the message. */
   buttons: Map<string, FieldErrors>;
+  /** By page id, for the page tabs. */
+  pages: Map<string, string[]>;
 };
 
 export const emptyErrors = (): ErrorMap => ({
   grid: [],
   general: [],
   buttons: new Map(),
+  pages: new Map(),
 });
 
 export const hasErrors = (map: ErrorMap): boolean =>
-  map.grid.length > 0 || map.general.length > 0 || map.buttons.size > 0;
+  map.grid.length > 0 ||
+  map.general.length > 0 ||
+  map.buttons.size > 0 ||
+  map.pages.size > 0;
 
 /** Which field of an action `problem` is about, from the start of Rust's message. */
 function actionField(problem: string): ActionField | null {
@@ -90,6 +97,8 @@ function fieldOf(problem: string): Field {
     [/^label /, "label"],
     [/^icon/, "icon"],
     [/^font /, "font"],
+    // `page "y" is not one of the [[page]] ids`, `page "y" is set, but the file has no [[page]] tables`.
+    [/^page /, "page"],
     [/^tile\.font /, "tile.font"],
     [/^bg /, "bg"],
     [/^fg /, "fg"],
@@ -163,13 +172,26 @@ export function addButtonError(
 
 /**
  * Sorts messages by what they are about. With `ids`, the ids of the draft's buttons, a message
- * about a button the draft doesn't have goes to `general`, whole, so it still shows.
+ * about a button the draft doesn't have goes to `general`, whole, so it still shows. `pageIds`
+ * does the same for pages.
  */
-export function mapErrors(messages: string[], ids?: string[]): ErrorMap {
+export function mapErrors(
+  messages: string[],
+  ids?: string[],
+  pageIds?: string[],
+): ErrorMap {
   const map = emptyErrors();
   for (const message of messages) {
     const button = message.match(/^button ("(?:[^"\\]|\\.)*"): (.*)$/s);
-    if (button) {
+    const page = message.match(/^page ("(?:[^"\\]|\\.)*"): (.*)$/s);
+    if (page) {
+      const id = unquote(page[1]);
+      if (pageIds && !pageIds.includes(id)) {
+        map.general.push(message);
+        continue;
+      }
+      map.pages.set(id, [...(map.pages.get(id) ?? []), page[2]]);
+    } else if (button) {
       const id = unquote(button[1]);
       if (ids && !ids.includes(id)) {
         map.general.push(message);
@@ -178,7 +200,11 @@ export function mapErrors(messages: string[], ids?: string[]): ErrorMap {
       for (const field of fieldsOf(button[2])) {
         addButtonError(map, id, field, button[2]);
       }
-    } else if (/^(layout\.(cols|rows|font)|version) /.test(message)) {
+    } else if (
+      /^(layout\.(cols|rows|font)|version) |^\d+ pages, at most |^\d+ tiles across all pages, at most /.test(
+        message,
+      )
+    ) {
       map.grid.push(message);
     } else {
       map.general.push(message);

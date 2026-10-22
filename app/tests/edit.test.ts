@@ -2,17 +2,26 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ButtonConfig, Config } from "../src/config.ts";
 import {
+  addPage,
+  buttonAt,
+  buttonsOnPage,
   canon,
   duplicateNames,
   layoutChanged,
   layoutTargets,
   moveButton,
+  movePage,
+  pageCount,
+  pageIndexOf,
+  pageName,
   parseWhole,
   recordToRows,
+  removePage,
+  renamePage,
   rowsToRecord,
   withGridFont,
 } from "../src/edit.ts";
-import { mapErrors, numberErrors, unquote } from "../src/errors.ts";
+import { hasErrors, mapErrors, numberErrors, unquote } from "../src/errors.ts";
 import { resolveFonts } from "../src/fonts.ts";
 
 const button = (id: string, pos: [number, number]): ButtonConfig => ({
@@ -513,4 +522,299 @@ test("an invalid header name shows under both header tables", () => {
   assert.equal(tile?.["tile.source.headers"]?.length, 1);
   assert.equal(tile?.["tile.source.secret_headers"]?.length, 1);
   assert.equal(tile?.["action.headers"], undefined);
+});
+
+// Pages. `a` and `b` are on the first page (`b` implicitly), `c` is on "media".
+const pagedConfig: Config = {
+  ...config,
+  page: [{ id: "main" }, { id: "media", label: "Media" }],
+  button: [
+    { ...button("a", [0, 0]), page: "main" },
+    button("b", [1, 0]),
+    { ...button("c", [0, 0]), page: "media" },
+  ],
+};
+
+const bothCaps = { id: "both", connected: true, caps: ["fonts", "pages"] };
+const pagesOnly = { id: "pages", connected: true, caps: ["pages"] };
+const fontsOnly = { id: "fonts", connected: true, caps: ["fonts"] };
+const neither = { id: "old", connected: true, caps: [] };
+const everyone = [bothCaps, pagesOnly, fontsOnly, neither];
+
+const ids = (...devices: { id: string }[]) => devices.map((d) => d.id);
+
+/** `pagedConfig` with the button called `id` changed. */
+const editPaged = (id: string, change: Partial<ButtonConfig>): Config => ({
+  ...pagedConfig,
+  button: pagedConfig.button.map((b) =>
+    b.id === id ? { ...b, ...change } : b,
+  ),
+});
+
+test("layoutChanged counts the page ids in order and each button's page, never a label", () => {
+  assert.equal(layoutChanged(pagedConfig, pagedConfig), false);
+  // A label is config only.
+  assert.equal(
+    layoutChanged(pagedConfig, renamePage(pagedConfig, 1, "Films")),
+    false,
+  );
+  assert.equal(
+    layoutChanged(pagedConfig, renamePage(pagedConfig, 1, "")),
+    false,
+  );
+  // An action edit on any page is not a layout change.
+  assert.equal(
+    layoutChanged(
+      pagedConfig,
+      editPaged("c", { action: { kind: "shell", argv: ["x"], timeout_s: 1 } }),
+    ),
+    false,
+  );
+  // A page added, a page's id, the order of the pages and a button's page all are.
+  assert.equal(layoutChanged(config, addPage(config)), true);
+  assert.equal(layoutChanged(pagedConfig, addPage(pagedConfig)), true);
+  const renamedId = {
+    ...pagedConfig,
+    page: [{ id: "main" }, { id: "films" }],
+    button: pagedConfig.button.map((b) =>
+      b.page === "media" ? { ...b, page: "films" } : b,
+    ),
+  };
+  assert.equal(layoutChanged(pagedConfig, renamedId), true);
+  assert.equal(layoutChanged(pagedConfig, movePage(pagedConfig, 1, -1)), true);
+  assert.equal(
+    layoutChanged(pagedConfig, editPaged("b", { page: "media" })),
+    true,
+  );
+  assert.equal(
+    layoutChanged(pagedConfig, editPaged("c", { label: "C!" })),
+    true,
+  );
+});
+
+test("layoutTargets compares each device's view, as the daemon does", () => {
+  // An edit on page 2 reaches only the devices that have pages.
+  const onSecond = editPaged("c", { label: "Films" });
+  assert.deepEqual(
+    layoutTargets(pagedConfig, onSecond, everyone),
+    ids(bothCaps, pagesOnly),
+  );
+  // An edit on the home page reaches every connected device.
+  const onHome = editPaged("a", { label: "Home" });
+  assert.deepEqual(
+    layoutTargets(pagedConfig, onHome, everyone),
+    ids(...everyone),
+  );
+  // From 1 page to 2 with no icon on the home page: only the pages devices get a new layout. The
+  // others see the same home page, and `paged` only resizes icons.
+  assert.deepEqual(
+    layoutTargets(config, addPage(config), everyone),
+    ids(bothCaps, pagesOnly),
+  );
+  assert.deepEqual(
+    layoutTargets(addPage(config), config, everyone),
+    ids(bothCaps, pagesOnly),
+  );
+  // With an icon on the home page its box changes size, so every device is sent a layout.
+  const iconed: Config = {
+    ...config,
+    button: [{ ...config.button[0], icon: "a.png" }, config.button[1]],
+  };
+  assert.deepEqual(
+    layoutTargets(iconed, addPage(iconed), everyone),
+    ids(...everyone),
+  );
+  assert.deepEqual(
+    layoutTargets(addPage(iconed), iconed, everyone),
+    ids(...everyone),
+  );
+  // A font-only edit on page 2 reaches only the devices with both capabilities.
+  const fontOnSecond = editPaged("c", { font: "orbitron" });
+  assert.deepEqual(
+    layoutTargets(pagedConfig, fontOnSecond, everyone),
+    ids(bothCaps),
+  );
+  // A font-only edit on page 1 reaches the devices with fonts.
+  const fontOnHome = editPaged("a", { font: "orbitron" });
+  assert.deepEqual(
+    layoutTargets(pagedConfig, fontOnHome, everyone),
+    ids(bothCaps, fontsOnly),
+  );
+  // A label edit, or an action edit, reaches nobody.
+  assert.deepEqual(
+    layoutTargets(pagedConfig, renamePage(pagedConfig, 0, "Home"), everyone),
+    [],
+  );
+  assert.deepEqual(layoutTargets(pagedConfig, pagedConfig, everyone), []);
+  // Moving a button from page 2 to the home page changes the home view too.
+  assert.deepEqual(
+    layoutTargets(
+      pagedConfig,
+      editPaged("c", { page: "main", pos: [2, 2] }),
+      everyone,
+    ),
+    ids(...everyone),
+  );
+  // Offline devices are never targets.
+  assert.deepEqual(
+    layoutTargets(pagedConfig, onHome, [{ ...bothCaps, connected: false }]),
+    [],
+  );
+});
+
+test("a single [[page]] table, or a rename of the only page, changes nothing a device sees", () => {
+  const solo = { ...config, page: [{ id: "main" }] };
+  assert.equal(layoutChanged(config, solo), false);
+  assert.equal(layoutChanged(solo, { ...solo, page: [{ id: "home" }] }), false);
+  assert.deepEqual(layoutTargets(config, solo, everyone), []);
+  // Adding the second page does change it.
+  assert.equal(layoutChanged(solo, addPage(solo)), true);
+});
+
+test("page problems land on the page tabs, a button's page problem on its page select, counts on the grid", () => {
+  const map = mapErrors(
+    [
+      'page "media": label is 25 characters, at most 24',
+      'page "media": label must be printable ASCII',
+      'page "main": another page has this id',
+      'button "c": page "nope" is not one of the [[page]] ids',
+      'button "b": page "x" is set, but the file has no [[page]] tables',
+      "5 pages, at most 4",
+      "41 tiles across all pages, at most 40",
+    ],
+    ["a", "b", "c"],
+    ["main", "media"],
+  );
+  assert.deepEqual(map.pages.get("media"), [
+    "label is 25 characters, at most 24",
+    "label must be printable ASCII",
+  ]);
+  assert.deepEqual(map.pages.get("main"), ["another page has this id"]);
+  assert.equal(map.buttons.get("c")?.page?.length, 1);
+  assert.equal(map.buttons.get("b")?.page?.length, 1);
+  assert.deepEqual(map.grid, [
+    "5 pages, at most 4",
+    "41 tiles across all pages, at most 40",
+  ]);
+  assert.deepEqual(map.general, []);
+  assert.equal(hasErrors(map), true);
+  // Only a page error is still an error.
+  assert.equal(hasErrors(mapErrors(['page "x": label is empty'])), true);
+  // A page the draft doesn't have goes to the general list, whole.
+  const stray = mapErrors(['page "gone": label is empty'], [], ["main"]);
+  assert.deepEqual(stray.general, ['page "gone": label is empty']);
+  assert.equal(stray.pages.size, 0);
+  // A page id with a Rust escape reads back as written.
+  assert.ok(mapErrors(['page "a\\"b": label is empty']).pages.has('a"b'));
+});
+
+test("adding the first page writes [[page]] tables, and deleting back to one removes them", () => {
+  const two = addPage(config);
+  assert.deepEqual(two.page, [{ id: "main" }, { id: "page-2" }]);
+  // The buttons were on the implicit page, and still are, without a key.
+  assert.deepEqual(two.button, config.button);
+  assert.equal(pageCount(two), 2);
+  // Back to one: the file is in its old form, no `page` key anywhere.
+  const back = removePage(two, 1);
+  assert.equal(canon(back), canon(config));
+  assert.equal("page" in back, false);
+  // With keys on the buttons, they go too.
+  const keyed = removePage(editPaged("b", { page: "main" }), 1);
+  assert.equal("page" in keyed, false);
+  assert.ok(keyed.button.every((b) => !("page" in b)));
+  assert.deepEqual(
+    keyed.button.map((b) => b.id),
+    ["a", "b"],
+  );
+});
+
+test("a fifth page is refused and ids stay free", () => {
+  let c = config;
+  for (let i = 0; i < 6; i++) {
+    c = addPage(c);
+  }
+  assert.equal(pageCount(c), 4);
+  assert.deepEqual(
+    c.page?.map((p) => p.id),
+    ["main", "page-2", "page-3", "page-4"],
+  );
+  // A taken id is skipped.
+  const taken = addPage({
+    ...config,
+    page: [{ id: "main" }, { id: "page-3" }],
+  });
+  assert.deepEqual(
+    taken.page?.map((p) => p.id),
+    ["main", "page-3", "page-4"],
+  );
+});
+
+test("deleting a page of three keeps the tables and drops only its buttons", () => {
+  const three = addPage(pagedConfig);
+  const gone = removePage(three, 1);
+  assert.deepEqual(
+    gone.page?.map((p) => p.id),
+    ["main", "page-3"],
+  );
+  assert.deepEqual(
+    gone.button.map((b) => b.id),
+    ["a", "b"],
+  );
+  assert.deepEqual(
+    buttonsOnPage(three, 1).map((b) => b.id),
+    ["c"],
+  );
+  // Deleting the home page: the buttons without a `page` were on it.
+  const noHome = removePage(three, 0);
+  assert.deepEqual(
+    noHome.button.map((b) => b.id),
+    ["c"],
+  );
+  assert.deepEqual(
+    noHome.page?.map((p) => p.id),
+    ["media", "page-3"],
+  );
+});
+
+test("moving the first page keeps the buttons that had no page key where they were", () => {
+  const moved = movePage(pagedConfig, 0, 1);
+  assert.deepEqual(
+    moved.page?.map((p) => p.id),
+    ["media", "main"],
+  );
+  const b = moved.button.find((x) => x.id === "b");
+  assert.equal(b?.page, "main");
+  assert.equal(pageIndexOf(moved, b as ButtonConfig), 1);
+  // The ends stay put.
+  assert.equal(movePage(pagedConfig, 0, -1), pagedConfig);
+  assert.equal(movePage(pagedConfig, 1, 1), pagedConfig);
+});
+
+test("a name is the label, an empty name removes it, and the tab falls back to the id", () => {
+  const named = renamePage(pagedConfig, 0, "Home");
+  assert.deepEqual(named.page?.[0], { id: "main", label: "Home" });
+  assert.deepEqual(named.page?.[1], pagedConfig.page?.[1]);
+  const cleared = renamePage(named, 0, "");
+  assert.deepEqual(cleared.page?.[0], { id: "main" });
+  assert.equal("label" in (cleared.page?.[0] ?? {}), false);
+  assert.equal(pageName({ id: "main" }), "main");
+  assert.equal(pageName({ id: "media", label: "Media" }), "Media");
+});
+
+test("a move swaps within a page, and a cell on another page is not in the way", () => {
+  // `a` (main) and `c` (media) share cell 0,0.
+  const swapped = moveButton(pagedConfig, 0, [1, 0]);
+  assert.deepEqual(
+    swapped.button.map((b) => b.pos),
+    [
+      [1, 0],
+      [0, 0],
+      [0, 0],
+    ],
+  );
+  // Which button holds a cell on a page, for the form's refusal.
+  assert.equal(buttonAt(pagedConfig, 1, [0, 0])?.id, "c");
+  assert.equal(buttonAt(pagedConfig, 0, [0, 0])?.id, "a");
+  assert.equal(buttonAt(pagedConfig, 0, [0, 0], 0), undefined);
+  assert.equal(buttonAt(pagedConfig, 1, [1, 0]), undefined);
 });

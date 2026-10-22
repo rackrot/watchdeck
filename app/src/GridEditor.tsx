@@ -8,11 +8,17 @@ import {
 } from "react";
 import type { TileReading } from "./api";
 import ButtonPreview from "./ButtonPreview";
-import type { Config } from "./config";
-import { canon, moveButton, withGridFont } from "./edit";
+import type { ButtonConfig, Config } from "./config";
+import {
+  canon,
+  moveButton,
+  pageCount,
+  pageIndexOf,
+  withGridFont,
+} from "./edit";
 import type { FieldErrors } from "./errors";
 import { Field, FontSelect, NumberField, Problems } from "./fields";
-import { DEFAULT_FONT, resolveFonts } from "./fonts";
+import { DEFAULT_FONT, fontInfo, resolveFonts, slotFont } from "./fonts";
 import {
   cellAt,
   cellRect,
@@ -21,6 +27,8 @@ import {
   layoutButton,
   MAX_COLS,
   MAX_ROWS,
+  PAGER_H,
+  pagerLabel,
   SCREEN_W,
   type TileState,
 } from "./preview";
@@ -32,6 +40,8 @@ type Drag = { index: number; moved: boolean; over: [number, number] | null };
 
 type Props = {
   config: Config;
+  /** The page shown, from 0. */
+  page: number;
   selected: number | null;
   /** Rust's complaints, by button id. */
   errors: Map<string, FieldErrors>;
@@ -62,6 +72,7 @@ function useWidth() {
 
 export default function GridEditor({
   config,
+  page,
   selected,
   errors,
   gridProblems,
@@ -79,14 +90,21 @@ export default function GridEditor({
   const { cols, rows } = config.layout;
   const gridOk = cols >= 1 && rows >= 1 && cols <= MAX_COLS && rows <= MAX_ROWS;
   const scale = Math.min(1, stageWidth / SCREEN_W);
-  const cell = gridOk ? cellSize(cols, rows) : null;
+  const pages = pageCount(config);
+  const paged = pages >= 2;
+  const cell = gridOk ? cellSize(cols, rows, paged) : null;
   const inside = (pos: [number, number]) => pos[0] < cols && pos[1] < rows;
+  const onPage = (b: ButtonConfig) => pageIndexOf(config, b) === page;
   const taken = new Set(
-    config.button.filter((b) => inside(b.pos)).map((b) => `${b.pos}`),
+    config.button
+      .filter((b) => onPage(b) && inside(b.pos))
+      .map((b) => `${b.pos}`),
   );
   const outside = config.button
     .map((b, index) => ({ b, index }))
-    .filter(({ b }) => !inside(b.pos));
+    .filter(({ b }) => onPage(b) && !inside(b.pos));
+  const pager = pagerLabel(page, pages);
+  const pagerFont = slotFont(config.layout.font, 24);
 
   function toGrid(e: PointerEvent): [number, number] {
     const box = screen.current?.getBoundingClientRect();
@@ -114,7 +132,11 @@ export default function GridEditor({
       Math.hypot(e.clientX - press.current.x, e.clientY - press.current.y) >
         DRAG_SLOP;
     const [x, y] = toGrid(e);
-    setDrag({ ...drag, moved, over: moved ? cellAt(x, y, cols, rows) : null });
+    setDrag({
+      ...drag,
+      moved,
+      over: moved ? cellAt(x, y, cols, rows, paged) : null,
+    });
   }
 
   function up() {
@@ -232,7 +254,7 @@ export default function GridEditor({
           {cells}
           {cell &&
             config.button.map((b, index) => {
-              if (!inside(b.pos)) {
+              if (!onPage(b) || !inside(b.pos)) {
                 return null;
               }
               const found = reading(index);
@@ -256,6 +278,7 @@ export default function GridEditor({
                     rows,
                     found?.text,
                     resolveFonts(config.layout, b),
+                    paged,
                   )}
                   tile={tile}
                   iconSrc={b.icon ? iconUrl(b.icon) : null}
@@ -265,6 +288,20 @@ export default function GridEditor({
                 />
               );
             })}
+          {pager && (
+            // The strip under the grid, in the grid's font (ui.c puts the same text in a slot-24 line).
+            <div
+              className="dev-pager"
+              style={{
+                top: GRID_H - PAGER_H,
+                fontFamily: fontInfo(config.layout.font).family,
+                fontSize: pagerFont.px,
+                lineHeight: `${pagerFont.lineHeight}px`,
+              }}
+            >
+              {pager}
+            </div>
+          )}
         </div>
       </div>
 

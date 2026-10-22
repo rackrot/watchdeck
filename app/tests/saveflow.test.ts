@@ -68,6 +68,26 @@ test("the replace notice says what is written and where the old text goes", () =
   assert.ok(good.includes("last good config"), good);
 });
 
+test("the replace notice names the page count from 2 pages on", () => {
+  const page = (id: string) => ({ id });
+  const one = replaceNotice(
+    { ...view, errors: ["bad"] },
+    {
+      ...config,
+      page: [page("main")],
+    },
+  );
+  assert.ok(!one.includes("pages"), one);
+  const three = replaceNotice(
+    { ...view, errors: ["bad"] },
+    {
+      ...config,
+      page: [page("main"), page("b"), page("c")],
+    },
+  );
+  assert.ok(three.includes("5x3 grid with 0 buttons on 3 pages"), three);
+});
+
 test("a button can be tested only when the draft matches the saved one", () => {
   const button: ButtonConfig = {
     id: "a",

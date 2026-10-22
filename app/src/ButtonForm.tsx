@@ -12,6 +12,12 @@ type Props = {
   button: ButtonConfig;
   /** The grid's font id (`layout.font`), which a button without its own font inherits. */
   gridFont: string | undefined;
+  /** The pages, as `[[page]]` ids and the names their tabs show. The select shows with 2 or more. */
+  pages: { id: string; name: string }[];
+  /** The id of the page the button is on. */
+  pageId: string;
+  /** The id of the button in this button's cell on page `id`, if there is one. */
+  occupant: (id: string) => string | undefined;
   onChange: (button: ButtonConfig) => void;
   onDelete: () => void;
   /** Rust's complaints about this button, from the last save. */
@@ -63,6 +69,9 @@ function ColorField({
 export default function ButtonForm({
   button,
   gridFont,
+  pages,
+  pageId,
+  occupant,
   onChange,
   onDelete,
   errors,
@@ -90,6 +99,20 @@ export default function ButtonForm({
     onLocalProblems([...dupes.action, ...dupes.source]);
     return () => onLocalProblems([]);
   }, [dupes, onLocalProblems]);
+  // Why a move to another page was refused, until the next try.
+  const [moveRefused, setMoveRefused] = useState("");
+  function moveTo(id: string) {
+    const other = occupant(id);
+    if (other !== undefined) {
+      const name = pages.find((p) => p.id === id)?.name ?? id;
+      setMoveRefused(
+        `Not moved: column ${button.pos[0]}, row ${button.pos[1]} on ${name} is taken by ${other}. Move one of them first.`,
+      );
+      return;
+    }
+    setMoveRefused("");
+    set({ page: id });
+  }
   const [testing, setTesting] = useState(false);
   const [test, setTest] = useState<
     { result: ActionResult } | { error: string } | null
@@ -127,6 +150,8 @@ export default function ButtonForm({
         </button>
       </div>
       <Problems list={errors.button} />
+      {/* With fewer than 2 pages there is no select, so a complaint about `page` shows here. */}
+      {pages.length < 2 && <Problems list={errors.page} />}
 
       <section>
         <h4>Look</h4>
@@ -161,6 +186,26 @@ export default function ButtonForm({
               onChange={(row) => set({ pos: [button.pos[0], row] })}
             />
           </Field>
+          {pages.length >= 2 && (
+            <Field
+              label="Page"
+              problems={[
+                ...(errors.page ?? []),
+                ...(moveRefused ? [moveRefused] : []),
+              ]}
+            >
+              <select
+                value={pageId}
+                onChange={(e) => moveTo(e.currentTarget.value)}
+              >
+                {pages.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          )}
           <ColorField
             label="Background"
             value={button.bg}

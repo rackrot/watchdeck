@@ -1,7 +1,7 @@
 // Pure helpers behind the editor: turning form rows into config values, moving a button, and
 // telling a change the device draws from one it doesn't.
 
-import type { ButtonConfig, Config } from "./config";
+import type { ButtonConfig, Config, PageConfig } from "./config";
 import { DEFAULT_FONT, resolveFonts } from "./fonts.ts";
 
 export type Row = { name: string; value: string };
@@ -38,28 +38,147 @@ export function parseWhole(text: string): number {
   return /^\d+$/.test(text.trim()) ? Number(text) : Number.NaN;
 }
 
+/** The most pages a config can have (`MAX_PAGES` in config.rs). */
+export const MAX_PAGES = 4;
+
+/** How many pages the config has: 1 without `[[page]]` tables. */
+export const pageCount = (config: Config): number =>
+  Math.max(1, config.page?.length ?? 0);
+
+/** What a page's tab shows: its label, else its id. */
+export const pageName = (page: PageConfig): string => page.label ?? page.id;
+
+/** The page a button is on. One without `page` is on the first page, and so is a stray name. */
+export function pageIndexOf(config: Config, button: ButtonConfig): number {
+  const i = config.page?.findIndex((p) => p.id === button.page) ?? -1;
+  return Math.max(0, i);
+}
+
+/** The button in cell `pos` of page `page`, other than number `except`, or undefined. */
+export function buttonAt(
+  config: Config,
+  page: number,
+  pos: [number, number],
+  except?: number,
+): ButtonConfig | undefined {
+  return config.button.find(
+    (b, i) =>
+      i !== except &&
+      pageIndexOf(config, b) === page &&
+      b.pos[0] === pos[0] &&
+      b.pos[1] === pos[1],
+  );
+}
+
 /**
- * Moves button number `index` to `to`. If another button is there the two swap, so a move never
- * makes an overlap.
+ * Moves button number `index` to `to`. If another button of its page is there the two swap, so a
+ * move never makes an overlap.
  */
 export function moveButton(
   config: Config,
   index: number,
   to: [number, number],
 ): Config {
-  const from = config.button[index]?.pos;
-  if (!from) {
+  const mover = config.button[index];
+  if (!mover) {
     return config;
   }
+  const from = mover.pos;
+  const page = pageIndexOf(config, mover);
   return {
     ...config,
     button: config.button.map((b, i) => {
       if (i === index) {
         return { ...b, pos: to };
       }
-      return b.pos[0] === to[0] && b.pos[1] === to[1] ? { ...b, pos: from } : b;
+      const there =
+        pageIndexOf(config, b) === page &&
+        b.pos[0] === to[0] &&
+        b.pos[1] === to[1];
+      return there ? { ...b, pos: from } : b;
     }),
   };
+}
+
+/** `[[page]]` ids are 1 to 63 characters; a new page is `page-2` or the next free number. */
+function freePageId(pages: PageConfig[]): string {
+  const ids = new Set(pages.map((p) => p.id));
+  let n = pages.length + 1;
+  while (ids.has(`page-${n}`)) {
+    n++;
+  }
+  return `page-${n}`;
+}
+
+/**
+ * Adds a page at the end. The first one turns the implicit page into `[[page]] id = "main"`, and
+ * the buttons without a `page` stay on it. A fifth page is refused: the config comes back as it was.
+ */
+export function addPage(config: Config): Config {
+  const pages = config.page ?? [];
+  if (pageCount(config) >= MAX_PAGES) {
+    return config;
+  }
+  const base = pages.length === 0 ? [{ id: "main" }] : pages;
+  return { ...config, page: [...base, { id: freePageId(base) }] };
+}
+
+/** Sets page `index`'s label. An empty label is removed, since the daemon refuses one. */
+export function renamePage(
+  config: Config,
+  index: number,
+  label: string,
+): Config {
+  return {
+    ...config,
+    page: config.page?.map((p, i) => {
+      if (i !== index) {
+        return p;
+      }
+      const { label: _, ...rest } = p;
+      return label === "" ? rest : { ...rest, label };
+    }),
+  };
+}
+
+/**
+ * Swaps page `index` with its neighbour `by` places away (-1 or 1). Buttons without a `page` are on
+ * the first page, so they are given its id first: a move of the first page must not carry them along.
+ */
+export function movePage(config: Config, index: number, by: -1 | 1): Config {
+  const pages = config.page;
+  const to = index + by;
+  if (!pages?.[index] || !pages[to]) {
+    return config;
+  }
+  const home = pages[0].id;
+  const next = [...pages];
+  [next[index], next[to]] = [next[to], next[index]];
+  return {
+    ...config,
+    page: next,
+    button: config.button.map((b) =>
+      b.page === undefined ? { ...b, page: home } : b,
+    ),
+  };
+}
+
+/** The buttons on page `index`. */
+export const buttonsOnPage = (config: Config, index: number): ButtonConfig[] =>
+  config.button.filter((b) => pageIndexOf(config, b) === index);
+
+/**
+ * Deletes page `index` and its buttons. Down to one page, the `[[page]]` tables and every `page`
+ * key go too, so the file is in the form it had before it had pages.
+ */
+export function removePage(config: Config, index: number): Config {
+  const pages = config.page?.filter((_, i) => i !== index);
+  const button = config.button.filter((b) => pageIndexOf(config, b) !== index);
+  if (!pages || pages.length < 2) {
+    const { page: _, ...rest } = config;
+    return { ...rest, button: button.map(({ page: _p, ...b }) => b) };
+  }
+  return { ...config, page: pages, button };
 }
 
 /** JSON with sorted keys, so two values compare equal whatever order their keys were made in. */
@@ -89,18 +208,45 @@ function drawn(b: ButtonConfig, layout: Config["layout"]) {
   ];
 }
 
-/** Whether going from `a` to `b` changes the layout a device is sent. An action edit doesn't. */
-export function layoutChanged(a: Config, b: Config): boolean {
-  const key = (c: Config) =>
-    JSON.stringify([
-      c.layout.cols,
-      c.layout.rows,
-      // The message carries the grid's font even when no button shows it.
-      c.layout.font ?? DEFAULT_FONT,
-      c.button.map((button) => drawn(button, c.layout)),
-    ]);
-  return key(a) !== key(b);
+/** What a device names in `hello.caps` that changes the layout it is sent. */
+type Caps = { pages: boolean; fonts: boolean };
+
+/**
+ * What the daemon sends a session, as a key (`Layout` and its views in config.rs): each page's id
+ * and buttons, in order. A view of one page has no page id, so a single `[[page]]` table, or a
+ * rename of the first page, changes nothing in it. A page's label never counts. `paged` is in the
+ * key because icons are drawn for a shorter cell with 2 or more pages, so their ids change.
+ */
+function viewKey(config: Config, caps: Caps): string {
+  const c = caps.fonts ? config : withoutFonts(config);
+  const count = pageCount(c);
+  // Without "pages" a device is sent the first page only.
+  const sent = caps.pages ? count : 1;
+  const pages = Array.from({ length: sent }, (_, i) => [
+    sent > 1 ? (c.page?.[i]?.id ?? "") : "",
+    buttonsOnPage(c, i).map((button) => drawn(button, c.layout)),
+  ]);
+  const sentIcons = Array.from({ length: sent }, (_, i) => i).some((i) =>
+    buttonsOnPage(c, i).some((b) => b.icon !== undefined),
+  );
+  return JSON.stringify([
+    c.layout.cols,
+    c.layout.rows,
+    // The message carries the grid's font even when no button shows it.
+    c.layout.font ?? DEFAULT_FONT,
+    // The message has no `paged` field: it only sizes icons, so it matters to a view that names
+    // one. Residual: a raster already smaller than its box keeps its id, so the daemon may still
+    // push nothing; the config can't tell.
+    count >= 2 && sentIcons,
+    pages,
+  ]);
 }
+
+const FULL: Caps = { pages: true, fonts: true };
+
+/** Whether going from `a` to `b` changes the layout a device is sent. An action edit doesn't. */
+export const layoutChanged = (a: Config, b: Config): boolean =>
+  viewKey(a, FULL) !== viewKey(b, FULL);
 
 /** `config` with every font key removed, to tell a font-only change from the rest. */
 function withoutFonts(config: Config): Config {
@@ -119,20 +265,24 @@ function withoutFonts(config: Config): Config {
 }
 
 /**
- * The devices a save pushes a layout to. A change to fonts alone reaches only those that have the
- * "fonts" capability: the daemon sends the others nothing, so waiting for them would fail.
+ * The devices a save pushes a layout to: those whose view of the layout changes, as the daemon
+ * compares them. A change to fonts alone reaches only the "fonts" devices, and one to a page after
+ * the first only the "pages" devices. The daemon sends the others nothing, so waiting for them
+ * would fail.
  */
 export function layoutTargets(
   before: Config,
   after: Config,
   devices: { id: string; connected: boolean; caps: string[] }[],
 ): string[] {
-  if (!layoutChanged(before, after)) {
-    return [];
-  }
-  const fontOnly = !layoutChanged(withoutFonts(before), withoutFonts(after));
   return devices
-    .filter((d) => d.connected && (!fontOnly || d.caps.includes("fonts")))
+    .filter((d) => {
+      const caps = {
+        pages: d.caps.includes("pages"),
+        fonts: d.caps.includes("fonts"),
+      };
+      return d.connected && viewKey(before, caps) !== viewKey(after, caps);
+    })
     .map((d) => d.id);
 }
 

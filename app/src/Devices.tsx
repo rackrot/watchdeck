@@ -82,6 +82,14 @@ export default function Devices({
               Montserrat. Update its firmware.
             </p>
           ))}
+        {devices
+          .filter((d) => d.connected && !d.caps.includes("pages"))
+          .map((d) => (
+            <p key={d.id} className="muted">
+              <span className="mono">{d.id}</span> shows page 1 only. Update its
+              firmware.
+            </p>
+          ))}
         <button
           type="button"
           onClick={() => {

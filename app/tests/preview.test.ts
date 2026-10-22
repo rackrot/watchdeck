@@ -13,7 +13,18 @@ import {
   labelLines,
   layoutButton,
   PAGER_H,
+  pagerLabel,
 } from "../src/preview.ts";
+
+test("the preview of a 5x3 grid is 44 px icons and no label, and with 2 pages 33 px and the label", () => {
+  const preview = (pages: number, page: number) => ({
+    icon: iconBox(5, 3, pages >= 2),
+    label: pagerLabel(page, pages),
+  });
+  assert.deepEqual(preview(1, 0), { icon: 44, label: null });
+  assert.deepEqual(preview(2, 0), { icon: 33, label: "Page 1 of 2" });
+  assert.equal(pagerLabel(2, 4), "Page 3 of 4");
+});
 
 test("cells match build_grid on the grids the firmware was checked with", () => {
   assert.deepEqual(cellSize(5, 3), { w: 195, h: 124 });

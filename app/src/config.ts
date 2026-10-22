@@ -42,14 +42,25 @@ export type ButtonConfig = {
   icon?: string;
   /** A font id for the label, and for the tile value unless `tile.font` says otherwise. Absent: the grid's font. */
   font?: string;
+  /** A `[[page]]` id. Absent: the first page. Only with `Config.page` tables. */
+  page?: string;
   action: Action;
   tile?: TileConfig;
+};
+
+/** A `[[page]]` table. */
+export type PageConfig = {
+  id: string;
+  /** What the editor's tab shows instead of the id. Config only: it never reaches a device. */
+  label?: string;
 };
 
 export type Config = {
   version: number;
   /** `font` is the grid's default font id. Absent: Montserrat. */
   layout: { cols: number; rows: number; font?: string };
+  /** The TOML array of tables is `[[page]]`. Absent: one page. With tables: 1 to 4, the first is home. */
+  page?: PageConfig[];
   /** The TOML array of tables is `[[button]]`. */
   button: ButtonConfig[];
 };
@@ -102,10 +113,16 @@ function freeId(taken: ButtonConfig[]): string {
   return `button-${n}`;
 }
 
-export function newButton(config: Config, pos: [number, number]): ButtonConfig {
+/** A new button at `pos`, on `page` (a `[[page]]` id) when the config has page tables. */
+export function newButton(
+  config: Config,
+  pos: [number, number],
+  page?: string,
+): ButtonConfig {
   return {
     id: freeId(config.button),
     pos,
+    ...(page !== undefined && { page }),
     label: "New",
     bg: "#1e88e5",
     fg: "#ffffff",
