@@ -86,7 +86,16 @@ export default function ButtonPreview({
           src={iconSrc}
           alt=""
           draggable={false}
-          style={{ maxWidth: layout.icon, maxHeight: layout.icon }}
+          style={
+            iconSrc.endsWith(".svg")
+              ? // The device draws an SVG to fill its box, so the preview does too.
+                {
+                  width: layout.icon,
+                  height: layout.icon,
+                  objectFit: "contain",
+                }
+              : { maxWidth: layout.icon, maxHeight: layout.icon }
+          }
           onError={() => setFailed(iconSrc)}
         />
       )}

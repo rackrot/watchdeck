@@ -164,7 +164,7 @@ pub async fn test_action(
     daemon.devices.test_press(&button).await
 }
 
-/// Asks the user for a PNG, JPEG or WebP in a native file dialog, copies it into the icons
+/// Asks the user for a PNG, JPEG, WebP or SVG in a native file dialog, copies it into the icons
 /// directory and returns the file name for a button's `icon`, or `None` if they cancel. The
 /// dialog is opened here, so the window never names a path, and the file must pass the same size
 /// and decoding checks as a configured icon.
@@ -177,7 +177,7 @@ pub async fn import_icon(
     app.dialog()
         .file()
         .set_title("Import an icon")
-        .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
+        .add_filter("Images", &["png", "jpg", "jpeg", "webp", "svg"])
         .pick_file(move |picked| {
             // The receiver only goes away if the command was dropped.
             let _ = tx.send(picked);
