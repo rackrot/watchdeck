@@ -35,7 +35,6 @@ use watchdeck_lib::daemon::pairing::{Pairing, PairingState};
 use watchdeck_lib::daemon::protocol::{
     decode_hex, encode_hex, pairing_code, ErrorCode, IconFrame, Message, Report, TileState, Token,
 };
-use watchdeck_lib::daemon::reporting::{self, Reporting};
 use watchdeck_lib::daemon::secrets::Secrets;
 use watchdeck_lib::daemon::server::{DaemonEvent, DeviceInfo, Devices, Server};
 use watchdeck_lib::daemon::store::Store;
@@ -142,16 +141,6 @@ impl Daemon {
 /// A daemon on an ephemeral port with `DEVICE` paired and `config` as its `config.toml`, whose
 /// pairing listener binds `pair_addr` for at most `window` once started.
 async fn start_with(pair_addr: SocketAddr, window: Duration, config: &str) -> Daemon {
-    start_reporting(pair_addr, window, config, None).await
-}
-
-/// [`start_with`] with device reports going to `reporting`.
-async fn start_reporting(
-    pair_addr: SocketAddr,
-    window: Duration,
-    config: &str,
-    reporting: Option<Reporting>,
-) -> Daemon {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join(config::FILE), config).unwrap();
     let secrets = Arc::new(Secrets::new(dir.path()));
@@ -163,16 +152,9 @@ async fn start_reporting(
     let actions = Actions::new(secrets.clone(), dir.path().to_path_buf()).unwrap();
     let tls = identity().server_config().unwrap();
     let store = Store::load(dir.path()).unwrap();
-    let server = Server::bind(
-        "127.0.0.1:0",
-        tls,
-        store,
-        configs.subscribe(),
-        actions,
-        reporting,
-    )
-    .await
-    .unwrap();
+    let server = Server::bind("127.0.0.1:0", tls, store, configs.subscribe(), actions)
+        .await
+        .unwrap();
     let devices = server.devices();
     devices.pair(DEVICE, Sha256::digest(TOKEN).into()).unwrap();
     let pairing = Pairing::new(
@@ -1640,7 +1622,7 @@ async fn assert_next_is_a_press_result(c: &mut Client) {
 }
 
 #[tokio::test]
-async fn a_report_is_logged_once_then_acked_with_sentry_off() {
+async fn a_report_is_logged_once_then_acked() {
     install_logger();
     let elf = "c0".repeat(32);
     let daemon = start().await;
@@ -1729,36 +1711,6 @@ async fn a_report_without_a_usable_id_is_dropped_unacked_and_the_session_goes_on
         .await
         .unwrap();
     assert_eq!(recv(&mut c).await, ack("00000003"));
-}
-
-#[tokio::test]
-async fn a_report_is_acked_when_sentry_is_on_even_if_the_budget_refuses_it() {
-    install_logger();
-    let elf = "c3".repeat(32);
-    let dir = tempfile::tempdir().unwrap();
-    let secrets = Arc::new(Secrets::new(dir.path()));
-    // A loopback DSN with nothing listening: the client queues the event and the send fails
-    // quietly, which is all this test needs.
-    let sentry = config::SentryConfig {
-        dsn: "http://key@127.0.0.1:9/1".into(),
-        pii: false,
-    };
-    let reporting = reporting::start(Some(&sentry), secrets).unwrap();
-    let daemon = start_reporting(
-        "127.0.0.1:0".parse().unwrap(),
-        Duration::from_secs(30),
-        CONFIG,
-        Some(reporting.clone()),
-    )
-    .await;
-    // The same crash in two sessions: the second is over the per-device cap.
-    for id in ["00000001", "00000002"] {
-        let mut c = handshake(daemon.addr, DEVICE, &TOKEN).await;
-        c.send(report(crash_report(id, &elf))).await.unwrap();
-        assert_eq!(recv(&mut c).await, ack(id));
-    }
-    assert_eq!(accepted_lines(&elf).len(), 2);
-    reporting.close();
 }
 
 // ---- Icons ----

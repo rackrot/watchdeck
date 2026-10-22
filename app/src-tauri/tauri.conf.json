@@ -13,7 +13,6 @@
     "windows": [
       {
         "label": "main",
-        "create": false,
         "title": "watchdeck",
         "width": 800,
         "height": 600,

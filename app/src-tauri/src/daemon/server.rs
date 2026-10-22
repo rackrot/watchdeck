@@ -28,7 +28,6 @@ use super::protocol::{
     decode_hex, encode_hex, valid_device_id, ErrorCode, Message, Report, Token, ICON_ID_BYTES,
     MAX_MESSAGE_BYTES, MAX_REPORTS_PER_SESSION, TOKEN_BYTES, VERSION,
 };
-use super::reporting::Reporting;
 use super::store::Store;
 use super::tiles::{self, Sent, Tiles, Values};
 
@@ -98,8 +97,6 @@ struct Shared {
     next_id: AtomicU64,
     /// Polls the tiles while a session is open, and holds their latest values.
     tiles: Tiles,
-    /// Where device reports go. Without it they are logged and acked only.
-    reporting: Option<Reporting>,
     /// One lock, so a session is only ever registered under a pairing that still exists.
     registry: Mutex<Registry>,
 }
@@ -115,15 +112,13 @@ struct Registry {
 impl Server {
     /// Sessions show the layout of the live config in `config`, and push it again whenever it
     /// changes. Presses run through `actions`, which also poll the config's tiles for as long as
-    /// a session is open. Device crash reports go to `reporting` when it is set. Must run inside a
-    /// tokio runtime.
+    /// a session is open. Must run inside a tokio runtime.
     pub async fn bind(
         addr: impl ToSocketAddrs,
         tls: Arc<ServerConfig>,
         store: Store,
         config: watch::Receiver<Arc<Live>>,
         actions: Actions,
-        reporting: Option<Reporting>,
     ) -> io::Result<Self> {
         let hostname = gethostname::gethostname().to_string_lossy().into_owned();
         let (events, _) = broadcast::channel(64);
@@ -140,7 +135,6 @@ impl Server {
                 events,
                 next_id: AtomicU64::new(0),
                 tiles,
-                reporting,
                 registry: Mutex::new(Registry {
                     store,
                     sessions: HashMap::new(),
@@ -597,7 +591,7 @@ where
         screen[0],
         screen[1]
     );
-    let outcome = serve(tx, rx, kick, shared, &device, &fw).await;
+    let outcome = serve(tx, rx, kick, shared, &device).await;
     shared.unregister(&device, id);
     outcome
 }
@@ -681,15 +675,13 @@ impl TileFeed {
 
 /// The session after a good hello. Presses run as tasks of their own, so the session keeps
 /// reading (and answering pings) and pushing layouts and tiles while actions run. A run whose
-/// session has ended still finishes, and its result is dropped. `fw` is the version the device's
-/// `hello` named.
+/// session has ended still finishes, and its result is dropped.
 async fn serve<S>(
     tx: &mut WsSink<S>,
     rx: &mut WsRead<S>,
     mut kick: oneshot::Receiver<Kick>,
     shared: &Shared,
     device: &str,
-    fw: &str,
 ) -> Result<(), WsError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -859,11 +851,6 @@ where
                     }
                 } else {
                     log::warn!("{device}: {report}");
-                    if let Some(reporting) = &shared.reporting {
-                        if !reporting.device_report(device, fw, &report) {
-                            log::info!("{device}: report {} not sent, over budget", report.id);
-                        }
-                    }
                     send(tx, &Message::ReportAck { id: report.id }).await?;
                 }
             }

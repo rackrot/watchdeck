@@ -43,8 +43,6 @@ export type ButtonConfig = {
 export type Config = {
   version: number;
   layout: { cols: number; rows: number };
-  /** Opt-in error reporting. Edited by hand; the window only keeps it through a save. */
-  sentry?: { dsn: string; pii: boolean };
   /** The TOML array of tables is `[[button]]`. */
   button: ButtonConfig[];
 };

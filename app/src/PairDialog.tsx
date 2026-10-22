@@ -78,7 +78,6 @@ export default function PairDialog({
     // still closes the window on its own deadline.
     cancelPairing().catch((e) => {
       console.error("cancel_pairing failed:", e);
-      window.Sentry?.captureException(e);
     });
     onClose();
   }
