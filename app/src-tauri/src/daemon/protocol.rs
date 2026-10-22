@@ -9,14 +9,13 @@ use sha2::{Digest, Sha256};
 pub const VERSION: u32 = 1;
 
 /// The capabilities a session keeps from `hello.caps`; any other name is dropped.
-pub const CAPS: [&str; 2] = [CAP_FONTS, CAP_PAGES];
+pub const CAPS: [&str; 3] = [CAP_FONTS, CAP_PAGES, CAP_STATUS_BAR];
 /// The device draws every font in `fonts_gen::FONT_IDS` and reads the layout's font fields.
 pub const CAP_FONTS: &str = "fonts";
 /// The device assembles a set of up to 4 `layout` pages and lays out the shorter grid for 2 or
 /// more.
 pub const CAP_PAGES: &str = "pages";
-/// The device reads `stats` frames and shows the host's CPU, memory, network and clock. Not in
-/// [`CAPS`] until a session can send them.
+/// The device reads `stats` frames and shows the host's CPU, memory, network and clock.
 pub const CAP_STATUS_BAR: &str = "status_bar";
 
 /// Largest message, and largest frame, in either direction.

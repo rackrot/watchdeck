@@ -6,7 +6,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -2850,4 +2850,115 @@ async fn a_layout_ack_sent_before_an_icon_get_of_forty_ids_is_announced_before_t
         got.push(encode_hex(&recv_icon(&mut c).await.id));
     }
     assert_eq!(got, ids, "every frame, in the order asked");
+}
+
+/// The next `stats` frame and when it arrived, skipping other frames. Panics if none comes
+/// within `within`.
+async fn next_stats<S: AsyncRead + AsyncWrite + Unpin>(
+    c: &mut WebSocketStream<S>,
+    within: Duration,
+) -> (Message, Instant) {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let msg = tokio::time::timeout_at(deadline, recv(c))
+            .await
+            .unwrap_or_else(|_| panic!("no stats frame within {within:?}"));
+        if matches!(msg, Message::Stats { .. }) {
+            return (msg, Instant::now());
+        }
+    }
+}
+
+fn stats_time(msg: &Message) -> u64 {
+    let Message::Stats { time, .. } = msg else {
+        panic!("expected a stats frame, got {msg:?}")
+    };
+    *time
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// Opens a session whose hello names `caps`, and reads its welcome.
+async fn status_session(addr: SocketAddr, caps: &[&str]) -> Client {
+    let mut c = connect(addr).await;
+    c.send(hello_with_caps(1, DEVICE, Some(&TOKEN), caps))
+        .await
+        .unwrap();
+    assert!(matches!(recv(&mut c).await, Message::Welcome { .. }));
+    c
+}
+
+async fn wait_until_disconnected(devices: &Devices) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while devices.list().iter().any(|d| d.connected) {
+        assert!(
+            Instant::now() < deadline,
+            "the session did not close within 2 s"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_status_bar_session_gets_stats_within_two_seconds_then_about_once_a_second() {
+    let daemon = start().await;
+    let mut c = status_session(daemon.addr, &["fonts", "pages", "status_bar"]).await;
+
+    let (first, mut last) = next_stats(&mut c, Duration::from_secs(2)).await;
+    let time = stats_time(&first);
+    assert!(
+        time.abs_diff(unix_now()) <= 5,
+        "time {time} is not near now"
+    );
+    for _ in 0..3 {
+        let (_, at) = next_stats(&mut c, Duration::from_secs(3)).await;
+        let gap = at - last;
+        assert!(
+            gap >= Duration::from_millis(500) && gap < Duration::from_secs(2),
+            "stats came {gap:?} apart"
+        );
+        last = at;
+    }
+}
+
+#[tokio::test]
+async fn a_session_without_status_bar_gets_no_stats_in_three_seconds() {
+    let daemon = start().await;
+    let mut c = status_session(daemon.addr, &["fonts", "pages"]).await;
+    // The welcome and layout are read here too; only a stats frame fails the test.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while let Ok(msg) = tokio::time::timeout_at(deadline, recv(&mut c)).await {
+        assert!(!matches!(msg, Message::Stats { .. }), "{msg:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_session_opened_after_the_others_closed_gets_no_earlier_reading() {
+    let daemon = start().await;
+    let mut first = status_session(daemon.addr, &["status_bar"]).await;
+    next_stats(&mut first, Duration::from_secs(2)).await;
+    drop(first);
+    wait_until_disconnected(&daemon.devices).await;
+    // Long enough that the first session's last reading is older than this one's hello.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let before = unix_now();
+    let sent = Instant::now();
+    let mut second = status_session(daemon.addr, &["status_bar"]).await;
+    let (msg, at) = next_stats(&mut second, Duration::from_secs(3)).await;
+    assert!(
+        stats_time(&msg) >= before,
+        "a reading from before this session"
+    );
+    // The first reading of a period comes one second after its session opens.
+    assert!(
+        at - sent >= Duration::from_millis(900),
+        "a reading came {:?} after the hello",
+        at - sent
+    );
 }

@@ -22,11 +22,15 @@ use tokio_tungstenite::tungstenite::Bytes;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message as WsMessage};
 use tokio_tungstenite::{accept_async_with_config, WebSocketStream};
 
+use time::OffsetDateTime;
+
 use super::actions::{ActionResult, Actions, Run, MAX_RUNNING};
 use super::config::{Action, Layout, Live, MAX_COLS, MAX_ROWS};
+use super::hoststats::{self, HostStats};
 use super::protocol::{
     decode_hex, encode_hex, valid_device_id, ErrorCode, Message, Report, Token, CAPS, CAP_FONTS,
-    CAP_PAGES, ICON_ID_BYTES, MAX_MESSAGE_BYTES, MAX_REPORTS_PER_SESSION, TOKEN_BYTES, VERSION,
+    CAP_PAGES, CAP_STATUS_BAR, ICON_ID_BYTES, MAX_MESSAGE_BYTES, MAX_REPORTS_PER_SESSION,
+    TOKEN_BYTES, VERSION,
 };
 use super::store::Store;
 use super::tiles::{self, Sent, Tiles, Values};
@@ -100,6 +104,8 @@ struct Shared {
     next_id: AtomicU64,
     /// Polls the tiles while a session is open, and holds their latest values.
     tiles: Tiles,
+    /// The host's stats, sampled while a session is open. `None` between periods.
+    stats: watch::Receiver<Option<HostStats>>,
     /// One lock, so a session is only ever registered under a pairing that still exists.
     registry: Mutex<Registry>,
 }
@@ -134,6 +140,7 @@ impl Server {
         let (events, _) = broadcast::channel(64);
         let listener = TcpListener::bind(addr).await?;
         let (connected, polling) = watch::channel(0);
+        let stats = hoststats::spawn(polling.clone());
         let tiles = tiles::spawn(actions.clone(), config.clone(), polling);
         Ok(Self {
             listener,
@@ -145,6 +152,7 @@ impl Server {
                 events,
                 next_id: AtomicU64::new(0),
                 tiles,
+                stats,
                 registry: Mutex::new(Registry {
                     store,
                     sessions: HashMap::new(),
@@ -769,6 +777,11 @@ where
     let (done_tx, mut done_rx) = mpsc::channel::<Done>(MAX_RUNNING);
     let idle = sleep(IDLE_TIMEOUT);
     tokio::pin!(idle);
+    let status_bar = caps.iter().any(|cap| cap == CAP_STATUS_BAR);
+    // A clone starts out unseen, so the latest reading from before this session is marked seen
+    // here; only readings from now on are sent.
+    let mut stats = shared.stats.clone();
+    stats.borrow_and_update();
     loop {
         let incoming = tokio::select! {
             // The kick goes first, so presses queued behind a revocation never run.
@@ -801,6 +814,17 @@ where
                 let live = config.borrow().clone();
                 if let Some(kicked) = tiles.push(tx, &mut kick, &layout, &live).await? {
                     return end_kicked(tx, kicked, device).await;
+                }
+                continue;
+            }
+            Ok(()) = stats.changed(), if status_bar => {
+                // Copied out, so no watch guard is held across the send.
+                let reading = *stats.borrow_and_update();
+                if let Some(reading) = reading {
+                    let now = OffsetDateTime::now_utc();
+                    let time = u64::try_from(now.unix_timestamp()).unwrap_or_default();
+                    let offset = hoststats::utc_offset_seconds(now);
+                    send(tx, &stats_frame(reading, time, offset)).await?;
                 }
                 continue;
             }
@@ -942,6 +966,32 @@ fn icon_ids(ids: &[String]) -> Option<Vec<[u8; ICON_ID_BYTES]>> {
     ids.iter().map(|id| decode_hex(id)).collect()
 }
 
+/// Largest integer the wire carries exactly, 2^53 - 1 (`site/src/protocol.md`).
+const MAX_WIRE_INT: u64 = (1 << 53) - 1;
+/// The widest UTC offset the wire carries, in seconds either way (`site/src/protocol.md`).
+const MAX_UTC_OFFSET: i32 = 64_800;
+
+/// A `stats` frame for one reading. A field outside its wire range is left out, and so is each
+/// pair that is half missing or breaks its rule, so the device never refuses the frame.
+fn stats_frame(stats: HostStats, time: u64, utc_offset: Option<i32>) -> Message {
+    let cpu = stats.cpu.filter(|cpu| *cpu <= 100).map(u32::from);
+    let mem = stats
+        .mem
+        .filter(|m| m.total >= 1 && m.used <= m.total && m.total <= MAX_WIRE_INT);
+    let net = stats
+        .net
+        .filter(|n| n.rx <= MAX_WIRE_INT && n.tx <= MAX_WIRE_INT);
+    Message::Stats {
+        time,
+        utc_offset: utc_offset.filter(|o| (-MAX_UTC_OFFSET..=MAX_UTC_OFFSET).contains(o)),
+        cpu,
+        mem_used: mem.map(|m| m.used),
+        mem_total: mem.map(|m| m.total),
+        net_rx: net.map(|n| n.rx),
+        net_tx: net.map(|n| n.tx),
+    }
+}
+
 /// Ends a session whose kick fired. A revoked device is told `unauthorized` first, so it drops
 /// its pairing instead of retrying a dead token.
 async fn end_kicked<S>(tx: &mut WsSink<S>, kick: Option<Kick>, device: &str) -> Result<(), WsError>
@@ -953,4 +1003,158 @@ where
         send_error(tx, ErrorCode::Unauthorized, UNAUTHORIZED.into()).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::hoststats::{Mem, Net};
+    use super::*;
+
+    fn cpu_of(msg: Message) -> Option<u32> {
+        let Message::Stats { cpu, .. } = msg else {
+            panic!("expected a stats frame")
+        };
+        cpu
+    }
+
+    fn mem_of(msg: Message) -> Option<(u64, u64)> {
+        let Message::Stats {
+            mem_used,
+            mem_total,
+            ..
+        } = msg
+        else {
+            panic!("expected a stats frame")
+        };
+        mem_used.zip(mem_total)
+    }
+
+    fn net_of(msg: Message) -> Option<(u64, u64)> {
+        let Message::Stats { net_rx, net_tx, .. } = msg else {
+            panic!("expected a stats frame")
+        };
+        net_rx.zip(net_tx)
+    }
+
+    fn full() -> HostStats {
+        HostStats {
+            cpu: Some(12),
+            mem: Some(Mem {
+                used: 10,
+                total: 20,
+            }),
+            net: Some(Net { rx: 5, tx: 6 }),
+        }
+    }
+
+    #[test]
+    fn a_full_reading_maps_every_field() {
+        let msg = stats_frame(full(), 1_700_000_000, Some(-14_400));
+        assert_eq!(
+            msg,
+            Message::Stats {
+                time: 1_700_000_000,
+                utc_offset: Some(-14_400),
+                cpu: Some(12),
+                mem_used: Some(10),
+                mem_total: Some(20),
+                net_rx: Some(5),
+                net_tx: Some(6),
+            }
+        );
+    }
+
+    #[test]
+    fn an_empty_reading_sends_only_the_time() {
+        let msg = stats_frame(HostStats::default(), 7, None);
+        assert_eq!(
+            msg,
+            Message::Stats {
+                time: 7,
+                utc_offset: None,
+                cpu: None,
+                mem_used: None,
+                mem_total: None,
+                net_rx: None,
+                net_tx: None,
+            }
+        );
+    }
+
+    #[test]
+    fn the_wire_bounds_are_inclusive() {
+        let edge = HostStats {
+            cpu: Some(100),
+            mem: Some(Mem {
+                used: MAX_WIRE_INT,
+                total: MAX_WIRE_INT,
+            }),
+            net: Some(Net {
+                rx: MAX_WIRE_INT,
+                tx: 0,
+            }),
+        };
+        let msg = stats_frame(edge, 1, Some(MAX_UTC_OFFSET));
+        assert_eq!(cpu_of(msg.clone()), Some(100));
+        assert_eq!(mem_of(msg.clone()), Some((MAX_WIRE_INT, MAX_WIRE_INT)));
+        assert_eq!(net_of(msg), Some((MAX_WIRE_INT, 0)));
+        let Message::Stats { utc_offset, .. } = stats_frame(edge, 1, Some(-MAX_UTC_OFFSET)) else {
+            unreachable!()
+        };
+        assert_eq!(utc_offset, Some(-MAX_UTC_OFFSET));
+    }
+
+    #[test]
+    fn out_of_range_values_are_left_out() {
+        let bad = HostStats {
+            cpu: Some(101),
+            mem: Some(Mem {
+                used: 1,
+                total: MAX_WIRE_INT + 1,
+            }),
+            net: Some(Net {
+                rx: 1,
+                tx: MAX_WIRE_INT + 1,
+            }),
+        };
+        let msg = stats_frame(bad, 1, Some(MAX_UTC_OFFSET + 1));
+        let Message::Stats { utc_offset, .. } = msg.clone() else {
+            unreachable!()
+        };
+        assert_eq!(utc_offset, None);
+        assert_eq!(cpu_of(msg.clone()), None);
+        assert_eq!(mem_of(msg.clone()), None);
+        assert_eq!(net_of(msg), None);
+    }
+
+    #[test]
+    fn memory_needs_a_total_of_at_least_one_and_used_within_it() {
+        let no_total = HostStats {
+            mem: Some(Mem { used: 0, total: 0 }),
+            ..HostStats::default()
+        };
+        assert_eq!(mem_of(stats_frame(no_total, 1, None)), None);
+        let over = HostStats {
+            mem: Some(Mem { used: 3, total: 2 }),
+            ..HostStats::default()
+        };
+        assert_eq!(mem_of(stats_frame(over, 1, None)), None);
+        let fine = HostStats {
+            mem: Some(Mem { used: 0, total: 1 }),
+            ..HostStats::default()
+        };
+        assert_eq!(mem_of(stats_frame(fine, 1, None)), Some((0, 1)));
+    }
+
+    #[test]
+    fn a_network_pair_is_all_or_nothing() {
+        let one_over = HostStats {
+            net: Some(Net {
+                rx: MAX_WIRE_INT + 1,
+                tx: 9,
+            }),
+            ..HostStats::default()
+        };
+        assert_eq!(net_of(stats_frame(one_over, 1, None)), None);
+    }
 }
