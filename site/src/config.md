@@ -79,6 +79,7 @@ If the file on disk breaks a rule, the page says so and offers **Replace config.
 | `version` | `1` |
 | `layout.cols` | 1 to 8 |
 | `layout.rows` | 1 to 5 |
+| `layout.font` | The default font of every button; see [Fonts](#fonts). Default `montserrat` |
 
 ## Buttons
 
@@ -92,6 +93,7 @@ Each `[[button]]` table is one cell.
 | `bg` | no | Background as `#rrggbb`. Default `#1e88e5` |
 | `fg` | no | Label color as `#rrggbb`. Default `#ffffff` |
 | `icon` | no | A picture in the `icons/` folder, such as `"3f2a9c1d0e44.png"`; see [Icons](#icons) |
+| `font` | no | The font of the label, and of a tile's value unless the tile sets its own; see [Fonts](#fonts). Default: the grid's font |
 | `action` | yes | A shell or HTTP action, below |
 | `tile` | no | Makes the button show a live value; see [Tiles](#tiles) |
 
@@ -131,6 +133,48 @@ To add one, either copy the file into `icons/` yourself (make the folder if it's
 - Buttons that name the same file share one picture on the device.
 - A missing, unreadable or invalid file holds back the whole config, like any other broken rule, and the app logs which button and file.
 - Adding or removing a file in `icons/`, or changing one a button names (its modified time or size), reloads the config once the change has held for two polls. That covers replacing a picture in place, and a file that is still being copied is read again when it finishes. A different picture gets a new id, so the device fetches it and drops the old one.
+
+## Fonts
+
+The device can draw a button's text in Montserrat or in one of six other fonts. Pick the font at three levels:
+
+```toml
+[layout]
+cols = 5
+rows = 3
+font = "inter"            # the default for every button. Absent: montserrat
+
+[[button]]
+id = "nas-load"
+pos = [2, 0]
+label = "NAS load"
+font = "orbitron"         # this button's label. Absent: the grid's font
+action = { kind = "shell", argv = ["true"] }
+tile = { every_s = 30, font = "fira-code", source = { kind = "shell", argv = ["cat", "/proc/loadavg"] } }
+#                          ^ the value only. Absent: the button's font
+```
+
+| Id | Font |
+|---|---|
+| `montserrat` | Montserrat, the device's built-in font and the default |
+| `inter` | Inter |
+| `roboto` | Roboto |
+| `fira-code` | Fira Code |
+| `roboto-mono` | Roboto Mono |
+| `orbitron` | Orbitron |
+| `oxanium` | Oxanium |
+
+- A label's font is the button's `font`, else `layout.font`, else `montserrat`. A tile's value uses `tile.font`, else the label's font. A button has only those two texts, so any pair of fonts is `font` for the label and `tile.font` for the value.
+- `montserrat` is valid at every level, so a button can keep Montserrat under another grid font. Naming the font a level would inherit anyway is allowed, and pins it: a later change to `layout.font` leaves that button alone.
+- An unknown name is an error like any other, and the last good config stays live: `layout.font "comic" is not one of montserrat, inter, roboto, fira-code, roboto-mono, orbitron, oxanium`. Names are lowercase.
+- Only button labels and tile values change. The status lines, the pairing screens and the result screens always use Montserrat.
+- A font never changes the size of a button, its icon box or how many lines its label gets: a label still takes 1 or 2 lines and ends in dots where it doesn't fit, and a tile value is still one line. A wide font shows fewer characters before the dots, though. Orbitron is the widest, and it cuts a long value sooner than Montserrat or Inter. The config editor's preview breaks lines and places the dots the way the device does.
+- Every font covers printable ASCII, the only characters labels and values may use. Orbitron has no `^` of its own, so the device draws that one character from Oxanium.
+
+### Older firmware and older apps
+
+- A device on firmware from before fonts tells the app so when it connects, and the app sends it no font information. It draws everything in Montserrat, and the Devices page says so while it is connected. A change to fonts alone sends it nothing. Update its firmware to see the fonts.
+- An app from before fonts refuses a `config.toml` with a `font` key, because it rejects keys it doesn't know, and keeps its last good config (an empty grid on a fresh start). Before going back to an older app, remove the `font` keys from `config.toml`.
 
 ## Shell actions
 
@@ -187,6 +231,7 @@ A tile puts a live value on a button, such as a load average, a disk percentage 
 |---|---|---|
 | `every_s` | yes | Seconds between polls, 2 to 86400 |
 | `json_pointer` | no | An [RFC 6901](https://www.rfc-editor.org/rfc/rfc6901) pointer such as `/state` or `/attributes/brightness`. It must start with `/` |
+| `font` | no | The value's font; see [Fonts](#fonts). Default: the button's font |
 | `source` | yes | A shell or HTTP action, with the keys above. Its `timeout_s` applies to each poll. A source that sends secret headers over plain http needs `insecure_http`, as for any action |
 
 ### When it polls

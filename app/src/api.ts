@@ -1,7 +1,8 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import type { Config, ConfigView, TileConfig } from "./config";
 
-export type DeviceInfo = { id: string; connected: boolean };
+/** `caps` are what the live session's device supports, such as "fonts". Empty while offline. */
+export type DeviceInfo = { id: string; connected: boolean; caps: string[] };
 
 /** Mirrors `PairingState` in `src-tauri/src/daemon/pairing.rs`, sent as the `pairing` event. */
 export type PairingState =

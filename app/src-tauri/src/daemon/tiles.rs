@@ -977,6 +977,7 @@ mod tests {
         TileConfig {
             every_s: 5,
             json_pointer: pointer.map(String::from),
+            font: None,
             source,
         }
     }

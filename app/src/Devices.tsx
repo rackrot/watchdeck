@@ -74,6 +74,14 @@ export default function Devices({
             ))}
           </ul>
         )}
+        {devices
+          .filter((d) => d.connected && !d.caps.includes("fonts"))
+          .map((d) => (
+            <p key={d.id} className="muted">
+              <span className="mono">{d.id}</span> draws every font as
+              Montserrat. Update its firmware.
+            </p>
+          ))}
         <button
           type="button"
           onClick={() => {

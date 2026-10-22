@@ -25,8 +25,8 @@ use tokio_tungstenite::{accept_async_with_config, WebSocketStream};
 use super::actions::{ActionResult, Actions, Run, MAX_RUNNING};
 use super::config::{Action, Layout, Live, MAX_COLS, MAX_ROWS};
 use super::protocol::{
-    decode_hex, encode_hex, valid_device_id, ErrorCode, Message, Report, Token, ICON_ID_BYTES,
-    MAX_MESSAGE_BYTES, MAX_REPORTS_PER_SESSION, TOKEN_BYTES, VERSION,
+    decode_hex, encode_hex, valid_device_id, ErrorCode, Message, Report, Token, CAPS, CAP_FONTS,
+    ICON_ID_BYTES, MAX_MESSAGE_BYTES, MAX_REPORTS_PER_SESSION, TOKEN_BYTES, VERSION,
 };
 use super::store::Store;
 use super::tiles::{self, Sent, Tiles, Values};
@@ -68,6 +68,8 @@ pub enum DaemonEvent {
 pub struct DeviceInfo {
     pub id: String,
     pub connected: bool,
+    /// The capabilities of the live session (see [`CAPS`]), empty while disconnected.
+    pub caps: Vec<String>,
 }
 
 /// Why a live session is told to end.
@@ -101,10 +103,17 @@ struct Shared {
     registry: Mutex<Registry>,
 }
 
+/// A device's live session, as the registry knows it.
+struct SessionEntry {
+    id: u64,
+    /// Closes the session.
+    kick: oneshot::Sender<Kick>,
+    caps: Vec<String>,
+}
+
 struct Registry {
     store: Store,
-    /// device id -> (session id, kick that closes the session)
-    sessions: HashMap<String, (u64, oneshot::Sender<Kick>)>,
+    sessions: HashMap<String, SessionEntry>,
     /// How many sessions are live. Tile polling follows it.
     connected: watch::Sender<usize>,
 }
@@ -203,9 +212,13 @@ impl Devices {
         registry
             .store
             .ids()
-            .map(|id| DeviceInfo {
-                id: id.to_string(),
-                connected: registry.sessions.contains_key(id),
+            .map(|id| {
+                let session = registry.sessions.get(id);
+                DeviceInfo {
+                    id: id.to_string(),
+                    connected: session.is_some(),
+                    caps: session.map(|s| s.caps.clone()).unwrap_or_default(),
+                }
             })
             .collect()
     }
@@ -272,9 +285,9 @@ impl Registry {
     /// Tells `device`'s live session, if any, that its token is void. Returns whether there was one.
     fn revoke(&mut self, device: &str) -> bool {
         match self.sessions.remove(device) {
-            Some((_, kick)) => {
+            Some(session) => {
                 // An error only means the session is already ending.
-                let _ = kick.send(Kick::Revoked);
+                let _ = session.kick.send(Kick::Revoked);
                 self.publish_count();
                 true
             }
@@ -294,11 +307,12 @@ impl Shared {
 
     /// Checks `token` for `device` and, only if it is valid, registers a session for it, kicking
     /// the one it replaces. An impostor using a paired device's id never gets this far, so it
-    /// can't kick the real session.
+    /// can't kick the real session. `caps` are the device's, shown in [`DeviceInfo`].
     fn authenticate(
         &self,
         device: &str,
         token: &[u8; TOKEN_BYTES],
+        caps: Vec<String>,
     ) -> Option<(u64, oneshot::Receiver<Kick>)> {
         let mut registry = self.registry();
         if !registry.store.verify(device, token) {
@@ -306,13 +320,18 @@ impl Shared {
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (kick_tx, kick_rx) = oneshot::channel();
-        let old = registry.sessions.insert(device.to_string(), (id, kick_tx));
+        let entry = SessionEntry {
+            id,
+            kick: kick_tx,
+            caps,
+        };
+        let old = registry.sessions.insert(device.to_string(), entry);
         registry.publish_count();
         drop(registry);
-        if let Some((_, old_kick)) = old {
+        if let Some(old) = old {
             log::info!("{device} reconnected, replacing its old session");
             // An error only means the old session is already ending.
-            let _ = old_kick.send(Kick::Replaced);
+            let _ = old.kick.send(Kick::Replaced);
             self.emit(DaemonEvent::DeviceDisconnected(device.to_string()));
         }
         self.emit(DaemonEvent::DeviceConnected(device.to_string()));
@@ -325,7 +344,7 @@ impl Shared {
         if registry
             .sessions
             .get(device)
-            .is_some_and(|(current, _)| *current == id)
+            .is_some_and(|current| current.id == id)
         {
             registry.sessions.remove(device);
             registry.publish_count();
@@ -555,13 +574,14 @@ where
             return Ok(());
         }
     };
-    let (device, token, fw, screen) = match hello {
+    let (device, token, fw, screen, caps) = match hello {
         Incoming::Msg(Message::Hello {
             v,
             device,
             token,
             fw,
             screen,
+            caps,
         }) => {
             if v != VERSION {
                 let why = format!("unsupported protocol version {v}");
@@ -570,7 +590,14 @@ where
             if !valid_device_id(&device) {
                 return send_error(tx, ErrorCode::BadRequest, "invalid device id".into()).await;
             }
-            (device, token, fw, screen)
+            // Names this daemon doesn't know are a newer device's, and mean nothing here. Built
+            // from CAPS, so the list is at most CAPS long whatever the device repeats.
+            let caps: Vec<String> = CAPS
+                .iter()
+                .filter(|known| caps.iter().any(|cap| cap == *known))
+                .map(|known| (*known).to_owned())
+                .collect();
+            (device, token, fw, screen, caps)
         }
         Incoming::BadRequest(msg) => return send_error(tx, ErrorCode::BadRequest, msg).await,
         Incoming::BadVersion(msg) => return send_error(tx, ErrorCode::Version, msg).await,
@@ -582,7 +609,9 @@ where
     };
 
     let token = token.and_then(|Token(hex)| decode_hex::<TOKEN_BYTES>(&hex));
-    let Some((id, kick)) = token.and_then(|token| shared.authenticate(&device, &token)) else {
+    let fonts = caps.iter().any(|cap| cap == CAP_FONTS);
+    let Some((id, kick)) = token.and_then(|token| shared.authenticate(&device, &token, caps))
+    else {
         log::warn!("{peer}: refused {device}: not paired, or a missing or wrong token");
         return send_error(tx, ErrorCode::Unauthorized, UNAUTHORIZED.into()).await;
     };
@@ -591,7 +620,7 @@ where
         screen[0],
         screen[1]
     );
-    let outcome = serve(tx, rx, kick, shared, &device).await;
+    let outcome = serve(tx, rx, kick, shared, &device, fonts).await;
     shared.unregister(&device, id);
     outcome
 }
@@ -675,13 +704,16 @@ impl TileFeed {
 
 /// The session after a good hello. Presses run as tasks of their own, so the session keeps
 /// reading (and answering pings) and pushing layouts and tiles while actions run. A run whose
-/// session has ended still finishes, and its result is dropped.
+/// session has ended still finishes, and its result is dropped. A session without the `fonts`
+/// capability sees the layout with its font fields stripped, so a font-only edit changes nothing
+/// it sees and pushes nothing.
 async fn serve<S>(
     tx: &mut WsSink<S>,
     rx: &mut WsRead<S>,
     mut kick: oneshot::Receiver<Kick>,
     shared: &Shared,
     device: &str,
+    fonts: bool,
 ) -> Result<(), WsError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -695,7 +727,15 @@ where
         },
     )
     .await?;
-    let mut layout = config.borrow_and_update().layout();
+    let view = |live: &Live| {
+        let layout = live.layout();
+        if fonts {
+            layout
+        } else {
+            layout.without_fonts()
+        }
+    };
+    let mut layout = view(&config.borrow_and_update());
     let mut rev = 1;
     send(tx, &layout.message(rev)).await?;
     let mut tiles = TileFeed {
@@ -724,7 +764,7 @@ where
             Ok(()) = config.changed() => {
                 // An edit to actions alone leaves the layout as it was, and sends nothing.
                 let live = config.borrow_and_update().clone();
-                let next = live.layout();
+                let next = view(&live);
                 if next != layout {
                     layout = next;
                     rev += 1;

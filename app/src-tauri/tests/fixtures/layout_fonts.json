@@ -1,0 +1,28 @@
+{
+  "t": "layout",
+  "rev": 3,
+  "cols": 5,
+  "rows": 3,
+  "font": "inter",
+  "buttons": [
+    {
+      "id": "plain",
+      "col": 0,
+      "row": 0,
+      "label": "Plain",
+      "bg": 0,
+      "fg": 16777215
+    },
+    {
+      "id": "nas-load",
+      "col": 2,
+      "row": 0,
+      "label": "NAS load",
+      "bg": 2001125,
+      "fg": 16777215,
+      "tile": true,
+      "label_font": "orbitron",
+      "value_font": "fira-code"
+    }
+  ]
+}

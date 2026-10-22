@@ -177,7 +177,7 @@ device                      daemon
 ### `hello` (device → daemon)
 
 ```json
-{"t":"hello","v":1,"device":"wd-e8f60ae276ab","token":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","fw":"0.2.0","screen":[1024,600]}
+{"t":"hello","v":1,"device":"wd-e8f60ae276ab","token":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","fw":"0.2.0","screen":[1024,600],"caps":["fonts"]}
 ```
 
 | Field | Type | Meaning |
@@ -187,6 +187,18 @@ device                      daemon
 | `token` | string | The device's 32-byte token from pairing, as 64 lowercase hex digits |
 | `fw` | string | Firmware version |
 | `screen` | [int, int] | Screen width and height in pixels |
+| `caps` | [string] | Optional, default empty. The capabilities the device supports, listed below |
+
+`caps` is how the protocol grows without a new `v`, which the daemon accepts only as `1`:
+
+- A device names only capabilities it fully supports, and the firmware that adds a capability's support is the firmware that starts naming it. A `hello` without `caps` means none.
+- The daemon ignores names it doesn't know, so a newer device can name more than an older daemon understands. An older daemon ignores the whole field, so a device that names capabilities still works with it, and gets none of their fields.
+- The daemon decides per session. It sends a capability's fields only to a session whose `hello` names it. A session lasts one connection, so a device that updates its firmware names the new capability on its next `hello`.
+- Adding a capability doesn't change `v`, the mDNS TXT `v` or the pairing label.
+
+| Capability | The device |
+|---|---|
+| `fonts` | Draws the seven fonts listed under [Fonts](#fonts), and reads the font fields of `layout` |
 
 The daemon hashes `token` and compares the result in constant time with the hash it stored for `device`. A missing, malformed or wrong token and an unknown device all get the same `error`, then a close:
 
@@ -230,10 +242,35 @@ The daemon closes the connection after sending it. `code` is one of `version`, `
 | `buttons[].bg`, `fg` | int | Colors as `0xRRGGBB` integers |
 | `buttons[].icon` | string | Optional. The icon's id as 32 lowercase hex digits. Absent for a button without one. A layout with any other value, `null` included, is refused |
 | `buttons[].tile` | bool | Optional, default `false`. `true` for a button that shows a live value, which arrives as [`tile`](#tile-daemon--device) messages. Any other type is refused |
+| `font`, `buttons[].label_font`, `buttons[].value_font` | string | Optional, only to a session with the `fonts` capability. See [Fonts](#fonts) |
 
 The daemon sends `layout` after `welcome`. When the user's config changes the grid, a button, a label, a color or a position, the daemon pushes a new `layout` on the same session, and the device replaces its grid without reconnecting. An edit that changes only actions sends nothing. Empty cells have no button. A layout that turns a tile on or off for a button counts as a change to a button.
 
 The layout carries only icon ids. The device keeps the icons it has, and asks for the rest with `icon_get`. A button without its icon yet shows its label alone and gains the picture when the frame arrives.
+
+#### Fonts
+
+A device that names `fonts` in `hello.caps` draws button text in Montserrat (built in) or any of six more fonts. The ids are `montserrat`, `inter`, `roboto`, `fira-code`, `roboto-mono`, `orbitron` and `oxanium`.
+
+```json
+{"t":"layout","rev":3,"cols":5,"rows":3,"font":"inter","buttons":[
+  {"id":"plain","col":0,"row":0,"label":"Plain","bg":0,"fg":16777215},
+  {"id":"nas-load","col":2,"row":0,"label":"NAS load","bg":2001125,"fg":16777215,"tile":true,"label_font":"orbitron","value_font":"fira-code"}
+]}
+```
+
+| Field | Where | Meaning |
+|---|---|---|
+| `font` | message | The grid's default font. Absent means `montserrat` |
+| `label_font` | button | The label's font. Absent means the message's `font` |
+| `value_font` | button | A tile's value font. Absent means the button's label font |
+
+- The device resolves a label font as `label_font`, else `font`, else `montserrat`, and a value font as `value_font`, else the label font. The daemon sends `label_font` only when the button's label font differs from the message's `font`, and `value_font` only when the value font differs from the label font. So a button that uses the grid's font carries nothing, and `montserrat` is sent where a button pins it under another grid font.
+- The daemon sends `font` whenever the grid's font isn't `montserrat`, even when no button uses it, because a later field of the layout can draw in it.
+- The device draws status lines, the pairing screens and result screens in Montserrat whatever the layout says.
+- A font never changes a button's size, so changing only fonts changes no icon id and needs no new `icon_get`.
+- **Fallback.** A device that gets a font id it doesn't know, or a value that isn't a string, draws that text in Montserrat, logs it, and still builds and acks the layout. A font is cosmetic, so the layout is never refused for one.
+- **Without the capability** a session gets none of these fields. Its layout is the one a config without fonts would produce, and a change to fonts alone sends it no new `layout`, so its `rev` doesn't move. With the capability, a change to fonts alone pushes a new `layout` with the next `rev`.
 
 ### `layout_ack` (device → daemon)
 

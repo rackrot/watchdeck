@@ -185,7 +185,7 @@ export default function GridEditor({
             <NumberField
               value={cols}
               onChange={(n) =>
-                onChange({ ...config, layout: { cols: n, rows } })
+                onChange({ ...config, layout: { ...config.layout, cols: n } })
               }
             />
           </Field>
@@ -193,7 +193,7 @@ export default function GridEditor({
             <NumberField
               value={rows}
               onChange={(n) =>
-                onChange({ ...config, layout: { cols, rows: n } })
+                onChange({ ...config, layout: { ...config.layout, rows: n } })
               }
             />
           </Field>

@@ -155,7 +155,8 @@ const MAX_NAME_BYTES: usize = 63;
 
 // The device's button geometry, from `firmware/main/ui.c` (GRID_TOP, GRID_GAP, ICON_PAD,
 // ICON_GAP) and `display.h`. A button with an icon is a column: the icon, then a label of fixed
-// height, with padding around them. LABEL_LINE is the line height of Montserrat 32.
+// height, with padding around them. LABEL_LINE is the line box of text slot 32 (Montserrat 32's
+// line height), the same for every font: the firmware lays out by the slot, never by the font.
 const SCREEN_W: u32 = 1024;
 const SCREEN_H: u32 = 600;
 const GRID_TOP: u32 = 204;

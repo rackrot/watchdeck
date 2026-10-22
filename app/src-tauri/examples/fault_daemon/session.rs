@@ -94,6 +94,8 @@ fn button(id: &str, col: u32, label: &str, icon: Option<String>, tile: bool) -> 
         fg: 0xff_ffff,
         icon,
         tile,
+        label_font: None,
+        value_font: None,
     }
 }
 
@@ -221,6 +223,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
             rev: self.rev,
             cols: 4,
             rows: 1,
+            font: None,
             buttons,
         };
         self.send_json(&layout).await

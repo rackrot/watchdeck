@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 
+use super::fonts_gen::FONT_IDS;
 use super::icons::{self, IconSet, Icons};
 use super::protocol::{encode_hex, Button, IconFrame, Message};
 use super::secrets::Secrets;
@@ -73,11 +74,14 @@ pub struct Config {
     pub buttons: Vec<ButtonConfig>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Grid {
     pub cols: u32,
     pub rows: u32,
+    /// The font of every label and tile value that doesn't name its own. Absent: Montserrat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +98,10 @@ pub struct ButtonConfig {
     /// A file in `icons/`, shown above the label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    /// The label's font, and the tile value's too unless `tile.font` says otherwise. Absent: the
+    /// grid's font.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font: Option<String>,
     pub action: Action,
     /// Makes the button show a live value, polled from `source`. The tile table goes last
     /// because TOML wants tables after plain values.
@@ -110,6 +118,9 @@ pub struct TileConfig {
     /// Without it the value is the first line of output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub json_pointer: Option<String>,
+    /// The value's font. Absent: the button's font.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font: Option<String>,
     pub source: Action,
 }
 
@@ -160,6 +171,8 @@ fn default_timeout() -> u64 {
 pub struct Layout {
     pub cols: u32,
     pub rows: u32,
+    /// The grid's default font, absent for Montserrat.
+    pub font: Option<String>,
     pub buttons: Vec<Button>,
     /// The pictures the buttons name, for answering `icon_get`.
     pub icons: Vec<Arc<IconFrame>>,
@@ -171,9 +184,29 @@ impl Layout {
             rev,
             cols: self.cols,
             rows: self.rows,
+            font: self.font.clone(),
             buttons: self.buttons.clone(),
         }
     }
+
+    /// What a device without the `fonts` capability is sent: no font fields at all.
+    pub fn without_fonts(mut self) -> Self {
+        self.font = None;
+        for button in &mut self.buttons {
+            button.label_font = None;
+            button.value_font = None;
+        }
+        self
+    }
+}
+
+/// Montserrat is built into the device, so it needs no wire field where it is the default.
+const DEFAULT_FONT: &str = FONT_IDS[0];
+
+/// Why `font` isn't a font id, or `None` if it is one. `what` names the key.
+fn font_error(what: &str, font: &str) -> Option<String> {
+    (!FONT_IDS.contains(&font))
+        .then(|| format!("{what} {font:?} is not one of {}", FONT_IDS.join(", ")))
 }
 
 /// `#rrggbb` as `0xRRGGBB`.
@@ -231,31 +264,41 @@ impl Live {
     pub fn layout(&self) -> Layout {
         let rgb = |text: &str| color(text).expect("colors are checked before a config goes live");
         let mut icons = Vec::new();
+        let grid_font = self.config.layout.font.as_deref().unwrap_or(DEFAULT_FONT);
         let buttons = self
             .config
             .buttons
             .iter()
-            .map(|b| Button {
-                id: b.id.clone(),
-                col: b.pos[0],
-                row: b.pos[1],
-                label: b.label.clone(),
-                bg: rgb(&b.bg),
-                fg: rgb(&b.fg),
-                tile: b.tile.is_some(),
-                icon: b.icon.as_ref().map(|name| {
-                    let icon = self
-                        .icons
-                        .get(name)
-                        .expect("icons are rendered before a config goes live");
-                    icons.push(icon.clone());
-                    encode_hex(&icon.id)
-                }),
+            .map(|b| {
+                // The wire carries only what differs from what a font inherits, so the device
+                // needs two fallbacks and none of the config's rules.
+                let label = b.font.as_deref().unwrap_or(grid_font);
+                let value = b.tile.as_ref().map(|t| t.font.as_deref().unwrap_or(label));
+                Button {
+                    id: b.id.clone(),
+                    col: b.pos[0],
+                    row: b.pos[1],
+                    label: b.label.clone(),
+                    bg: rgb(&b.bg),
+                    fg: rgb(&b.fg),
+                    tile: b.tile.is_some(),
+                    icon: b.icon.as_ref().map(|name| {
+                        let icon = self
+                            .icons
+                            .get(name)
+                            .expect("icons are rendered before a config goes live");
+                        icons.push(icon.clone());
+                        encode_hex(&icon.id)
+                    }),
+                    label_font: (label != grid_font).then(|| label.to_string()),
+                    value_font: value.filter(|value| *value != label).map(str::to_string),
+                }
             })
             .collect();
         Layout {
             cols: self.config.layout.cols,
             rows: self.config.layout.rows,
+            font: (grid_font != DEFAULT_FONT).then(|| grid_font.to_string()),
             buttons,
             icons,
         }
@@ -267,7 +310,11 @@ impl Config {
     pub fn empty() -> Self {
         Self {
             version: 1,
-            layout: Grid { cols: 5, rows: 3 },
+            layout: Grid {
+                cols: 5,
+                rows: 3,
+                font: None,
+            },
             buttons: Vec::new(),
         }
     }
@@ -296,13 +343,18 @@ impl Config {
         if self.version != 1 {
             errors.push(format!("version is {}, expected 1", self.version));
         }
-        let Grid { cols, rows } = self.layout;
+        let (cols, rows) = (self.layout.cols, self.layout.rows);
         let grid_ok = (1..=MAX_COLS).contains(&cols) && (1..=MAX_ROWS).contains(&rows);
         if !(1..=MAX_COLS).contains(&cols) {
             errors.push(format!("layout.cols is {cols}, expected 1 to {MAX_COLS}"));
         }
         if !(1..=MAX_ROWS).contains(&rows) {
             errors.push(format!("layout.rows is {rows}, expected 1 to {MAX_ROWS}"));
+        }
+        if let Some(problem) =
+            (self.layout.font.as_deref()).and_then(|font| font_error("layout.font", font))
+        {
+            errors.push(problem);
         }
 
         let mut ids = HashSet::new();
@@ -345,6 +397,9 @@ impl Config {
             if let Some(problem) = b.icon.as_deref().and_then(icons::name_error) {
                 error(problem);
             }
+            if let Some(problem) = b.font.as_deref().and_then(|f| font_error("font", f)) {
+                error(problem);
+            }
             for (field, value) in [("bg", &b.bg), ("fg", &b.fg)] {
                 if color(value).is_none() {
                     error(format!("{field} {value:?} is not a #rrggbb color"));
@@ -371,6 +426,9 @@ impl TileConfig {
                 "tile.every_s is {}, expected {MIN_EVERY_S} to {MAX_EVERY_S}",
                 self.every_s
             ));
+        }
+        if let Some(problem) = (self.font.as_deref()).and_then(|f| font_error("tile.font", f)) {
+            errors.push(problem);
         }
         // "" names the whole document, which is never a short value; RFC 6901 pointers that
         // select something start with '/'.
@@ -1525,9 +1583,14 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
     #[test]
     fn the_fullest_layout_fits_in_one_message() {
         let mut config = Config::empty();
+        // The longest id (`roboto-mono`) at every level, each differing from what it inherits:
+        // the grid's, then a label font that isn't the grid's, then a value font that isn't that.
+        let longest = FONT_IDS.into_iter().max_by_key(|id| id.len()).unwrap();
+        assert_eq!(longest, "roboto-mono");
         config.layout = Grid {
             cols: MAX_COLS,
             rows: MAX_ROWS,
+            font: Some(longest.into()),
         };
         for i in 0..MAX_COLS * MAX_ROWS {
             config.buttons.push(ButtonConfig {
@@ -1537,6 +1600,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
                 bg: "#ffffff".into(),
                 fg: "#ffffff".into(),
                 icon: Some("i.png".into()),
+                font: Some("fira-code".into()),
                 action: Action::Shell {
                     argv: vec!["true".into()],
                     timeout_s: 1,
@@ -1544,6 +1608,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
                 tile: Some(TileConfig {
                     every_s: MIN_EVERY_S,
                     json_pointer: None,
+                    font: Some("roboto-mono".into()),
                     source: Action::Shell {
                         argv: vec!["true".into()],
                         timeout_s: 1,
@@ -1555,8 +1620,231 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
         let mut live = live(config);
         live.icons
             .insert("i.png".into(), Arc::new(IconFrame::new(1, 1, vec![0; 4])));
-        let json = serde_json::to_string(&live.layout().message(u32::MAX)).unwrap();
-        assert!(json.len() <= MAX_MESSAGE_BYTES, "{} bytes", json.len());
+        let mut layout = live.layout();
+        let size = |layout: &Layout| {
+            serde_json::to_string(&layout.message(u32::MAX))
+                .unwrap()
+                .len()
+        };
+        let resolved = size(&layout);
+        println!("fullest layout, fonts as the config resolves them: {resolved} bytes");
+        assert!(resolved <= MAX_MESSAGE_BYTES, "{resolved} bytes");
+
+        // Every font field at its longest, which resolution can't produce (a value font equal to
+        // its label font is never sent), so it bounds anything the daemon can send.
+        assert_eq!(layout.font.as_deref(), Some(longest));
+        for button in &mut layout.buttons {
+            button.label_font = Some(longest.into());
+            button.value_font = Some(longest.into());
+        }
+        let bound = size(&layout);
+        println!(
+            "fullest layout, every font field at {longest}: {bound} bytes of {MAX_MESSAGE_BYTES}"
+        );
+        assert!(bound <= MAX_MESSAGE_BYTES, "{bound} bytes");
+    }
+
+    // ---- Fonts ----
+
+    /// One button `b` at the top left, with `font` and, for `Some(tile_font)`, a tile.
+    fn font_config(grid: Option<&str>, font: Option<&str>, tile: Option<Option<&str>>) -> String {
+        let key = |font: Option<&str>| font.map_or(String::new(), |f| format!("font = {f:?}\n"));
+        let tile = tile.map_or(String::new(), |tile_font| {
+            format!(
+                "[button.tile]\nevery_s = 30\n{}source = {{ kind = \"shell\", argv = [\"true\"] }}\n",
+                key(tile_font)
+            )
+        });
+        format!(
+            "version = 1\n[layout]\ncols = 5\nrows = 3\n{}\n[[button]]\nid = \"b\"\npos = [0, 0]\n\
+             label = \"B\"\n{}action = {{ kind = \"shell\", argv = [\"true\"] }}\n{tile}",
+            key(grid),
+            key(font),
+        )
+    }
+
+    /// The font fields a layout of `text` puts on the wire: the message's, then the one button's.
+    fn wire_fonts(text: &str) -> (Option<String>, Option<String>, Option<String>) {
+        let layout = live(parse(text, &names()).unwrap()).layout();
+        let button = &layout.buttons[0];
+        (
+            layout.font.clone(),
+            button.label_font.clone(),
+            button.value_font.clone(),
+        )
+    }
+
+    #[test]
+    fn an_unknown_font_is_refused_at_each_level_with_the_prefix_the_editor_routes_on() {
+        let list =
+            "is not one of montserrat, inter, roboto, fira-code, roboto-mono, orbitron, oxanium";
+        for (text, expected) in [
+            (
+                font_config(Some("comic"), None, None),
+                format!("layout.font \"comic\" {list}"),
+            ),
+            (
+                font_config(None, Some("Inter"), None),
+                format!("button \"b\": font \"Inter\" {list}"),
+            ),
+            (
+                font_config(None, None, Some(Some("papyrus"))),
+                format!("button \"b\": tile.font \"papyrus\" {list}"),
+            ),
+        ] {
+            assert_eq!(errors(&text), [expected]);
+        }
+        // Every real id passes, at every level.
+        for id in FONT_IDS {
+            parse(&font_config(Some(id), Some(id), Some(Some(id))), &names()).unwrap();
+        }
+    }
+
+    #[test]
+    fn fonts_go_on_the_wire_only_where_they_differ_from_what_they_inherit() {
+        let none = None::<&str>;
+        // (grid, button font, tile font (outer: has a tile), message font, label_font, value_font)
+        #[allow(clippy::type_complexity)]
+        let matrix: [(
+            Option<&str>,
+            Option<&str>,
+            Option<Option<&str>>,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+        ); 11] = [
+            // Nothing set.
+            (none, none, None, none, none, none),
+            (none, none, Some(none), none, none, none),
+            // The grid only: the message carries it and no button repeats it.
+            (Some("inter"), none, Some(none), Some("inter"), none, none),
+            // A button only: its tile value follows it.
+            (
+                none,
+                Some("orbitron"),
+                Some(none),
+                none,
+                Some("orbitron"),
+                none,
+            ),
+            // A tile only: the label stays on the grid's font.
+            (
+                none,
+                none,
+                Some(Some("fira-code")),
+                none,
+                none,
+                Some("fira-code"),
+            ),
+            // All three.
+            (
+                Some("inter"),
+                Some("orbitron"),
+                Some(Some("fira-code")),
+                Some("inter"),
+                Some("orbitron"),
+                Some("fira-code"),
+            ),
+            // Montserrat pinned under another grid font differs, so it is sent...
+            (
+                Some("inter"),
+                Some("montserrat"),
+                None,
+                Some("inter"),
+                Some("montserrat"),
+                none,
+            ),
+            // ...and is nothing under a grid that is Montserrat anyway.
+            (none, Some("montserrat"), None, none, none, none),
+            (Some("montserrat"), none, None, none, none, none),
+            // A button equal to the grid, and a value equal to its label.
+            (
+                Some("inter"),
+                Some("inter"),
+                Some(Some("inter")),
+                Some("inter"),
+                none,
+                none,
+            ),
+            (
+                none,
+                Some("orbitron"),
+                Some(Some("orbitron")),
+                none,
+                Some("orbitron"),
+                none,
+            ),
+        ];
+        for (grid, font, tile, message, label, value) in matrix {
+            let text = font_config(grid, font, tile);
+            let got = wire_fonts(&text);
+            let owned = |font: Option<&str>| font.map(String::from);
+            assert_eq!(
+                got,
+                (owned(message), owned(label), owned(value)),
+                "grid {grid:?}, font {font:?}, tile {tile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tile_value_in_montserrat_under_another_label_font_is_sent() {
+        let text = font_config(Some("inter"), None, Some(Some("montserrat")));
+        assert_eq!(
+            wire_fonts(&text),
+            (Some("inter".into()), None, Some("montserrat".into()))
+        );
+    }
+
+    #[test]
+    fn a_config_without_font_keys_sends_the_same_layout_bytes_with_and_without_the_cap() {
+        let layout = live(parse(EXAMPLE, &names()).unwrap()).layout();
+        let json = |layout: &Layout| serde_json::to_string(&layout.message(1)).unwrap();
+        assert!(!json(&layout).contains("font"), "{}", json(&layout));
+        assert_eq!(json(&layout), json(&layout.clone().without_fonts()));
+        assert_eq!(layout, layout.clone().without_fonts());
+    }
+
+    #[test]
+    fn without_fonts_strips_every_font_field_and_only_those() {
+        let text = font_config(Some("inter"), Some("orbitron"), Some(Some("fira-code")));
+        let layout = live(parse(&text, &names()).unwrap()).layout();
+        let stripped = layout.clone().without_fonts();
+        assert_eq!(
+            wire_fonts(&text),
+            (
+                Some("inter".into()),
+                Some("orbitron".into()),
+                Some("fira-code".into())
+            )
+        );
+        let json = serde_json::to_string(&stripped.message(1)).unwrap();
+        assert!(!json.contains("font"), "{json}");
+        assert_eq!(stripped.buttons[0].label, layout.buttons[0].label);
+        assert!(stripped.buttons[0].tile);
+    }
+
+    #[test]
+    fn fonts_at_all_three_levels_survive_a_save_and_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let secrets = Arc::new(Secrets::new(tmp.path()));
+        let configs = Configs::open(tmp.path(), secrets).unwrap();
+        let revision = configs.status().borrow().revision.clone();
+        let mut config = parse(
+            &font_config(Some("inter"), Some("orbitron"), Some(Some("fira-code"))),
+            &names(),
+        )
+        .unwrap();
+        // A second button with no font keys must not gain any.
+        let mut plain = config.buttons[0].clone();
+        (plain.id, plain.pos, plain.font, plain.tile) = ("plain".into(), [1, 0], None, None);
+        config.buttons.push(plain);
+
+        configs.save(config.clone(), &revision).unwrap();
+        let text = fs::read_to_string(tmp.path().join(FILE)).unwrap();
+        assert_eq!(text.matches("font = ").count(), 3, "{text}");
+        assert_eq!(parse(&text, &names()).unwrap(), config);
+        assert_eq!(configs.current().config, config);
     }
 
     /// `config` as it goes live when it names no icons.
@@ -2080,6 +2368,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
             bg: "#000000".into(),
             fg: "#ffffff".into(),
             icon: None,
+            font: None,
             action,
             tile,
         };
@@ -2090,6 +2379,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
         let tile = TileConfig {
             every_s: 30,
             json_pointer: None,
+            font: None,
             source: http("tile-only"),
         };
         let configs = Configs::open(tmp.path(), secrets.clone()).unwrap();
@@ -2165,6 +2455,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
             bg: "#000000".into(),
             fg: "#ffffff".into(),
             icon: None,
+            font: None,
             tile: None,
             action: Action::Http {
                 method: "POST".into(),
@@ -2182,6 +2473,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
         web.tile = Some(TileConfig {
             every_s: 30,
             json_pointer: Some("/state".into()),
+            font: None,
             source: web.action.clone(),
         });
         config.buttons.push(web);

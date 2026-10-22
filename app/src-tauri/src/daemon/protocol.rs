@@ -8,6 +8,11 @@ use sha2::{Digest, Sha256};
 
 pub const VERSION: u32 = 1;
 
+/// The capabilities a session keeps from `hello.caps`; any other name is dropped.
+pub const CAPS: [&str; 1] = [CAP_FONTS];
+/// The device draws every font in `fonts_gen::FONT_IDS` and reads the layout's font fields.
+pub const CAP_FONTS: &str = "fonts";
+
 /// Largest message, and largest frame, in either direction.
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 
@@ -61,6 +66,12 @@ pub struct Button {
     /// The button shows a live value, which arrives as `tile` messages.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tile: bool,
+    /// The label's font, sent only when it differs from the message's `font`. Needs the `fonts` cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_font: Option<String>,
+    /// A tile's value font, sent only when it differs from the label's. Needs the `fonts` cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_font: Option<String>,
 }
 
 /// How a tile's last poll went, which the device shows as a color. A device treats any other
@@ -96,6 +107,10 @@ pub enum Message {
         token: Option<Token>,
         fw: String,
         screen: [u32; 2],
+        /// What the device supports beyond the base protocol (see [`CAPS`]). A hello without the
+        /// field has none, and names this daemon doesn't know are ignored by the session.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        caps: Vec<String>,
     },
     Welcome {
         v: u32,
@@ -109,6 +124,9 @@ pub enum Message {
         rev: u32,
         cols: u32,
         rows: u32,
+        /// The grid's default font, absent for Montserrat. Needs the `fonts` cap.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        font: Option<String>,
         buttons: Vec<Button>,
     },
     /// The device has built the grid of the layout with this `rev`. An older device never sends it.
@@ -467,11 +485,12 @@ mod tests {
     use serde_json::Value;
 
     // The fixtures are the JSON examples from site/src/protocol.md.
-    const FIXTURES: [&str; 16] = [
+    const FIXTURES: [&str; 17] = [
         include_str!("../../tests/fixtures/hello.json"),
         include_str!("../../tests/fixtures/welcome.json"),
         include_str!("../../tests/fixtures/error.json"),
         include_str!("../../tests/fixtures/layout.json"),
+        include_str!("../../tests/fixtures/layout_fonts.json"),
         include_str!("../../tests/fixtures/layout_ack.json"),
         include_str!("../../tests/fixtures/icon_get.json"),
         include_str!("../../tests/fixtures/press.json"),
@@ -531,6 +550,27 @@ mod tests {
             assert!(parse(bad).is_err(), "{bad}");
         }
         assert!(serde_json::from_str::<Message>(r#"{"t":"layout_ack"}"#).is_err());
+    }
+
+    #[test]
+    fn a_hello_without_caps_has_none_and_prints_none() {
+        let text = r#"{"t":"hello","v":1,"device":"wd-1","fw":"0.2.0","screen":[1,1]}"#;
+        let Message::Hello { caps, .. } = serde_json::from_str(text).unwrap() else {
+            panic!("expected a hello")
+        };
+        assert!(caps.is_empty());
+        let msg: Message = serde_json::from_str(text).unwrap();
+        assert!(!serde_json::to_string(&msg).unwrap().contains("caps"));
+
+        // Names pass through the parser as they came; the session drops those it doesn't know.
+        let text = text.replace(
+            r#""screen":[1,1]"#,
+            r#""screen":[1,1],"caps":["fonts","bogus"]"#,
+        );
+        let Message::Hello { caps, .. } = serde_json::from_str(&text).unwrap() else {
+            panic!("expected a hello")
+        };
+        assert_eq!(caps, ["fonts", "bogus"]);
     }
 
     #[test]

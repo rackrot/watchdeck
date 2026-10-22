@@ -224,6 +224,10 @@ async fn connect(addr: SocketAddr) -> Client {
 }
 
 fn hello(v: u32, device: &str, token: Option<&[u8; 32]>) -> Ws {
+    hello_with_caps(v, device, token, &[])
+}
+
+fn hello_with_caps(v: u32, device: &str, token: Option<&[u8; 32]>, caps: &[&str]) -> Ws {
     Ws::text(
         serde_json::to_string(&Message::Hello {
             v,
@@ -231,6 +235,7 @@ fn hello(v: u32, device: &str, token: Option<&[u8; 32]>) -> Ws {
             token: token.map(|t| Token(encode_hex(t))),
             fw: "0.2.0".into(),
             screen: [1024, 600],
+            caps: caps.iter().map(|c| c.to_string()).collect(),
         })
         .unwrap(),
     )
@@ -717,7 +722,8 @@ async fn an_impostor_with_a_stolen_device_id_cannot_kick_the_paired_session() {
         daemon.devices.list(),
         [DeviceInfo {
             id: DEVICE.into(),
-            connected: true
+            connected: true,
+            caps: Vec::new(),
         }]
     );
 }
@@ -1923,6 +1929,149 @@ async fn a_binary_frame_from_the_device_is_a_bad_request() {
     };
     assert_eq!(code, ErrorCode::BadRequest);
     expect_closed(&mut c).await;
+}
+
+// ---- Fonts ----
+
+/// `ICON_CONFIG` with `grid_font` for the grid and Orbitron on `pic`.
+fn fonts_config(grid_font: &str) -> String {
+    ICON_CONFIG
+        .replacen("rows = 3", &format!("rows = 3\nfont = {grid_font:?}"), 1)
+        .replacen("label = \"Pic\"", "label = \"Pic\"\nfont = \"orbitron\"", 1)
+}
+
+/// A daemon whose config has fonts and an icon, and a device that sent `caps` in its hello and
+/// has the `welcome`.
+async fn start_with_fonts(caps: &[&str]) -> (Daemon, Client) {
+    let daemon = start().await;
+    put_icon(&daemon, "a.png", &quadrants_png(200));
+    daemon.reconfigure(&fonts_config("inter")).unwrap();
+    let mut c = connect(daemon.addr).await;
+    c.send(hello_with_caps(1, DEVICE, Some(&TOKEN), caps))
+        .await
+        .unwrap();
+    assert!(matches!(recv(&mut c).await, Message::Welcome { .. }));
+    (daemon, c)
+}
+
+#[tokio::test]
+async fn a_hello_without_caps_gets_no_font_fields_and_a_font_edit_pushes_it_nothing() {
+    let (mut daemon, mut c) = start_with_fonts(&[]).await;
+    let Message::Layout {
+        rev: 1,
+        font,
+        buttons,
+        ..
+    } = recv(&mut c).await
+    else {
+        panic!("expected the first layout")
+    };
+    assert_eq!(font, None);
+    assert!(buttons
+        .iter()
+        .all(|b| b.label_font.is_none() && b.value_font.is_none()));
+    assert_eq!(
+        daemon.events.recv().await.unwrap(),
+        DaemonEvent::DeviceConnected(DEVICE.into())
+    );
+
+    assert_eq!(daemon.reconfigure(&fonts_config("roboto")), Ok(true));
+    // A pushed layout would come before this press's result.
+    c.send(press("plain", 1)).await.unwrap();
+    assert!(matches!(recv(&mut c).await, Message::Result { seq: 1, .. }));
+    assert!(daemon.events.try_recv().is_err(), "nothing was pushed");
+
+    // An edit the board can see still arrives, as rev 2 with no font fields.
+    let edited = fonts_config("roboto").replacen("label = \"Plain\"", "label = \"Flat\"", 1);
+    assert_eq!(daemon.reconfigure(&edited), Ok(true));
+    let Message::Layout {
+        rev: 2,
+        font,
+        buttons,
+        ..
+    } = recv(&mut c).await
+    else {
+        panic!("expected the edited layout")
+    };
+    assert_eq!(font, None);
+    assert!(buttons
+        .iter()
+        .all(|b| b.label_font.is_none() && b.value_font.is_none()));
+}
+
+#[tokio::test]
+async fn the_fonts_cap_gets_font_fields_and_a_font_only_edit_pushes_a_new_rev_with_the_same_icons()
+{
+    // An unknown cap beside it changes nothing.
+    let (mut daemon, mut c) = start_with_fonts(&["fonts", "bogus"]).await;
+    let Message::Layout {
+        rev: 1,
+        font,
+        buttons,
+        ..
+    } = recv(&mut c).await
+    else {
+        panic!("expected the first layout")
+    };
+    assert_eq!(font.as_deref(), Some("inter"));
+    let fonts: Vec<_> = buttons
+        .iter()
+        .map(|b| {
+            (
+                b.id.as_str(),
+                b.label_font.as_deref(),
+                b.value_font.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        fonts,
+        [
+            ("pic", Some("orbitron"), None),
+            ("twin", None, None),
+            ("plain", None, None)
+        ]
+    );
+    let icons: Vec<_> = buttons.iter().map(|b| b.icon.clone()).collect();
+    assert_eq!(
+        daemon.devices.list(),
+        [DeviceInfo {
+            id: DEVICE.into(),
+            connected: true,
+            caps: vec!["fonts".into()],
+        }],
+        "the unknown cap is not kept"
+    );
+    assert_eq!(
+        daemon.events.recv().await.unwrap(),
+        DaemonEvent::DeviceConnected(DEVICE.into())
+    );
+
+    assert_eq!(daemon.reconfigure(&fonts_config("roboto")), Ok(true));
+    let Message::Layout {
+        rev: 2,
+        font,
+        buttons,
+        ..
+    } = recv(&mut c).await
+    else {
+        panic!("expected a new layout for the font-only edit")
+    };
+    assert_eq!(font.as_deref(), Some("roboto"));
+    assert_eq!(
+        buttons.iter().map(|b| b.icon.clone()).collect::<Vec<_>>(),
+        icons,
+        "a font change leaves every icon id alone"
+    );
+    assert_eq!(buttons[0].label_font.as_deref(), Some("orbitron"));
+    assert_eq!(
+        daemon.events.recv().await.unwrap(),
+        DaemonEvent::LayoutPushed(DEVICE.into(), 2)
+    );
+    // The icon is still served, so the board never needs a fresh icon_get for the edit.
+    let id = icons[0].clone().unwrap();
+    c.send(icon_get(&[&id])).await.unwrap();
+    assert_eq!(encode_hex(&recv_icon(&mut c).await.id), id);
 }
 
 // ---- Tiles ----
