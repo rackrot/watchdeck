@@ -171,6 +171,10 @@ tile = { every_s = 30, font = "fira-code", source = { kind = "shell", argv = ["c
 - A font never changes the size of a button, its icon box or how many lines its label gets: a label still takes 1 or 2 lines and ends in dots where it doesn't fit, and a tile value is still one line. A wide font shows fewer characters before the dots, though. Orbitron is the widest, and it cuts a long value sooner than Montserrat or Inter. The config editor's preview breaks lines and places the dots the way the device does.
 - Every font covers printable ASCII, the only characters labels and values may use. Orbitron has no `^` of its own, so the device draws that one character from Oxanium.
 
+### Font licenses
+
+All six fonts are under the SIL Open Font License 1.1. The firmware carries the license texts, each under its font's name and copyright line. Tap **Licenses** on the device (right of the USB line), drag to scroll and tap **Close** to leave. The same texts are in the app bundle under `fonts/licenses/`, and in the firmware image as plain text, so `strings` on a `.bin` finds them.
+
 ### Older firmware and older apps
 
 - A device on firmware from before fonts tells the app so when it connects, and the app sends it no font information. It draws everything in Montserrat, and the Devices page says so while it is connected. A change to fonts alone sends it nothing. Update its firmware to see the fonts.

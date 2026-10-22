@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
 #include "display.h"
+#include "font_licenses.h"
 #include "fonts.h"
 #include "link.h"
 
@@ -21,6 +22,11 @@
 #define FORGET_W 300                    // "Forget pairing", right of the touch status line
 #define FORGET_H 40
 #define FORGET_HOLD_MS 2000
+// "Licenses" sits on the USB line, x 784..1004, y 72..106: 8 px above Forget pairing (y 114..154), so a
+// 2 s hold on Forget can't start on it.
+#define LICENSES_W 220
+#define LICENSES_H 34
+#define LICENSES_Y 72
 #define ROW_W (DISPLAY_H_RES - 80) // labels and buttons of the pairing views
 #define ROW_H 76
 #define ICON_PAD 4 // a button with an icon is a column: the icon, a gap, and a label of fixed height
@@ -39,6 +45,7 @@ static lv_obj_t *s_daemon_label;
 static lv_obj_t *s_grid;      // NULL until the first layout
 static lv_obj_t *s_pair_view; // unpaired: the daemon list, the pairing code, or its question
 static lv_obj_t *s_forget;    // shown while paired
+static lv_obj_t *s_licenses;  // the font license viewer on the top layer, NULL while closed
 static lv_obj_t *s_toast;
 static lv_timer_t *s_toast_timer;
 static lv_obj_t *s_result;      // a press's result, on the top layer: a backdrop over the grid
@@ -270,6 +277,68 @@ static void create_forget(void)
     lv_obj_set_hidden(s_forget, true);
 }
 
+/* ---- Font license viewer, all under the LVGL lock ---- */
+
+static void licenses_close(lv_event_t *e)
+{
+    lv_obj_delete_async(s_licenses); // from inside the Close button's own callback
+    s_licenses = NULL;
+}
+
+// A full-screen page: Close on top, then the license text, which a drag scrolls.
+static void licenses_open(lv_event_t *e)
+{
+    if (s_licenses) {
+        return;
+    }
+    s_licenses = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(s_licenses);
+    lv_obj_set_size(s_licenses, DISPLAY_H_RES, DISPLAY_V_RES);
+    lv_obj_set_style_bg_color(s_licenses, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_licenses, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(s_licenses, 12, 0);
+    lv_obj_set_style_pad_row(s_licenses, GRID_GAP, 0);
+    lv_obj_set_flex_flow(s_licenses, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scrollable(s_licenses, false);
+
+    lv_obj_t *close = lv_button_create(s_licenses);
+    lv_obj_set_size(close, 240, 56);
+    lv_obj_add_event_cb(close, licenses_close, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *close_label = lv_label_create(close);
+    lv_obj_set_style_text_font(close_label, &lv_font_montserrat_32, 0);
+    lv_label_set_text(close_label, "Close");
+    lv_obj_center(close_label);
+
+    lv_obj_t *hint = lv_label_create(s_licenses);
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(hint, lv_palette_lighten(LV_PALETTE_GREY, 1), 0);
+    lv_label_set_text(hint, "Drag to scroll");
+
+    lv_obj_t *body = lv_obj_create(s_licenses);
+    lv_obj_remove_style_all(body);
+    lv_obj_set_width(body, LV_PCT(100));
+    lv_obj_set_flex_grow(body, 1);
+    lv_obj_t *text = lv_label_create(body);
+    lv_obj_set_width(text, LV_PCT(100));
+    lv_label_set_long_mode(text, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(text, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(text, lv_color_white(), 0);
+    lv_label_set_text_static(text, font_licenses_text()); // lives in flash, no copy
+}
+
+static void create_licenses_button(void)
+{
+    lv_obj_t *btn = lv_button_create(lv_screen_active());
+    lv_obj_set_size(btn, LICENSES_W, LICENSES_H);
+    lv_obj_align(btn, LV_ALIGN_TOP_RIGHT, -20, LICENSES_Y);
+    lv_obj_set_style_bg_color(btn, lv_palette_darken(LV_PALETTE_GREY, 2), 0);
+    lv_obj_add_event_cb(btn, licenses_open, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *label = lv_label_create(btn);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_24, 0);
+    lv_label_set_text(label, "Licenses");
+    lv_obj_center(label);
+}
+
 // Drop presses whose result never came, so they cannot fill the table forever.
 static void expire_pending(void)
 {
@@ -312,8 +381,11 @@ esp_err_t ui_init(lv_display_t *disp)
     s_usb_label = add_status(LV_PALETTE_AMBER, 80, "USB: starting");
     s_touch_label = add_status(LV_PALETTE_PINK, 118, "Touch: starting");
     lv_obj_set_width(s_touch_label, DISPLAY_H_RES - 60 - FORGET_W); // the touch text is short
+    lv_obj_set_width(s_usb_label,
+                     DISPLAY_H_RES - 60 - LICENSES_W); // "USB: error (ESP_ERR_NOT_SUPPORTED)" is 655 px of 744
     s_daemon_label = add_status(LV_PALETTE_PURPLE, 156, "Daemon: waiting for Wi-Fi");
     create_forget();
+    create_licenses_button();
     create_toast();
     create_result();
     lvgl_port_unlock();
