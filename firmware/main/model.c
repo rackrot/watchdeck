@@ -77,6 +77,17 @@ uint8_t model_shown(void)
     return i;
 }
 
+bool model_step(int dir)
+{
+    model_shown(); // settles s_shown_id on a page of the set
+    const int to = pageset_step(s_pages, s_n_pages, s_shown_id, dir);
+    if (to < 0) {
+        return false;
+    }
+    strlcpy(s_shown_id, s_pages[to].page_id, sizeof(s_shown_id));
+    return true;
+}
+
 static bool is_tile_button(const char *btn)
 {
     for (uint8_t p = 0; p < s_n_pages; p++) {

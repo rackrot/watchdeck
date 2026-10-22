@@ -47,6 +47,12 @@ const proto_layout_t *model_page(uint8_t i);
 uint8_t model_shown(void);
 
 /**
+ * Move the page shown one page forward (`dir` > 0) or back (`dir` < 0), stopping at the ends. Returns whether it moved.
+ * Call only with model_pages() > 0.
+ */
+bool model_step(int dir);
+
+/**
  * Store a tile's value if a page of the applied set has a tile button with its id. Returns false, and logs why, when
  * there is none or the store is full.
  */

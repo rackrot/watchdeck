@@ -67,3 +67,16 @@ pageset_result_t pageset_add(pageset_t *ps, const proto_layout_t *page, int64_t 
     ps->completed = true;
     return PAGESET_COMPLETE;
 }
+
+int pageset_step(const proto_layout_t *pages, size_t n, const char *shown_id, int dir)
+{
+    size_t from = 0;
+    while (from < n && strcmp(pages[from].page_id, shown_id) != 0) {
+        from++;
+    }
+    if (from == n) {
+        from = 0;
+    }
+    const int to = (int)from + (dir > 0 ? 1 : -1);
+    return n == 0 || to < 0 || to >= (int)n ? -1 : to;
+}

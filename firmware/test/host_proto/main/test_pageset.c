@@ -198,6 +198,45 @@ void test_pageset_reset_starts_a_new_connection(void)
     TEST_ASSERT_EQUAL(PAGESET_COMPLETE, add(page_of(1, 1, 2), 0));
 }
 
+// Three pages with ids p0, p1, p2 in `slots`.
+static void three_pages(void)
+{
+    fresh();
+    for (uint8_t i = 0; i < 3; i++) {
+        snprintf(slots[i].page_id, sizeof(slots[i].page_id), "p%u", i);
+    }
+}
+
+void test_pageset_step_moves_one_page_either_way(void)
+{
+    three_pages();
+    TEST_ASSERT_EQUAL(2, pageset_step(slots, 3, "p1", 1));
+    TEST_ASSERT_EQUAL(0, pageset_step(slots, 3, "p1", -1));
+    TEST_ASSERT_EQUAL(1, pageset_step(slots, 3, "p0", 1));
+}
+
+void test_pageset_step_stops_at_the_ends(void)
+{
+    three_pages();
+    TEST_ASSERT_EQUAL(-1, pageset_step(slots, 3, "p2", 1));
+    TEST_ASSERT_EQUAL(-1, pageset_step(slots, 3, "p0", -1));
+}
+
+void test_pageset_step_single_page_does_not_move(void)
+{
+    three_pages();
+    TEST_ASSERT_EQUAL(-1, pageset_step(slots, 1, "p0", 1));
+    TEST_ASSERT_EQUAL(-1, pageset_step(slots, 1, "p0", -1));
+    TEST_ASSERT_EQUAL(-1, pageset_step(slots, 0, "", 1));
+}
+
+void test_pageset_step_unknown_id_steps_from_page_0(void)
+{
+    three_pages();
+    TEST_ASSERT_EQUAL(1, pageset_step(slots, 3, "gone", 1));
+    TEST_ASSERT_EQUAL(-1, pageset_step(slots, 3, "gone", -1));
+}
+
 void test_pageset_run(void)
 {
     RUN_TEST(test_pageset_complete_set_of_4);
@@ -213,4 +252,8 @@ void test_pageset_run(void)
     RUN_TEST(test_pageset_older_rev_after_a_newer_one_breaks);
     RUN_TEST(test_pageset_plain_layout_while_a_set_is_arriving);
     RUN_TEST(test_pageset_reset_starts_a_new_connection);
+    RUN_TEST(test_pageset_step_moves_one_page_either_way);
+    RUN_TEST(test_pageset_step_stops_at_the_ends);
+    RUN_TEST(test_pageset_step_single_page_does_not_move);
+    RUN_TEST(test_pageset_step_unknown_id_steps_from_page_0);
 }

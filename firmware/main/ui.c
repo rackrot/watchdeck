@@ -30,6 +30,7 @@ _Static_assert(GRID_SCREEN_W == DISPLAY_H_RES && GRID_SCREEN_H == DISPLAY_V_RES,
 #define LICENSES_W 220
 #define LICENSES_H 34
 #define LICENSES_Y 72
+#define SWIPE_LOCK_WARN_MS 100     // a page build holding the model lock longer than this could cost a frame
 #define ROW_W (DISPLAY_H_RES - 80) // labels and buttons of the pairing views
 #define ROW_H 76
 
@@ -74,6 +75,7 @@ static bool s_has_icon[PROTO_MAX_BUTTONS];
 static lv_obj_t *s_cell_values[PROTO_MAX_BUTTONS]; // a tile's value label, NULL for a button without a tile
 static uint32_t s_cell_bgs[PROTO_MAX_BUTTONS];     // the configured color, shown while a tile is ok
 static size_t s_n_buttons;
+static uint32_t s_swipe_tick; // when the latest swipe was recognized; two queued swipes both log the later one's time
 static char s_printable[PROTO_TEXT_MAX];
 static bool s_paired;
 static bool s_attempt_shown; // a pairing attempt's code or question is on screen
@@ -387,6 +389,21 @@ esp_err_t ui_init(lv_display_t *disp)
     return ESP_OK;
 }
 
+static void swipe_page(void *user_data);
+
+// A swipe anywhere on the grid, whatever it started on. The release must press nothing, an outward swipe at either end
+// included. The rebuild waits for lv_async_call, so the pressed widget isn't deleted inside its own event.
+static void grid_gesture(lv_event_t *e)
+{
+    lv_indev_t *indev = lv_indev_active();
+    lv_indev_wait_release(indev);
+    const lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+    if (dir == LV_DIR_LEFT || dir == LV_DIR_RIGHT) {
+        s_swipe_tick = lv_tick_get();
+        lv_async_call(swipe_page, (void *)(intptr_t)(dir == LV_DIR_LEFT ? 1 : -1));
+    }
+}
+
 // Replace the grid with page `l` of a set of `pages`. With 2 or more pages the cells give up a strip at the bottom for
 // "Page x of y". The grid keeps its full height either way, and never scrolls.
 static void build_grid(const proto_layout_t *l, uint8_t pages)
@@ -396,6 +413,9 @@ static void build_grid(const proto_layout_t *l, uint8_t pages)
     }
     s_grid = lv_obj_create(lv_screen_active());
     lv_obj_remove_style_all(s_grid);
+    // Children bubble gestures by default (lv_obj.c), so a swipe that starts on a button lands here.
+    lv_obj_set_gesture_bubble(s_grid, false);
+    lv_obj_add_event_cb(s_grid, grid_gesture, LV_EVENT_GESTURE, NULL);
     lv_obj_set_size(s_grid, DISPLAY_H_RES, DISPLAY_V_RES - GRID_TOP);
     lv_obj_set_pos(s_grid, 0, GRID_TOP);
     lv_obj_set_scrollable(s_grid, false);
@@ -521,6 +541,27 @@ static uint8_t build_page(void)
     }
     lv_obj_set_style_opa(s_grid, s_online ? LV_OPA_COVER : LV_OPA_30, 0);
     return shown;
+}
+
+// Runs in the LVGL task, so under the LVGL lock. `user_data` is the direction (+1 next, -1 previous), resolved against
+// the page shown now, since a new set may have applied since the swipe. Sends nothing to the link, and works offline.
+static void swipe_page(void *user_data)
+{
+    const int dir = (int)(intptr_t)user_data;
+    model_lock();
+    const uint32_t locked_at = lv_tick_get();
+    if (!s_grid || model_pages() == 0 || !model_step(dir)) {
+        model_unlock();
+        return; // no set, or an outward swipe at an end
+    }
+    const uint8_t shown = build_page();
+    const uint8_t pages = model_pages();
+    model_unlock();
+    const uint32_t held_ms = lv_tick_elaps(locked_at);
+    ESP_LOGI(TAG, "page %u/%u shown in %u ms", shown + 1, pages, (unsigned)lv_tick_elaps(s_swipe_tick));
+    if (held_ms > SWIPE_LOCK_WARN_MS) {
+        ESP_LOGW(TAG, "page build held the model lock %u ms, copy the page out under it", (unsigned)held_ms);
+    }
 }
 
 // One line to compare memory at the same point across runs: the LVGL pool, then the internal and PSRAM heaps.

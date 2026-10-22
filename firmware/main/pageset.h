@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "proto.h"
@@ -39,6 +40,13 @@ void pageset_reset(pageset_t *ps);
  * PAGESET_COMPLETE, `*why` is NULL, or a note that a newer rev discarded the set that was arriving.
  */
 pageset_result_t pageset_add(pageset_t *ps, const proto_layout_t *page, int64_t now_ms, const char **why);
+
+/**
+ * The index of the page one step from the page named `shown_id` in `pages[0 .. n - 1]`: forward for `dir` > 0, back
+ * otherwise. An id no page has counts as page 0. Returns -1 when there is no such page (an end, with no wrap, or n =
+ * 0).
+ */
+int pageset_step(const proto_layout_t *pages, size_t n, const char *shown_id, int dir);
 
 /** Whether a set has some of its pages in and waits for the rest. */
 bool pageset_arriving(const pageset_t *ps);
