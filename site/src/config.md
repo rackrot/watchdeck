@@ -1,6 +1,6 @@
 # Buttons and actions
 
-The desktop app reads the button grid, and what each button does, from `config.toml`. HTTP actions can take header values from `secrets.toml`, which keeps tokens out of `config.toml`. Both files live in `~/.config/dev.rackrot.watchdeck/`.
+The desktop app reads the button grid, and what each button does, from `config.toml`. HTTP actions can take header values from `secrets.toml`, which keeps tokens out of `config.toml`. Both files live in `$XDG_CONFIG_HOME/watchdeck/`, which is `~/.config/watchdeck/` when `XDG_CONFIG_HOME` is unset, empty or not an absolute path. Earlier versions kept them in `~/.config/dev.rackrot.watchdeck/`. On first start the app moves that whole folder to the new place, so paired devices stay paired. If the move fails, the app doesn't start and names both folders.
 
 On its first run the app writes a commented `config.toml` with one button, Hello, which shows a desktop notification.
 
@@ -60,7 +60,7 @@ Save the file and the change applies within about a second. The app checks `conf
 A version that breaks any rule on this page doesn't apply. The last good config stays live, and the app logs every problem it found:
 
 ```text
-[2026-10-11T02:14:49Z ERROR watchdeck::config_rejected] /home/you/.config/dev.rackrot.watchdeck/config.toml not applied, keeping the live config: button "disk": pos [5, 0] is outside the 5x3 grid
+[2026-10-11T02:14:49Z ERROR watchdeck::config_rejected] /home/you/.config/watchdeck/config.toml not applied, keeping the live config: button "disk": pos [5, 0] is outside the 5x3 grid
 ```
 
 - If the file breaks a rule when the app starts, the device shows an empty grid until you fix it.
@@ -99,7 +99,7 @@ Unknown keys are errors, so a misspelled key is caught rather than ignored.
 
 ## Icons
 
-A button can show a picture above its label. The picture is a PNG, JPEG or WebP file in `~/.config/dev.rackrot.watchdeck/icons/`, and `icon` names the file:
+A button can show a picture above its label. The picture is a PNG, JPEG or WebP file in `$XDG_CONFIG_HOME/watchdeck/icons/`, and `icon` names the file:
 
 ```toml
 [[button]]
@@ -205,7 +205,7 @@ A tile puts a live value on a button, such as a load average, a disk percentage 
 ha = "Bearer paste-your-token-here"
 ```
 
-- The file must have mode 0600, or the app won't read it and logs the fix: `chmod 600 ~/.config/dev.rackrot.watchdeck/secrets.toml`.
+- The file must have mode 0600, or the app won't read it and logs the fix: `chmod 600 "${XDG_CONFIG_HOME:-$HOME/.config}"/watchdeck/secrets.toml`.
 - A value goes out as an HTTP header, so it must be printable ASCII on one line, up to 4096 bytes. The app won't read a file with any other value, and the error names the secret.
 - A button that names a missing secret holds back the whole config. Adding the secret applies it.
 - The Secrets page can remove a secret, after a confirmation. It refuses while the running config still names the secret in a button's action or a tile's source, and the message lists the buttons. Change those buttons first, then remove it.

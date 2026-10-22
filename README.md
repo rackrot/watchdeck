@@ -86,7 +86,7 @@ If the display says "No desktop is ready to pair", the app's pairing dialog isn'
 
 ## Configure buttons
 
-The button grid lives in `config.toml` in the app's config directory, `~/.config/dev.rackrot.watchdeck/`. The app writes a default file on first run, with one button that shows a desktop notification.
+The button grid lives in `config.toml` in the app's config directory, `$XDG_CONFIG_HOME/watchdeck/` (`~/.config/watchdeck/` by default). The app moves an existing `~/.config/dev.rackrot.watchdeck/` there on first start. The app writes a default file on first run, with one button that shows a desktop notification.
 
 This example defines a button that restarts a container over SSH, and a tile that shows disk usage:
 

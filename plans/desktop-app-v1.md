@@ -215,7 +215,7 @@ S2 runs unauthenticated. Its only action is a compiled-in `notify-send`. Nothing
 
 ## 5. Config model
 
-Location: `~/.config/dev.rackrot.watchdeck/`, holding `config.toml` (owned by the user), `state.json` (owned by the daemon), `secrets.toml`, `identity.{pem,key}` and `icons/`.
+Location: `$XDG_CONFIG_HOME/watchdeck/` (`~/.config/watchdeck/` by default), holding `config.toml` (owned by the user), `state.json` (owned by the daemon), `secrets.toml`, `identity.{pem,key}` and `icons/`.
 
 ```toml
 version = 1

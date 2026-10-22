@@ -1,5 +1,4 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { appConfigDir } from "@tauri-apps/api/path";
 import type { Config, ConfigView, TileConfig } from "./config";
 
 export type DeviceInfo = { id: string; connected: boolean };
@@ -81,9 +80,10 @@ export const testAction = (button: string) =>
 
 /**
  * Turns an icon file name into a URL the webview may load, through the asset protocol, whose
- * scope in tauri.conf.json is only the icons directory. `configDir` is `appConfigDir()`.
+ * scope is only the icons directory, which the daemon allows at startup. `configDir` is the
+ * daemon's config folder, from `config_dir`.
  */
 export const iconUrl = (configDir: string, name: string) =>
   convertFileSrc(`${configDir}/icons/${name}`);
 
-export const configDir = () => appConfigDir();
+export const configDir = () => invoke<string>("config_dir");

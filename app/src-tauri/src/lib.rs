@@ -2,7 +2,9 @@ mod commands;
 pub mod daemon;
 mod tray;
 
+use std::ffi::OsString;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use daemon::actions::Actions;
@@ -18,6 +20,49 @@ use tauri::{Emitter, Manager, WindowEvent};
 use tauri_plugin_log::{RotationStrategy, Target, TargetKind};
 use tokio::sync::{broadcast, watch};
 use tokio_rustls::rustls::crypto::aws_lc_rs;
+
+/// Where the daemon keeps its files: `$XDG_CONFIG_HOME/watchdeck`, or `~/.config/watchdeck` when
+/// the variable is unset, empty or not an absolute path (the XDG spec says to ignore those).
+fn config_dir(xdg: Option<OsString>, home: &Path) -> PathBuf {
+    match xdg.map(PathBuf::from) {
+        Some(base) if base.is_absolute() => base.join("watchdeck"),
+        _ => home.join(".config").join("watchdeck"),
+    }
+}
+
+/// Moves the folder an earlier version kept under Tauri's app config dir to `new`, so the TLS
+/// identity survives and paired devices stay paired. Does nothing when `new` exists or `old`
+/// doesn't. A rename, never a copy: it fails across filesystems, and the app then won't start.
+fn migrate_config_dir(old: &Path, new: &Path) -> Result<(), String> {
+    if !old.is_dir() {
+        return Ok(());
+    }
+    if new.exists() {
+        log::warn!(
+            "not moving {} to {}: the new folder already exists, so the old one is ignored",
+            old.display(),
+            new.display()
+        );
+        return Ok(());
+    }
+    if let Some(parent) = new.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("creating {}: {e}", parent.display()))?;
+    }
+    std::fs::rename(old, new).map_err(|e| {
+        format!(
+            "moving the config folder from {} to {}: {e}. Move it by hand, then start the app again.",
+            old.display(),
+            new.display()
+        )
+    })?;
+    log::info!(
+        "moved the config folder from {} to {}",
+        old.display(),
+        new.display()
+    );
+    Ok(())
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -63,7 +108,9 @@ pub fn run() {
                 .build(),
         )
         .setup(|app| {
-            let dir = app.path().app_config_dir()?;
+            let home = std::env::home_dir().ok_or("HOME is not set")?;
+            let dir = config_dir(std::env::var_os("XDG_CONFIG_HOME"), &home);
+            migrate_config_dir(&app.path().app_config_dir()?, &dir)?;
             let identity = Identity::load_or_create(&dir)
                 .map_err(|e| format!("TLS identity in {}: {e}", dir.display()))?;
             log::info!("TLS identity in {}, fp={}", dir.display(), identity.fp());
@@ -72,8 +119,17 @@ pub fn run() {
             let secrets = Arc::new(Secrets::new(&dir));
             let configs = Configs::open(&dir, secrets.clone())
                 .map_err(|e| format!("config in {}: {e}", dir.display()))?;
+            // The window loads icons through the asset protocol, from this one folder only. The
+            // scope matches canonicalized request paths against patterns as given, so a symlinked
+            // config dir needs its real path allowed too. The dir exists by now.
+            let scope = app.asset_protocol_scope();
+            scope.allow_directory(dir.join("icons"), false)?;
+            if let Ok(real) = std::fs::canonicalize(&dir) {
+                if real != dir {
+                    scope.allow_directory(real.join("icons"), false)?;
+                }
+            }
             // Shell actions run in the home directory, wherever the app was started from.
-            let home = std::env::home_dir().ok_or("HOME is not set")?;
             let actions = Actions::new(secrets.clone(), home)
                 .map_err(|e| format!("HTTP client for actions: {e}"))?;
 
@@ -184,6 +240,7 @@ pub fn run() {
             });
 
             app.manage(commands::Daemon {
+                dir,
                 devices,
                 pairing,
                 configs,
@@ -212,8 +269,60 @@ pub fn run() {
             commands::list_icons,
             commands::test_action,
             commands::tile_values,
+            commands::config_dir,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|_, _| {});
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dir(xdg: Option<&str>) -> PathBuf {
+        config_dir(xdg.map(OsString::from), Path::new("/home/me"))
+    }
+
+    #[test]
+    fn xdg_config_home_wins_when_absolute() {
+        assert_eq!(dir(Some("/x/cfg")), PathBuf::from("/x/cfg/watchdeck"));
+    }
+
+    #[test]
+    fn falls_back_to_home_when_unset_empty_or_relative() {
+        let fallback = PathBuf::from("/home/me/.config/watchdeck");
+        assert_eq!(dir(None), fallback);
+        assert_eq!(dir(Some("")), fallback);
+        assert_eq!(dir(Some("rel/cfg")), fallback);
+    }
+
+    #[test]
+    fn migration_moves_the_old_folder_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = tmp.path().join("old");
+        let new = tmp.path().join("deep/new");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("identity.key"), "k").unwrap();
+
+        migrate_config_dir(&old, &new).unwrap();
+        assert!(!old.exists());
+        assert_eq!(
+            std::fs::read_to_string(new.join("identity.key")).unwrap(),
+            "k"
+        );
+
+        // With the new folder in place, a reappearing old one is left alone.
+        std::fs::create_dir(&old).unwrap();
+        migrate_config_dir(&old, &new).unwrap();
+        assert!(old.is_dir());
+    }
+
+    #[test]
+    fn migration_skips_when_there_is_no_old_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let new = tmp.path().join("new");
+        migrate_config_dir(&tmp.path().join("old"), &new).unwrap();
+        assert!(!new.exists());
+    }
 }

@@ -1,5 +1,6 @@
 //! Tauri commands for the window. They only forward to the daemon, which owns the rules.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -14,6 +15,7 @@ use crate::daemon::server::{DeviceInfo, Devices};
 use crate::daemon::tiles::TileView;
 
 pub struct Daemon {
+    pub dir: PathBuf,
     pub devices: Devices,
     pub pairing: Arc<Pairing>,
     pub configs: Arc<Configs>,
@@ -136,6 +138,12 @@ pub async fn set_secret(
 pub async fn delete_secret(daemon: State<'_, Daemon>, name: String) -> Result<(), String> {
     let configs = daemon.configs.clone();
     blocking(move || configs.delete_secret(&name)).await?
+}
+
+/// The folder that holds `config.toml` and `icons/`, for the window to build icon URLs from.
+#[tauri::command]
+pub fn config_dir(daemon: State<'_, Daemon>) -> String {
+    daemon.dir.display().to_string()
 }
 
 /// The files in `icons/` that a button's `icon` could name.

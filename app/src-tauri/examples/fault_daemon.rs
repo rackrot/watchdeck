@@ -126,8 +126,12 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Mode, String> {
     }
     let dir = match dir {
         Some(dir) => dir,
-        None => PathBuf::from(env::var("HOME").map_err(|_| "HOME is not set; pass --dir")?)
-            .join(".config/dev.rackrot.watchdeck"),
+        // The app's own rule: $XDG_CONFIG_HOME when absolute, else ~/.config.
+        None => match env::var_os("XDG_CONFIG_HOME").map(PathBuf::from) {
+            Some(base) if base.is_absolute() => base.join("watchdeck"),
+            _ => PathBuf::from(env::var("HOME").map_err(|_| "HOME is not set; pass --dir")?)
+                .join(".config/watchdeck"),
+        },
     };
     Ok(Mode::Run(Args {
         device,
