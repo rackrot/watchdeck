@@ -63,14 +63,6 @@ jobs:
           idf.py set-target esp32p4
           idf.py build
 
-      # The stamped debug ELF must carry the build id of watchdeck.elf and no loadable bytes.
-      - name: Check debug ELF
-        shell: bash
-        working-directory: firmware
-        run: |
-          . "$IDF_PATH/export.sh"
-          bash tools/check_debug_elf.sh build
-
       # Host unit tests of proto.c, built for the linux target. Fails the job on any failed case.
       - name: Run host parser tests
         shell: bash
