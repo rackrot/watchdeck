@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "font_ids.h"
 
 /* Wire format: site/src/protocol.md. Every function here is pure (no I/O, no globals). */
 
@@ -54,12 +55,16 @@ typedef struct {
     bool has_icon;
     uint8_t icon[PROTO_ICON_ID_LEN]; // valid when has_icon
     bool tile;                       // shows a live value, sent as tile messages
+    wd_font_t label_font;            // already resolved: label_font, else the message font
+    wd_font_t value_font;            // already resolved: value_font, else label_font
 } proto_button_t;
 
 typedef struct {
     uint32_t rev;
     uint8_t cols;
     uint8_t rows;
+    wd_font_t font;    // the grid's default font
+    bool unknown_font; // a font field was not a known name and was drawn as Montserrat
     size_t n_buttons;
     proto_button_t buttons[PROTO_MAX_BUTTONS];
 } proto_layout_t;
@@ -147,9 +152,12 @@ void proto_device_id(char out[PROTO_DEVICE_ID_LEN], const uint8_t mac[6]);
  */
 esp_err_t proto_fp(const char *pem, char out[PROTO_FP_LEN + 1]);
 
-/** Build a hello message carrying `token`. Returns the JSON length, or 0 if it does not fit in `buf`. */
+/**
+ * Build a hello message carrying `token`. `caps` names the optional features this build fully supports;
+ * the key is left out when `n_caps` is 0. Returns the JSON length, or 0 if it does not fit in `buf`.
+ */
 size_t proto_build_hello(char *buf, size_t buf_len, const char *device, const uint8_t token[PROTO_TOKEN_LEN],
-                         const char *fw, int width, int height);
+                         const char *fw, int width, int height, const char *const *caps, size_t n_caps);
 
 /** Build pair_req. Returns the JSON length, or 0 if it does not fit in `buf`. */
 size_t proto_build_pair_req(char *buf, size_t buf_len, const char *device, const uint8_t commit[PROTO_HASH_LEN]);

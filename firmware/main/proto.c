@@ -64,7 +64,7 @@ static size_t print_into(cJSON *root, char *buf, size_t buf_len)
 }
 
 size_t proto_build_hello(char *buf, size_t buf_len, const char *device, const uint8_t token[PROTO_TOKEN_LEN],
-                         const char *fw, int width, int height)
+                         const char *fw, int width, int height, const char *const *caps, size_t n_caps)
 {
     char token_hex[2 * PROTO_TOKEN_LEN + 1];
     to_hex(token, PROTO_TOKEN_LEN, token_hex);
@@ -83,6 +83,14 @@ size_t proto_build_hello(char *buf, size_t buf_len, const char *device, const ui
     cJSON_AddStringToObject(root, "token", token_hex);
     cJSON_AddStringToObject(root, "fw", fw);
     cJSON_AddItemToObject(root, "screen", screen);
+    if (n_caps > 0) {
+        cJSON *list = cJSON_CreateStringArray(caps, (int)n_caps);
+        if (!list) {
+            cJSON_Delete(root);
+            return 0;
+        }
+        cJSON_AddItemToObject(root, "caps", list);
+    }
     return print_into(root, buf, buf_len);
 }
 
@@ -263,6 +271,24 @@ static bool get_int(const cJSON *obj, const char *key, double min, double max, d
     return true;
 }
 
+// Read a font field. Absent gives `inherit`. A known name gives that font. Anything else (an unknown
+// name, a non-string, an over-long string) gives Montserrat and sets `*bad`: a font is cosmetic, so the
+// layout is still accepted. The first such field in a layout is logged.
+static wd_font_t get_font(const cJSON *obj, const char *key, wd_font_t inherit, bool *bad)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (!item) {
+        return inherit;
+    }
+    bool known = false;
+    wd_font_t font = wd_font_from_name(cJSON_IsString(item) ? item->valuestring : NULL, &known);
+    if (!known && !*bad) {
+        *bad = true;
+        ESP_LOGW(TAG, "layout field \"%s\" is not a known font, drawing it in montserrat", key);
+    }
+    return font;
+}
+
 static esp_err_t parse_layout(const cJSON *root, proto_layout_t *out)
 {
     double rev, cols, rows;
@@ -276,6 +302,8 @@ static esp_err_t parse_layout(const cJSON *root, proto_layout_t *out)
     out->cols = (uint8_t)cols;
     out->rows = (uint8_t)rows;
     out->n_buttons = 0;
+    out->unknown_font = false;
+    out->font = get_font(root, "font", WD_FONT_MONTSERRAT, &out->unknown_font);
 
     const cJSON *item;
     cJSON_ArrayForEach(item, buttons)
@@ -304,6 +332,8 @@ static esp_err_t parse_layout(const cJSON *root, proto_layout_t *out)
             return ESP_ERR_INVALID_ARG;
         }
         b->tile = cJSON_IsTrue(tile);
+        b->label_font = get_font(item, "label_font", out->font, &out->unknown_font);
+        b->value_font = get_font(item, "value_font", b->label_font, &out->unknown_font);
         out->n_buttons++;
     }
     return ESP_OK;

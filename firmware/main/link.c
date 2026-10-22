@@ -704,9 +704,11 @@ static void send_hello(void)
         lost("no MAC");
         return;
     }
+    // Only names this build fully supports: "fonts" means ui.c draws every font id in font_list.h.
+    static const char *const caps[] = {"fonts"};
     char buf[256];
     size_t len = proto_build_hello(buf, sizeof(buf), device, s.pairing->token, esp_app_get_description()->version,
-                                   DISPLAY_H_RES, DISPLAY_V_RES);
+                                   DISPLAY_H_RES, DISPLAY_V_RES, caps, sizeof(caps) / sizeof(caps[0]));
     if (len == 0) {
         lost("hello does not fit");
         return;

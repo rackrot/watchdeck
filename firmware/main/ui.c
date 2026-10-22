@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
 #include "display.h"
+#include "fonts.h"
 #include "link.h"
 
 #define GRID_TOP 204
@@ -332,7 +333,8 @@ static void build_grid(const proto_layout_t *l)
     const int cell_w = (DISPLAY_H_RES - (l->cols + 1) * GRID_GAP) / l->cols;
     const int cell_h = (DISPLAY_V_RES - GRID_TOP - l->rows * GRID_GAP) / l->rows;
     // The daemon sizes icons to what is left (icons.rs box_px), so both sides use these numbers.
-    const int line_h = lv_font_get_line_height(&lv_font_montserrat_32);
+    // Slot line boxes, never a font's own line height, so that no font moves the geometry.
+    const int line_h = SLOT32_H;
     const int room = cell_h - 2 * ICON_PAD;
     const int label_lines = room >= 2 * line_h + ICON_GAP + ICON_MIN ? 2 : 1;
     int icon_side = room - label_lines * line_h - ICON_GAP;
@@ -377,24 +379,25 @@ static void build_grid(const proto_layout_t *l)
             lv_obj_set_height(label, label_lines * line_h);
         }
         lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_text_font(label, &lv_font_montserrat_32, 0);
+        lv_obj_set_style_text_font(label, wd_font(b->label_font, WD_SLOT_32), 0);
         lv_obj_set_style_text_color(label, lv_color_hex(b->fg), 0);
         lv_label_set_text(label, s_labels[i]);
 
         if (b->tile) {
             // The label shrinks to one line of 24 pt and the value goes under it. With an icon on a grid of
             // 4 or 5 rows there is room for the icon and the value only, so the label goes.
-            lv_obj_set_style_text_font(label, &lv_font_montserrat_24, 0);
+            lv_obj_set_style_text_font(label, wd_font(b->label_font, WD_SLOT_24), 0);
             lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
-            lv_obj_set_height(label, lv_font_get_line_height(&lv_font_montserrat_24));
+            lv_obj_set_height(label, SLOT24_H);
             lv_obj_set_hidden(label, b->has_icon && label_lines == 1);
 
-            const lv_font_t *font = cell_h >= TILE_BIG_MIN_H ? &lv_font_montserrat_32 : &lv_font_montserrat_24;
+            const bool big = cell_h >= TILE_BIG_MIN_H;
+            const lv_font_t *font = wd_font(b->value_font, big ? WD_SLOT_32 : WD_SLOT_24);
             lv_obj_t *value = lv_label_create(btn);
             s_cell_values[i] = value;
             lv_obj_set_width(value, cell_w - 16);
             lv_label_set_long_mode(value, LV_LABEL_LONG_DOT);
-            lv_obj_set_height(value, lv_font_get_line_height(font));
+            lv_obj_set_height(value, big ? SLOT32_H : SLOT24_H);
             lv_obj_set_style_text_align(value, LV_TEXT_ALIGN_CENTER, 0);
             lv_obj_set_style_text_font(value, font, 0);
             lv_obj_set_style_text_color(value, lv_color_hex(b->fg), 0);

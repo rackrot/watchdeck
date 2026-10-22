@@ -496,6 +496,168 @@ void test_layout_label_cut_inside_a_utf8_sequence_leaves_a_lone_lead_byte(void)
     TEST_ASSERT_EQUAL_UINT8(0, (uint8_t)msg.layout.buttons[0].label[47]);
 }
 
+// ---- Fonts ----
+
+// A layout whose message carries `font_field` (a JSON fragment such as "\"font\":\"inter\"", or "") and one button.
+static void layout_font(const char *font_field, const char *button_fields)
+{
+    snprintf(json, sizeof(json), "{\"t\":\"layout\",\"rev\":1,\"cols\":4,\"rows\":2,%s\"buttons\":[{" BUTTON "%s}]}",
+             font_field, button_fields);
+}
+
+void test_font_none_given_is_montserrat_without_a_flag(void)
+{
+    layout_font("", ",\"tile\":true");
+    TEST_ASSERT_EQUAL(ESP_OK, proto_parse(json, strlen(json), &msg));
+    TEST_ASSERT_EQUAL(WD_FONT_MONTSERRAT, msg.layout.font);
+    TEST_ASSERT_EQUAL(WD_FONT_MONTSERRAT, msg.layout.buttons[0].label_font);
+    TEST_ASSERT_EQUAL(WD_FONT_MONTSERRAT, msg.layout.buttons[0].value_font);
+    TEST_ASSERT_FALSE(msg.layout.unknown_font);
+}
+
+void test_font_on_the_message_covers_every_label_and_value(void)
+{
+    layout_font("\"font\":\"inter\",", ",\"tile\":true");
+    TEST_ASSERT_EQUAL(ESP_OK, proto_parse(json, strlen(json), &msg));
+    TEST_ASSERT_EQUAL(WD_FONT_inter, msg.layout.font);
+    TEST_ASSERT_EQUAL(WD_FONT_inter, msg.layout.buttons[0].label_font);
+    TEST_ASSERT_EQUAL(WD_FONT_inter, msg.layout.buttons[0].value_font);
+    TEST_ASSERT_FALSE(msg.layout.unknown_font);
+}
+
+void test_font_label_font_carries_over_to_the_value_unless_value_font_is_given(void)
+{
+    layout_font("\"font\":\"inter\",", ",\"tile\":true,\"label_font\":\"orbitron\"");
+    TEST_ASSERT_EQUAL(ESP_OK, proto_parse(json, strlen(json), &msg));
+    TEST_ASSERT_EQUAL(WD_FONT_orbitron, msg.layout.buttons[0].label_font);
+    TEST_ASSERT_EQUAL(WD_FONT_orbitron, msg.layout.buttons[0].value_font);
+
+    layout_font("\"font\":\"inter\",", ",\"tile\":true,\"label_font\":\"orbitron\",\"value_font\":\"fira-code\"");
+    TEST_ASSERT_EQUAL(ESP_OK, proto_parse(json, strlen(json), &msg));
+    TEST_ASSERT_EQUAL(WD_FONT_orbitron, msg.layout.buttons[0].label_font);
+    TEST_ASSERT_EQUAL(WD_FONT_fira_code, msg.layout.buttons[0].value_font);
+
+    // A value_font alone leaves the label on the message font.
+    layout_font("\"font\":\"inter\",", ",\"tile\":true,\"value_font\":\"oxanium\"");
+    TEST_ASSERT_EQUAL(ESP_OK, proto_parse(json, strlen(json), &msg));
+    TEST_ASSERT_EQUAL(WD_FONT_inter, msg.layout.buttons[0].label_font);
+    TEST_ASSERT_EQUAL(WD_FONT_oxanium, msg.layout.buttons[0].value_font);
+}
+
+void test_font_every_id_is_known(void)
+{
+    static const char *const names[WD_FONT_COUNT] = {"montserrat",  "inter",    "roboto", "fira-code",
+                                                     "roboto-mono", "orbitron", "oxanium"};
+    for (int i = 0; i < WD_FONT_COUNT; i++) {
+        bool known = false;
+        TEST_ASSERT_EQUAL(i, wd_font_from_name(names[i], &known));
+        TEST_ASSERT_TRUE(known);
+    }
+}
+
+// A font is cosmetic: a bad value is Montserrat with the flag set, and the layout is still accepted.
+void test_font_unknown_or_mistyped_values_fall_back_to_montserrat_and_set_the_flag(void)
+{
+    char long_name[260];
+    snprintf(long_name, sizeof(long_name), "\"label_font\":\"%s\"", run_of('a', 200));
+    const char *bad_labels[] = {"\"label_font\":\"nope\"", "\"label_font\":7", "\"label_font\":null",
+                                "\"label_font\":{}",       long_name,          "\"label_font\":\"Inter\"",
+                                "\"label_font\":\"\""};
+    for (size_t i = 0; i < sizeof(bad_labels) / sizeof(bad_labels[0]); i++) {
+        char fields[300];
+        snprintf(fields, sizeof(fields), ",\"tile\":true,%s", bad_labels[i]);
+        layout_font("\"font\":\"inter\",", fields);
+        TEST_ASSERT_EQUAL(ESP_OK, proto_parse(json, strlen(json), &msg));
+        TEST_ASSERT_EQUAL(WD_FONT_inter, msg.layout.font);
+        TEST_ASSERT_EQUAL(WD_FONT_MONTSERRAT, msg.layout.buttons[0].label_font);
+        TEST_ASSERT_EQUAL(WD_FONT_MONTSERRAT, msg.layout.buttons[0].value_font);
+        TEST_ASSERT_TRUE(msg.layout.unknown_font);
+    }
+
+    snprintf(long_name, sizeof(long_name), "\"font\":\"%s\",", run_of('a', 200));
+    const char *bad_messages[] = {"\"font\":\"nope\",", "\"font\":7,", "\"font\":null,", "\"font\":{},", long_name};
+    for (size_t i = 0; i < sizeof(bad_messages) / sizeof(bad_messages[0]); i++) {
+        layout_font(bad_messages[i], ",\"tile\":true");
+        TEST_ASSERT_EQUAL(ESP_OK, proto_parse(json, strlen(json), &msg));
+        TEST_ASSERT_EQUAL(WD_FONT_MONTSERRAT, msg.layout.font);
+        TEST_ASSERT_EQUAL(WD_FONT_MONTSERRAT, msg.layout.buttons[0].label_font);
+        TEST_ASSERT_EQUAL(WD_FONT_MONTSERRAT, msg.layout.buttons[0].value_font);
+        TEST_ASSERT_TRUE(msg.layout.unknown_font);
+    }
+
+    // A bad value_font leaves the label alone.
+    layout_font("\"font\":\"inter\",", ",\"tile\":true,\"value_font\":\"nope\"");
+    TEST_ASSERT_EQUAL(ESP_OK, proto_parse(json, strlen(json), &msg));
+    TEST_ASSERT_EQUAL(WD_FONT_inter, msg.layout.buttons[0].label_font);
+    TEST_ASSERT_EQUAL(WD_FONT_MONTSERRAT, msg.layout.buttons[0].value_font);
+    TEST_ASSERT_TRUE(msg.layout.unknown_font);
+}
+
+// The flag belongs to one message: a clean layout after a bad one clears it.
+void test_font_flag_does_not_stick_to_the_next_layout(void)
+{
+    layout_font("\"font\":\"nope\",", "");
+    TEST_ASSERT_EQUAL(ESP_OK, proto_parse(json, strlen(json), &msg));
+    TEST_ASSERT_TRUE(msg.layout.unknown_font);
+    layout_font("", "");
+    TEST_ASSERT_EQUAL(ESP_OK, proto_parse(json, strlen(json), &msg));
+    TEST_ASSERT_FALSE(msg.layout.unknown_font);
+}
+
+// The fullest layout: 40 buttons with 63-byte ids, labels and every font field at its longest.
+void test_font_fullest_layout_with_every_font_field_parses(void)
+{
+#define FILLER "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii"
+    static char big[PROTO_MAX_MSG];
+    size_t len = (size_t)snprintf(
+        big, sizeof(big), "{\"t\":\"layout\",\"rev\":1,\"cols\":8,\"rows\":5,\"font\":\"roboto-mono\",\"buttons\":[");
+    for (int i = 0; i < 40; i++) {
+        len += (size_t)snprintf(
+            big + len, sizeof(big) - len,
+            "%s{\"id\":\"%.60s%03d\",\"label\":\"%.47s\",\"col\":%d,\"row\":%d,\"bg\":16777215,"
+            "\"fg\":16777215,\"tile\":true,\"label_font\":\"roboto-mono\",\"value_font\":\"roboto-mono\"}",
+            i ? "," : "", FILLER, i, FILLER, i % 8, i / 8);
+    }
+    len += (size_t)snprintf(big + len, sizeof(big) - len, "]}");
+    TEST_ASSERT_LESS_THAN(PROTO_MAX_MSG, len);
+    TEST_ASSERT_EQUAL(ESP_OK, proto_parse(big, len, &msg));
+    TEST_ASSERT_EQUAL_size_t(40, msg.layout.n_buttons);
+    TEST_ASSERT_EQUAL(WD_FONT_roboto_mono, msg.layout.buttons[39].value_font);
+    TEST_ASSERT_FALSE(msg.layout.unknown_font);
+}
+
+// ---- Hello ----
+
+static const uint8_t TOKEN[PROTO_TOKEN_LEN] = {0};
+
+void test_hello_without_caps_has_no_caps_key(void)
+{
+    char buf[256];
+    size_t len = proto_build_hello(buf, sizeof(buf), "wd-e8f60ae276ab", TOKEN, "0.3.0", 1024, 600, NULL, 0);
+    TEST_ASSERT_GREATER_THAN(0, len);
+    TEST_ASSERT_NULL(strstr(buf, "caps"));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"screen\":[1024,600]"));
+}
+
+void test_hello_with_fonts_names_it_in_caps(void)
+{
+    char buf[256];
+    const char *const caps[] = {"fonts"};
+    size_t len = proto_build_hello(buf, sizeof(buf), "wd-e8f60ae276ab", TOKEN, "0.3.0", 1024, 600, caps, 1);
+    TEST_ASSERT_GREATER_THAN(0, len);
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"caps\":[\"fonts\"]"));
+}
+
+void test_hello_with_two_caps_and_a_32_character_fw_fits_256_bytes(void)
+{
+    char buf[256];
+    const char *const caps[] = {"fonts", "pages"};
+    size_t len = proto_build_hello(buf, sizeof(buf), "wd-e8f60ae276ab", TOKEN, run_of('v', 32), 1024, 600, caps, 2);
+    TEST_ASSERT_GREATER_THAN(0, len);
+    TEST_ASSERT_LESS_THAN(sizeof(buf), len);
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"caps\":[\"fonts\",\"pages\"]"));
+}
+
 void app_main(void)
 {
     psa_status_t status = psa_crypto_init();
@@ -544,6 +706,16 @@ void app_main(void)
     RUN_TEST(test_layout_fractions_are_truncated);
     RUN_TEST(test_layout_nesting_depth_9_is_refused);
     RUN_TEST(test_layout_label_cut_inside_a_utf8_sequence_leaves_a_lone_lead_byte);
+    RUN_TEST(test_font_none_given_is_montserrat_without_a_flag);
+    RUN_TEST(test_font_on_the_message_covers_every_label_and_value);
+    RUN_TEST(test_font_label_font_carries_over_to_the_value_unless_value_font_is_given);
+    RUN_TEST(test_font_every_id_is_known);
+    RUN_TEST(test_font_unknown_or_mistyped_values_fall_back_to_montserrat_and_set_the_flag);
+    RUN_TEST(test_font_flag_does_not_stick_to_the_next_layout);
+    RUN_TEST(test_font_fullest_layout_with_every_font_field_parses);
+    RUN_TEST(test_hello_without_caps_has_no_caps_key);
+    RUN_TEST(test_hello_with_fonts_names_it_in_caps);
+    RUN_TEST(test_hello_with_two_caps_and_a_32_character_fw_fits_256_bytes);
 
     // Returning from app_main does not end a linux-target process, so the failure count becomes the exit status.
     exit(UNITY_END());
