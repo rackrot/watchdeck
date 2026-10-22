@@ -589,5 +589,5 @@ Rollback: each slice is its own commit on `main` (see the status table), so `git
 
 - ~~**Sentry error reporting.**~~ Dropped 2026-10-21 by the user, and the code is removed. See `plans/sentry.md`.
 - ~~**Pages (protocol v2).**~~ Built 2026-10-22 as the `pages` capability on protocol v1, not v2: up to 4 pages per layout, swipe to turn them, and page tabs in the config editor. The S8 hardware run passed on 2026-10-22. See `plans/pages.md`.
-- **`insecure_tls` for HTTP actions.** A per-action opt-in that skips certificate checks, for self-signed services (open question 5).
-- **SVG icons via resvg.** The daemon rasterizes SVG to the button size, like the other formats (open question 6).
+- ~~**`insecure_tls` for HTTP actions.**~~ Built 2026-10-21 in d2468c2: a per-action opt-in that skips certificate checks, for self-signed services (open question 5). See `site/src/config.md`.
+- ~~**SVG icons via resvg.**~~ Built 2026-10-21 in 4437fd4: the daemon rasterizes SVG to the button size, like the other formats, under a strict subset and a render-cost limit (open question 6). See `site/src/config.md`.
