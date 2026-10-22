@@ -467,7 +467,7 @@ The firmware was the f75bf5c build, already on the board, so no flash. The daemo
 - **Acceptance (on the board, from the serial and daemon logs)**: neither log shows a `press` for any swipe.
   - Swipes in both directions: some starting on a button, some kept inside one big button (a 2×1 grid), some starting in a gap, some on the label strip, and some going outward at each end, where they do nothing.
   - Plain taps still press. A tap that closes the result modal doesn't navigate.
-  - A slow drag that isn't a gesture behaves as it does today.
+  - A slow drag that isn't a gesture behaves as it does today. (Superseded in S8: a drag of more than 20 px never presses; see S8 results.)
   - No `icon_get` after any page switch.
   - A tile on page 3 shows its value at once on the first visit.
   - Pending result: press a slow button on page A, swipe to page B, and the result names A's button. Two slow presses whose results come back in reverse order each name their own button.
@@ -483,7 +483,7 @@ Code, host tests and build only. The swipe acceptance items above wait for S8 on
   - `lv_indev_wait_release` runs for every gesture. Left or right also queues `lv_async_call(swipe_page, ±1)`.
   - `swipe_page` runs in the LVGL task. It takes the model lock, steps the page, builds it, and logs `page N/M shown in X ms`. If the lock was held for over 100 ms it logs a warning.
 - `model_step` calls the new pure `pageset_step(pages, n, shown_id, dir)`. That returns the new index, or -1 at either end or with one page, and treats an unknown id as page 0. Four host cases cover it, 82 in all.
-- Departure: a quick flick in any direction, vertical included, no longer presses the button under it. Before S6 a vertical flick on a button pressed it on release. A slow drag isn't a gesture, so it behaves as before.
+- Departure: a quick flick in any direction, vertical included, no longer presses the button under it. Before S6 a vertical flick on a button pressed it on release. S8 added a drag fallback (S8 results), so a slow drag that LVGL misses as a gesture no longer presses either.
 - The image is 1,888,512 bytes.
 
 ### S7 Config UI
@@ -553,6 +553,41 @@ Run on the board with the dev daemon unless a step says otherwise. Evidence is t
 
 - **Docs**: `plans/desktop-app-v1.md` status and backlog, the Assumptions line at `:57`, `site/src/protocol.md` and `site/src/config.md` finished, `CLAUDE.md` (Daemon facts: up to 4 `[[page]]` tables and the `pages` cap; Hardware facts: the icon cache holds every page's icons), and a results section in this plan.
 - **Acceptance**: every step passes, or its failure is recorded with a decision.
+
+#### S8 results (2026-10-22)
+
+- **Builds**:
+  - New firmware: 5c4441f, then the swipe fix (edc440b).
+  - Daemon: `mise run app:dev` at 5c4441f.
+  - Old firmware and old daemon: f75bf5c, built in a scratch worktree.
+  - Every flash was confirmed by the user, and the pairing survived all four.
+- **Run state**: the fixtures were swapped into the real `config.toml`, and the original was restored byte for byte afterwards.
+
+| Step | Result |
+|---|---|
+| 1 Old file | Pass. One page, no label, today's geometry (5×5, 26 px). `layout_ack` went out before `icon_get`. |
+| 2 Three pages | Pass. Paged geometry (33 px on 5×3). Swipes took 20 to 25 ms with no `icon_get`. Page 3's tiles were stored before its first visit and shown at once. The label was unclipped in Orbitron. No swipe pressed, and a plain tap pressed. |
+| 3 Live edits | Pass. A page-2 edit stayed on page 2. Deleting page 2 went to the home page. Moving page 2 to the end stayed on it ("Page 3 of 3"). 3 → 1 pages gave 44 px icons and one `icon_get`. |
+| 4 Reconnect | Pass. After a daemon restart the board stayed on page 2, with no `icon_get`. |
+| 5 Link down | Pass. Pages stayed dimmed, swipes took 25 ms, and a tap logged `tap on main-5 ignored, daemon offline`. |
+| 6 Memory | Pass after a fix (below). 160 icons came in 4 requests of 40, and 16 icons of 238 px in one request of about 7 s, with no timeout. |
+| 7 Old firmware, new daemon | Pass. Page 1 only, at full height (44 px box, 33 px icons). The daemon logged `firmware without pages, showing page 1 of 3`. The Devices note showed. A page-2 save didn't wait on the board. |
+| 8 New firmware, old daemon | Pass. One page, no label and today's geometry. With a paged config the old daemon logged ``unknown field `page` `` and served an empty grid. |
+
+- **Memory, step 6**:
+  - 4 pages of 8×5 with 160 icons and 40 tiles: the LVGL pool settled at 49,052 to 49,072 of about 59,600 bytes, with a peak of 50,524 and the largest free block about 10.5 KB.
+  - Repeated switching left the heap where it was: a push after the switch rounds gave the same number as a push with none.
+  - The internal-heap minimum was 273,816, 6.8 KB under the S5 baseline (limit 10 KB). The link task stack kept 5,992 bytes or more unused.
+  - Page switches took 60 to 65 ms, and 95 to 105 ms for the page with 40 tiles. No "lock held" warning fired.
+- **New set mid-frames**: this can't happen with this daemon. It sends a requested icon batch whole before the next push, so a new set reached the board only after the old frames. Both sets settled cleanly.
+- **Failure found and fixed: fast swipes pressed buttons** (edc440b).
+  - On the 8×5 grid, fast swiping sent about 9 presses in 80 s.
+  - The touch indev was read every 33 ms, about 40 ms in practice with the 100 Hz FreeRTOS tick. A flick produced 2 or 3 reads, too few for LVGL's 50 px gesture, so it ended as CLICKED on the start button.
+  - Fix, part 1: `touch.c` sets the read timer to 10 ms, which gives about 10 to 15 ms per read with no tick change.
+  - Fix, part 2: `ui.c` tracks each touch. A touch whose largest movement passes 20 px (`DRAG_PX`) never presses and logs `drag on <id> ignored`. If it moved at least 40 px sideways and more than twice as far sideways as down (`DRAG_SWIPE_PX`, `DRAG_SWIPE_RATIO`), it turns the page through the same `swipe_page`. 40 px was picked from the measured short flicks of 24 to 50 px, and the user chose it.
+  - Every press logs `touch on <id>: N samples in T ms, max X,Y net X,Y`. It was INFO during the run and is now DEBUG, since an INFO line costs about 10 ms of the LVGL task at 115200 baud.
+  - Retest: no stray presses. Taps had zero movement (2 to 8 samples), and short flicks turned the page.
+- **Decision**: `CONFIG_FREERTOS_HZ` stays at 100, because the 10 ms read timer was enough.
 
 ## Risks
 

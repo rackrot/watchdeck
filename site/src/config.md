@@ -131,8 +131,9 @@ action = { kind = "shell", argv = ["ssh", "nas", "docker", "restart", "plex"] }
 - Button ids stay unique across all pages.
 - At most 40 buttons across all pages have a `tile`, which keeps the polling load where it was. Every page's tiles poll, whether or not the page is on screen.
 - The grid is the same size on every page (`layout.cols` by `layout.rows`).
-- A layout of 2 or more pages gives the grid 31 px less height, for a "Page x of y" label under it, so icon boxes get smaller; see [Icons](#icons). Going from one page to two makes every icon a new size, so the device fetches them again. A single `[[page]]` table keeps the full-height grid.
+- A layout of 2 or more pages gives the grid 31 px less height, for a "Page x of y" label under it, so icon boxes get smaller; see [Icons](#icons). Going from one page to two changes the box of every icon, so every SVG and each raster bigger than its new box gets a new id, and the device fetches it again. A smaller raster keeps its id. A single `[[page]]` table keeps the full-height grid.
 - An error names the page, as `page "media": another page has this id`, or the button, as `button "plex": page "music" is not one of the [[page]] ids`. Other counts read `5 pages, at most 4` and `41 tiles across all pages, at most 40`.
+- On a device with pages, a sideways swipe turns the page: left for the next, right for the previous. Past the first or last page a swipe does nothing. A swipe never presses a button, and nor does any touch that moves more than 20 px in any direction. A drag at least 40 px sideways, and more than twice as far sideways as up or down, also turns the page. Turning a page doesn't wait for the app, so it works while the device is offline. A reconnect keeps the page on screen, and a restart shows the first page.
 
 ### Older firmware and older apps (pages)
 

@@ -27,13 +27,14 @@
   - The stall F1 is accepted by design: a live peer that stalls mid-frame still wedges the board until a reboot.
 - Open beyond v1:
   - Sentry error reporting: dropped 2026-10-21 and removed from the code; see `plans/sentry.md`
+  - Pages: built 2026-10-22 as the `pages` capability on protocol v1; see `plans/pages.md`. The S8 hardware run passed on 2026-10-22, the S7 window check included.
 
 ## Decisions
 
 | Topic | Decision |
 |---|---|
 | Daemon host | The Tauri tray app runs the daemon in-process. The window is only the config UI |
-| Actions | Shell commands/scripts, HTTP requests, live status tiles. Pages come later |
+| Actions | Shell commands/scripts, HTTP requests, live status tiles. Pages came later, see Backlog |
 | Trust | Pair once with a code shown on the device, then a token on every connection |
 
 ## Outcome
@@ -54,7 +55,7 @@ Done when all of these hold:
 ## Assumptions
 
 - The desktop is Linux. The shell runner uses Unix process groups.
-- One layout serves every paired device, with no pages. Pages can come later as protocol v2.
+- One layout serves every paired device. Since 2026-10-22 it can hold up to 4 pages, sent under the `pages` capability on protocol v1 (see Backlog).
 - The LAN is untrusted enough that a Wi-Fi sniffer or an ARP spoofer is in scope.
 - GT911 RST 40, INT 42 and address 0x5D were verified on hardware in S1.
 
@@ -587,6 +588,6 @@ Rollback: each slice is its own commit on `main` (see the status table), so `git
 ## Backlog
 
 - ~~**Sentry error reporting.**~~ Dropped 2026-10-21 by the user, and the code is removed. See `plans/sentry.md`.
-- **Pages (protocol v2).** Decided 2026-10-21 by the user: plan next. Several button pages with navigation, across firmware, daemon, config and the config UI. Needs its own plan.
+- ~~**Pages (protocol v2).**~~ Built 2026-10-22 as the `pages` capability on protocol v1, not v2: up to 4 pages per layout, swipe to turn them, and page tabs in the config editor. The S8 hardware run passed on 2026-10-22. See `plans/pages.md`.
 - **`insecure_tls` for HTTP actions.** A per-action opt-in that skips certificate checks, for self-signed services (open question 5).
 - **SVG icons via resvg.** The daemon rasterizes SVG to the button size, like the other formats (open question 6).

@@ -328,9 +328,9 @@ The device sends it once per `layout`, or once per set of pages when it has appl
 |---|---|---|
 | `ids` | [string] | Icon ids from the current layout that the device lacks. At most 40, each exactly 32 lowercase hex digits |
 
-The daemon answers each id that the session's current layout names with one [icon frame](#icon-frames), in the order asked, and sends nothing for any other id. A repeated id gets one frame, since the daemon drops duplicates. A list that is too long or has a malformed id gets `error` `bad_request` and a close.
+The daemon answers each id that the session's current layout names (any page of the set, with [`pages`](#pages)) with one [icon frame](#icon-frames), in the order asked, and sends nothing for any other id. A repeated id gets one frame, since the daemon drops duplicates. A list that is too long or has a malformed id gets `error` `bad_request` and a close.
 
-The device sends one `icon_get` per layout, listing every distinct id it doesn't hold, and sends none when it holds them all. It keeps the icons of the layout on screen only. A layout that drops an icon frees it, and a link that drops and returns keeps the rest, so a reconnect to an unchanged layout fetches nothing.
+Without `pages`, the device sends one `icon_get` per layout, listing every distinct id it doesn't hold, and sends none when it holds them all. It keeps the icons of the layout on screen only. A layout that drops an icon frees it, and a link that drops and returns keeps the rest, so a reconnect to an unchanged layout fetches nothing.
 
 With the [`pages`](#pages) capability the ids come from every page of the set, not only the one on screen:
 
