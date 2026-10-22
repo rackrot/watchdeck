@@ -769,6 +769,125 @@ void test_hello_with_two_caps_and_a_32_character_fw_fits_256_bytes(void)
     TEST_ASSERT_NOT_NULL(strstr(buf, "\"caps\":[\"fonts\",\"pages\"]"));
 }
 
+void test_hello_with_three_caps_and_a_32_character_fw_is_219_bytes(void)
+{
+    char buf[256];
+    const char *const caps[] = {"fonts", "pages", "status_bar"};
+    size_t len = proto_build_hello(buf, sizeof(buf), "wd-e8f60ae276ab", TOKEN, run_of('v', 32), 1024, 600, caps, 3);
+    TEST_ASSERT_EQUAL_size_t(219, len);
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"caps\":[\"fonts\",\"pages\",\"status_bar\"]"));
+}
+
+// ---- Stats ----
+
+// The fixtures in app/src-tauri/tests/fixtures/, which the daemon round-trips.
+static const char STATS_FULL[] =
+    "{\"t\":\"stats\",\"time\":1792692433,\"utc_offset\":-14400,\"cpu\":12,\"mem_used\":10522394624,"
+    "\"mem_total\":33395638272,\"net_rx\":125000,\"net_tx\":34000}";
+static const char STATS_MIN[] = "{\"t\":\"stats\",\"time\":1792692433}";
+
+// Parse a stats message whose body is `fields`, the members after "t".
+static esp_err_t stats_with(const char *fields)
+{
+    snprintf(json, sizeof(json), "{\"t\":\"stats\",%s}", fields);
+    return proto_parse(json, strlen(json), &msg);
+}
+
+void test_stats_full_fixture_has_every_field(void)
+{
+    TEST_ASSERT_EQUAL(ESP_OK, proto_parse(STATS_FULL, strlen(STATS_FULL), &msg));
+    TEST_ASSERT_EQUAL(PROTO_MSG_STATS, msg.type);
+    TEST_ASSERT_EQUAL_UINT64(1792692433ULL, msg.stats.time);
+    TEST_ASSERT_TRUE(msg.stats.has_utc_offset);
+    TEST_ASSERT_EQUAL_INT32(-14400, msg.stats.utc_offset);
+    TEST_ASSERT_TRUE(msg.stats.has_cpu);
+    TEST_ASSERT_EQUAL_UINT8(12, msg.stats.cpu);
+    TEST_ASSERT_TRUE(msg.stats.has_mem);
+    TEST_ASSERT_EQUAL_UINT64(10522394624ULL, msg.stats.mem_used);
+    TEST_ASSERT_EQUAL_UINT64(33395638272ULL, msg.stats.mem_total);
+    TEST_ASSERT_TRUE(msg.stats.has_net);
+    TEST_ASSERT_EQUAL_UINT64(125000, msg.stats.net_rx);
+    TEST_ASSERT_EQUAL_UINT64(34000, msg.stats.net_tx);
+}
+
+void test_stats_time_only_leaves_every_optional_field_out(void)
+{
+    TEST_ASSERT_EQUAL(ESP_OK, proto_parse(STATS_MIN, strlen(STATS_MIN), &msg));
+    TEST_ASSERT_EQUAL(PROTO_MSG_STATS, msg.type);
+    TEST_ASSERT_EQUAL_UINT64(1792692433ULL, msg.stats.time);
+    TEST_ASSERT_FALSE(msg.stats.has_utc_offset);
+    TEST_ASSERT_FALSE(msg.stats.has_cpu);
+    TEST_ASSERT_FALSE(msg.stats.has_mem);
+    TEST_ASSERT_FALSE(msg.stats.has_net);
+}
+
+void test_stats_time_absent_or_null_is_refused(void)
+{
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"cpu\":5"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":null"));
+}
+
+void test_stats_time_as_a_string_negative_or_2_to_the_53_is_refused(void)
+{
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":\"1792692433\""));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":-1"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":9007199254740992"));
+}
+
+void test_stats_time_of_2_to_the_53_minus_1_is_accepted(void)
+{
+    TEST_ASSERT_EQUAL(ESP_OK, stats_with("\"time\":9007199254740991"));
+    TEST_ASSERT_EQUAL_UINT64(9007199254740991ULL, msg.stats.time);
+}
+
+void test_stats_cpu_0_and_100_are_accepted_and_101_and_minus_1_are_refused(void)
+{
+    TEST_ASSERT_EQUAL(ESP_OK, stats_with("\"time\":1,\"cpu\":0"));
+    TEST_ASSERT_EQUAL(ESP_OK, stats_with("\"time\":1,\"cpu\":100"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"cpu\":101"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"cpu\":-1"));
+}
+
+void test_stats_utc_offset_outside_plus_minus_64800_is_refused(void)
+{
+    TEST_ASSERT_EQUAL(ESP_OK, stats_with("\"time\":1,\"utc_offset\":64800"));
+    TEST_ASSERT_EQUAL(ESP_OK, stats_with("\"time\":1,\"utc_offset\":-64800"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"utc_offset\":64801"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"utc_offset\":-64801"));
+}
+
+void test_stats_mem_used_without_mem_total_is_refused(void)
+{
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"mem_used\":5"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"mem_total\":5"));
+}
+
+void test_stats_mem_used_above_mem_total_is_refused_and_equal_is_accepted(void)
+{
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"mem_used\":6,\"mem_total\":5"));
+    TEST_ASSERT_EQUAL(ESP_OK, stats_with("\"time\":1,\"mem_used\":5,\"mem_total\":5"));
+}
+
+void test_stats_net_rx_without_net_tx_is_refused(void)
+{
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"net_rx\":5"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"net_tx\":5"));
+}
+
+void test_stats_fraction_in_an_int_field_is_refused(void)
+{
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1.5"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"cpu\":12.5"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"net_rx\":5.5,\"net_tx\":1"));
+}
+
+void test_stats_unknown_fields_are_ignored(void)
+{
+    TEST_ASSERT_EQUAL(ESP_OK, stats_with("\"time\":5,\"extra\":[1,{\"x\":2}],\"cpu_avg\":3"));
+    TEST_ASSERT_EQUAL_UINT64(5, msg.stats.time);
+    TEST_ASSERT_FALSE(msg.stats.has_cpu);
+}
+
 void app_main(void)
 {
     psa_status_t status = psa_crypto_init();
@@ -838,6 +957,19 @@ void app_main(void)
     RUN_TEST(test_hello_without_caps_has_no_caps_key);
     RUN_TEST(test_hello_with_fonts_names_it_in_caps);
     RUN_TEST(test_hello_with_two_caps_and_a_32_character_fw_fits_256_bytes);
+    RUN_TEST(test_hello_with_three_caps_and_a_32_character_fw_is_219_bytes);
+    RUN_TEST(test_stats_full_fixture_has_every_field);
+    RUN_TEST(test_stats_time_only_leaves_every_optional_field_out);
+    RUN_TEST(test_stats_time_absent_or_null_is_refused);
+    RUN_TEST(test_stats_time_as_a_string_negative_or_2_to_the_53_is_refused);
+    RUN_TEST(test_stats_time_of_2_to_the_53_minus_1_is_accepted);
+    RUN_TEST(test_stats_cpu_0_and_100_are_accepted_and_101_and_minus_1_are_refused);
+    RUN_TEST(test_stats_utc_offset_outside_plus_minus_64800_is_refused);
+    RUN_TEST(test_stats_mem_used_without_mem_total_is_refused);
+    RUN_TEST(test_stats_mem_used_above_mem_total_is_refused_and_equal_is_accepted);
+    RUN_TEST(test_stats_net_rx_without_net_tx_is_refused);
+    RUN_TEST(test_stats_fraction_in_an_int_field_is_refused);
+    RUN_TEST(test_stats_unknown_fields_are_ignored);
     test_grid_run();
     test_pageset_run();
 

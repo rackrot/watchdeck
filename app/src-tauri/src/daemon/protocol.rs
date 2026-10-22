@@ -15,6 +15,9 @@ pub const CAP_FONTS: &str = "fonts";
 /// The device assembles a set of up to 4 `layout` pages and lays out the shorter grid for 2 or
 /// more.
 pub const CAP_PAGES: &str = "pages";
+/// The device reads `stats` frames and shows the host's CPU, memory, network and clock. Not in
+/// [`CAPS`] until a session can send them.
+pub const CAP_STATUS_BAR: &str = "status_bar";
 
 /// Largest message, and largest frame, in either direction.
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
@@ -167,6 +170,30 @@ pub enum Message {
         btn: String,
         text: String,
         state: TileState,
+    },
+    /// The host's stats, once a second, to a session whose `hello` names [`CAP_STATUS_BAR`]. Only
+    /// `time` is required. Each optional pair comes together or not at all.
+    Stats {
+        /// The host's clock when the frame was sent, Unix seconds.
+        time: u64,
+        /// The host's offset from UTC in seconds, so the device can show local time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        utc_offset: Option<i32>,
+        /// Busy share of all CPUs since the last frame, 0 to 100.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cpu: Option<u32>,
+        /// Bytes in use, which is the total minus what is available. Needs `mem_total`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mem_used: Option<u64>,
+        /// Bytes of memory in all. Needs `mem_used`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mem_total: Option<u64>,
+        /// Bytes per second received on the default-route interface. Needs `net_tx`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        net_rx: Option<u64>,
+        /// Bytes per second sent on the default-route interface. Needs `net_rx`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        net_tx: Option<u64>,
     },
     /// A crash or abnormal reset from an earlier boot. Unchecked until [`Report::check`] passes.
     Report(Report),
@@ -497,7 +524,7 @@ mod tests {
     use serde_json::Value;
 
     // The fixtures are the JSON examples from site/src/protocol.md.
-    const FIXTURES: [&str; 18] = [
+    const FIXTURES: [&str; 20] = [
         include_str!("../../tests/fixtures/hello.json"),
         include_str!("../../tests/fixtures/welcome.json"),
         include_str!("../../tests/fixtures/error.json"),
@@ -509,6 +536,8 @@ mod tests {
         include_str!("../../tests/fixtures/press.json"),
         include_str!("../../tests/fixtures/result.json"),
         include_str!("../../tests/fixtures/tile.json"),
+        include_str!("../../tests/fixtures/stats.json"),
+        include_str!("../../tests/fixtures/stats_min.json"),
         include_str!("../../tests/fixtures/report.json"),
         include_str!("../../tests/fixtures/report_ack.json"),
         include_str!("../../tests/fixtures/pair_req.json"),

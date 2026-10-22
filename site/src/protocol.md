@@ -161,6 +161,7 @@ device                      daemon
   |--- layout_ack ----------->|   once the grid is built (before icon_get, with pages)
   |--- icon_get ------------->|   for icons the device doesn't have
   |<-- icon frame (binary) ---|   one per icon
+  |<-- stats -----------------|   once a second, with status_bar
   |--- press ---------------->|
   |<-- result ----------------|   exactly one per press
   |--- report --------------->|   a crash or reset from an earlier boot, if the device has one
@@ -200,6 +201,7 @@ device                      daemon
 |---|---|
 | `fonts` | Draws the seven fonts listed under [Fonts](#fonts), and reads the font fields of `layout` |
 | `pages` | Assembles a set of up to 4 `layout` pages, shows one at a time, and lays out the shorter grid when a set has 2 or more. See [Pages](#pages) |
+| `status_bar` | Reads `stats` and shows the host's CPU, memory, network and clock in a bar. See [`stats`](#stats-daemon--device) |
 
 The daemon hashes `token` and compares the result in constant time with the hash it stored for `device`. A missing, malformed or wrong token and an unknown device all get the same `error`, then a close:
 
@@ -425,6 +427,26 @@ The daemon polls each tile only while at least one device has a session, and sen
 - A session that the daemon has revoked or replaced gets no more `tile` messages. See [Config](config.md#tiles) for what the value and the state mean.
 
 The device updates the button's text and color in place and doesn't rebuild the grid.
+
+### `stats` (daemon → device)
+
+```json
+{"t":"stats","time":1792692433,"utc_offset":-14400,"cpu":12,"mem_used":10522394624,"mem_total":33395638272,"net_rx":125000,"net_tx":34000}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `time` | int | Required. The daemon host's clock when the frame was sent, Unix seconds, 0 to 2^53 - 1 |
+| `utc_offset` | int | Optional. The host's local offset from UTC in seconds, -64800 to 64800. Absent: the device shows UTC |
+| `cpu` | int | Optional. Busy share of all CPUs since the last frame, 0 to 100. Absent on the first frame |
+| `mem_used`, `mem_total` | int | Optional, both or neither. Bytes, used = total minus available. `mem_used` at most `mem_total`. Each 0 to 2^53 - 1 |
+| `net_rx`, `net_tx` | int | Optional, both or neither. Bytes per second received and sent on the host's default-route interface since the last frame. Each 0 to 2^53 - 1 |
+
+The daemon sends `stats` once a second, and only to a session whose `hello` names `status_bar` in [`caps`](#hello-device--daemon), and only after `welcome`. It never sends one between the pages of a [set](#pages).
+
+- **Refused**: a field of the wrong type (a fraction in an int field, a string, `null`), a value out of its range, a missing `time`, a `mem_*` or `net_*` field without its partner, or `mem_used` above `mem_total`. The device logs the frame and drops it. The link stays up.
+- **Unknown fields** are ignored.
+- The device logs each `stats` at debug level, not in the INFO line it logs for other messages, since a frame arrives every second.
 
 ### `report` (device → daemon)
 

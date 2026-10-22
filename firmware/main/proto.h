@@ -44,6 +44,7 @@ typedef enum {
     PROTO_MSG_PAIR_REVEAL,
     PROTO_MSG_PAIR_RESULT,
     PROTO_MSG_REPORT_ACK,
+    PROTO_MSG_STATS,
 } proto_type_t;
 
 typedef struct {
@@ -101,6 +102,21 @@ typedef struct {
     uint8_t c_host[PROTO_HASH_LEN];
 } proto_pair_offer_t;
 
+// A `stats` frame. Each has_ flag says its field was sent; the pairs come together or not at all.
+typedef struct {
+    uint64_t time; // the host's clock, Unix seconds
+    bool has_utc_offset;
+    int32_t utc_offset; // seconds east of UTC
+    bool has_cpu;
+    uint8_t cpu; // percent
+    bool has_mem;
+    uint64_t mem_used;
+    uint64_t mem_total;
+    bool has_net;
+    uint64_t net_rx; // bytes per second
+    uint64_t net_tx;
+} proto_stats_t;
+
 // A validated icon frame. `pixels` points into the frame, which the caller still owns.
 typedef struct {
     uint8_t id[PROTO_ICON_ID_LEN];
@@ -144,6 +160,7 @@ typedef struct {
         uint8_t n_host[PROTO_NONCE_LEN];         // PROTO_MSG_PAIR_REVEAL
         bool pair_ok;                            // PROTO_MSG_PAIR_RESULT
         char report_ack_id[PROTO_REPORT_ID_LEN]; // PROTO_MSG_REPORT_ACK, 8 lowercase hex digits
+        proto_stats_t stats;                     // PROTO_MSG_STATS
     };
 } proto_msg_t;
 

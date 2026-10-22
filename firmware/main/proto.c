@@ -9,6 +9,9 @@
 
 static const char *TAG = "proto";
 
+// 2^53 - 1, the largest whole number a JSON number in a double carries exactly.
+#define STATS_INT_MAX 9007199254740991.0
+
 void proto_device_id(char out[PROTO_DEVICE_ID_LEN], const uint8_t mac[6])
 {
     snprintf(out, PROTO_DEVICE_ID_LEN, "wd-%02x%02x%02x%02x%02x%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
@@ -271,6 +274,34 @@ static bool get_int(const cJSON *obj, const char *key, double min, double max, d
     return true;
 }
 
+// Read an integer field in [min, max] that has no fraction. get_int truncates a fraction, which layouts accept.
+static bool get_whole(const cJSON *obj, const char *key, double min, double max, double *out)
+{
+    return get_int(obj, key, min, max, out) && *out == (double)(int64_t)*out;
+}
+
+// Read two integer fields, each in [0, STATS_INT_MAX], that come together or not at all. `*present` is
+// set when both are there. Returns false for one without the other, or for a value that is not a whole number.
+static bool get_pair(const cJSON *obj, const char *a, const char *b, uint64_t out[2], bool *present)
+{
+    bool has_a = cJSON_GetObjectItemCaseSensitive(obj, a) != NULL;
+    bool has_b = cJSON_GetObjectItemCaseSensitive(obj, b) != NULL;
+    *present = has_a && has_b;
+    if (has_a != has_b) {
+        return false;
+    }
+    if (!*present) {
+        return true;
+    }
+    double va, vb;
+    if (!get_whole(obj, a, 0, STATS_INT_MAX, &va) || !get_whole(obj, b, 0, STATS_INT_MAX, &vb)) {
+        return false;
+    }
+    out[0] = (uint64_t)va;
+    out[1] = (uint64_t)vb;
+    return true;
+}
+
 // Read a font field. Absent gives `inherit`. A known name gives that font. Anything else (an unknown
 // name, a non-string, an over-long string) gives Montserrat and sets `*bad`: a font is cosmetic, so the
 // layout is still accepted. The first such field in a layout is logged.
@@ -389,6 +420,50 @@ static esp_err_t parse_tile(const cJSON *root, proto_tile_t *out)
     return ESP_OK;
 }
 
+static esp_err_t parse_stats(const cJSON *root, proto_stats_t *out)
+{
+    double v;
+    if (!get_whole(root, "time", 0, STATS_INT_MAX, &v)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    out->time = (uint64_t)v;
+
+    out->has_utc_offset = cJSON_GetObjectItemCaseSensitive(root, "utc_offset") != NULL;
+    if (out->has_utc_offset) {
+        if (!get_whole(root, "utc_offset", -64800, 64800, &v)) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        out->utc_offset = (int32_t)v;
+    }
+
+    out->has_cpu = cJSON_GetObjectItemCaseSensitive(root, "cpu") != NULL;
+    if (out->has_cpu) {
+        if (!get_whole(root, "cpu", 0, 100, &v)) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        out->cpu = (uint8_t)v;
+    }
+
+    uint64_t mem[2] = {0};
+    bool has_mem;
+    if (!get_pair(root, "mem_used", "mem_total", mem, &has_mem) || (has_mem && mem[0] > mem[1])) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    out->has_mem = has_mem;
+    out->mem_used = mem[0];
+    out->mem_total = mem[1];
+
+    uint64_t net[2] = {0};
+    bool has_net;
+    if (!get_pair(root, "net_rx", "net_tx", net, &has_net)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    out->has_net = has_net;
+    out->net_rx = net[0];
+    out->net_tx = net[1];
+    return ESP_OK;
+}
+
 static esp_err_t parse_pair_offer(const cJSON *root, proto_pair_offer_t *out)
 {
     if (!get_str(root, "name", out->name, sizeof(out->name), false) ||
@@ -485,6 +560,9 @@ esp_err_t proto_parse(const char *json, size_t len, proto_msg_t *out)
         bool ok =
             get_str(root, "id", out->report_ack_id, sizeof(out->report_ack_id), true) && is_hex(out->report_ack_id, 8);
         err = ok ? ESP_OK : ESP_ERR_INVALID_ARG;
+    } else if (strcmp(t, "stats") == 0) {
+        out->type = PROTO_MSG_STATS;
+        err = parse_stats(root, &out->stats);
     } else {
         out->type = PROTO_MSG_UNKNOWN;
         strlcpy(out->unknown_t, t, sizeof(out->unknown_t));
