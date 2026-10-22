@@ -1,10 +1,19 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { type Action, METHODS, newHttp, newShell } from "./config";
 import { duplicateNames, type Row, recordToRows, rowsToRecord } from "./edit";
 import type { ActionField } from "./errors";
 import { Field, NumberField, Problems } from "./fields";
 
 type Problem = string[] | undefined;
+
+/** The host and port of `url`, or null while it doesn't parse. */
+function hostOf(url: string): string | null {
+  try {
+    return new URL(url).host;
+  } catch {
+    return null;
+  }
+}
 
 /** A list of one-line values, such as a command's arguments. */
 function ArgvRows({
@@ -157,6 +166,13 @@ export default function ActionForm({
     action.kind === "http" ? recordToRows(action.secret_headers) : [],
   );
 
+  // The host of the last URL that parsed, so a URL typed through a broken state still counts as
+  // a change of host.
+  const lastHost = useRef<string | null>(null);
+  if (action.kind === "http") {
+    lastHost.current = hostOf(action.url) ?? lastHost.current;
+  }
+
   useEffect(() => {
     const messages = [
       ...duplicateNames(headers).map(
@@ -234,7 +250,16 @@ export default function ActionForm({
           className="mono"
           value={action.url}
           spellCheck={false}
-          onChange={(e) => setHttp({ url: e.currentTarget.value })}
+          onChange={(e) => {
+            const url = e.currentTarget.value;
+            const host = hostOf(url);
+            // Skipping verification was agreed for one host, not for whatever the URL becomes.
+            const moved =
+              host !== null &&
+              lastHost.current !== null &&
+              host !== lastHost.current;
+            setHttp(moved ? { url, insecure_tls: undefined } : { url });
+          }}
         />
       </Field>
       <Field label="Body" hint="optional" wide problems={problems("body")}>
@@ -298,6 +323,26 @@ export default function ActionForm({
           </p>
         )}
         <Problems list={problems("insecure_http")} />
+      </div>
+      <div className="field wide">
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={action.insecure_tls ?? false}
+            onChange={(e) =>
+              setHttp({ insecure_tls: e.currentTarget.checked || undefined })
+            }
+          />
+          Skip certificate verification (self-signed https://)
+        </label>
+        {action.insecure_tls && (
+          <p className="warning" role="note">
+            Anyone on the network can intercept this request, and read or change
+            what it sends and gets back, including secret headers. Use it only
+            for a service you trust on a network you trust.
+          </p>
+        )}
+        <Problems list={problems("insecure_tls")} />
       </div>
     </div>
   );

@@ -135,6 +135,9 @@ pub enum Action {
         /// Lets `secret_headers` cross the network over plain http.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         insecure_http: bool,
+        /// Skips certificate verification for this action, so a self-signed https service works.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        insecure_tls: bool,
         #[serde(default = "default_timeout")]
         timeout_s: u64,
     },
@@ -412,6 +415,17 @@ impl Action {
             && reqwest::Url::parse(url).is_ok_and(|u| u.scheme() == "http" && !loopback(&u))
     }
 
+    /// Whether this skips certificate verification of its server.
+    pub fn insecure_tls(&self) -> bool {
+        matches!(
+            self,
+            Action::Http {
+                insecure_tls: true,
+                ..
+            }
+        )
+    }
+
     fn check(&self, secrets: &io::Result<Vec<String>>) -> Vec<String> {
         let mut errors = Vec::new();
         let timeout_s = self.timeout().as_secs();
@@ -442,6 +456,7 @@ impl Action {
                 headers,
                 secret_headers,
                 insecure_http,
+                insecure_tls,
                 ..
             } => {
                 if !METHODS.contains(&method.as_str()) {
@@ -467,6 +482,9 @@ impl Action {
                          use https://, or set insecure_http = true"
                             .into(),
                     );
+                }
+                if *insecure_tls && !reqwest::Url::parse(url).is_ok_and(|u| u.scheme() == "https") {
+                    errors.push("insecure_tls only applies to https:// urls".into());
                 }
                 if body.as_ref().is_some_and(|b| b.len() > MAX_BODY_BYTES) {
                     errors.push(format!("body is over {} KB", MAX_BODY_BYTES / 1024));
@@ -875,6 +893,15 @@ impl Configs {
                 for b in next.buttons.iter().filter(|b| sources(b)) {
                     log::warn!(
                         "button {:?} sends secret headers over plain http, as insecure_http allows",
+                        b.id
+                    );
+                }
+                let unverified = |b: &&ButtonConfig| {
+                    b.action.insecure_tls() || b.tile.as_ref().is_some_and(|t| t.source.insecure_tls())
+                };
+                for b in next.buttons.iter().filter(unverified) {
+                    log::warn!(
+                        "button {:?} skips certificate verification of its server, as insecure_tls allows",
                         b.id
                     );
                 }
@@ -1369,6 +1396,30 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
         let without_secrets =
             plain.replacen(", secret_headers = { Authorization = \"ha\" }", "", 1);
         parse(&without_secrets, &names()).unwrap();
+    }
+
+    #[test]
+    fn insecure_tls_is_off_by_default_and_only_for_https_http_actions() {
+        let config = parse(EXAMPLE, &names()).unwrap();
+        assert!(!config.buttons[1].action.insecure_tls());
+
+        let https = EXAMPLE.replacen(EXAMPLE_URL, "url = \"https://ha.lan/x\"", 1);
+        let on = https.replacen(
+            "secret_headers = {",
+            "insecure_tls = true, secret_headers = {",
+            1,
+        );
+        let config = parse(&on, &names()).unwrap();
+        assert!(config.buttons[1].action.insecure_tls());
+        assert!(!config.buttons[0].action.insecure_tls());
+
+        // Over plain http there is nothing to skip.
+        let plain = on.replacen("https://ha.lan/x", "http://127.0.0.1/x", 1);
+        assert_refused(&plain, "insecure_tls only applies to https://");
+
+        // A shell action has no such key.
+        let shell = EXAMPLE.replacen("argv = [", "insecure_tls = true, argv = [", 1);
+        assert_refused(&shell, "insecure_tls");
     }
 
     #[test]
@@ -2017,6 +2068,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
             headers: BTreeMap::new(),
             secret_headers: BTreeMap::from([("Authorization".into(), name.into())]),
             insecure_http: false,
+            insecure_tls: false,
             timeout_s: 5,
         };
         let button = |id: &str, col, action: Action, tile: Option<TileConfig>| ButtonConfig {
@@ -2080,6 +2132,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
             headers: BTreeMap::new(),
             secret_headers: BTreeMap::from([("Authorization".into(), "ha".into())]),
             insecure_http: false,
+            insecure_tls: false,
             timeout_s: 5,
         };
         // Hold the config lock so the save passes its first check, then waits. The secret goes
@@ -2118,6 +2171,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
                 headers: BTreeMap::from([("Content-Type".into(), "application/json".into())]),
                 secret_headers: BTreeMap::from([("Authorization".into(), "ha".into())]),
                 insecure_http,
+                insecure_tls: url.starts_with("https://"),
                 timeout_s: 5,
             },
         };
@@ -2136,6 +2190,8 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
         configs.save(config.clone(), &revision).unwrap();
         let text = fs::read_to_string(tmp.path().join(FILE)).unwrap();
         assert_eq!(text.matches("insecure_http").count(), 1, "{text}");
+        // Only the true ones are written: "web" (action and tile source), not "lan".
+        assert_eq!(text.matches("insecure_tls").count(), 2, "{text}");
         assert_eq!(parse(&text, &names()).unwrap(), config);
     }
 }

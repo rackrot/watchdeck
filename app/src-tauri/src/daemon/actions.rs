@@ -102,6 +102,8 @@ pub struct Actions(Arc<Inner>);
 
 struct Inner {
     http: reqwest::Client,
+    /// Only for actions that set `insecure_tls`; it accepts any certificate.
+    http_unverified: reqwest::Client,
     secrets: Arc<Secrets>,
     /// Where shell commands run.
     cwd: PathBuf,
@@ -121,7 +123,8 @@ impl Actions {
     /// Shell commands run in `cwd` with the daemon's environment.
     pub fn new(secrets: Arc<Secrets>, cwd: PathBuf) -> reqwest::Result<Self> {
         Ok(Self(Arc::new(Inner {
-            http: http::client()?,
+            http: http::client(false)?,
+            http_unverified: http::client(true)?,
             secrets,
             cwd,
             slots: Arc::new(Semaphore::new(MAX_RUNNING)),
@@ -191,6 +194,7 @@ impl Run {
                 body,
                 headers,
                 secret_headers,
+                insecure_tls,
                 ..
             } => {
                 let request = http::Request {
@@ -201,7 +205,12 @@ impl Run {
                     secret_headers,
                     timeout: action.timeout(),
                 };
-                http::ran(&inner.http, &inner.secrets, request).await
+                let client = if *insecure_tls {
+                    &inner.http_unverified
+                } else {
+                    &inner.http
+                };
+                http::ran(client, &inner.secrets, request).await
             }
         };
         ran.result.ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);

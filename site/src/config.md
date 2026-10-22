@@ -149,12 +149,13 @@ To add one, either copy the file into `icons/` yourself (make the folder if it's
 | `headers` | no | Header name → value, sent as written, e.g. `{ "Content-Type" = "application/json" }`. Values are printable ASCII |
 | `secret_headers` | no | Header name → secret name, e.g. `{ Authorization = "ha" }` |
 | `insecure_http` | no | `true` lets `secret_headers` go over `http://` to another machine. Default `false` |
+| `insecure_tls` | no | `true` skips certificate verification for this action, for a self-signed `https://` service. Refused on a `http://` url. Default `false` |
 | `timeout_s` | no | 1 to 600 seconds for the whole exchange. Default 10 |
 
 - A header name may appear only once across `headers` and `secret_headers`, ignoring case.
 - Redirects aren't followed, so a 3xx reply is a failure.
 - Proxy settings are ignored, so a request goes only to the host in its URL. Over `https://`, only a server that proves it is that host gets it.
-- HTTPS checks the server's certificate against the system's trusted roots. Self-signed certificates aren't supported yet.
+- HTTPS checks the server's certificate against the system's trusted roots, unless the action sets `insecure_tls`.
 - The app reads at most 64 KB of the reply.
 
 ### Secrets over plain http
@@ -162,6 +163,12 @@ To add one, either copy the file into `icons/` yourself (make the folder if it's
 The app refuses a button whose `secret_headers` would go over `http://` to another machine. Over plain http, anyone on the network path can read the header. So can anyone who answers for the host name first, which is easy on a LAN, above all for `.local` names. Use `https://`, or a URL on this machine (`localhost`, `127.0.0.1` or `[::1]`), which needs no setting.
 
 To send them anyway, set `insecure_http = true` on the action. The app then logs a warning whenever a config with that button goes live.
+
+### Self-signed certificates
+
+A service with a self-signed certificate, such as Home Assistant on its own `https://`, fails with a certificate error. Set `insecure_tls = true` on that action to accept any certificate from the server. The setting covers that action only, and also applies to a tile whose `source` sets it.
+
+This turns off the protection https gives. The app can no longer tell the service from an impostor, so anyone on the network can answer in its place or sit in the middle, then read or change the request and the reply. That includes the `secret_headers` the request carries. Use it only for a service you trust on a network you trust. Redirects, the 64 KB reply limit and the timeout work as before. The app logs a warning naming the button whenever a config with this setting goes live.
 
 ## Tiles
 

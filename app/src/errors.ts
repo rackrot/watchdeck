@@ -12,7 +12,8 @@ export type ActionField =
   | "body"
   | "headers"
   | "secret_headers"
-  | "insecure_http";
+  | "insecure_http"
+  | "insecure_tls";
 
 export type Field =
   | "id"
@@ -56,6 +57,7 @@ function actionField(problem: string): ActionField | null {
     [/^method /, "method"],
     [/^url /, "url"],
     [/^secret_headers would cross/, "insecure_http"],
+    [/^insecure_tls /, "insecure_tls"],
     [/^body /, "body"],
     [/^header .* uses secret /, "secret_headers"],
     [/^header /, "headers"],

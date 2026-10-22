@@ -29,12 +29,14 @@ pub(super) struct Request<'a> {
 
 /// No proxy and no redirects, so a request goes only to the host in its URL. Over https only a
 /// server that proves it is that host gets it; plain http is for this machine unless an action
-/// sets `insecure_http`.
-pub(super) fn client() -> reqwest::Result<Client> {
+/// sets `insecure_http`. With `unverified`, which only an action that sets `insecure_tls` gets,
+/// any certificate is accepted, so the server need not prove anything.
+pub(super) fn client(unverified: bool) -> reqwest::Result<Client> {
     Client::builder()
         .redirect(redirect::Policy::none())
         .no_proxy()
         .user_agent(concat!("watchdeck/", env!("CARGO_PKG_VERSION")))
+        .tls_danger_accept_invalid_certs(unverified)
         .build()
 }
 
@@ -199,9 +201,12 @@ mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
 
     use super::*;
-    use crate::daemon::actions::TEXT_BYTES;
+    use crate::daemon::actions::{Actions, TEXT_BYTES};
+    use crate::daemon::config::Action;
+    use crate::daemon::tls::Identity;
 
     const SECRET: &str = "Bearer test-s3cret-0123";
 
@@ -298,7 +303,100 @@ mod tests {
             secret_headers: &secret_headers,
             timeout: Duration::from_secs(timeout_s),
         };
-        run(&client().unwrap(), &fixture.secrets, request).await
+        run(&client(false).unwrap(), &fixture.secrets, request).await
+    }
+
+    /// An https responder on 127.0.0.1 with a self-signed cert that has no name. It answers
+    /// every request that completes a handshake with 200 "secure".
+    async fn tls_responder() -> (String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = Identity::load_or_create(&dir.path().join("id")).unwrap();
+        let acceptor = TlsAcceptor::from(identity.server_config().unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("https://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    // A client that rejects the cert aborts the handshake; that is the point.
+                    let Ok(mut socket) = acceptor.accept(socket).await else {
+                        return;
+                    };
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        if socket.read(&mut byte).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        head.push(byte[0]);
+                    }
+                    let _ = socket.write_all(&reply("200 OK", "", b"secure")).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (url, dir)
+    }
+
+    #[tokio::test]
+    async fn a_self_signed_server_fails_by_default_and_works_with_insecure_tls() {
+        let (url, _dir) = tls_responder().await;
+        let f = fixture();
+        let none = BTreeMap::new();
+        let get = |client: Client| {
+            let request = Request {
+                method: "GET",
+                url: &url,
+                body: None,
+                headers: &none,
+                secret_headers: &none,
+                timeout: Duration::from_secs(5),
+            };
+            let secrets = &f.secrets;
+            async move { run(&client, secrets, request).await }
+        };
+        let refused = get(client(false).unwrap()).await;
+        assert!(!refused.ok, "{refused:?}");
+        assert!(
+            refused.summary.starts_with("request failed: "),
+            "{}",
+            refused.summary
+        );
+
+        let accepted = get(client(true).unwrap()).await;
+        assert_eq!(
+            (accepted.ok, accepted.code, accepted.text.as_str()),
+            (true, 200, "secure")
+        );
+    }
+
+    #[tokio::test]
+    async fn only_an_action_that_sets_insecure_tls_skips_verification() {
+        let (url, dir) = tls_responder().await;
+        let actions = Actions::new(Arc::new(Secrets::new(dir.path())), dir.path().into()).unwrap();
+        let action = |insecure_tls| Action::Http {
+            method: "GET".into(),
+            url: url.clone(),
+            body: None,
+            headers: BTreeMap::new(),
+            secret_headers: BTreeMap::new(),
+            insecure_http: false,
+            insecure_tls,
+            timeout_s: 5,
+        };
+        let strict = actions.start("a").unwrap().run(&action(false)).await;
+        assert!(!strict.ok, "{strict:?}");
+        let lax = actions.start("b").unwrap().run(&action(true)).await;
+        assert!(lax.ok, "{lax:?}");
+        // The opt-in left the strict client alone.
+        let strict = actions.start("c").unwrap().run(&action(false)).await;
+        assert!(!strict.ok, "{strict:?}");
+        // A tile source takes the same path.
+        let tile = actions.start_tile("d").unwrap().poll(&action(true)).await;
+        assert!(tile.result.ok, "{:?}", tile.result);
+        let tile = actions.start_tile("e").unwrap().poll(&action(false)).await;
+        assert!(!tile.result.ok, "{:?}", tile.result);
     }
 
     /// Secrets with these values, as `secrets.toml` hands them out.
@@ -367,7 +465,7 @@ mod tests {
             secret_headers: &secret_headers,
             timeout: Duration::from_secs(5),
         };
-        let r = run(&client().unwrap(), &f.secrets, request).await;
+        let r = run(&client(false).unwrap(), &f.secrets, request).await;
         assert!(r.ok, "{r:?}");
         let head = server.heads.lock().unwrap()[0].to_ascii_lowercase();
         assert!(head.contains("content-type: application/json"), "{head}");

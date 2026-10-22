@@ -996,6 +996,7 @@ mod tests {
             headers: Default::default(),
             secret_headers: Default::default(),
             insecure_http: false,
+            insecure_tls: false,
             timeout_s: 10,
         }
     }

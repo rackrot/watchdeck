@@ -17,6 +17,8 @@ export type HttpAction = {
   /** Header name -> the name of a secret. */
   secret_headers?: Record<string, string>;
   insecure_http?: boolean;
+  /** Skip certificate verification, for a self-signed https service. */
+  insecure_tls?: boolean;
   timeout_s: number;
 };
 
