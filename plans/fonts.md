@@ -126,7 +126,7 @@ Negotiation is a capability list, not a `v` bump, because today's daemon closes 
 ### Conversion pipeline
 
 - **Inputs** in `fonts/` at the repo root:
-  - `fonts/fonts.toml`, the manifest: for each id its display name, file, source URL, SHA-256, license file and `--size` for slots 24 and 32.
+  - `fonts/fonts.json`, the manifest: for each id its display name, file, source URL, SHA-256, license file and `--size` for slots 24 and 32.
   - `fonts/<id>/<file>.ttf`, unmodified, plus that family's license text, as downloaded.
   - `fonts/generate.mjs`, the generator (node, from mise).
 - **Tool**: lv_font_conv 1.5.3 from a lockfile, not a global install. Its dependencies are semver ranges (`opentype.js ^1.3.4`, `pngjs ^6.0.0` and others), so `npm install -g`, which is what mise's `npm:` backend does, could resolve a different tree later and change the output. `fonts/package.json` pins `"lv_font_conv": "1.5.3"` exactly and `fonts/pnpm-lock.yaml` fixes the tree. node and pnpm already come from `mise.toml`, so no new mise tool is needed. `fonts:gen` and `fonts:check` run `pnpm --dir fonts install --frozen-lockfile` first. Vet the package and its tree once in S1 (the `dependency-vetting` skill); `npm view` already shows no install scripts.
@@ -215,6 +215,18 @@ Order: S1, then S2 and S3 in parallel, then S4, then S5. All five land before pa
   - Each `fonts/<id>/` has the license text that came with its file, and the manifest records the license.
 - **Cheapest check**: `mise run fonts:check`, and `grep -h line_height firmware/main/fonts/*.c`.
 
+#### S1 as built (2026-10-21)
+
+- **Manifest** is `fonts/fonts.json`, not `fonts.toml`: node has no TOML parser, and a parser would be a second vetted dependency. It records per font the file, its SHA-256, the source URL (and the archive's SHA-256), the license file with its hash and URL, the copyright line and the slot sizes. The generator refuses to run when a TTF or license hash differs.
+- **Sizes** (`--size`, resulting `line_height`), slot 24 then slot 32: Inter 22 (26) and 29 (35); Roboto 24 (26) and 32 (35); Fira Code 24 (27) and 31 (34); Roboto Mono 24 (26) and 32 (35); Orbitron 21 (26) and 28 (34); Oxanium 24 (25) and 32 (33). All inside 14..27 and 24..35.
+- **Generated arrays**: 155,939 bytes for the 12 fonts (`node fonts/generate.mjs --stats`): `glyph_bitmap` 136,335, `glyph_dsc` 9,216, kern class maps 1,536, `kern_class_values` 8,852. The sums match `nm -S` of the C compiled with the host gcc, apart from the per-font structs (about 170 bytes each). That is under the 200 to 320 KB estimate, so the S2 stop trigger is unlikely.
+- **Orbitron has no `^`** (U+005E; the League of Moveable Type TTF). Its `^` comes from Oxanium Medium (also OFL-1.1): both Orbitron builds are converted from Orbitron for 0x20-0x5D and 0x5F-0x7E plus Oxanium for 0x5E, at the same `--size`, and the line-height rule still holds. The manifest records this as a `fallback`, the generated C header credits Oxanium, and the generator fails if any of the 95 glyphs is missing. The other five cover all 95 glyphs.
+- **Directory check**: the generator also fails on any file in `fonts/` or `fonts/<id>/` that the manifest doesn't name.
+- **Licenses**: Inter and Oxanium ship theirs in the release zip. The Roboto and Fira Code zips carry none, so their texts are the repo's at the release tag (URLs in the manifest). Roboto Mono and Orbitron come from a pinned commit of the upstream repo, as no release archive carries a static Medium. Only Orbitron has a Reserved Font Name. Orbitron's TTF and license were renamed on copy (spaces in the names); the bytes are unchanged.
+- **`static_bitmap`**: lv_font_conv 1.5.3 does not write `.static_bitmap = 1`, unlike the built-in Montserrat. LVGL's software renderer reads it only for A8 glyphs (`lv_draw_sw_letter.c:144`), so it has no effect on these 4 bpp fonts, and the C stays as the converter wrote it.
+- **Dependencies**: lv_font_conv 1.5.3 bundles its seven dependencies in the tarball (`bundledDependencies`), so the lockfile pins one integrity hash. None has an install script or a native binary. The tasks pass `--ignore-scripts` anyway.
+- **Not done here**: the CI run of the lint job on a pushed branch.
+
 ### S2 Firmware
 
 - **Files**: `firmware/main/font_ids.c/.h`, `fonts.c/.h`, `proto.c/.h`, `ui.c`, `CMakeLists.txt`; `firmware/test/host_proto/main/CMakeLists.txt` and `test_proto.c`.
@@ -230,6 +242,7 @@ Order: S1, then S2 and S3 in parallel, then S4, then S5. All five land before pa
   - `mise run fw:build` passes with no new warnings, and `idf.py size` reports the image.
   - The font total, summed from `riscv32-esp-elf-nm -S` over `wd_font_*` symbols and their `glyph_*`/`kern_*`/`cmaps` tables, is recorded. Expected 200 to 320 KB (estimate below). If the image grows by more than 600 KB over the baseline 1,695,888 bytes, stop and revisit kerning or compression.
   - `mise run fw:test` passes, and CI's host-test step is green.
+- **Also**: pin `CONFIG_LV_USE_FONT_PLACEHOLDER=y` in `firmware/sdkconfig.defaults` (it is on in the generated `sdkconfig` today, but a default is not a pin), and check the generated `sdkconfig` after adding it.
 - **Cheapest check**: `mise run fw:test`, then `mise run fw:build`.
 
 ### S3 Daemon config, wire and docs
@@ -272,6 +285,7 @@ Run with the tray app in `app:dev` and serial capture on. Don't edit under `app/
 4. **Overrides**: button font and value font on one tile button, everything else on the grid font. Only that button changes.
 5. **Old firmware, new daemon**: flash the build at the commit before S2 (record its hash here), keep the font config. Its hello has no `fonts` cap, so the daemon sends no font fields (check the daemon's debug log of the layout), a font-only edit pushes nothing, and the Devices tab shows the note. The board draws Montserrat and acks every layout. Then reflash the new build; the pairing survives both flashes.
 6. **Unknown font on new firmware**: optional, with the fault harness sending `"label_font":"nope"`. The host test already covers the parser, so run it only if harness time is cheap.
+
 - **Acceptance**: every step passes, and the plan records the measured image size, font total, heap lines and photos.
 
 ## Flash estimate
@@ -286,7 +300,7 @@ Run with the tray app in `app:dev` and serial capture on. Don't edit under `app/
 
 The user chose to land fonts first. Every fonts slice lands before pages S1.
 
-**What pages S1 and later slices rebase onto**
+#### What pages S1 and later slices rebase onto
 
 - **`hello.caps` already exists** on both sides, as pages S1 specified it: `Hello.caps: Vec<String>` (serde default, unknown names ignored), `proto_build_hello(…, caps, n_caps)`, the `hello.json` fixture with `caps`, `DeviceInfo.caps`, and the general rules in `protocol.md`. Pages S1 drops those items and adds only the `"pages"` name. Pages S4 makes `link.c` pass `{"fonts","pages"}` in the commit that adds set assembly, as pages already plans for its own cap.
 - **The session view exists**: `server.rs` compares and sends `view(&live.layout(), &caps)`, which today only strips font fields. Pages S3 adds "home page only, no page links" for sessions without `pages`.
@@ -297,7 +311,7 @@ The user chose to land fonts first. Every fonts slice lands before pages S1.
 - **Devices tab**: the caps note exists. Pages adds its own line from the same list.
 - **Flash**: fonts take about 200-320 KB. Pages adds code, not data, so the 4 MB partition is not a concern for it.
 
-**Pages' "Page x of y" label**
+#### Pages' "Page x of y" label
 
 - It draws in the **grid's default font** (`layout.font`, the message `font`) at **slot 24**, in Montserrat when none is set. It belongs to the grid, not to any button, so per-button overrides don't apply, and slot 24 needs no new font sizes.
 - Its line box is the slot-24 box, **27 px for every font** (fonts' fixed slots), so pages can reserve a fixed strip below the grid (27 px plus its own margins) that no font choice moves. That keeps pages' geometry change (a shorter grid, new `box_px` numbers) one-time and font-independent.

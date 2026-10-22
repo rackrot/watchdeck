@@ -4,9 +4,12 @@ exclude: ^(app/src-tauri/(gen|icons)/|firmware/(build/|managed_components/|sdkco
 repos:
   - repo: builtin
     hooks:
+      # The vendored font files and their license texts stay byte-identical to upstream.
       - id: trailing-whitespace
         args: [--markdown-linebreak-ext=md]
+        exclude: ^fonts/[^/]+/
       - id: end-of-file-fixer
+        exclude: ^fonts/[^/]+/
 
   - repo: local
     hooks:
@@ -21,13 +24,20 @@ repos:
         name: typos
         language: system
         entry: typos
-        exclude: ^app/pnpm-lock\.yaml$
+        exclude: ^(app/pnpm-lock\.yaml|fonts/pnpm-lock\.yaml|fonts/[^/]+/)
 
       - id: biome
         name: biome check
         language: system
         entry: sh -c 'cd app && biome check .'
         files: ^app/.*\.(ts|tsx|js|jsx|json|css|html)$
+        pass_filenames: false
+
+      - id: biome-fonts
+        name: biome check fonts generator
+        language: system
+        entry: biome check --config-path=app fonts/generate.mjs
+        files: ^fonts/generate\.mjs$
         pass_filenames: false
 
       - id: cargo-fmt
@@ -49,6 +59,15 @@ repos:
         language: system
         entry: clang-format --dry-run -Werror
         files: ^firmware/.*\.(c|h)$
+        exclude: ^firmware/main/fonts/
+
+      - id: fonts-generated
+        name: fonts generated
+        language: system
+        entry: mise run fonts:check
+        # yamllint disable-line rule:line-length
+        files: ^(fonts/|firmware/main/fonts/|firmware/main/font_list\.h$|app/src/fonts\.gen\.ts$|app/src-tauri/src/daemon/fonts_gen\.rs$)
+        pass_filenames: false
 
       - id: rumdl
         name: rumdl

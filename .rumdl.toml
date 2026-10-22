@@ -3,6 +3,7 @@ disable = ["MD013"] # long lines and wide tables in site/src/device-spec.md
 exclude = [
   "site/book",
   "app/node_modules",
+  "fonts/node_modules",
   "app/src-tauri/target",
   "firmware/managed_components",
   "firmware/build",

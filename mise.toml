@@ -85,6 +85,24 @@ run = "mdbook build site"
 description = "Serve the docs site locally"
 run = "mdbook serve site --open"
 
+# The converter is lv_font_conv from fonts/pnpm-lock.yaml, not a global install, so its output only
+# depends on committed inputs. See plans/fonts.md.
+[tasks."fonts:gen"]
+description = "Regenerate the font outputs (firmware C, font_list.h, fonts.gen.ts, fonts_gen.rs)"
+dir = "{{config_root}}"
+run = [
+  "pnpm --dir fonts install --frozen-lockfile --ignore-scripts",
+  "node fonts/generate.mjs",
+]
+
+[tasks."fonts:check"]
+description = "Fail if the checked-in font outputs differ from a fresh generation"
+dir = "{{config_root}}"
+run = [
+  "pnpm --dir fonts install --frozen-lockfile --ignore-scripts",
+  "node fonts/generate.mjs --check",
+]
+
 [tasks.lint]
 description = "Run all pre-commit hooks on every file"
 run = "prek run --all-files"
@@ -96,5 +114,5 @@ run = [
   "biome format --write app",
   "taplo fmt",
   "rumdl fmt .",
-  "git ls-files -z 'firmware/*.c' 'firmware/*.h' | xargs -0 -r clang-format -i",
+  "git ls-files -z 'firmware/*.c' 'firmware/*.h' ':!firmware/main/fonts/' | xargs -0 -r clang-format -i",
 ]

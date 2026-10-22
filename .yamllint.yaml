@@ -1,6 +1,7 @@
 extends: default
 ignore: |
   app/pnpm-lock.yaml
+  fonts/pnpm-lock.yaml
 rules:
   document-start: disable
   line-length:

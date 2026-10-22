@@ -2,3 +2,4 @@
 site/book/
 .claude/worktrees/
 **/*.log
+fonts/node_modules/

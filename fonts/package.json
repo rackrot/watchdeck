@@ -1,0 +1,8 @@
+{
+  "name": "watchdeck-fonts",
+  "private": true,
+  "description": "Pinned lv_font_conv for the generated firmware fonts. See ../plans/fonts.md.",
+  "devDependencies": {
+    "lv_font_conv": "1.5.3"
+  }
+}

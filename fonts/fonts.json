@@ -1,0 +1,135 @@
+{
+  "comment": "Source of truth for the selectable fonts. Edited by hand; fonts/generate.mjs reads it and writes every generated file. `sha256` is the checked-in file's hash, checked on every run. `source.archive_sha256` is the downloaded archive's hash, for provenance only. `sizes` are the lv_font_conv --size per text slot, found once with `node fonts/generate.mjs --probe` and then pinned.",
+  "lv_font_conv": "1.5.3",
+  "range": "0x20-0x7E",
+  "fonts": [
+    {
+      "id": "inter",
+      "name": "Inter",
+      "file": "Inter-Medium.ttf",
+      "sha256": "97ad806f526e41546d46365bb3a393145f75b7b1568913db74549ad8b8dba872",
+      "source": {
+        "url": "https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip",
+        "archive_sha256": "9883fdd4a49d4fb66bd8177ba6625ef9a64aa45899767dde3d36aa425756b11e",
+        "member": "extras/ttf/Inter-Medium.ttf"
+      },
+      "license": {
+        "spdx": "OFL-1.1",
+        "file": "LICENSE.txt",
+        "sha256": "262481e844521b326f5ecd053e59b98c8b2da78c8ee1bdbb6e8174305e54935a",
+        "url": "https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip",
+        "member": "LICENSE.txt",
+        "reserved_font_name": null
+      },
+      "copyright": "Copyright (c) 2016 The Inter Project Authors (https://github.com/rsms/inter)",
+      "sizes": { "24": 22, "32": 29 }
+    },
+    {
+      "id": "roboto",
+      "name": "Roboto",
+      "file": "Roboto-Medium.ttf",
+      "sha256": "663bedb17df44144ea2ccf4c3a3c1853547bcfed2395ad29904502ea92c74bcb",
+      "source": {
+        "url": "https://github.com/googlefonts/roboto-3-classic/releases/download/v3.016/Roboto_v3.016.zip",
+        "archive_sha256": "1653dbe12f248da8fb0b9920db7b9496cd677ed3981154f6f15285c8bd4e334f",
+        "member": "unhinted/static/Roboto-Medium.ttf"
+      },
+      "license": {
+        "spdx": "OFL-1.1",
+        "file": "OFL.txt",
+        "sha256": "061402327a96aadb0bfb694a960ed289ecd38d383e396243831ab81feb109c41",
+        "url": "https://raw.githubusercontent.com/googlefonts/roboto-3-classic/v3.016/OFL.txt",
+        "note": "The release zip carries no license file; this is the repo's OFL.txt at the release tag.",
+        "reserved_font_name": null
+      },
+      "copyright": "Copyright 2011 The Roboto Project Authors (https://github.com/googlefonts/roboto-classic)",
+      "sizes": { "24": 24, "32": 32 }
+    },
+    {
+      "id": "fira-code",
+      "name": "Fira Code",
+      "file": "FiraCode-Medium.ttf",
+      "sha256": "97091f90623661fb4f7979c10d188f30f4806d8ce326b0bc8d1acc79dcc20d8f",
+      "source": {
+        "url": "https://github.com/tonsky/FiraCode/releases/download/6.2/Fira_Code_v6.2.zip",
+        "archive_sha256": "0949915ba8eb24d89fd93d10a7ff623f42830d7c5ffc3ecbf960e4ecad3e3e79",
+        "member": "ttf/FiraCode-Medium.ttf"
+      },
+      "license": {
+        "spdx": "OFL-1.1",
+        "file": "LICENSE",
+        "sha256": "1d41e10031ab125302780a05ec4c91d218e47db0c7e37cf315cce5e608cdc25c",
+        "url": "https://raw.githubusercontent.com/tonsky/FiraCode/6.2/LICENSE",
+        "note": "The release zip carries no license file; this is the repo's LICENSE at the release tag.",
+        "reserved_font_name": null
+      },
+      "copyright": "Copyright (c) 2014, The Fira Code Project Authors (https://github.com/tonsky/FiraCode)",
+      "sizes": { "24": 24, "32": 31 }
+    },
+    {
+      "id": "roboto-mono",
+      "name": "Roboto Mono",
+      "file": "RobotoMono-Medium.ttf",
+      "sha256": "4acbb2725a260eafff1bcaade3501204ca774e56346e259ee1b61d56996d2611",
+      "source": {
+        "url": "https://raw.githubusercontent.com/googlefonts/RobotoMono/895ec691990d041dd727c7b5afa3ce56525d98e6/fonts/ttf/RobotoMono-Medium.ttf"
+      },
+      "license": {
+        "spdx": "OFL-1.1",
+        "file": "OFL.txt",
+        "sha256": "50ab8dd54680d3473f649c9db86fece88434d097c7834475c1c72d2f8c429215",
+        "url": "https://raw.githubusercontent.com/googlefonts/RobotoMono/895ec691990d041dd727c7b5afa3ce56525d98e6/OFL.txt",
+        "reserved_font_name": null
+      },
+      "copyright": "Copyright 2015 The Roboto Mono Project Authors (https://github.com/googlefonts/robotomono)",
+      "sizes": { "24": 24, "32": 32 }
+    },
+    {
+      "id": "orbitron",
+      "name": "Orbitron",
+      "file": "Orbitron-Medium.ttf",
+      "sha256": "826f71504dfc50c8508f795b4bb5cd90f673ac55f02c8c2a97f236ba1ea68651",
+      "source": {
+        "url": "https://raw.githubusercontent.com/theleagueof/orbitron/13e6a5222aa6818d81c9acd27edd701a2d744152/Orbitron%20Medium.ttf",
+        "note": "Upstream name is 'Orbitron Medium.ttf'; renamed on copy to avoid a space in paths. The bytes are unchanged."
+      },
+      "license": {
+        "spdx": "OFL-1.1",
+        "file": "OFL.txt",
+        "sha256": "e0dcb396bc35a553c0d7bd8e471434444834f2d3afe91cf40aab1dffe6a75ac1",
+        "url": "https://raw.githubusercontent.com/theleagueof/orbitron/13e6a5222aa6818d81c9acd27edd701a2d744152/Open%20Font%20License.markdown",
+        "note": "Upstream name is 'Open Font License.markdown'; renamed on copy to OFL.txt so rumdl leaves it alone. The bytes are unchanged.",
+        "reserved_font_name": "Orbitron"
+      },
+      "copyright": "Copyright (c) 2009, Matt McInerney <matt@pixelspread.com>, with Reserved Font Name: \"Orbitron\"",
+      "fallback": {
+        "font": "oxanium",
+        "range": "0x5E",
+        "primary_range": "0x20-0x5D,0x5F-0x7E",
+        "note": "The Orbitron TTF has no U+005E (^). Its glyph is taken from Oxanium Medium at the same --size (both OFL-1.1)."
+      },
+      "sizes": { "24": 21, "32": 28 }
+    },
+    {
+      "id": "oxanium",
+      "name": "Oxanium",
+      "file": "Oxanium-Medium.ttf",
+      "sha256": "d0676de4894cd22591b4bb538dae5b8e06c44e0fb943300a7cff3945fe643689",
+      "source": {
+        "url": "https://github.com/sevmeyer/oxanium/releases/download/2.000/oxanium-2.000.zip",
+        "archive_sha256": "0f9b8b2b6cd2f64aaf08752b9d038449034775e636f4b138877d288c0bc3a850",
+        "member": "fonts/ttf/Oxanium-Medium.ttf"
+      },
+      "license": {
+        "spdx": "OFL-1.1",
+        "file": "OFL.txt",
+        "sha256": "fe17c0f2581d71b4e1ea7e636e7f4877c29223e11bb1dd1a871e8c3f2a86336b",
+        "url": "https://github.com/sevmeyer/oxanium/releases/download/2.000/oxanium-2.000.zip",
+        "member": "OFL.txt",
+        "reserved_font_name": null
+      },
+      "copyright": "Copyright 2019 The Oxanium Project Authors (https://github.com/sevmeyer/oxanium)",
+      "sizes": { "24": 24, "32": 32 }
+    }
+  ]
+}
