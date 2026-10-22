@@ -334,7 +334,7 @@ The device sends one `icon_get` per layout, listing every distinct id it doesn't
 
 With the [`pages`](#pages) capability the ids come from every page of the set, not only the one on screen:
 
-- The device keeps one request outstanding. Each takes up to 40 missing ids: the current page's first, then the other pages' in order. The next goes out when every frame of the last has arrived or 5 s have passed.
+- The device keeps one request outstanding. Each takes up to 40 missing ids: the current page's first, then the other pages' in order. The next goes out when every frame of the last has arrived, or after 5 s with no frame for it. The wait restarts on each frame, so a slow stream of large icons isn't cut off.
 - A new set cancels what is left and sends its own request at once, so frames of the old request may still be on the way.
 - It keeps the icons of every page of the set, so a page switch sends no `icon_get`.
 

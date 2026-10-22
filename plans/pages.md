@@ -135,7 +135,7 @@ Pages is a capability on the list fonts built (F21), not a new `v`:
   - Staging, `rev` and ack state belong to one connection (`s.gen`). A reconnect clears them, since every session starts again at `rev` 1 (`server.rs:739`). The current `page_id` is kept apart from them.
 - **Recovery.** A page can be lost (F27). If a set breaks (a page out of order, counts that disagree, a page that won't parse) or isn't complete 5 s after its first page, the board drops the link and reconnects, and the new session sends a complete set. Nothing new goes on the wire for this. So that a deterministic fault can't spin, a broken set counts as a failed attempt: the next `welcome` doesn't reset the backoff until a set completes (today `welcome` resets it, `link.c:1011`).
 - `layout_ack {rev}` goes out once per set, right after the board has applied it and built the current page, and **before** any `icon_get` (F26). That holds for a single `layout` too. `protocol.md:285` changes to say so. The daemon's ack rules don't change.
-- **`icon_get`** keeps its limit of 40 ids, and the board keeps one request outstanding. Each request takes up to 40 missing ids: the current page's first, then the other pages' in order. The next goes out when every frame of the last has arrived or 5 s have passed. A new set cancels what is left and sends its own request at once, so frames of the old request may still be on the way, exactly as when today's firmware gets a new layout. Apart from that a burst stays at 40 frames, and a set whose pages miss 40 icons or fewer in all takes one request. The daemon answers from every page of the session's view.
+- **`icon_get`** keeps its limit of 40 ids, and the board keeps one request outstanding. Each request takes up to 40 missing ids: the current page's first, then the other pages' in order. The next goes out when every frame of the last has arrived, or after 5 s with no frame for it (the wait restarts on each frame; changed after the S5 baseline, below). A new set cancels what is left and sends its own request at once, so frames of the old request may still be on the way, exactly as when today's firmware gets a new layout. Apart from that a burst stays at 40 frames, and a set whose pages miss 40 icons or fewer in all takes one request. The daemon answers from every page of the session's view.
 - The daemon sends `tile` for every tile button on every page of the session's view, as today.
 - What a page is called and where the board is never goes on the wire. "Page x of y" is drawn from `page` and `pages`.
 
@@ -339,6 +339,19 @@ Behavior-neutral: every caller passes "not paged" until S3, S5 and S7.
 - **Acceptance**: `cargo test` and clippy are clean. A config with pages survives a save and load unchanged. A file without pages saves with no page keys. Every existing `device_sim` test passes unchanged.
 - **Cheapest check**: `cargo test --manifest-path app/src-tauri/Cargo.toml config`.
 
+#### S3 as built (2026-10-22)
+
+- `config.rs`: `PageConfig`, `Config.pages`, `ButtonConfig.page`, `MAX_PAGES` 4, `MAX_TILES` 40, `MAX_PAGE_LABEL` 24. `Layout` holds `pages: Vec<LayoutPage>` and has `buttons()` (a flat iterator), `messages(rev)`, `home_only()` and a page-wide `without_fonts()`. `message(rev)` is gone.
+- Any layout of exactly one page has an empty page id, in `Live::layout()` and in `home_only()`. So adding a single `[[page]]` table, or renaming page 0, pushes nothing to a one-page view.
+- `server.rs`: every session's view is `without_fonts` (without that cap), then `home_only()`. It sends `messages(rev)` in a loop, and `TileFeed` iterates `layout.buttons()`. `CAPS` is unchanged.
+- `Icons::load` renders at `box_px(cols, rows, pages >= 2)`: 44 px for 0 or 1 page and 33 px for 2 on 5×3.
+- The fullest page message is 13,377 bytes, as estimated. A config without pages sends byte-identical JSON, with and without fonts, pinned by full literals.
+- Departures:
+  - `page` with no `[[page]]` tables reads `button "x": page "y" is set, but the file has no [[page]] tables`.
+  - A button naming an unknown page gets that one error and no collision entry.
+  - An empty `label` is refused (`page "x": label is empty; leave it out to show the id`).
+- Tests: 199 lib tests and 59 integration tests pass.
+
 ### S4 Daemon sessions
 
 - **Files**: `app/src-tauri/src/daemon/server.rs`, `protocol.rs` (`CAPS` gains `CAP_PAGES`), `tests/device_sim.rs`, `site/src/protocol.md` only if S1's text needs a fix.
@@ -385,6 +398,49 @@ Behavior-neutral: every caller passes "not paged" until S3, S5 and S7.
   - The link task stack high-water mark keeps at least 2 KB free after the S8 step 6 workload.
   - Against the `f75bf5c` daemon (S8 step 8) the board shows one page, no label, and today's geometry (`icon box 44 px` on 5×3).
 - **Cheapest check**: `mise run fw:test`, `mise run fw:build`, then the board against the S4 daemon with a 3-page config.
+
+#### S5 as built (2026-10-22)
+
+Code, host tests and build only. The serial-log acceptance and the memory baseline still wait for the board, with the user.
+
+- **New files**:
+  - `pageset.c/.h`: set assembly with no LVGL, FreeRTOS or clock (the caller passes `now_ms`).
+  - `model.c/.h`: one mutex over the applied set, 40 tile slots and the shown page id, in PSRAM. `model_apply` swaps storage pointers with the staging area, so nothing is copied under the lock.
+- **`link.c`**:
+  - `on_set` and `on_icons_settled` replace `on_layout`, and `hello` names `{"fonts","pages"}`.
+  - A broken set, or one still incomplete after 5 s, drops the link ("layout set broken"). `welcome` and `EV_GOT_IP` reset the backoff only after a set has completed.
+  - `layout_ack` goes out after the apply and page build and before any `icon_get`.
+  - One `icon_get` of up to 40 ids is outstanding at a time, from a PSRAM queue with the shown page first. It times out after 5 s with no frame for it (the timer restarts on each accepted frame), and ids that timed out aren't asked for again for that set.
+- **`icons.c`**: `ICONS_MAX` 160, with the table in PSRAM. `icons_retain` runs over the whole set.
+- **`ui.c`**:
+  - `ui_show_set` and `build_page`, with geometry from `grid_geometry(cols, rows, pages >= 2)`.
+  - The "Page x of y" label is created only with 2 or more pages.
+  - `s_grid` is no longer scrollable.
+  - A pending press keeps its label.
+- **Lock order as built**: the LVGL lock, then the model lock. No UI callback and no send runs under the model lock. `drop` re-takes the recursive LVGL lock.
+- **Logs**:
+  - `layout rev N: K pages applied, showing page X`
+  - `tile for X stored` once per button per set
+  - `LVGL heap (<when>)` at page built, icons settled and result shown. The settled sample is skipped with `icons gave up waiting (N missing)` after a timeout.
+- **Departures**:
+  - An icon frame is accepted for any id the applied set names. That's still bounded by the set and `ICONS_MAX`.
+  - Each page builds from its own `cols` and `rows`.
+  - Booting unpaired skips `icons_clear`.
+- **Checks**: 78 host tests, 13 of them for `pageset`. The image is 1,887,824 bytes, 5,200 more than before. The link task stack stays 8192, and the 2 KB `icon_get` buffer, the `seen` list and the staging area all moved to PSRAM.
+
+#### S5 memory baseline (2026-10-22)
+
+The firmware was the f75bf5c build, already on the board, so no flash. The daemon was `mise run app:dev` at 74cc3cf, where S1 and S2 change no behavior. Each fixture had distinct SVG icons. A "settled" sample is the heap line of a second push, made after every icon had arrived, with all icons served from the cache. The old firmware logs the LVGL pool only when it applies a layout, and the internal-heap minimum only on the first layout after boot.
+
+| Fixture | LVGL pool used, settled | Pool peak since boot | Pool size | Min free internal |
+|---|---|---|---|---|
+| 8×5, 40 icons (26 px), 40 tiles, one page | 44,676–45,696 | 48,440; 52,196 after a result screen with 1 KB of text | 59,832 | 280,648–280,720 (first layout, before icons) |
+| 4×1, 4 icons (238 px) | 14,020 | 52,196 (left over from the 8×5 run) | 63,104 | not logged after boot |
+
+- An 8×5 page with a 1 KB result screen peaks at 52,196 of 59,832 bytes (87%). That's about 7.6 KB of headroom, so `CONFIG_LV_MEM_SIZE` stays as it is. The S5 firmware builds only one page's widgets plus a label, so it should land within a few hundred bytes of this. The S8 run repeats the measurement with pages.
+- The internal-heap minimum with 8×5 is 280,648, against 300,060 for the fonts baseline, which used the user's 5×5 config.
+- Icons of 238×238 px arrive about one every 0.5 s (4 took 2.2 s), so a 4-page 4×1 set takes about 8 s in one request. That would have tripped a 5 s timeout counted from the request, so the timeout now restarts on each frame (Wire, and `protocol.md`).
+- Opening the serial port with pyserial reset the board once more, as noted in CLAUDE.md. That reset lost the first result-screen peak, and the tap was repeated after it.
 
 ### S6 Swipe on the board
 
