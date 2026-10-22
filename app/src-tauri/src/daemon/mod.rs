@@ -3,6 +3,7 @@
 pub mod actions;
 pub mod config;
 mod fonts_gen;
+pub mod hoststats;
 pub mod icons;
 pub mod mdns;
 pub mod pairing;
