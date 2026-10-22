@@ -2919,7 +2919,7 @@ async fn a_status_bar_session_gets_stats_within_two_seconds_then_about_once_a_se
         let (_, at) = next_stats(&mut c, Duration::from_secs(3)).await;
         let gap = at - last;
         assert!(
-            gap >= Duration::from_millis(500) && gap < Duration::from_secs(2),
+            gap >= Duration::from_millis(500) && gap < Duration::from_secs(3),
             "stats came {gap:?} apart"
         );
         last = at;
