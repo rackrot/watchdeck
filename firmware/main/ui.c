@@ -1075,7 +1075,8 @@ static void bar_refresh(void)
     } else {
         strlcpy(a, "--", sizeof(a));
     }
-    snprintf(text, sizeof(text), "CPU %*s", HOSTSTAT_VALUE_W, a);
+    // The temperature cells show "--°" until a later plan fills them, so the group fills its reserved width.
+    snprintf(text, sizeof(text), "CPU %*s %3s\xC2\xB0", HOSTSTAT_VALUE_W, a, "--");
     bar_set(BAR_CPU, text);
 
     if (fresh && s_stats.has_mem) {
@@ -1086,7 +1087,8 @@ static void bar_refresh(void)
     snprintf(text, sizeof(text), "RAM %*s", HOSTSTAT_VALUE_W, a);
     bar_set(BAR_RAM, text);
 
-    bar_set(BAR_GPU, "GPU   --"); // a later plan fills it
+    snprintf(text, sizeof(text), "GPU %*s %3s\xC2\xB0", HOSTSTAT_VALUE_W, "--", "--"); // a later plan fills it
+    bar_set(BAR_GPU, text);
 
     if (fresh && s_stats.has_net) {
         hoststat_rate(a, sizeof(a), s_stats.net_rx);
