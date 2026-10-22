@@ -1,5 +1,7 @@
 # watchdeck: Sentry error reporting
 
+**Status: dropped (2026-10-21).** The user took Sentry out of the project, because it was more trouble than it was worth. The self-hosted ingest also stopped storing events that day. The code is removed: the daemon client, the `[sentry]` config table, the scrubber and budget, `daemon/reporting.rs`, and the webview `tauri-plugin-sentry`. The S5 firmware and CI tooling was reverted too. The device's crash `report` and `report_ack` protocol stays. The history below is kept as a record and no longer describes the code.
+
 ## Status (2026-10-16)
 
 S1 to S4 are built, reviewed and merged (S4 at 917a5ec). The live checks passed on 2026-10-21 (see "Live checks" below), apart from `kind=reset` on hardware and a webview rejection.

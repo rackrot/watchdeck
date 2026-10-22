@@ -375,10 +375,10 @@ The device updates the button's text and color in place and doesn't rebuild the 
 
 - The device sends its report after `welcome` and again on every session until it gets the matching `report_ack`. It keeps the report until then.
 - The daemon checks every field above, and a report counts toward the session's limit of two whether it passes or not.
-  - A report with a valid `id` that fails a check, or whose fields have the wrong JSON type, is rejected. The daemon logs the failed field without the report's values, sends `report_ack` so the device erases it, and sends nothing to Sentry.
+  - A report with a valid `id` that fails a check, or whose fields have the wrong JSON type, is rejected. The daemon logs the failed field without the report's values and sends `report_ack` so the device erases it.
   - A report without a valid `id`, or one that arrives after the session's second, is logged and dropped with no `report_ack`.
   - Either way the session goes on.
-- The daemon writes one `warn` log line per accepted report, whether or not it sends the report to Sentry, and then sends `report_ack`. It sends the ack even when it is not configured to report to Sentry, or when it keeps the report out of Sentry to stay under its limits (one report per device, `elf`, `pc` and `reason` per hour, and 10 device reports an hour in all).
+- The daemon writes one `warn` log line per accepted report and then sends `report_ack`.
 - A daemon from before this message ignores it as an unknown `t` and never acks, so the device keeps the report for a newer daemon. Adding `report` and `report_ack` doesn't change `v`.
 
 ### `report_ack` (daemon → device)

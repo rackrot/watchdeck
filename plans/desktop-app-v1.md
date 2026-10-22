@@ -26,7 +26,7 @@
     - The P5 wedge is accepted.
   - The stall F1 is accepted by design: a live peer that stalls mid-frame still wedges the board until a reboot.
 - Open beyond v1:
-  - Sentry error reporting (Backlog): planned in `plans/sentry.md`; S1–S4 merged (917a5ec), S5 held behind a live experiment
+  - Sentry error reporting: dropped 2026-10-21 and removed from the code; see `plans/sentry.md`
 
 ## Decisions
 
@@ -586,7 +586,4 @@ Rollback: each slice is its own commit on `main` (see the status table), so `git
 
 ## Backlog
 
-- **Sentry error reporting.** Research, then plan as its own slice.
-  - Firmware: [getsentry/sentry-micro](https://github.com/getsentry/sentry-micro). First check ESP-IDF v6.1 and ESP32-P4 support, maturity, footprint, and transport (it needs TLS to the Sentry host). If upstream falls short, forking it and adding what watchdeck needs is acceptable.
-  - App: the Sentry SDK for the Rust daemon, and probably the React frontend.
-  - Config: a DSN setting, off by default. On the desktop it goes in `config.toml`. Decide how the device gets its DSN, for example pushed by the daemon over the session or stored in NVS. Keep DSNs and any PII (device ids, IPs, labels) out of events unless the user opts in.
+- ~~**Sentry error reporting.**~~ Dropped 2026-10-21 by the user, and the code is removed. See `plans/sentry.md`.
