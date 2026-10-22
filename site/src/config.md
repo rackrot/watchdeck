@@ -140,6 +140,21 @@ action = { kind = "shell", argv = ["ssh", "nas", "docker", "restart", "plex"] }
 - A device on firmware without pages shows the first page only, whatever the config holds, and gets nothing for edits to the other pages. With 2 or more pages the icons are rendered for the shorter paged grid, so such a device shows them smaller than its full-height box (see the paged sizes under [Icons](#icons)).
 - An app from before pages refuses a `config.toml` with a `[[page]]` table or a `page` key, because it rejects keys it doesn't know, and keeps its last good config (an empty grid on a fresh start). Before going back to an older app, remove the `[[page]]` tables and every `page` key, and keep the buttons you want on the first page.
 
+## Status bar and settings
+
+A paired device with a grid shows a bar 36 px high above it. From left to right the bar shows:
+
+- `CPU`, the desktop's processor use, and `RAM`, its memory in use as a percent.
+- `GPU --`, a slot reserved for a GPU reading. It shows `--` for now.
+- Network rates for the interface of the desktop's default route, as `▼` (received) and `▲` (sent), in bytes per second. Under 1000 the rate is a whole number. Above that it has one decimal and a unit, such as `1.2M` or `340.0k`.
+- The desktop's date and time in 24-hour form, such as `Wed 22 Oct 14:32`.
+
+The desktop sends the host values once a second while the device is connected. A value more than 5 s old shows as `--`. While the link is down, the daemon's status text takes the place of the host values, and the clock keeps running on the device.
+
+Swipe up on the grid to open settings. A swipe counts when it moves at least 200 px up and more than twice as far up as it moves sideways. Its touch doesn't press a button or turn a page. Settings shows the device's firmware, uptime and memory, the status of Wi-Fi, the desktop, the SD card, USB and touch, and the layout revision. Its buttons are Licenses, Forget pairing (the same 2 s hold as before) and Close. Settings closes with Close, with a swipe down, or after 60 s without a touch, and then the grid comes back. An unpaired device closes settings too.
+
+Until the first layout arrives, and while the device is unpaired, it shows the status screen instead: the Wi-Fi, SD, USB, touch and daemon lines, with Licenses and, while paired, Forget pairing.
+
 ## Icons
 
 A button can show a picture above its label. The picture is a PNG, JPEG, WebP or SVG file in `$XDG_CONFIG_HOME/watchdeck/icons/`, and `icon` names the file:
@@ -209,13 +224,13 @@ tile = { every_s = 30, font = "fira-code", source = { kind = "shell", argv = ["c
 - A label's font is the button's `font`, else `layout.font`, else `montserrat`. A tile's value uses `tile.font`, else the label's font. A button has only those two texts, so any pair of fonts is `font` for the label and `tile.font` for the value.
 - `montserrat` is valid at every level, so a button can keep Montserrat under another grid font. Naming the font a level would inherit anyway is allowed, and pins it: a later change to `layout.font` leaves that button alone.
 - An unknown name is an error like any other, and the last good config stays live: `layout.font "comic" is not one of montserrat, inter, roboto, fira-code, roboto-mono, orbitron, oxanium`. Names are lowercase.
-- Only button labels and tile values change. The status lines, the pairing screens and the result screens always use Montserrat.
+- Only button labels and tile values change. The status lines, settings, the pairing screens and the result screens always use Montserrat. The status bar uses its own font, Roboto Mono.
 - A font never changes the size of a button, its icon box or how many lines its label gets: a label still takes 1 or 2 lines and ends in dots where it doesn't fit, and a tile value is still one line. A wide font shows fewer characters before the dots, though. Orbitron is the widest, and it cuts a long value sooner than Montserrat or Inter. The config editor's preview breaks lines and places the dots the way the device does.
 - Every font covers printable ASCII, the only characters labels and values may use. Orbitron has no `^` of its own, so the device draws that one character from Oxanium.
 
 ### Font licenses
 
-All six fonts are under the SIL Open Font License 1.1. The firmware carries the license texts, each under its font's name and copyright line. Tap **Licenses** on the device (right of the USB line), drag to scroll and tap **Close** to leave. The same texts are in the app bundle under `fonts/licenses/`, and in the firmware image as plain text, so `strings` on a `.bin` finds them.
+All six fonts are under the SIL Open Font License 1.1. The firmware carries the license texts, each under its font's name and copyright line. On the device, tap **Licenses** in settings (swipe up on the grid to open it), or on the status screen, to the right of the USB line. Drag to scroll and tap **Close** to leave. The same texts are in the app bundle under `fonts/licenses/`, and in the firmware image as plain text, so `strings` on a `.bin` finds them.
 
 ### Older firmware and older apps
 

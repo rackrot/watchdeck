@@ -1,6 +1,6 @@
 # Device UI: a status bar, and settings behind a long swipe up
 
-Status: planned 2026-10-22, revised with user decisions. Against `main` at `aad6e3f`. No slice started.
+Status: S1 to S7 built on `main` (through `0a12633`), against the plan as revised 2026-10-22. S8's docs are updated; the hardware run and its results section are still to come.
 
 Gives the paired screen's top 204 px back to the buttons. Today a paired board shows five status lines (Wi-Fi, SD, USB, Touch, Daemon), a Licenses button and a Forget pairing button above the grid (`ui.c:443-462`). After this plan:
 
@@ -43,7 +43,7 @@ The user answered the open questions of the first draft:
 - **Time.** The board has no SNTP and no time zone. The daemon sends Unix seconds and its UTC offset in seconds, so the board shows the desktop's wall clock, and DST changes arrive with the next frame. A time zone change on the desktop needs a daemon restart (the `time` crate reads TZ once).
 - **LVGL pool.** 64 KB internal (`CONFIG_LV_MEM_SIZE=65536`, `sdkconfig:4965`), about 59,800 bytes usable. Pages S8 measured 49,052 to 49,072 bytes settled with 4 pages of 8×5 and 160 icons, and a 52,196-byte peak with a 1 KB result screen (`plans/pages.md`, S5 baseline and S8 results). Keeping the grid alive under a settings page of about 4 to 6 KB would leave about 2 KB, so the grid goes while settings is open.
 - **Bigger cells don't add widgets.** The pool cost of a page depends on its widget count, not its pixel size. Icons live in PSRAM (`icons.c`), so the bigger boxes cost PSRAM and transfer time, not pool.
-- **Montserrat 24 for the bar.** Chrome stays Montserrat, as fonts decided (`site/src/config.md:212`). The built-in font carries `LV_SYMBOL_UP`/`DOWN` (`lv_symbol_def.h:160`, `:164`) for the rate arrows. A Unicode arrow (U+2193) is not in the font.
+- **Montserrat 24 for the bar (superseded).** The bar is Roboto Mono 20 with Montserrat 20 behind it for the arrows, as built (Decisions). Other chrome stays Montserrat (`site/src/config.md:212`).
 - **Development only.** Every board runs the firmware built from the same commit as the daemon. Mixed versions are not tested or documented.
 
 ## Findings
@@ -130,18 +130,13 @@ Checked against `aad6e3f`.
 
 ### Bar
 
-- A container at (0, 0), 1024 × 36, created when grid mode starts and deleted when status mode returns. Black, with grey Montserrat 24 text at y 4 to 31. The grid starts 8 px under it (`GRID_TOP` = `BAR_H` 36 + `GRID_GAP` 8 = 44).
-- Slots, left to right, each a label of fixed width that ends in dots:
-  - the daemon's name from `welcome` while up, else the link status text
-  - `CPU 12%`
-  - `MEM 9.8/31.1 GiB`
-  - `▼ 1.2 MB/s ▲ 340 kB/s` (with `LV_SYMBOL_DOWN`/`UP`)
-  - `Wed 22 Oct 14:32` on the right
-- Slot widths come from Montserrat 24's advance widths for the worst cases (`CPU 100%`, `MEM 999.9/999.9 GiB`, `▼ 999.9 MB/s ▲ 999.9 MB/s`, `Wed 30 Sep 23:59`). At creation the bar measures those strings with `lv_text_get_size` and logs a warning for any slot they overflow, so a font or format change can't silently clip.
+- A container at (0, 0), 1024 × 36, created when grid mode starts and deleted when status mode returns. Black, with grey Roboto Mono 20 text (`wd_font_bar`, Montserrat 20 behind it for the arrows), centered vertically. The grid starts 8 px under it (`GRID_TOP` = `BAR_H` 36 + `GRID_GAP` 8 = 44).
+- Groups, left to right, each a label of fixed width, with equal gaps: `CPU 12%`, `RAM 45%`, `GPU --` (reserved), the rates `▼ 1.2M ▲340.0k`, and the clock flush right. While the link is down, the daemon's status text takes the place of the four host groups. The as-built layout and its reasons are under Decisions ("Bar layout, as built in S7"), which replaces the first draft's four slots (the daemon's name, `MEM` in GiB, Montserrat 24).
+- Each group's worst case is measured with `lv_text_get_size` at creation (`bar_create`), including the CPU and GPU temperature room a later plan adds. The bar logs `bar slot overflow` if the groups don't fit, so a font or format change can't silently clip.
 - One `lv_timer` of 1 s, owned by the bar, ticks the clock and blanks stale host values. A `stats` frame updates the labels at once.
 - `on_stats` stores every frame in `ui.c` whether or not the bar exists. The daemon sends `stats` from the first `select!` pass after `welcome`, which can be while a set is still arriving and the board is in status mode. The bar reads the stored values when it is created.
 - **Clock**: each frame stores `time + utc_offset` and `esp_timer_get_time()`. The shown time is that plus the elapsed time. The frames correct it every second while up, and the crystal holds it well enough between them for an offline evening. 24-hour, as `Wed 22 Oct 14:32`.
-- **Formatting** lives in a new `firmware/main/hoststat.c/.h` with no LVGL (rates in bytes per second with SI prefixes, memory in GiB, the clock from `gmtime_r` with its own day and month names), so `fw:test` covers it, like `pageset.c`.
+- **Formatting** lives in a new `firmware/main/hoststat.c/.h` with no LVGL (rates in bytes per second with SI prefixes, memory as a percent, the clock from `gmtime_r` with its own day and month names), so `fw:test` covers it, like `pageset.c`.
 
 ### Geometry
 

@@ -52,7 +52,7 @@ The `rm` step is required. The defaults files only fill in settings that are mis
 
 ## Checking the connection
 
-The screen's Wi-Fi line shows the progress:
+The status screen's Wi-Fi line shows the progress. The device shows the status screen from boot until its first layout arrives, and whenever it is unpaired. Once the grid is up, the same lines are in settings: swipe up on the grid to open it.
 
 | Screen text | Meaning |
 |---|---|

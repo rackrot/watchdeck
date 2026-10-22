@@ -80,7 +80,7 @@ The app runs a tray icon and a background daemon. The daemon serves the display'
 3. Type the 6-digit code shown on the display into the app, and click **Pair**.
 4. The display then asks whether the app says "Paired <device>". Check that it does, and tap **Yes**. Nothing is saved on the display until you tap Yes.
 
-To remove a pairing, hold **Forget pairing** on the display for 2 seconds. The display then erases its saved pairing.
+To remove a pairing, swipe up on the display's grid to open settings, then hold **Forget pairing** for 2 seconds. The display then erases its saved pairing. Until the display has its grid, the button is on the status screen, on the Touch line.
 
 If the display says "No desktop is ready to pair", the app's pairing dialog isn't open. Click **Pair a device** again. If your computer never shows up in the list, check that the display has joined your Wi-Fi network: `ping watchdeck.local` from a computer on the same network should get a reply.
 

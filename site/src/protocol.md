@@ -446,7 +446,7 @@ The daemon sends `stats` once a second, and only to a session whose `hello` name
 
 - **Refused**: a field of the wrong type (a fraction in an int field, a string, `null`), a value out of its range, a missing `time`, a `mem_*` or `net_*` field without its partner, or `mem_used` above `mem_total`. The device logs the frame and drops it. The link stays up.
 - **Unknown fields** are ignored.
-- The device logs each `stats` at debug level, not in the INFO line it logs for other messages, since a frame arrives every second.
+- The device logs each valid `stats` at debug level, not in the INFO line it logs for other messages, since a frame arrives every second. The default log level is INFO, so the serial log shows none of them unless debug is turned on. A refused `stats` gets the INFO line.
 
 ### `report` (device → daemon)
 
