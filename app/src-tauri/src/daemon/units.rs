@@ -151,8 +151,11 @@ impl Metric {
 
     /// `at` counted in `to` instead of `from`, or `None` when the change of units leaves this
     /// metric alone (percent, or the other kind of unit). Temperatures round to the nearest
-    /// whole degree. Rates go by the ratio of the units, rounded, at least 1.
+    /// whole degree. Rates go by the ratio of the units, rounded, at least 1. A draft `at` comes
+    /// from the window before any rule has looked at it, so it is held to ±10^9 first, which no
+    /// conversion here can overflow; the result is far outside every valid range anyway.
     pub fn convert(self, at: i64, from: Units, to: Units) -> Option<i64> {
+        let at = at.clamp(-DRAFT_AT_LIMIT, DRAFT_AT_LIMIT);
         match self {
             Self::CpuTemp | Self::GpuTemp if from.temp != to.temp => Some(match to.temp {
                 TempUnit::F => celsius_to_fahrenheit(at),
@@ -165,6 +168,8 @@ impl Metric {
         }
     }
 }
+
+const DRAFT_AT_LIMIT: i64 = 1_000_000_000;
 
 /// `n / d` rounded to the nearest whole number, halves up. `d` is positive.
 fn div_round(n: i64, d: i64) -> i64 {
@@ -203,8 +208,8 @@ pub fn fit_steps(ats: &mut [i64], range: &RangeInclusive<i64>) {
 mod tests {
     use super::*;
 
-    /// Whole °C and the whole °F the bar shows for it. The board's `test_hoststat.c` holds the
-    /// same rows.
+    /// Whole °C and the whole °F the bar shows for it. B7's `test_hoststat.c` must hold the same
+    /// rows.
     const TEMP_VECTORS: &[(i64, i64)] = &[
         (-40, -40),
         (0, 32),
@@ -217,7 +222,7 @@ mod tests {
         (150, 302),
     ];
 
-    /// Bytes per second, the unit, and the text the bar shows. The board's `test_hoststat.c` holds
+    /// Bytes per second, the unit, and the text the bar shows. B7's `test_hoststat.c` must hold
     /// the same rows.
     const RATE_VECTORS: &[(u64, NetUnit, &str)] = &[
         (0, NetUnit::Si, "0"),
@@ -361,6 +366,38 @@ mod tests {
         assert_eq!(Metric::NetRx.convert(100, si, f), None);
         assert_eq!(Metric::CpuTemp.convert(85, si, bin), None);
         assert_eq!(Metric::Mem.convert(90, si, bin), None);
+    }
+
+    #[test]
+    fn a_huge_draft_step_converts_without_overflow() {
+        let si = Units::default();
+        let f = Units {
+            temp: TempUnit::F,
+            ..si
+        };
+        let bin = Units {
+            net: NetUnit::Binary,
+            ..si
+        };
+        let bits = Units {
+            net: NetUnit::Bits,
+            ..si
+        };
+        for at in [i64::MAX, i64::MIN, 10_000_000_000_000] {
+            for (from, to) in [(si, f), (f, si)] {
+                assert!(Metric::CpuTemp.convert(at, from, to).is_some(), "{at}");
+            }
+            for (from, to) in [(si, bin), (bin, si), (si, bits), (bits, si), (bits, bin)] {
+                assert!(Metric::NetRx.convert(at, from, to).is_some(), "{at}");
+            }
+        }
+        // Past the limit it is the limit that converts, and the result is out of any range.
+        assert_eq!(
+            Metric::NetRx.convert(i64::MAX, si, bin),
+            Metric::NetRx.convert(DRAFT_AT_LIMIT, si, bin)
+        );
+        assert!(Metric::CpuTemp.convert(i64::MAX, si, f).unwrap() > 302);
+        assert_eq!(Metric::NetTx.convert(i64::MIN, si, bin), Some(1));
     }
 
     #[test]
