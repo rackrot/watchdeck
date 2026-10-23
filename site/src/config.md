@@ -144,14 +144,15 @@ action = { kind = "shell", argv = ["ssh", "nas", "docker", "restart", "plex"] }
 
 A paired device with a grid shows a bar 36 px high above it. From left to right the bar shows:
 
-- `CPU`, the desktop's processor use, and `RAM`, its memory in use as a percent.
-- `GPU --`, a slot reserved for a GPU reading. It shows `--` for now.
+- `CPU`, the desktop's processor use, then a temperature that shows `--°` for now.
+- `RAM`, its memory in use as a percent.
+- `GPU --`, a slot reserved for a GPU reading, then a temperature that shows `--°` for now.
 - Network rates for the interface of the desktop's default route, as `▼` (received) and `▲` (sent), in bytes per second. Under 1000 the rate is a whole number. Above that it has one decimal and a unit, such as `1.2M` or `340.0k`.
 - The desktop's date and time in 24-hour form, such as `Wed 22 Oct 14:32`.
 
 The desktop sends the host values once a second while the device is connected. A value more than 5 s old shows as `--`. While the link is down, the daemon's status text takes the place of the host values, and the clock keeps running on the device.
 
-Swipe up on the grid to open settings. A swipe counts when it moves at least 200 px up and more than twice as far up as it moves sideways. Its touch doesn't press a button or turn a page. Settings shows the device's firmware, uptime and memory, the status of Wi-Fi, the desktop, the SD card, USB and touch, and the layout revision. Its buttons are Licenses, Forget pairing (the same 2 s hold as before) and Close. Settings closes with Close, with a swipe down, or after 60 s without a touch, and then the grid comes back. An unpaired device closes settings too.
+Swipe up on the grid to open settings. A swipe counts when it moves at least 200 px up and more than twice as far up as it moves sideways. Its touch doesn't press a button or turn a page. Settings shows the device's firmware, uptime and memory, the status of Wi-Fi, the desktop, the SD card, USB and touch, and the layout revision. Its buttons are Licenses, Forget pairing (the same 2 s hold as before) and Close. Settings closes with Close, with a swipe down, or after 60 s without a touch (the idle close waits while the license viewer is open), and then the grid comes back. An unpaired device closes settings too.
 
 Until the first layout arrives, and while the device is unpaired, it shows the status screen instead: the Wi-Fi, SD, USB, touch and daemon lines, with Licenses and, while paired, Forget pairing.
 

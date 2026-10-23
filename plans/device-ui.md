@@ -2,7 +2,7 @@
 
 Status: S1 to S7 built on `main` (through `0a12633`), against the plan as revised 2026-10-22. S8's docs are updated; the hardware run and its results section are still to come.
 
-Gives the paired screen's top 204 px back to the buttons. Today a paired board shows five status lines (Wi-Fi, SD, USB, Touch, Daemon), a Licenses button and a Forget pairing button above the grid (`ui.c:443-462`). After this plan:
+Gives the paired screen's top 204 px back to the buttons. Before this plan, a paired board shows five status lines (Wi-Fi, SD, USB, Touch, Daemon), a Licenses button and a Forget pairing button above the grid. After this plan:
 
 - The grid starts 44 px from the top, under a 36 px bar that shows the desktop's CPU and memory use, its network rates, and the time and date.
 - A long swipe up opens a settings page with the device's status and info, Licenses, and Forget pairing. It is built when it opens and deleted when it closes.
@@ -17,21 +17,20 @@ The user answered the open questions of the first draft:
 - **Capability** (was C): `status_bar` stays, but only to gate `stats` (Wire). It no longer says anything about geometry.
 - **Clock** (was D): 24-hour, shown as `Wed 22 Oct 14:32`.
 - **Long swipe** (was E): 200 px up, more than twice as far up as sideways, anywhere on the grid, tuned on the board in S6.
-- **Auto-close** (was F): settings closes after 60 s without a touch.
+- **Auto-close** (was F): settings closes after 60 s without a touch, except while the license viewer is open.
 - **Bar layout, as built in S7** (replaces G and H):
   - The bar is Roboto Mono Regular 20, a chrome font generated from `fonts/fonts.json` (not selectable), with Montserrat 20 behind it for the arrows, so every group has a fixed width.
   - Rates are compact: bytes per second with one decimal and an SI suffix, truncated (`▼  1.2M ▲340.0k`, `999.9k`, never `1000.0k`; under 1000 a whole number), right-aligned in 6 cells.
   - No daemon name in the bar, since settings shows it. While the link is down the link status text takes the place of the four host groups, and the clock stays.
   - Memory is a percent, `RAM 45%` (used over total).
-  - Left to right: `CPU 12%`, `RAM 45%`, `GPU --` (reserved, always `--`; sized for `GPU 100% 100°`), the net rates, then the date and time flush right (`Wed 22 Oct 14:32`, worst case `Wed 24 May 04:44`).
-  - The CPU group is also sized for a later temperature (`CPU 100% 100°`).
+  - Left to right: `CPU 12% --°`, `RAM 45%`, `GPU -- --°` (the GPU usage is reserved and always `--`; the two `--°` are temperature placeholders, drawn now and filled by a later change, sized for `CPU 100% 100°` and `GPU 100% 100°`), the net rates, then the date and time flush right (`Wed 22 Oct 14:32`, worst case `Wed 24 May 04:44`).
   - The four groups are spread with equal gaps from the left edge to the clock's area. `bar_create` measures them and computes the gap, and logs `bar slot overflow` if they do not fit.
 
 ## Goal and done
 
 - **Grid mode** (paired, and a layout set applied since boot): the bar on top, then the grid from y 44. No status lines, Licenses or Forget pairing on screen.
 - **Status mode** (booting, unpaired, or paired with no set yet): today's screen. The five status lines at y 4 to 156, Licenses on the USB line, Forget pairing on the Touch line while paired, and the pairing views from y 204. A board that can't reach its daemon (wrong cert, daemon gone) stays here and can still be unpaired.
-- **Settings** opens on a long swipe up in grid mode: at least 200 px up, more than twice as far up as sideways, starting on the grid. It never presses a button or turns a page. It closes with Close, a swipe down, 60 s without a touch, or an unpair. While it is open the grid's widgets are deleted; closing rebuilds the page from the model. Opening and closing it 10 times leaves the LVGL pool where it was.
+- **Settings** opens on a long swipe up in grid mode: at least 200 px up, more than twice as far up as sideways, starting on the grid. It never presses a button or turns a page. It closes with Close, a swipe down, 60 s without a touch (not while the license viewer is open), or an unpair. While it is open the grid's widgets are deleted; closing rebuilds the page from the model. Opening and closing it 10 times leaves the LVGL pool where it was.
 - **The bar** shows CPU %, memory percent used, a reserved GPU slot, receive and send rates, and `Wed 22 Oct 14:32` (or the link status in place of the host values while down). Host values come from the daemon once a second. The clock keeps ticking on the board between frames and while the link is down. Without stats (never connected since boot, or more than 5 s since the last frame) the host values show `--`, and the clock shows `--:--` until the first frame since boot.
 - **Contract**: `GRID_TOP` is 44 on the board, in the daemon's `box_px` and in the preview. A session whose hello names `status_bar` gets a `stats` frame once a second.
 - `cargo test`, `pnpm test` and `mise run fw:test` cover the new rules. The hardware run (S8) passes on the board with serial-log evidence.
@@ -105,7 +104,7 @@ Checked against `aad6e3f`.
   - A press needs a touch under 20 px.
   - The result modal is a clickable full-screen backdrop on the top layer (`ui.c:182-188`), so a touch while it shows never reaches the grid. The toast isn't clickable, so it doesn't block. The license viewer covers the screen.
   - Status mode has no grid, so the swipe doesn't exist there (settings isn't reachable unpaired; status mode shows what it would).
-- **Close**: a Close button; a swipe down (`LV_EVENT_GESTURE` `LV_DIR_BOTTOM` on the page, which clears `gesture_bubble` like `s_grid`, and waits for release so a swipe that starts on Forget never forgets); 60 s without a touch (`lv_display_get_inactive_time`, F10); and an unpair, which deletes it before status mode returns.
+- **Close**: a Close button; a swipe down (`LV_EVENT_GESTURE` `LV_DIR_BOTTOM` on the page, which clears `gesture_bubble` like `s_grid`, and waits for release so a swipe that starts on Forget never forgets); 60 s without a touch, not while the license viewer is open (`lv_display_get_inactive_time`, F10); and an unpair, which deletes it before status mode returns.
 
 ### Settings page
 
@@ -131,7 +130,7 @@ Checked against `aad6e3f`.
 ### Bar
 
 - A container at (0, 0), 1024 × 36, created when grid mode starts and deleted when status mode returns. Black, with grey Roboto Mono 20 text (`wd_font_bar`, Montserrat 20 behind it for the arrows), centered vertically. The grid starts 8 px under it (`GRID_TOP` = `BAR_H` 36 + `GRID_GAP` 8 = 44).
-- Groups, left to right, each a label of fixed width, with equal gaps: `CPU 12%`, `RAM 45%`, `GPU --` (reserved), the rates `▼ 1.2M ▲340.0k`, and the clock flush right. While the link is down, the daemon's status text takes the place of the four host groups. The as-built layout and its reasons are under Decisions ("Bar layout, as built in S7"), which replaces the first draft's four slots (the daemon's name, `MEM` in GiB, Montserrat 24).
+- Groups, left to right, each a label of fixed width, with equal gaps: `CPU 12% --°`, `RAM 45%`, `GPU -- --°` (both temperatures are drawn `--°` placeholders), the rates `▼ 1.2M ▲340.0k`, and the clock flush right. While the link is down, the daemon's status text takes the place of the four host groups. The as-built layout and its reasons are under Decisions ("Bar layout, as built in S7"), which replaces the first draft's four slots (the daemon's name, `MEM` in GiB, Montserrat 24).
 - Each group's worst case is measured with `lv_text_get_size` at creation (`bar_create`), including the CPU and GPU temperature room a later plan adds. The bar logs `bar slot overflow` if the groups don't fit, so a font or format change can't silently clip.
 - One `lv_timer` of 1 s, owned by the bar, ticks the clock and blanks stale host values. A `stats` frame updates the labels at once.
 - `on_stats` stores every frame in `ui.c` whether or not the bar exists. The daemon sends `stats` from the first `select!` pass after `welcome`, which can be while a set is still arriving and the board is in status mode. The bar reads the stored values when it is created.

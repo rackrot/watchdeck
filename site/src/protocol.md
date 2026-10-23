@@ -271,7 +271,7 @@ A device that names `fonts` in `hello.caps` draws button text in Montserrat (bui
 
 - The device resolves a label font as `label_font`, else `font`, else `montserrat`, and a value font as `value_font`, else the label font. The daemon sends `label_font` only when the button's label font differs from the message's `font`, and `value_font` only when the value font differs from the label font. So a button that uses the grid's font carries nothing, and `montserrat` is sent where a button pins it under another grid font.
 - The daemon sends `font` whenever the grid's font isn't `montserrat`, even when no button uses it, because a later field of the layout can draw in it.
-- The device draws status lines, the pairing screens and result screens in Montserrat whatever the layout says.
+- The device draws status lines, settings, the pairing screens and result screens in Montserrat whatever the layout says. The status bar uses its own font, Roboto Mono.
 - A font never changes a button's size, so changing only fonts changes no icon id and needs no new `icon_get`.
 - **Fallback.** A device that gets a font id it doesn't know, or a value that isn't a string, draws that text in Montserrat, logs it, and still builds and acks the layout. A font is cosmetic, so the layout is never refused for one.
 - **Without the capability** a session gets none of these fields. Its layout is the one a config without fonts would produce, and a change to fonts alone sends it no new `layout`, so its `rev` doesn't move. With the capability, a change to fonts alone pushes a new `layout` with the next `rev`.
@@ -446,7 +446,7 @@ The daemon sends `stats` once a second, and only to a session whose `hello` name
 
 - **Refused**: a field of the wrong type (a fraction in an int field, a string, `null`), a value out of its range, a missing `time`, a `mem_*` or `net_*` field without its partner, or `mem_used` above `mem_total`. The device logs the frame and drops it. The link stays up.
 - **Unknown fields** are ignored.
-- The device logs each valid `stats` at debug level, not in the INFO line it logs for other messages, since a frame arrives every second. The default log level is INFO, so the serial log shows none of them unless debug is turned on. A refused `stats` gets the INFO line.
+- The device logs each valid `stats` at debug level, not in the INFO line it logs for other messages, since a frame arrives every second. The firmware compiles debug logs out (`CONFIG_LOG_MAXIMUM_LEVEL=3`), so seeing them needs a rebuild with debug enabled. A refused `stats` gets the INFO line.
 
 ### `report` (device → daemon)
 
