@@ -51,7 +51,8 @@ void hoststat_rate(char *buf, size_t size, uint64_t bytes_per_s, proto_net_unit_
  * The four host groups of the bar, each a fixed number of cells, ready for a label with recolor on. A value the frame
  * lacks, or any value once `fresh` is false, is "--" in its cells and never colored. A value with a color in
  * `colors_mask` is wrapped as "#rrggbb 97%#", the padding outside the markup; the prefixes and the units stay
- * uncolored. Each result is at most HOSTSTAT_GROUP_MAX bytes with its NUL.
+ * uncolored. The group labels and the arrows given to hoststat_group_net go into the recolor stream unescaped, so they
+ * must not contain '#'. Each result is at most HOSTSTAT_GROUP_MAX bytes with its NUL.
  */
 
 /** "CPU  12%  64°C": busy and temperature. */

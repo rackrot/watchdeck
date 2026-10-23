@@ -19,7 +19,8 @@ static const struct {
     int c;
     int f;
 } temp_vectors[] = {
-    {-40, -40}, {0, 32}, {37, 99}, {64, 147}, {84, 183}, {85, 185}, {95, 203}, {100, 212}, {150, 302},
+    {-40, -40}, {-37, -35}, {-3, 27},  {-1, 30},  {0, 32},    {37, 99},
+    {64, 147},  {84, 183},  {85, 185}, {95, 203}, {100, 212}, {150, 302},
 };
 
 // Bytes per second, the unit and the text the bar shows. The same rows as RATE_VECTORS in units.rs.

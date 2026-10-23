@@ -144,6 +144,8 @@ impl Metric {
             }),
             Self::NetRx | Self::NetTx => net.map(|n| match n {
                 NetUnit::Si | NetUnit::Binary => (1..=100_000, n.label()),
+                // 800,000 Mb/s is 8e11 bits, under the 999.9G the board can show. A larger end
+                // would have a step the bar can never reach (the board caps its text at 999.9G).
                 NetUnit::Bits => (1..=800_000, n.label()),
             }),
         }
@@ -212,6 +214,9 @@ mod tests {
     /// rows.
     const TEMP_VECTORS: &[(i64, i64)] = &[
         (-40, -40),
+        (-37, -35),
+        (-3, 27),
+        (-1, 30),
         (0, 32),
         (37, 99),
         (64, 147),
@@ -298,6 +303,25 @@ mod tests {
         assert_eq!(rate_text(at, NetUnit::Binary), "100.0Mi");
         assert_eq!(NetUnit::Si.bytes_per_at(), 1_000_000);
         assert_eq!(NetUnit::Bits.bytes_per_at() * 8, 1_000_000);
+    }
+
+    #[test]
+    fn the_largest_rate_step_is_one_the_board_can_show() {
+        // The board's text caps at 999.9G of the unit: bytes for SI and binary, bits for bits.
+        for (unit, cap) in [
+            (NetUnit::Si, 999_900_000_000_i64),
+            (NetUnit::Binary, 9999 * (1_i64 << 30) / 10),
+            (NetUnit::Bits, 999_900_000_000),
+        ] {
+            let end = *Metric::NetRx.range(None, Some(unit)).unwrap().0.end();
+            let per_second = end * unit.bytes_per_at();
+            let in_unit = if unit == NetUnit::Bits {
+                per_second * 8
+            } else {
+                per_second
+            };
+            assert!(in_unit < cap, "{unit:?}: {in_unit} reaches {cap}");
+        }
     }
 
     #[test]
