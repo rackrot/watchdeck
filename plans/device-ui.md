@@ -1,6 +1,6 @@
 # Device UI: a status bar, and settings behind a long swipe up
 
-Status: S1 to S7 built on `main` (through `0a12633`), against the plan as revised 2026-10-22. S8's docs are updated and its hardware run is recorded in "S8 results", with four checks left for the user's go-ahead.
+Status: S1 to S7 built on `main` (through `0a12633`), against the plan as revised 2026-10-22. S8 done: docs updated, hardware run recorded in "S8 results". Plan complete.
 
 Gives the paired screen's top 204 px back to the buttons. Before this plan, a paired board shows five status lines (Wi-Fi, SD, USB, Touch, Daemon), a Licenses button and a Forget pairing button above the grid. After this plan:
 
@@ -348,7 +348,8 @@ Board on `main` at `0a12633` (the docs commits since change no code), dev daemon
 - **Internal heap**: minimum free 289,836 bytes over the run.
 - **RSSI**: read in 12.6 ms (`RSSI read took 12629 us`), under the 20 ms bound, so it stays on the link task.
 - **Bar**: groups at `cpu 12/156 ram 220/96 gpu 368/156 net 576/192 clock 820/192`, gaps 52, margins 12, text y 7, no overflow warning. Stats flowed (checked with a temporary log of the bar texts in S7).
-- **Not run**: stopping the daemon (values to `--`, clock keeps time), boot without Wi-Fi, the worst icon set (4 pages of 5×2), and the time zone change. They disturb the user's dev setup; each waits for the user's go-ahead.
+- **Daemon stopped** (user, on the panel): the host values left the bar and the link status ("offline", then "searching") showed in their place.
+- **Skipped by the user's decision**: boot without Wi-Fi (Wi-Fi is a requirement), the worst icon set (4 pages of 5×2), and the time zone change.
 
 ## Risks
 
