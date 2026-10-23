@@ -3,6 +3,7 @@ import { test } from "node:test";
 import type { ButtonConfig, Config } from "../src/config.ts";
 import {
   addPage,
+  barChanged,
   buttonAt,
   buttonsOnPage,
   canon,
@@ -19,7 +20,9 @@ import {
   removePage,
   renamePage,
   rowsToRecord,
+  withGpu,
   withGridFont,
+  withSteps,
 } from "../src/edit.ts";
 import { hasErrors, mapErrors, numberErrors, unquote } from "../src/errors.ts";
 import { resolveFonts } from "../src/fonts.ts";
@@ -855,4 +858,130 @@ test("every layout edit keeps status_bar in the draft, and a status_bar edit is 
   assert.equal(layoutChanged(pagedConfig, withBar), false);
   const devices = [{ id: "d", connected: true, caps: ["pages", "fonts"] }];
   assert.deepEqual(layoutTargets(withBar, changed, devices), []);
+});
+
+test("barChanged is true for a [status_bar] edit and false for a button edit", () => {
+  const bar: Config["status_bar"] = { temp_unit: "f" };
+  const withBar: Config = { ...config, status_bar: bar };
+  assert.equal(barChanged(config, withBar), true);
+  assert.equal(
+    barChanged(withBar, { ...withBar, status_bar: { gpu: "off" } }),
+    true,
+  );
+  assert.equal(barChanged(withBar, withBar), false);
+  assert.equal(barChanged(config, config), false);
+  // A button edit, even one a device draws, leaves the bar alone.
+  assert.equal(barChanged(withBar, moveButton(withBar, 0, [2, 0])), false);
+  assert.equal(
+    barChanged(withBar, {
+      ...withBar,
+      button: withBar.button.map((b) => ({ ...b, label: "x" })),
+    }),
+    false,
+  );
+});
+
+test("a [status_bar]-only edit has no layout targets, and a button edit still does", () => {
+  const devices = [
+    { id: "d", connected: true, caps: ["pages", "fonts"] },
+    { id: "old", connected: true, caps: [] },
+  ];
+  const edited: Config = {
+    ...config,
+    status_bar: {
+      gpu: "0000:01:00.0",
+      temp_unit: "f",
+      net_unit: "binary",
+      thresholds: { mem: [{ at: 90, color: "#e53935" }], cpu_temp: [] },
+    },
+  };
+  assert.equal(barChanged(config, edited), true);
+  assert.deepEqual(layoutTargets(config, edited, devices), []);
+  assert.deepEqual(layoutTargets(edited, config, devices), []);
+  const moved = moveButton(edited, 0, [2, 0]);
+  assert.equal(barChanged(edited, moved), false);
+  assert.deepEqual(layoutTargets(edited, moved, devices), ["d", "old"]);
+});
+
+test("steps and the GPU are set without leaving empty tables behind", () => {
+  const step = { at: 90, color: "#e53935" };
+  const one = withSteps(undefined, "mem", [step]);
+  assert.deepEqual(one, { thresholds: { mem: [step] } });
+  // `[]` is never colored and stays; removing the key takes the defaults and drops the table.
+  assert.deepEqual(withSteps(one, "cpu", []), {
+    thresholds: { mem: [step], cpu: [] },
+  });
+  assert.equal(withSteps(one, "mem", undefined), undefined);
+  assert.deepEqual(withSteps({ temp_unit: "f", ...one }, "mem", undefined), {
+    temp_unit: "f",
+  });
+  assert.deepEqual(withGpu(undefined, "off"), { gpu: "off" });
+  assert.equal(withGpu({ gpu: "off" }, "auto"), undefined);
+  assert.deepEqual(withGpu({ gpu: "off", net_unit: "bits" }, "auto"), {
+    net_unit: "bits",
+  });
+});
+
+test("every status_bar message lands next to the field it is about", () => {
+  const map = mapErrors([
+    'status_bar.gpu "x" is not auto, off or a PCI address such as 0000:01:00.0',
+    'status_bar.temp_unit "k" is not c or f',
+    'status_bar.net_unit "x" is not si, binary or bits',
+    "status_bar.thresholds.mem: 4 steps, at most 3",
+    "status_bar.thresholds.cpu_temp: at 400 is outside 34 to 302 °F",
+    "status_bar.thresholds.cpu_temp: steps must rise, 90 then 80",
+    'status_bar.thresholds.gpu_temp: color "red" is not #rrggbb',
+    "status_bar.thresholds.gpu: at 0 is outside 1 to 100 %",
+    "status_bar.thresholds.net_rx: at 100001 is outside 1 to 100000 MiB/s",
+    "status_bar.thresholds.net_tx: steps must rise, 80 then 80",
+    "status_bar.thresholds.cpu: 4 steps, at most 3",
+    "status_bar.something new",
+  ]);
+  assert.deepEqual(map.statusBar, {
+    gpu: [
+      'status_bar.gpu "x" is not auto, off or a PCI address such as 0000:01:00.0',
+    ],
+    temp_unit: ['status_bar.temp_unit "k" is not c or f'],
+    net_unit: ['status_bar.net_unit "x" is not si, binary or bits'],
+    "thresholds.mem": ["4 steps, at most 3"],
+    "thresholds.cpu_temp": [
+      "at 400 is outside 34 to 302 °F",
+      "steps must rise, 90 then 80",
+    ],
+    "thresholds.gpu_temp": ['color "red" is not #rrggbb'],
+    "thresholds.gpu": ["at 0 is outside 1 to 100 %"],
+    "thresholds.net_rx": ["at 100001 is outside 1 to 100000 MiB/s"],
+    "thresholds.net_tx": ["steps must rise, 80 then 80"],
+    "thresholds.cpu": ["4 steps, at most 3"],
+    bar: ["status_bar.something new"],
+  });
+  // None of them is a general or grid message, so none shows twice.
+  assert.deepEqual(map.general, []);
+  assert.deepEqual(map.grid, []);
+  assert.equal(hasErrors(map), true);
+  assert.equal(hasErrors(mapErrors([])), false);
+});
+
+test("a step's at that isn't a whole number is reported before the call", () => {
+  const withAt = (at: number): Config => ({
+    ...config,
+    status_bar: {
+      thresholds: {
+        mem: [{ at: 80, color: "#ffb300" }],
+        cpu_temp: [
+          { at: 85, color: "#ffb300" },
+          { at, color: "#e53935" },
+        ],
+      },
+    },
+  });
+  assert.equal(hasErrors(numberErrors(withAt(95))), false);
+  // Out of range is a rule, which Rust words.
+  assert.equal(hasErrors(numberErrors(withAt(-5))), false);
+  for (const bad of [1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 60]) {
+    assert.deepEqual(numberErrors(withAt(bad)).statusBar, {
+      "thresholds.cpu_temp": ["at must be a whole number"],
+    });
+  }
+  assert.equal(hasErrors(numberErrors(config)), false);
 });

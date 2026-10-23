@@ -43,6 +43,39 @@ export function Field({
   );
 }
 
+/** A `#rrggbb` field: the browser's picker, and the hex text beside it. */
+export function ColorField({
+  label,
+  value,
+  onChange,
+  problems,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  problems?: string[];
+}) {
+  return (
+    <Field label={label} problems={problems}>
+      <span className="color">
+        <input
+          type="color"
+          aria-label={`${label} picker`}
+          value={/^#[0-9a-fA-F]{6}$/.test(value) ? value : "#000000"}
+          onChange={(e) => onChange(e.currentTarget.value)}
+        />
+        <input
+          className="mono"
+          aria-label={`${label} hex`}
+          value={value}
+          spellCheck={false}
+          onChange={(e) => onChange(e.currentTarget.value)}
+        />
+      </span>
+    </Field>
+  );
+}
+
 /**
  * A font picker with a sample in the chosen font beside it (WebKitGTK doesn't style `<option>`).
  * With `inherit`, an extra first option means "no font of its own", labelled with the font it

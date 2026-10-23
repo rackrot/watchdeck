@@ -15,6 +15,7 @@ import {
   newButton,
 } from "./config";
 import {
+  barChanged,
   buttonAt,
   layoutTargets,
   pageCount,
@@ -32,6 +33,7 @@ import GridEditor from "./GridEditor";
 import { useIconUrls, useTileReadings } from "./hooks";
 import PageTabs from "./PageTabs";
 import SaveBar from "./SaveBar";
+import StatusBarForm from "./StatusBarForm";
 import {
   diskChanged as diskMoved,
   isDirty,
@@ -54,12 +56,19 @@ type Saved = {
   /** Connected devices that should get a new layout. */
   targets: string[];
   connected: number;
+  /** The save changed `[status_bar]`, which connected devices pick up without a layout. */
+  bar: boolean;
 };
+
+/** A `[status_bar]` edit reaches a connected device within this long: the config poll and the next tick. */
+const BAR_WITHIN_S = 2;
 
 export default function ConfigPage({ secrets }: { secrets: string[] }) {
   const [view, setView] = useState<ConfigView | null>(null);
   const [draft, setDraft] = useState<Config | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
+  // The status bar form takes the button form's place, so a button and the form are never both open.
+  const [statusBarOpen, setStatusBarOpen] = useState(false);
   // The page the grid shows, from 0. Clamped below, since the draft can lose pages.
   const [pageIdx, setPageIdx] = useState(0);
   const [errors, setErrors] = useState<ErrorMap>(emptyErrors);
@@ -216,6 +225,9 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
             .flat()
             .map((m) => `${id}: ${m}`),
         ),
+        ...Object.entries(numbers.statusBar).flatMap(([field, list]) =>
+          list.map((m) => `status_bar.${field}: ${m}`),
+        ),
       ]);
       return;
     }
@@ -243,6 +255,7 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
         t0,
         connected: connected.length,
         targets,
+        bar: barChanged(view.config, draft),
       });
     } catch (e) {
       const messages = Array.isArray(e) ? (e as string[]) : [String(e)];
@@ -398,7 +411,10 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
         gridProblems={errors.grid}
         readings={readings}
         iconUrl={iconUrl}
-        onSelect={setSelected}
+        onSelect={(index) => {
+          setStatusBarOpen(false);
+          setSelected(index);
+        }}
         onChange={set}
         onAdd={(pos) => {
           const home = draft.page?.[page]?.id;
@@ -406,11 +422,29 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
             ...draft,
             button: [...draft.button, newButton(draft, pos, home)],
           });
+          setStatusBarOpen(false);
           setSelected(draft.button.length);
+        }}
+        statusBarOpen={statusBarOpen}
+        statusBarProblems={Object.keys(errors.statusBar).length > 0}
+        onStatusBar={() => {
+          setStatusBarOpen(!statusBarOpen);
+          setSelected(null);
         }}
       />
 
-      {button ? (
+      {statusBarOpen ? (
+        <StatusBarForm
+          key={formKey}
+          bar={draft.status_bar}
+          defaults={view.status_bar_defaults}
+          errors={errors.statusBar}
+          onChange={(status_bar) => {
+            const { status_bar: _, ...rest } = draft;
+            set(status_bar === undefined ? rest : { ...rest, status_bar });
+          }}
+        />
+      ) : button ? (
         <ButtonForm
           // A fresh form per button, and after the draft is replaced, so its rows start from it.
           key={`${formKey}:${selected}`}
@@ -512,8 +546,9 @@ function SavedStatus({
       </span>
     );
   });
+  // A bar edit pushes no layout, so "the layout is unchanged" would only confuse beside its line.
   const note =
-    saved.targets.length > 0
+    saved.targets.length > 0 || (saved.bar && saved.connected > 0)
       ? null
       : saved.connected === 0
         ? "no device connected, so it gets the layout when it connects"
@@ -521,6 +556,11 @@ function SavedStatus({
   return (
     <>
       <span className="chip ok">Saved</span>
+      {saved.bar && saved.connected > 0 && (
+        <span className="chip ok">
+          status bar settings apply within {BAR_WITHIN_S} s
+        </span>
+      )}
       {lines}
       {note && <span className="muted">{note}</span>}
     </>

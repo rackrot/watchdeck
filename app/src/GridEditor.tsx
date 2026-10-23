@@ -51,6 +51,10 @@ type Props = {
   onSelect: (index: number | null) => void;
   onChange: (config: Config) => void;
   onAdd: (pos: [number, number]) => void;
+  /** Whether the status bar form is open, and whether the last save refused something in it. */
+  statusBarOpen: boolean;
+  statusBarProblems: boolean;
+  onStatusBar: () => void;
 };
 
 /** The width of an element, kept current. */
@@ -81,6 +85,9 @@ export default function GridEditor({
   onSelect,
   onChange,
   onAdd,
+  statusBarOpen,
+  statusBarProblems,
+  onStatusBar,
 }: Props) {
   const [stage, stageWidth] = useWidth();
   const screen = useRef<HTMLDivElement>(null);
@@ -229,6 +236,14 @@ export default function GridEditor({
             />
           </Field>
         </div>
+        <button
+          type="button"
+          className={statusBarProblems ? "danger" : undefined}
+          aria-pressed={statusBarOpen}
+          onClick={onStatusBar}
+        >
+          Status bar{statusBarProblems && " (has problems)"}
+        </button>
       </div>
       <Problems list={gridProblems} />
 

@@ -2,7 +2,7 @@
 // messages are the strings `Config::check` builds in app/src-tauri/src/daemon/config.rs, so this
 // file reads their wording. A message it doesn't know still shows, on its button or at the top.
 
-import type { Config } from "./config";
+import type { Config, Metric } from "./config";
 
 export type ActionField =
   | "timeout_s"
@@ -34,6 +34,17 @@ export type Field =
 
 export type FieldErrors = Partial<Record<Field, string[]>>;
 
+/** A field of the status bar form: a setting, or one metric's steps. */
+export type StatusBarField =
+  | "gpu"
+  | "temp_unit"
+  | "net_unit"
+  | `thresholds.${Metric}`
+  /** A `status_bar.*` problem that no field owns. */
+  | "bar";
+
+export type StatusBarErrors = Partial<Record<StatusBarField, string[]>>;
+
 export type ErrorMap = {
   /** Messages for the layout section: the grid size, its font, the version and the page and tile counts. */
   grid: string[];
@@ -43,6 +54,8 @@ export type ErrorMap = {
   buttons: Map<string, FieldErrors>;
   /** By page id, for the page tabs. */
   pages: Map<string, string[]>;
+  /** Messages about `[status_bar]`, by the field of the status bar form. */
+  statusBar: StatusBarErrors;
 };
 
 export const emptyErrors = (): ErrorMap => ({
@@ -50,13 +63,41 @@ export const emptyErrors = (): ErrorMap => ({
   general: [],
   buttons: new Map(),
   pages: new Map(),
+  statusBar: {},
 });
 
 export const hasErrors = (map: ErrorMap): boolean =>
   map.grid.length > 0 ||
   map.general.length > 0 ||
   map.buttons.size > 0 ||
-  map.pages.size > 0;
+  map.pages.size > 0 ||
+  Object.keys(map.statusBar).length > 0;
+
+function addStatusBarError(
+  map: ErrorMap,
+  field: StatusBarField,
+  message: string,
+) {
+  map.statusBar[field] = [...(map.statusBar[field] ?? []), message];
+}
+
+/**
+ * Which field of the status bar form a `status_bar.*` message is about. A threshold message loses
+ * its prefix, since it shows beside the row it names.
+ */
+function statusBarField(message: string): [StatusBarField, string] {
+  const setting = message.match(/^status_bar\.(gpu|temp_unit|net_unit) /);
+  if (setting) {
+    return [setting[1] as StatusBarField, message];
+  }
+  const metric = message.match(
+    /^status_bar\.thresholds\.(cpu|mem|gpu|cpu_temp|gpu_temp|net_rx|net_tx): (.*)$/s,
+  );
+  if (metric) {
+    return [`thresholds.${metric[1] as Metric}`, metric[2]];
+  }
+  return ["bar", message];
+}
 
 /** Which field of an action `problem` is about, from the start of Rust's message. */
 function actionField(problem: string): ActionField | null {
@@ -200,6 +241,9 @@ export function mapErrors(
       for (const field of fieldsOf(button[2])) {
         addButtonError(map, id, field, button[2]);
       }
+    } else if (message.startsWith("status_bar.")) {
+      const [field, text] = statusBarField(message);
+      addStatusBarError(map, field, text);
     } else if (
       /^(layout\.(cols|rows|font)|version) |^\d+ pages, at most |^\d+ tiles across all pages, at most /.test(
         message,
@@ -240,6 +284,13 @@ export function numberErrors(config: Config): ErrorMap {
     }
     if (b.tile && !isCount(b.tile.source.timeout_s)) {
       addButtonError(map, b.id, "tile.source.timeout_s", `timeout_s ${whole}`);
+    }
+  }
+  // Only the type is checked: a negative or huge `at` is a rule, which Rust words.
+  const thresholds = config.status_bar?.thresholds ?? {};
+  for (const [metric, steps] of Object.entries(thresholds)) {
+    if (steps?.some((step) => !Number.isSafeInteger(step.at))) {
+      addStatusBarError(map, `thresholds.${metric as Metric}`, `at ${whole}`);
     }
   }
   return map;

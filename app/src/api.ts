@@ -1,5 +1,12 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import type { Config, ConfigView, TileConfig } from "./config";
+import type {
+  Config,
+  ConfigView,
+  NetUnit,
+  StatusBarConfig,
+  TempUnit,
+  TileConfig,
+} from "./config";
 
 /** `caps` are what the live session's device supports, such as "fonts". Empty while offline. */
 export type DeviceInfo = { id: string; connected: boolean; caps: string[] };
@@ -73,6 +80,21 @@ export type GpuInfo = {
 /** `auto` is the id the status bar's `auto` picks now, or null if no GPU is readable. */
 export type GpuList = { gpus: GpuInfo[]; auto: string | null };
 export const listGpus = () => invoke<GpuList>("list_gpus");
+
+/**
+ * `bar` with its units changed and its steps counted in them, for the form's unit switch. Nothing
+ * is saved. Rejects with a message if a unit isn't one the daemon knows.
+ */
+export const convertStatusBar = (
+  bar: StatusBarConfig,
+  tempUnit: TempUnit,
+  netUnit: NetUnit,
+) =>
+  invoke<StatusBarConfig>("convert_status_bar", {
+    bar,
+    tempUnit,
+    netUnit,
+  });
 
 /** Mirrors `ActionResult` in `src-tauri/src/daemon/actions.rs`: what a device would be told. */
 export type ActionResult = {

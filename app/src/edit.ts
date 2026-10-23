@@ -1,7 +1,14 @@
 // Pure helpers behind the editor: turning form rows into config values, moving a button, and
 // telling a change the device draws from one it doesn't.
 
-import type { ButtonConfig, Config, PageConfig } from "./config";
+import type {
+  ButtonConfig,
+  Config,
+  Metric,
+  PageConfig,
+  StatusBarConfig,
+  Step,
+} from "./config";
 import { DEFAULT_FONT, resolveFonts } from "./fonts.ts";
 
 export type Row = { name: string; value: string };
@@ -284,6 +291,45 @@ export function layoutTargets(
       return d.connected && viewKey(before, caps) !== viewKey(after, caps);
     })
     .map((d) => d.id);
+}
+
+/** Whether going from `a` to `b` changes `[status_bar]`, which a device is never sent a layout for. */
+export const barChanged = (a: Config, b: Config): boolean =>
+  canon(a.status_bar ?? null) !== canon(b.status_bar ?? null);
+
+/** `bar` without empty parts: no `thresholds` table with no keys, and no bar with no keys. */
+function pruneBar(bar: StatusBarConfig): StatusBarConfig | undefined {
+  const { thresholds, ...rest } = bar;
+  const next =
+    thresholds && Object.keys(thresholds).length > 0
+      ? { ...rest, thresholds }
+      : rest;
+  return Object.keys(next).length > 0 ? next : undefined;
+}
+
+/**
+ * `bar` with `metric`'s steps set to `steps`. `undefined` removes the key, so the metric takes the
+ * defaults for the unit, where `[]` would mean never colored.
+ */
+export function withSteps(
+  bar: StatusBarConfig | undefined,
+  metric: Metric,
+  steps: Step[] | undefined,
+): StatusBarConfig | undefined {
+  const { [metric]: _, ...others } = bar?.thresholds ?? {};
+  return pruneBar({
+    ...bar,
+    thresholds: steps === undefined ? others : { ...others, [metric]: steps },
+  });
+}
+
+/** `bar` with `gpu` set. `auto` is the default, so picking it removes the key. */
+export function withGpu(
+  bar: StatusBarConfig | undefined,
+  gpu: string,
+): StatusBarConfig | undefined {
+  const { gpu: _, ...rest } = bar ?? {};
+  return pruneBar(gpu === "auto" ? rest : { ...rest, gpu });
 }
 
 /**

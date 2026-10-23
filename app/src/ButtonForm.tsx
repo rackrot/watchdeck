@@ -3,7 +3,7 @@ import ActionForm from "./ActionForm";
 import { type ActionResult, testAction } from "./api";
 import { type ButtonConfig, newShell } from "./config";
 import type { ActionField, FieldErrors } from "./errors";
-import { Field, FontSelect, NumberField, Problems } from "./fields";
+import { ColorField, Field, FontSelect, NumberField, Problems } from "./fields";
 import { DEFAULT_FONT, resolveFonts } from "./fonts";
 
 const MAX_LABEL_BYTES = 47;
@@ -33,38 +33,6 @@ type Props = {
   /** Problems the form can see itself, which keep a save from going out. */
   onLocalProblems: (messages: string[]) => void;
 };
-
-function ColorField({
-  label,
-  value,
-  onChange,
-  problems,
-}: {
-  label: string;
-  value: string;
-  onChange: (value: string) => void;
-  problems?: string[];
-}) {
-  return (
-    <Field label={label} problems={problems}>
-      <span className="color">
-        <input
-          type="color"
-          aria-label={`${label} picker`}
-          value={/^#[0-9a-fA-F]{6}$/.test(value) ? value : "#000000"}
-          onChange={(e) => onChange(e.currentTarget.value)}
-        />
-        <input
-          className="mono"
-          aria-label={`${label} hex`}
-          value={value}
-          spellCheck={false}
-          onChange={(e) => onChange(e.currentTarget.value)}
-        />
-      </span>
-    </Field>
-  );
-}
 
 export default function ButtonForm({
   button,
