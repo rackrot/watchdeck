@@ -7,8 +7,8 @@ import type {
   StatusBarDefaults,
   TempUnit,
 } from "./config";
-import { withGpu, withSteps } from "./edit";
-import type { StatusBarErrors } from "./errors";
+import { pruneBar, withGpu, withSteps } from "./edit";
+import { numberErrors, type StatusBarErrors } from "./errors";
 import { ColorField, Field, NumberField, Problems } from "./fields";
 
 type Props = {
@@ -67,24 +67,48 @@ export default function StatusBarForm({
     listGpus().then(setGpus, (e) => setGpuError(String(e)));
   }, []);
 
-  const temp: TempUnit = bar?.temp_unit ?? "c";
-  const net: NetUnit = bar?.net_unit ?? "si";
+  // A unit the file got wrong is refused on save; until then the form shows the default.
+  const temp: TempUnit = TEMP_UNITS.find((u) => u.id === bar?.temp_unit)
+    ? (bar?.temp_unit as TempUnit)
+    : "c";
+  const net: NetUnit = NET_UNITS.find((u) => u.id === bar?.net_unit)
+    ? (bar?.net_unit as NetUnit)
+    : "si";
   const tempLabel = TEMP_UNITS.find((u) => u.id === temp)?.label ?? temp;
   const netLabel = NET_UNITS.find((u) => u.id === net)?.label ?? net;
 
   async function switchUnits(nextTemp: TempUnit, nextNet: NetUnit) {
+    // Rust would answer a step that isn't a whole number with a decoding error.
+    const bad = numberErrors({
+      version: 1,
+      layout: { cols: 1, rows: 1 },
+      button: [],
+      status_bar: bar,
+    }).statusBar;
+    if (Object.keys(bad).length > 0) {
+      setNotice("");
+      setConvertError(
+        "Fix the steps first: every step's At must be a whole number.",
+      );
+      return;
+    }
     setConverting(true);
     setConvertError("");
     try {
       const next = await convertStatusBar(bar ?? {}, nextTemp, nextNet);
-      onChange(next);
-      const keys = Object.keys(next.thresholds ?? {}).length;
-      const to =
-        nextTemp !== temp
-          ? TEMP_UNITS.find((u) => u.id === nextTemp)?.label
-          : NET_UNITS.find((u) => u.id === nextNet)?.label;
+      onChange(pruneBar(next));
+      // Only a metric counted in the unit that changed has steps to convert.
+      const tempChanged = nextTemp !== temp;
+      const converted = METRICS.some(
+        (m) =>
+          m.unit === (tempChanged ? "temp" : "net") &&
+          (bar?.thresholds?.[m.id]?.length ?? 0) > 0,
+      );
+      const to = tempChanged
+        ? TEMP_UNITS.find((u) => u.id === nextTemp)?.label
+        : NET_UNITS.find((u) => u.id === nextNet)?.label;
       setNotice(
-        keys > 0
+        converted
           ? `Thresholds converted to ${to}.`
           : `No thresholds of your own to convert. The defaults are now in ${to}.`,
       );
@@ -112,7 +136,7 @@ export default function StatusBarForm({
   }
 
   const gpu = bar?.gpu ?? "auto";
-  const known = gpus?.gpus.some((g) => g.id === gpu) ?? true;
+  const listed = gpus?.gpus.some((g) => g.id === gpu) ?? false;
   const autoName = gpus?.gpus.find((g) => g.id === gpus.auto)?.name;
 
   return (
@@ -122,220 +146,234 @@ export default function StatusBarForm({
       </div>
       <Problems list={errors.bar} />
 
-      <section>
-        <h4>Units</h4>
-        <div className="form-grid">
-          <Field label="Temperature" problems={errors.temp_unit}>
-            <select
-              value={temp}
-              disabled={converting}
-              onChange={(e) =>
-                void switchUnits(e.currentTarget.value as TempUnit, net)
-              }
-            >
-              {TEMP_UNITS.map((u) => (
-                <option key={u.id} value={u.id}>
-                  {u.label} (shows {u.example})
-                </option>
-              ))}
-            </select>
-          </Field>
-          <Field label="Network rates" problems={errors.net_unit}>
-            <select
-              value={net}
-              disabled={converting}
-              onChange={(e) =>
-                void switchUnits(temp, e.currentTarget.value as NetUnit)
-              }
-            >
-              {NET_UNITS.map((u) => (
-                <option key={u.id} value={u.id}>
-                  {u.name} (shows {u.example})
-                </option>
-              ))}
-            </select>
-          </Field>
-        </div>
-        {notice && (
-          <p className="muted hint" role="status">
-            {notice}
-          </p>
-        )}
-        {convertError && (
-          <p className="problems" role="alert">
-            {convertError}
-          </p>
-        )}
-      </section>
+      {/* Disabled during a unit switch, so an edit made meanwhile isn't overwritten by its result. */}
+      <fieldset className="bare" disabled={converting}>
+        <section>
+          <h4>Units</h4>
+          <div className="form-grid">
+            <Field label="Temperature" problems={errors.temp_unit}>
+              <select
+                value={temp}
+                disabled={converting}
+                onChange={(e) =>
+                  void switchUnits(e.currentTarget.value as TempUnit, net)
+                }
+              >
+                {TEMP_UNITS.map((u) => (
+                  <option key={u.id} value={u.id}>
+                    {u.label} (shows {u.example})
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <Field label="Network rates" problems={errors.net_unit}>
+              <select
+                value={net}
+                disabled={converting}
+                onChange={(e) =>
+                  void switchUnits(temp, e.currentTarget.value as NetUnit)
+                }
+              >
+                {NET_UNITS.map((u) => (
+                  <option key={u.id} value={u.id}>
+                    {u.name} (shows {u.example})
+                  </option>
+                ))}
+              </select>
+            </Field>
+          </div>
+          {notice && (
+            <p className="muted hint" role="status">
+              {notice}
+            </p>
+          )}
+          {convertError && (
+            <p className="problems" role="alert">
+              {convertError}
+            </p>
+          )}
+        </section>
 
-      <section>
-        <h4>GPU</h4>
-        <Field label="GPU shown" problems={errors.gpu}>
-          <select
-            value={gpu}
-            onChange={(e) => onChange(withGpu(bar, e.currentTarget.value))}
-          >
-            <option value="auto">
-              Auto (currently: {gpus ? (autoName ?? "none readable") : "…"})
-            </option>
-            <option value="off">Off</option>
-            {gpus?.gpus.map((g) => (
-              <option key={g.id} value={g.id} disabled={!g.readable}>
-                {g.name} ({g.id}
-                {g.readable
-                  ? ""
-                  : `, can't be read${g.driver ? ` with the ${g.driver} driver` : ""}`}
-                )
+        <section>
+          <h4>GPU</h4>
+          <Field label="GPU shown" problems={errors.gpu}>
+            <select
+              value={gpu}
+              onChange={(e) => onChange(withGpu(bar, e.currentTarget.value))}
+            >
+              <option value="auto">
+                Auto (currently: {gpus ? (autoName ?? "none readable") : "…"})
               </option>
-            ))}
-            {!known && gpu !== "auto" && gpu !== "off" && (
-              <option value={gpu}>{gpu} (not found)</option>
-            )}
-          </select>
-        </Field>
-        {gpuError && (
-          <p className="problems" role="alert">
-            {gpuError}
-          </p>
-        )}
-      </section>
-
-      <section>
-        <h4>Colors past a threshold</h4>
-        <p className="muted hint">
-          A value turns the color of the highest step it has reached. Steps are
-          in the units above.
-        </p>
-        {METRICS.map((metric) => {
-          const own = bar?.thresholds?.[metric.id];
-          const steps = own ?? defaults[temp][metric.id];
-          const unit = unitOf(metric);
-          const problems = errors[`thresholds.${metric.id}`];
-          return (
-            <div className="metric-row" key={metric.id}>
-              <div className="metric-head">
-                <strong>{metric.name}</strong>
-                <span className="muted">steps in {unit}</span>
-                {own === undefined && <span className="chip">defaults</span>}
-              </div>
-              {steps.length === 0 && (
-                <span className="muted">Never colored.</span>
+              <option value="off">Off</option>
+              {gpus?.gpus.map((g) => (
+                <option key={g.id} value={g.id} disabled={!g.readable}>
+                  {g.name} ({g.id}
+                  {g.readable
+                    ? ""
+                    : `, can't be read${g.driver ? ` with the ${g.driver} driver` : ""}`}
+                  )
+                </option>
+              ))}
+              {!listed && gpu !== "auto" && gpu !== "off" && (
+                <option value={gpu}>
+                  {gpu}
+                  {gpus ? " (not found)" : ""}
+                </option>
               )}
-              {steps.map((step, i) => (
-                // biome-ignore lint/suspicious/noArrayIndexKey: steps have no id, and rows are edited in place
-                <div className="step-row" key={i}>
-                  {own === undefined ? (
-                    <span className="mono">
-                      {step.at} {unit}{" "}
-                      <span
-                        className="swatch"
-                        style={{ background: step.color }}
-                      />{" "}
-                      {step.color}
-                    </span>
-                  ) : (
-                    <>
-                      <Field label={`At (${unit})`}>
-                        <NumberField
-                          value={step.at}
-                          onChange={(at) =>
+            </select>
+          </Field>
+          {gpuError && (
+            <p className="problems" role="alert">
+              {gpuError}
+            </p>
+          )}
+        </section>
+
+        <section>
+          <h4>Colors past a threshold</h4>
+          <p className="muted hint">
+            A value turns the color of the highest step it has reached. Steps
+            are in the units above.
+          </p>
+          {METRICS.map((metric) => {
+            const own = bar?.thresholds?.[metric.id];
+            const steps = own ?? defaults[temp][metric.id];
+            const unit = unitOf(metric);
+            const problems = errors[`thresholds.${metric.id}`];
+            return (
+              <div className="metric-row" key={metric.id}>
+                <div className="metric-head">
+                  <strong>{metric.name}</strong>
+                  <span className="muted">steps in {unit}</span>
+                  {own === undefined && <span className="chip">defaults</span>}
+                </div>
+                {steps.length === 0 && (
+                  <span className="muted">Never colored.</span>
+                )}
+                {steps.map((step, i) => (
+                  // biome-ignore lint/suspicious/noArrayIndexKey: steps have no id, and rows are edited in place
+                  <div className="step-row" key={i}>
+                    {own === undefined ? (
+                      <span className="mono">
+                        {step.at} {unit}{" "}
+                        <span
+                          className="swatch"
+                          style={{ background: step.color }}
+                        />{" "}
+                        {step.color}
+                      </span>
+                    ) : (
+                      <>
+                        <Field
+                          label={`At (${unit}), ${metric.name}, step ${i + 1}`}
+                        >
+                          <NumberField
+                            value={step.at}
+                            onChange={(at) =>
+                              onChange(
+                                withSteps(
+                                  bar,
+                                  metric.id,
+                                  own.map((s, j) =>
+                                    j === i ? { ...s, at } : s,
+                                  ),
+                                ),
+                              )
+                            }
+                          />
+                        </Field>
+                        <ColorField
+                          label={`Color, ${metric.name}, step ${i + 1}`}
+                          value={step.color}
+                          onChange={(color) =>
                             onChange(
                               withSteps(
                                 bar,
                                 metric.id,
-                                own.map((s, j) => (j === i ? { ...s, at } : s)),
+                                own.map((s, j) =>
+                                  j === i ? { ...s, color } : s,
+                                ),
                               ),
                             )
                           }
                         />
-                      </Field>
-                      <ColorField
-                        label="Color"
-                        value={step.color}
-                        onChange={(color) =>
-                          onChange(
-                            withSteps(
-                              bar,
-                              metric.id,
-                              own.map((s, j) =>
-                                j === i ? { ...s, color } : s,
+                        <button
+                          type="button"
+                          aria-label={`Remove ${metric.name} step ${i + 1}`}
+                          onClick={() =>
+                            onChange(
+                              withSteps(
+                                bar,
+                                metric.id,
+                                own.filter((_, j) => j !== i),
                               ),
-                            ),
-                          )
-                        }
-                      />
+                            )
+                          }
+                        >
+                          Remove
+                        </button>
+                      </>
+                    )}
+                  </div>
+                ))}
+                <div className="outside">
+                  {own === undefined ? (
+                    <button
+                      type="button"
+                      aria-label={`Edit ${metric.name} steps`}
+                      onClick={() =>
+                        onChange(
+                          withSteps(
+                            bar,
+                            metric.id,
+                            steps.map((s) => ({ ...s })),
+                          ),
+                        )
+                      }
+                    >
+                      Edit steps
+                    </button>
+                  ) : (
+                    <>
                       <button
                         type="button"
+                        aria-label={`Add ${metric.name} step`}
+                        disabled={own.length >= MAX_STEPS}
                         onClick={() =>
                           onChange(
-                            withSteps(
-                              bar,
-                              metric.id,
-                              own.filter((_, j) => j !== i),
-                            ),
+                            withSteps(bar, metric.id, [
+                              ...own,
+                              {
+                                at:
+                                  own.length > 0
+                                    ? own[own.length - 1].at + 1
+                                    : firstAt(metric),
+                                color: AMBER,
+                              },
+                            ]),
                           )
                         }
                       >
-                        Remove
+                        Add step
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`Use default ${metric.name} steps`}
+                        onClick={() =>
+                          onChange(withSteps(bar, metric.id, undefined))
+                        }
+                      >
+                        Use defaults
                       </button>
                     </>
                   )}
                 </div>
-              ))}
-              <div className="outside">
-                {own === undefined ? (
-                  <button
-                    type="button"
-                    onClick={() =>
-                      onChange(
-                        withSteps(
-                          bar,
-                          metric.id,
-                          steps.map((s) => ({ ...s })),
-                        ),
-                      )
-                    }
-                  >
-                    Edit steps
-                  </button>
-                ) : (
-                  <>
-                    <button
-                      type="button"
-                      disabled={own.length >= MAX_STEPS}
-                      onClick={() =>
-                        onChange(
-                          withSteps(bar, metric.id, [
-                            ...own,
-                            {
-                              at:
-                                own.length > 0
-                                  ? own[own.length - 1].at + 1
-                                  : firstAt(metric),
-                              color: AMBER,
-                            },
-                          ]),
-                        )
-                      }
-                    >
-                      Add step
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        onChange(withSteps(bar, metric.id, undefined))
-                      }
-                    >
-                      Use defaults
-                    </button>
-                  </>
-                )}
+                <Problems list={problems} />
               </div>
-              <Problems list={problems} />
-            </div>
-          );
-        })}
-      </section>
+            );
+          })}
+        </section>
+      </fieldset>
     </div>
   );
 }

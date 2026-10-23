@@ -342,6 +342,16 @@ button.chip.selected {
 }
 
 /* The status bar form: one block per metric, with its steps beneath. */
+.status-bar-form fieldset.bare {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  border: 0;
+  padding: 0;
+  margin: 0;
+}
+
 .metric-row {
   display: flex;
   flex-direction: column;

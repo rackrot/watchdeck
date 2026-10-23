@@ -297,9 +297,17 @@ export function layoutTargets(
 export const barChanged = (a: Config, b: Config): boolean =>
   canon(a.status_bar ?? null) !== canon(b.status_bar ?? null);
 
-/** `bar` without empty parts: no `thresholds` table with no keys, and no bar with no keys. */
-function pruneBar(bar: StatusBarConfig): StatusBarConfig | undefined {
-  const { thresholds, ...rest } = bar;
+/**
+ * `bar` without parts that say nothing: a unit that is the default, a `thresholds` table with no
+ * keys, and a bar with no keys.
+ */
+export function pruneBar(bar: StatusBarConfig): StatusBarConfig | undefined {
+  const { thresholds, temp_unit, net_unit, ...base } = bar;
+  const rest = {
+    ...base,
+    ...(temp_unit !== undefined && temp_unit !== "c" && { temp_unit }),
+    ...(net_unit !== undefined && net_unit !== "si" && { net_unit }),
+  };
   const next =
     thresholds && Object.keys(thresholds).length > 0
       ? { ...rest, thresholds }

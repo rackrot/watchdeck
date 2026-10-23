@@ -16,6 +16,7 @@ import {
   pageIndexOf,
   pageName,
   parseWhole,
+  pruneBar,
   recordToRows,
   removePage,
   renamePage,
@@ -914,6 +915,12 @@ test("steps and the GPU are set without leaving empty tables behind", () => {
   assert.equal(withSteps(one, "mem", undefined), undefined);
   assert.deepEqual(withSteps({ temp_unit: "f", ...one }, "mem", undefined), {
     temp_unit: "f",
+  });
+  // A unit that is the default says nothing, so switching back leaves no no-op table.
+  assert.equal(pruneBar({ temp_unit: "c", net_unit: "si" }), undefined);
+  assert.deepEqual(pruneBar({ temp_unit: "f", net_unit: "si", ...one }), {
+    temp_unit: "f",
+    ...one,
   });
   assert.deepEqual(withGpu(undefined, "off"), { gpu: "off" });
   assert.equal(withGpu({ gpu: "off" }, "auto"), undefined);
