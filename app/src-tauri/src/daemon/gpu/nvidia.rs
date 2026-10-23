@@ -15,7 +15,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
@@ -198,9 +198,9 @@ type Reading = (Instant, Gpu);
 pub struct NvidiaReader {
     opener: Arc<dyn NvidiaOpener>,
     timings: Timings,
-    /// True while a thread is running, including one whose period has already ended.
+    /// True while a thread is running, including one whose period has already ended and which is
+    /// still shutting NVML down.
     alive: Arc<AtomicBool>,
-    warned_busy: AtomicBool,
 }
 
 impl NvidiaReader {
@@ -209,36 +209,60 @@ impl NvidiaReader {
             opener,
             timings,
             alive: Arc::new(AtomicBool::new(false)),
-            warned_busy: AtomicBool::new(false),
         }
     }
 
     /// Reads the GPU at `pci` until the returned [`Period`] is dropped. If the thread of an
-    /// earlier period is still running (stuck in a call), this period has no NVIDIA values.
+    /// earlier period hasn't finished, this period starts its own once it has: [`Period::latest`]
+    /// retries, so a thread that is only shutting down delays the first reading by milliseconds.
     pub fn start(&self, pci: &str) -> Period {
         let (tx, rx) = watch::channel(None);
         let (stop, stopped) = mpsc::channel();
         let period = Period {
             latest: rx,
             fresh_for: self.timings.fresh_for,
+            pending: Mutex::new(Some(Pending {
+                launch: Launch {
+                    opener: self.opener.clone(),
+                    pci: normalize_pci(pci),
+                    timings: self.timings,
+                    stopped,
+                    out: tx,
+                    alive: self.alive.clone(),
+                },
+                since: Instant::now(),
+                warned: false,
+            })),
             _stop: stop,
         };
+        period.poll();
+        period
+    }
+}
 
+/// Everything the `nvml` thread needs, kept by the period until the previous thread is gone.
+struct Launch {
+    opener: Arc<dyn NvidiaOpener>,
+    pci: String,
+    timings: Timings,
+    stopped: mpsc::Receiver<()>,
+    out: watch::Sender<Option<Reading>>,
+    alive: Arc<AtomicBool>,
+}
+
+impl Launch {
+    /// Spawns the thread, or gives `self` back when the previous one is still running.
+    fn spawn(self) -> Result<(), Self> {
         if self.alive.swap(true, Ordering::SeqCst) {
-            if !self.warned_busy.swap(true, Ordering::Relaxed) {
-                log::warn!("nvml: the previous reader is still stuck in a call, no NVIDIA values this period");
-            }
-            return period;
+            return Err(self);
         }
-        self.warned_busy.store(false, Ordering::Relaxed);
-
         let worker = Worker {
-            opener: self.opener.clone(),
-            pci: normalize_pci(pci),
+            opener: self.opener,
+            pci: self.pci,
             timings: self.timings,
-            stopped,
-            out: tx,
-            _alive: AliveGuard(self.alive.clone()),
+            stopped: self.stopped,
+            out: self.out,
+            _alive: AliveGuard(self.alive),
         };
         if let Err(e) = std::thread::Builder::new()
             .name("nvml".into())
@@ -247,21 +271,51 @@ impl NvidiaReader {
             // The closure, and with it the guard, is dropped, which clears `alive`.
             log::error!("nvml: starting the reader thread failed: {e}");
         }
-        period
+        Ok(())
     }
+}
+
+struct Pending {
+    launch: Launch,
+    since: Instant,
+    warned: bool,
 }
 
 /// One sampling period's view of the reader. Dropping it stops the thread and so shuts NVML down.
 pub struct Period {
     latest: watch::Receiver<Option<Reading>>,
     fresh_for: Duration,
+    /// Set until this period's thread has started.
+    pending: Mutex<Option<Pending>>,
     /// Dropping the sender wakes the thread's wait, and the thread exits.
     _stop: mpsc::Sender<()>,
 }
 
 impl Period {
+    /// Starts the thread if the previous period's has finished. [`latest`](Self::latest) calls
+    /// it, so the sampler only has to ask for readings. It never blocks.
+    pub fn poll(&self) {
+        let mut slot = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(mut pending) = slot.take() else {
+            return;
+        };
+        match pending.launch.spawn() {
+            Ok(()) => {}
+            Err(launch) => {
+                pending.launch = launch;
+                // Shutting NVML down takes milliseconds. Past `fresh_for` it is a stall.
+                if !pending.warned && pending.since.elapsed() >= self.fresh_for {
+                    pending.warned = true;
+                    log::warn!("nvml: the previous reader is stuck in a call, waiting for it");
+                }
+                *slot = Some(pending);
+            }
+        }
+    }
+
     /// The newest reading, if it is less than `fresh_for` old.
     pub fn latest(&self) -> Option<Gpu> {
+        self.poll();
         let (at, gpu) = (*self.latest.borrow())?;
         (at.elapsed() < self.fresh_for).then_some(gpu)
     }
@@ -378,6 +432,7 @@ pub mod fake {
         gpus: Vec<(String, String, Gpu)>,
         read: Option<NvidiaError>,
         block: bool,
+        shutdown_delay: Duration,
     }
 
     struct Shared {
@@ -399,6 +454,7 @@ pub mod fake {
                     gpus: Vec::new(),
                     read: None,
                     block: false,
+                    shutdown_delay: Duration::ZERO,
                 }),
                 unblocked: Condvar::new(),
                 opens: AtomicUsize::new(0),
@@ -432,6 +488,11 @@ pub mod fake {
             self.0.unblocked.notify_all();
         }
 
+        /// How long dropping an open handle takes, as nvmlShutdown and dlclose do.
+        pub fn set_shutdown_delay(&self, delay: Duration) {
+            self.script().shutdown_delay = delay;
+        }
+
         pub fn opens(&self) -> usize {
             self.0.opens.load(Ordering::SeqCst)
         }
@@ -459,6 +520,13 @@ pub mod fake {
 
     impl Drop for Handle {
         fn drop(&mut self) {
+            let delay = self
+                .0
+                .script
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .shutdown_delay;
+            std::thread::sleep(delay);
             self.0.shutdowns.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -684,21 +752,71 @@ mod tests {
         fake.set_block(true);
         eventually("the reading to go stale", || period.latest().is_none());
 
-        // The period ends, but the thread is stuck in its call. The next period gets no thread.
+        // The period ends, but the thread is stuck in its call. The next period starts no thread
+        // while it lasts, and warns once the stall is longer than `fresh_for`.
         drop(period);
         let next = r.start(PCI);
-        std::thread::sleep(Duration::from_millis(50));
+        assert!(!warned(&next));
+        std::thread::sleep(Duration::from_millis(150));
         assert_eq!(next.latest(), None);
         assert_eq!(fake.opens(), 1);
-        assert!(r.warned_busy.load(Ordering::Relaxed));
+        assert!(warned(&next));
 
-        // The call returns, the old thread ends, and a later period reads again.
+        // The call returns, the old thread ends, and the same period gets its own thread.
         fake.set_block(false);
-        eventually("the old thread to end", || !r.alive.load(Ordering::SeqCst));
-        assert_eq!(fake.shutdowns(), 1);
-        let later = r.start(PCI);
-        eventually("a reading", || later.latest().is_some());
-        assert!(!r.warned_busy.load(Ordering::Relaxed));
+        eventually("a reading in the same period", || next.latest().is_some());
+        assert_eq!((fake.opens(), fake.shutdowns()), (2, 1));
+    }
+
+    fn warned(period: &Period) -> bool {
+        let slot = period.pending.lock().unwrap();
+        slot.as_ref().is_some_and(|p| p.warned)
+    }
+
+    #[test]
+    fn a_period_started_while_the_last_one_shuts_down_still_reads() {
+        let fake = card(Some(7), Some(33));
+        fake.set_shutdown_delay(Duration::from_millis(60));
+        let r = reader(&fake);
+        let mut period = r.start(PCI);
+        for _ in 0..3 {
+            eventually("a reading", || period.latest().is_some());
+            // The next period starts at once, while NVML is still shutting down.
+            period = r.start(PCI);
+            assert_eq!(period.latest(), None);
+        }
+        eventually("a reading", || period.latest().is_some());
+        assert!(!warned(&period), "a shutdown is not a stall");
+        // Each open waited for the previous shutdown.
+        assert_eq!(fake.opens(), fake.shutdowns() + 1);
+    }
+
+    #[test]
+    fn a_brief_stall_resumes_readings_in_the_same_period() {
+        let fake = card(Some(7), Some(33));
+        let r = reader(&fake);
+        let period = r.start(PCI);
+        eventually("a reading", || period.latest().is_some());
+
+        fake.set_block(true);
+        eventually("the reading to go stale", || period.latest().is_none());
+        std::thread::sleep(Duration::from_millis(200));
+        fake.set_block(false);
+
+        eventually("readings again", || period.latest().is_some());
+        assert_eq!(fake.opens(), 1);
+    }
+
+    #[test]
+    fn unsupported_parts_are_none_and_a_lost_gpu_is_lost() {
+        assert_eq!(optional(Err(NvmlError::NotSupported)), Ok(None));
+        assert_eq!(optional(Ok(41)), Ok(Some(41)));
+        assert_eq!(optional(Err(NvmlError::GpuLost)), Err(NvidiaError::Lost));
+        assert_eq!(read_error(NvmlError::GpuLost), NvidiaError::Lost);
+        assert!(matches!(
+            read_error(NvmlError::Unknown),
+            NvidiaError::Other(_)
+        ));
     }
 
     #[test]
