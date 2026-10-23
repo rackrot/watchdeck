@@ -68,8 +68,7 @@ _Static_assert(GRID_SCREEN_W == DISPLAY_H_RES && GRID_SCREEN_H == DISPLAY_V_RES,
 // The status bar, 1024 px wide, in Roboto Mono Regular 20 so that every text of a group has a fixed width. Left to
 // right: CPU, RAM, GPU, NET, then the date and time. CPU starts BAR_MARGIN from the left edge and the clock ends
 // BAR_MARGIN from the right one. The gaps between CPU, RAM, GPU, NET and the clock's area are equal. bar_create
-// measures each group's worst case (the CPU and GPU ones with room for the temperature a later plan adds) and computes
-// them.
+// measures each group's worst case over every unit form and computes them.
 #define BAR_MARGIN 12 // px between the first group and the left edge, and between the clock and the right edge
 #define BAR_REFRESH_MS 1000
 
@@ -130,10 +129,10 @@ static uint32_t s_settings_tick;                 // when the long swipe that ope
 typedef enum {
     BAR_STATUS, // the link status text, in place of the four host groups while the link is down
     BAR_CLOCK,
-    BAR_CPU, // "CPU   7%": every host group is a fixed number of monospace cells
+    BAR_CPU, // "CPU   7%  64°C": every host group is a fixed number of monospace cells
     BAR_RAM,
     BAR_GPU,
-    BAR_NET, // "▼   1.2M ▲ 340.0k"
+    BAR_NET, // "▼  1.2M ▲ 340.0k"
     BAR_COUNT,
 } bar_slot_t;
 static lv_obj_t *s_bar;
@@ -1039,6 +1038,26 @@ static void bar_set(bar_slot_t slot, const char *text)
     set_label(s_bar_labels[slot], s_bar_text[slot], STATUS_TEXT_MAX, text);
 }
 
+// The text of a host group. Values sit right-aligned in fixed cells, so in a monospace font nothing moves within a
+// unit, and a value past a threshold is wrapped in recolor markup (the four labels have recolor on).
+static void bar_group_text(bar_slot_t slot, const proto_stats_t *stats, bool fresh, char *buf, size_t size)
+{
+    switch (slot) {
+    case BAR_CPU:
+        hoststat_group_cpu(buf, size, stats, fresh);
+        break;
+    case BAR_RAM:
+        hoststat_group_mem(buf, size, stats, fresh);
+        break;
+    case BAR_GPU:
+        hoststat_group_gpu(buf, size, stats, fresh);
+        break;
+    default:
+        hoststat_group_net(buf, size, stats, fresh, LV_SYMBOL_DOWN, LV_SYMBOL_UP);
+        break;
+    }
+}
+
 // Show the latest stats in the slots. While the link is down the status text takes the four host slots' place and the
 // clock stays. The host values show "--" once the latest frame is stale (hoststat_fresh), or when it lacked them.
 static void bar_refresh(void)
@@ -1047,7 +1066,7 @@ static void bar_refresh(void)
         return;
     }
     const int64_t now = esp_timer_get_time();
-    char text[2 * HOSTSTAT_TEXT_MAX + 8];
+    char text[HOSTSTAT_GROUP_MAX];
     if (s_have_stats) {
         // time and utc_offset are the frame's, and the crystal carries the clock on from there.
         hoststat_clock(
@@ -1067,38 +1086,10 @@ static void bar_refresh(void)
     }
     bar_set(BAR_STATUS, "");
     const bool fresh = hoststat_fresh(s_have_stats, now - s_stats_at_us);
-    char a[HOSTSTAT_TEXT_MAX], b[HOSTSTAT_TEXT_MAX];
-
-    // Values are right-aligned in HOSTSTAT_VALUE_W cells, so in a monospace font the "%" and the unit stay put.
-    if (fresh && s_stats.has_cpu) {
-        hoststat_cpu(a, sizeof(a), s_stats.cpu);
-    } else {
-        strlcpy(a, "--", sizeof(a));
+    for (bar_slot_t slot = BAR_CPU; slot < BAR_COUNT; slot++) {
+        bar_group_text(slot, &s_stats, fresh, text, sizeof(text));
+        bar_set(slot, text);
     }
-    // The temperature cells show "--°" until a later plan fills them, so the group fills its reserved width.
-    snprintf(text, sizeof(text), "CPU %*s %3s\xC2\xB0", HOSTSTAT_VALUE_W, a, "--");
-    bar_set(BAR_CPU, text);
-
-    if (fresh && s_stats.has_mem) {
-        hoststat_mem(a, sizeof(a), s_stats.mem_used, s_stats.mem_total);
-    } else {
-        strlcpy(a, "--", sizeof(a));
-    }
-    snprintf(text, sizeof(text), "RAM %*s", HOSTSTAT_VALUE_W, a);
-    bar_set(BAR_RAM, text);
-
-    snprintf(text, sizeof(text), "GPU %*s %3s\xC2\xB0", HOSTSTAT_VALUE_W, "--", "--"); // a later plan fills it
-    bar_set(BAR_GPU, text);
-
-    if (fresh && s_stats.has_net) {
-        hoststat_rate(a, sizeof(a), s_stats.net_rx);
-        hoststat_rate(b, sizeof(b), s_stats.net_tx);
-    } else {
-        strlcpy(a, "--", sizeof(a));
-        strlcpy(b, "--", sizeof(b));
-    }
-    snprintf(text, sizeof(text), LV_SYMBOL_DOWN "%*s " LV_SYMBOL_UP "%*s", HOSTSTAT_RATE_W, a, HOSTSTAT_RATE_W, b);
-    bar_set(BAR_NET, text);
 }
 
 static void bar_tick(lv_timer_t *timer)
@@ -1110,8 +1101,51 @@ static void bar_tick(lv_timer_t *timer)
 static int bar_text_w(const char *text)
 {
     lv_point_t size;
-    lv_text_get_size(&size, text, &s_bar_font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    // The recolor flag makes a "#rrggbb text#" measure as just its text, the way the labels draw it.
+    lv_text_get_size(&size, text, &s_bar_font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_RECOLOR);
     return size.x;
+}
+
+// The widest a host group gets: every value at its longest, in every unit form, and with a color on every value. The
+// same frame without colors must measure the same, or the markup would take width and the label would reach its dots,
+// which could cut a "#rrggbb ...#" in two.
+static int bar_group_w(bar_slot_t slot)
+{
+    proto_stats_t stats = {
+        .has_cpu = true,
+        .cpu = 100,
+        .has_mem = true,
+        .mem_used = 1,
+        .mem_total = 1,
+        .has_net = true,
+        .net_rx = UINT64_MAX,
+        .net_tx = UINT64_MAX,
+        .has_gpu = true,
+        .gpu = 100,
+        .has_cpu_temp = true,
+        .cpu_temp = 150,
+        .has_gpu_temp = true,
+        .gpu_temp = 150,
+    };
+    int widest = 0;
+    char text[HOSTSTAT_GROUP_MAX];
+    for (int temp = PROTO_TEMP_C; temp <= PROTO_TEMP_F; temp++) {
+        for (int net = PROTO_NET_SI; net <= PROTO_NET_BITS; net++) {
+            stats.temp_unit = temp;
+            stats.net_unit = net;
+            stats.colors_mask = (1 << PROTO_COLOR_COUNT) - 1;
+            bar_group_text(slot, &stats, true, text, sizeof(text));
+            const int colored = bar_text_w(text);
+            stats.colors_mask = 0;
+            bar_group_text(slot, &stats, true, text, sizeof(text));
+            const int plain = bar_text_w(text);
+            if (colored != plain) {
+                ESP_LOGW(TAG, "bar slot overflow: color markup takes %d px in slot %d", colored - plain, (int)slot);
+            }
+            widest = LV_MAX(widest, LV_MAX(colored, plain));
+        }
+    }
+    return widest;
 }
 
 // Grid mode starts: the bar on top, drawn from the stats and status already kept.
@@ -1131,13 +1165,12 @@ static void bar_create(void)
     if (bar_text_w("0") != bar_text_w("W") || bar_text_w("0 0") != 3 * bar_text_w("0")) {
         ESP_LOGW(TAG, "bar slot overflow: the bar font is not monospace, so its worst cases are not sized");
     }
-    // Each group's worst case. The CPU and GPU ones include the temperature a later plan adds.
+    // Each group's worst case over every unit form ("CPU 100% 302°F", "▼999.9Mi ▲999.9Mi").
     int w[BAR_COUNT] = {0};
     w[BAR_CLOCK] = bar_text_w("Wed 24 May 04:44");
-    w[BAR_CPU] = bar_text_w("CPU 100% 100\xC2\xB0");
-    w[BAR_RAM] = bar_text_w("RAM 100%");
-    w[BAR_GPU] = bar_text_w("GPU 100% 100\xC2\xB0");
-    w[BAR_NET] = bar_text_w(LV_SYMBOL_DOWN "999.9M " LV_SYMBOL_UP "999.9M");
+    for (bar_slot_t slot = BAR_CPU; slot < BAR_COUNT; slot++) {
+        w[slot] = bar_group_w(slot);
+    }
     // CPU starts at BAR_MARGIN and the clock ends BAR_MARGIN from the right edge. The four gaps between CPU, RAM, GPU,
     // NET and the clock's area are equal, within 1 px: the remainder goes one px each to the first gaps.
     const int clock_x = DISPLAY_H_RES - BAR_MARGIN - w[BAR_CLOCK];
@@ -1183,6 +1216,8 @@ static void bar_create(void)
         lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
         if (slot == BAR_CLOCK) {
             lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_RIGHT, 0);
+        } else if (slot >= BAR_CPU) {
+            lv_label_set_recolor(label, true);
         }
         lv_label_set_text(label, "");
     }
