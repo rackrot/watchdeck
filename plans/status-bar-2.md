@@ -522,7 +522,7 @@ Run on the board and this desktop, the daemon and firmware from the same commit.
 
 ## Results (2026-10-22)
 
-Results of V0 and B8. The B8 checks ran on the desktop and on the board, with the daemon and firmware from the same commit. The items marked UNVERIFIED are the operator's observations from that run. The docs pass didn't re-read them.
+Results of V0 and B8. The B8 checks ran on the desktop and on the board, with the daemon and firmware from the same commit (`b0447a8`). Each item names its source.
 
 ### V0 vetting record: nvml-wrapper 0.13.0
 
@@ -549,23 +549,23 @@ Results of V0 and B8. The B8 checks ran on the desktop and on the board, with th
 
 ### B4 real read
 
-On the desktop, the RTX 4070 read through NVML showed busy at 0 to 13% and temperature at 34 to 35 °C. UNVERIFIED (operator's run).
+On the desktop, the RTX 4070 read through NVML showed busy at 0 to 13% and temperature at 34 to 35 °C (the `#[ignore]` test `nvml_reads_the_rtx_4070`, run by B4's author and again by its reviewer).
 
 ### Board geometry
 
-The bar's log line from the board: `cpu 12/168 ram 220/96 gpu 356/168 net 564/216 clock 820/192, gap 40`. UNVERIFIED for the log line itself, which the docs pass didn't read. The numbers add up:
+The bar's log line from the board: `cpu 12/168 ram 220/96 gpu 356/168 net 564/216 clock 820/192, gap 40`, read from the serial boot log after the flash. The numbers add up:
 
 - Left to right: 12 + 168 + 40 + 96 + 40 + 168 + 40 + 216 + 40 + 192 + 12 = 1024 px, the board's width.
 - 168 px is 14 cells of 12 px, the CPU and GPU worst case `CPU 100% 302°F`. 96 px is 8 cells, `RAM 100%`.
-- The 40 px gaps are equal, and no `bar slot overflow` line was logged. UNVERIFIED (operator's run).
+- The 40 px gaps are equal, and the same boot log has no `bar slot overflow` line.
 
 ### NVML while the board is connected
 
-The dev daemon held 23 `/dev/nvidia*` descriptors. The docs pass counted the same 23 in `/proc/<pid>/fd` of that daemon. UNVERIFIED for the connection state (operator's run).
+The dev daemon held 23 `/dev/nvidia*` descriptors. Counted in `/proc/<pid>/fd` right after the board's log showed `connected to devbox`. The drop to none after a disconnect was not checked on hardware; `device_sim` covers it with the fake.
 
 ### Panel checks
 
-All passed. UNVERIFIED (the user's checks, not re-run by the docs pass):
+All passed, as reported by the user on the panel and in the app window:
 
 - CPU and GPU temperatures and busy shares show on the bar, and GPU load is visible.
 - The °F switch moved the steps 85 and 95 to 185 and 203, and switching back restored them.
@@ -577,7 +577,8 @@ All passed. UNVERIFIED (the user's checks, not re-run by the docs pass):
 
 ### Not run
 
-- Comparing the CPU temperature with `sensors` (B8 step 3).
+- Side-by-side readings against `nvidia-smi` (step 1) and `sensors` (steps 2 and 3); the user saw the values track load but no numbers were logged.
+- NVML closing after a disconnect, and `gpu = "off"`, on hardware (step 5).
 - Comparing the rates in each unit with `ip -s link` deltas (B8 step 4).
 - A host without the NVIDIA driver. CI's missing-library test (B4) is the evidence.
 - The memory run with the pages fixtures (B8 step 9).
