@@ -7,6 +7,8 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use crate::daemon::config::GpuChoice;
+
 /// One display controller on the PCI bus.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GpuInfo {
@@ -97,7 +99,13 @@ pub fn auto_pick(gpus: &[GpuInfo]) -> Option<&GpuInfo> {
 }
 
 /// Busy share and temperature of the AMD GPU at `pci`, from its own `gpu_busy_percent` and hwmon.
+/// Anything but a PCI address (`../..`, an absolute path) reads as nothing.
+///
+/// Blocking sysfs I/O: call it off the async runtime.
 pub fn read_amd(sys: &Path, pci: &str) -> GpuReading {
+    if !matches!(GpuChoice::parse(pci), Some(GpuChoice::Pci(_))) {
+        return GpuReading::default();
+    }
     let dir = sys.join("bus/pci/devices").join(pci);
     GpuReading {
         busy: fs::read_to_string(dir.join("gpu_busy_percent"))
@@ -141,9 +149,35 @@ pub(crate) mod testing {
     use std::fs;
     use std::path::Path;
 
-    /// Writes `text` to `root/rel`, creating directories.
+    /// Writes `text` to `root/rel`, creating directories. As in the kernel, a device
+    /// (`bus/pci/devices/<addr>`) or hwmon (`class/hwmon/<hwmonN>`) entry is a symlink into a
+    /// sibling `devices/` tree, made on first use.
     pub fn put(root: &Path, rel: &str, text: &str) {
-        let path = root.join(rel);
+        let parts: Vec<&str> = rel.split('/').collect();
+        let entry = match parts.as_slice() {
+            ["bus", "pci", "devices", _, ..] => Some(4),
+            ["class", "hwmon", _, ..] => Some(3),
+            _ => None,
+        };
+        let path = match entry {
+            Some(n) => {
+                let link = root.join(parts[..n].join("/"));
+                let real = root.join("devices").join(parts[..n].join("/"));
+                if !link.exists() {
+                    fs::create_dir_all(&real).unwrap();
+                    fs::create_dir_all(link.parent().unwrap()).unwrap();
+                    // Relative, from the link's directory back up to the root.
+                    let up = "../".repeat(n - 1);
+                    std::os::unix::fs::symlink(
+                        format!("{up}devices/{}", parts[..n].join("/")),
+                        &link,
+                    )
+                    .unwrap();
+                }
+                root.join("devices").join(rel)
+            }
+            None => root.join(rel),
+        };
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, text).unwrap();
     }
@@ -439,6 +473,18 @@ mod tests {
                 temp: Some(-273)
             }
         );
+    }
+
+    #[test]
+    fn read_amd_refuses_anything_but_a_pci_address() {
+        let (sys, other) = trees();
+        // `bus/pci/devices/../../x` is `bus/x`, inside the root but not a device.
+        put(sys.path(), "bus/x/gpu_busy_percent", "5\n");
+        assert_eq!(read_amd(sys.path(), "../../x"), GpuReading::default());
+        // An absolute path replaces the join's base entirely.
+        put(other.path(), "gpu_busy_percent", "6\n");
+        let abs = other.path().to_str().unwrap();
+        assert_eq!(read_amd(sys.path(), abs), GpuReading::default());
     }
 
     #[test]

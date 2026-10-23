@@ -8,16 +8,22 @@ use std::path::{Path, PathBuf};
 /// The CPU's temperature in whole °C, under the sysfs root `sys` (`/sys`). `k10temp` and
 /// `zenpower`: `Tdie` if present (older Zen parts add an offset to `Tctl`), else `Tctl`.
 /// `coretemp`: the hottest `Package id N`. `None` without any of these.
+///
+/// Blocking sysfs I/O: call it off the async runtime.
 pub fn cpu_temp(sys: &Path) -> Option<i32> {
     let (mut tdie, mut tctl, mut package) = (None, None, None::<i32>);
     for dir in hwmon_dirs(&sys.join("class/hwmon")) {
         match read_trimmed(&dir.join("name")).as_deref() {
             Some("k10temp" | "zenpower") => {
-                tdie = tdie.or(labeled(&dir, |l| l == "Tdie"));
-                tctl = tctl.or(labeled(&dir, |l| l == "Tctl"));
+                let all = temps(&dir);
+                tdie = tdie.or(labeled(&all, |l| l == "Tdie"));
+                tctl = tctl.or(labeled(&all, |l| l == "Tctl"));
             }
             Some("coretemp") => {
-                for (_, c) in temps(&dir).filter(|(l, _)| l.starts_with("Package id")) {
+                for (_, c) in temps(&dir)
+                    .into_iter()
+                    .filter(|(l, _)| l.starts_with("Package id"))
+                {
                     package = package.max(Some(c));
                 }
             }
@@ -30,39 +36,49 @@ pub fn cpu_temp(sys: &Path) -> Option<i32> {
 /// An AMD GPU's temperature in whole °C, from the hwmon directories under its own PCI device
 /// directory `device` (`.../devices/0000:75:00.0`): `junction` if present, else `edge`, else
 /// `temp1`. It never looks at other devices' sensors, so an iGPU and a dGPU don't mix.
+///
+/// Blocking sysfs I/O: call it off the async runtime.
 pub fn gpu_temp(device: &Path) -> Option<i32> {
     let dirs = hwmon_dirs(&device.join("hwmon"));
-    let find = |want: &dyn Fn(&str) -> bool| dirs.iter().find_map(|d| labeled(d, want));
-    find(&|l| l == "junction")
-        .or_else(|| find(&|l| l == "edge"))
+    let all: Vec<Vec<(String, i32)>> = dirs.iter().map(|d| temps(d)).collect();
+    let find = |name: &str| all.iter().find_map(|t| labeled(t, |l| l == name));
+    find("junction")
+        .or_else(|| find("edge"))
         .or_else(|| dirs.iter().find_map(|d| temp_input(d, 1)))
 }
 
-/// The `hwmon*` subdirectories of `parent`, sorted so the choice among several is stable.
+/// The `hwmon*` subdirectories of `parent` in numeric order (`hwmon2` before `hwmon10`), so the
+/// choice among several is stable.
 fn hwmon_dirs(parent: &Path) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(parent) else {
         return Vec::new();
     };
+    let number = |p: &Path| {
+        let name = p.file_name()?.to_string_lossy().into_owned();
+        name.strip_prefix("hwmon")?.parse::<u32>().ok()
+    };
     let mut dirs: Vec<PathBuf> = entries
         .flatten()
-        .filter(|e| e.file_name().to_string_lossy().starts_with("hwmon"))
         .map(|e| e.path())
+        .filter(|p| number(p).is_some())
         .collect();
-    dirs.sort();
+    dirs.sort_by_key(|p| number(p));
     dirs
 }
 
 /// Every `tempN_input` in `dir` that has a `tempN_label`, as (label, whole °C), in order of N.
-fn temps(dir: &Path) -> impl Iterator<Item = (String, i32)> + '_ {
-    (1..=64).filter_map(move |n| {
-        let label = read_trimmed(&dir.join(format!("temp{n}_label")))?;
-        Some((label, temp_input(dir, n)?))
-    })
+fn temps(dir: &Path) -> Vec<(String, i32)> {
+    (1..=64)
+        .filter_map(|n| {
+            let label = read_trimmed(&dir.join(format!("temp{n}_label")))?;
+            Some((label, temp_input(dir, n)?))
+        })
+        .collect()
 }
 
-/// The first temperature in `dir` whose label passes `want`.
-fn labeled(dir: &Path, want: impl Fn(&str) -> bool) -> Option<i32> {
-    temps(dir).find(|(l, _)| want(l)).map(|(_, c)| c)
+/// The first temperature in `temps` whose label passes `want`.
+fn labeled(temps: &[(String, i32)], want: impl Fn(&str) -> bool) -> Option<i32> {
+    temps.iter().find(|(l, _)| want(l)).map(|(_, c)| *c)
 }
 
 fn temp_input(dir: &Path, n: u32) -> Option<i32> {
@@ -168,6 +184,23 @@ mod tests {
         let sys = tempfile::tempdir().unwrap();
         sensor(sys.path(), "hwmon0", "k10temp", &[("Tctl", "64875")]);
         assert_eq!(cpu_temp(sys.path()), Some(65));
+    }
+
+    #[test]
+    fn negative_millidegrees_round_away_from_zero() {
+        let sys = tempfile::tempdir().unwrap();
+        sensor(sys.path(), "hwmon0", "k10temp", &[("Tctl", "-1500")]);
+        assert_eq!(cpu_temp(sys.path()), Some(-2));
+        sensor(sys.path(), "hwmon0", "k10temp", &[("Tctl", "-273500")]);
+        assert_eq!(cpu_temp(sys.path()), Some(-274));
+    }
+
+    #[test]
+    fn directories_are_taken_in_numeric_order() {
+        let sys = tempfile::tempdir().unwrap();
+        sensor(sys.path(), "hwmon10", "k10temp", &[("Tctl", "90000")]);
+        sensor(sys.path(), "hwmon2", "k10temp", &[("Tctl", "50000")]);
+        assert_eq!(cpu_temp(sys.path()), Some(50));
     }
 
     #[test]
