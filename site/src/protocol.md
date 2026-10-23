@@ -201,7 +201,7 @@ device                      daemon
 |---|---|
 | `fonts` | Draws the seven fonts listed under [Fonts](#fonts), and reads the font fields of `layout` |
 | `pages` | Assembles a set of up to 4 `layout` pages, shows one at a time, and lays out the shorter grid when a set has 2 or more. See [Pages](#pages) |
-| `status_bar` | Reads `stats` and shows the host's CPU, memory, network and clock in a bar. See [`stats`](#stats-daemon--device) |
+| `status_bar` | Reads `stats` and shows the host's CPU and GPU busy share and temperatures, memory, network rates and the clock in a bar, in the units and colors the frame gives. See [`stats`](#stats-daemon--device) |
 
 The daemon hashes `token` and compares the result in constant time with the hash it stored for `device`. A missing, malformed or wrong token and an unknown device all get the same `error`, then a close:
 
@@ -453,6 +453,7 @@ The daemon sends `stats` once a second, and only to a session whose `hello` name
 - **Refused**: a field of the wrong type (a fraction in an int field, a string, `null`), a value out of its range, a missing `time`, a `mem_*` or `net_*` field without its partner, or `mem_used` above `mem_total`. Also a unit string that isn't in its list (`"F"` is not `"f"`), and a `colors` that isn't an object or has a known key whose value isn't a whole number in range. The device logs the frame and drops it. The link stays up.
 - **Ignored**: unknown fields and unknown keys in `colors`. A `colors` entry for a value the frame doesn't send (a `gpu` color with no `gpu`) is accepted and does nothing.
 - `gpu`, `cpu_temp` and `gpu_temp` are independent: a GPU with no temperature sensor still sends its `gpu` busy share.
+- The daemon never sends a value outside these ranges. It leaves out that value and its color, so a sensor that reads 511 °C costs one value and not the frame. A `mem_*` pair with a total of 0 is left out too. Every frame carries `temp_unit` and `net_unit`, and `colors` is left out when no color is set.
 - The device logs each valid `stats` at debug level, not in the INFO line it logs for other messages, since a frame arrives every second. The firmware compiles debug logs out (`CONFIG_LOG_MAXIMUM_LEVEL=3`), so seeing them needs a rebuild with debug enabled. A refused `stats` gets the INFO line.
 
 ### `report` (device → daemon)

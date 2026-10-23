@@ -144,13 +144,15 @@ action = { kind = "shell", argv = ["ssh", "nas", "docker", "restart", "plex"] }
 
 A paired device with a grid shows a bar 36 px high above it. From left to right the bar shows:
 
-- `CPU`, the desktop's processor use, then a temperature that shows `--°` for now.
-- `RAM`, its memory in use as a percent.
-- `GPU --`, a slot reserved for a GPU reading, then a temperature that shows `--°` for now.
-- Network rates for the interface of the desktop's default route, as `▼` (received) and `▲` (sent), in bytes per second. Under 1000 the rate is a whole number. Above that it has one decimal and a unit, such as `1.2M` or `340.0k`.
-- The desktop's date and time in 24-hour form, such as `Wed 22 Oct 14:32`.
+- `CPU 12% 64°C`, the desktop's processor use and temperature.
+- `RAM 45%`, its memory in use as a percent.
+- `GPU 23% 41°C`, the selected GPU's busy share and temperature. See [Which GPU](#which-gpu).
+- `▼1.2M ▲340.0k`, network rates for the interface of the desktop's default route. `▼` is received and `▲` is sent. The unit is set in [Status bar settings](#status-bar-settings).
+- `Wed 22 Oct 14:32`, the desktop's date and time in 24-hour form.
 
-The desktop sends the host values once a second while the device is connected. A value more than 5 s old shows as `--`. While the link is down, the daemon's status text takes the place of the host values, and the clock keeps running on the device.
+A value shows as `--` in its place when the desktop hasn't sent it, when the last frame is more than 5 s old, or when the GPU can't be read. With `gpu = "off"` or no readable GPU, both GPU values read `--`. The `°C` or `°F` after a temperature stays on the bar.
+
+The desktop sends the host values once a second while the device is connected. While the link is down, the daemon's status text takes the place of the host values, and the clock keeps running on the device.
 
 Swipe up on the grid to open settings. A swipe counts when it moves at least 200 px up and more than twice as far up as it moves sideways. Its touch doesn't press a button or turn a page. Settings shows the device's firmware, uptime and memory, the status of Wi-Fi, the desktop, the SD card, USB and touch, and the layout revision. Its buttons are Licenses, Forget pairing (the same 2 s hold as before) and Close. Settings closes with Close, with a swipe down, or after 60 s without a touch (the idle close waits while the license viewer is open), and then the grid comes back. An unpaired device closes settings too.
 
@@ -172,7 +174,7 @@ cpu_temp = [{ at = 85, color = "#ffb300" }, { at = 95, color = "#e53935" }]
 net_rx = []         # never colored
 ```
 
-The window writes the same steps as `[[status_bar.thresholds.mem]]` tables when it saves. Both forms parse the same.
+When the window saves, it writes `[status_bar]` in its own TOML layout, so the steps may read differently from the example above. The saved file parses back to the same settings.
 
 | Key | Rule |
 |---|---|
@@ -181,7 +183,17 @@ The window writes the same steps as `[[status_bar.thresholds.mem]]` tables when 
 | `net_unit` | `si` (default): bytes with 1000-based prefixes, `1.2M`. `binary`: bytes with 1024-based prefixes, `1.1Mi`. `bits`: bits with 1000-based prefixes, `9.6Mb`. Bytes carry no `B`, and bits always carry their `b`, so the two never look alike |
 | `thresholds` | A table of up to 3 steps for each metric, below |
 
-Temperatures arrive from the sensors in whole °C. The device converts to °F to show them, rounding to the nearest degree (0 °C is 32 °F, 64 °C is 147 °F). A rate is shown in the chosen unit, divided by 1000 (1024 for `binary`) until it is under 1000, then one decimal, cut and not rounded, so `1.25 MB/s` shows `1.2M`. `binary` changes prefix at 1000, not 1024, so `1000 KiB/s` shows `0.9Mi`.
+#### Formats
+
+The daemon sends temperatures in whole °C and rates in bytes per second. The device formats them in the units you chose. Each value takes a fixed number of cells and is right-aligned in them, so a changing number doesn't move the bar's other groups.
+
+- **Percent** (CPU, RAM and GPU busy): a whole number and `%`, such as `12%`, in 4 cells. Above 100 it shows `100%`.
+- **Temperature**: a whole degree in 3 cells, then `°C` or `°F`. The device rounds °F to the nearest degree: 0 °C is 32 °F, 64 °C is 147 °F and -40 °C is -40 °F.
+- **`si`**: bytes per second, with no `B`. Under 1000 it's a whole number, such as `999`. Above that the number is divided by 1000 until its integer part is under 1000, then shows one decimal, cut and not rounded: `1.25 MB/s` shows `1.2M`, and `340,000 B/s` shows `340.0k`. A rate takes 6 cells.
+- **`binary`**: as `si`, but divided by 1024 and shown with `Ki`, `Mi` and `Gi`. The prefix still changes at 1000, so `1000 KiB/s` shows `0.9Mi`. A rate takes 7 cells.
+- **`bits`**: bits per second (bytes times 8), divided by 1000 and shown with `kb`, `Mb` and `Gb`, so `1.2 MB/s` shows `9.6Mb`. Under 1000 it's a whole number with `b`, such as `999b`. A rate takes 7 cells.
+
+The largest rate shown is `999.9` with its prefix, such as `999.9G`.
 
 #### Thresholds
 
@@ -206,8 +218,18 @@ Each metric takes `[{ at = N, color = "#rrggbb" }, ...]`, up to 3 steps with `at
 
 - `auto` picks the GPU the machine booted its console on (`boot_vga`), else the one with the lowest PCI address, among those the app can read (NVIDIA through its driver, AMD through `amdgpu`). On a desktop with a discrete card that is the discrete card.
 - `off` shows `GPU --`.
-- An address that names no GPU, or one that can't be read, is not a config error, since an external GPU can be unplugged. The bar shows `GPU --` and the app logs it once.
+- An address that names no GPU, or one that can't be read, is not a config error, since an external GPU can be unplugged. The bar shows `GPU --`, and the app logs the reason at info level each time a session starts.
 - On a laptop with a hybrid GPU, `auto` usually picks the integrated GPU. Naming the NVIDIA card by address keeps it awake while a device is connected, because reading it opens the driver.
+- Reading an AMD dGPU's sysfs each second may wake it if it is runtime-suspended. The daemon makes those reads while a device is connected and the AMD GPU is the one picked, whether by `auto` or by address. A read that takes longer than 500 ms leaves the CPU temperature and that GPU's values as `--` for that tick, and the next tick waits for the same read rather than starting another.
+- The daemon opens NVML only while a device is connected and the selected GPU is NVIDIA. While it is open, the daemon holds the driver's `/dev/nvidia*` files. They close when the last device disconnects, or when the selection moves to another GPU.
+
+#### The Status bar form
+
+The **Status bar** button in the Layout tab's grid panel opens the form in the editor beside the grid, in place of a button's form. The button reads "(has problems)" when the last save refused a bar setting. While the form is open, no button is selected. The form edits the same draft as the grid and saves with it. A save that changes only `[status_bar]` pushes no layout to a device.
+
+- **Temperature** and **Network rates** set the units. Each option shows its example, such as `°F (shows 147°F)`. Switching converts the steps you have in the unit that changed. The form then says "Thresholds converted to °F.", or, when you had no steps of your own in that unit, that the defaults are now in that unit. A switch doesn't run while a step's `at` isn't a whole number, and asks you to fix the steps first.
+- **GPU shown** is Auto, which names the GPU it picks now, or Off, or one GPU by its name and PCI address. A GPU the app can't read is listed but disabled, with its driver named. A saved address that no GPU matches is shown as "(not found)".
+- **Colors past a threshold** has one block for each value: CPU, RAM, GPU, CPU temperature, GPU temperature, Download and Upload. Each block says which unit its steps are in. A value on its defaults has a "defaults" tag and shows its steps as text, or "Never colored." when it has none. Edit steps copies the defaults into the file so you can change them. Add step adds a step above the last one, up to 3. Remove deletes a step. Use defaults removes the value's own steps. Errors from the last save show under the value they belong to.
 
 ## Icons
 

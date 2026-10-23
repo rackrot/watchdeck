@@ -1,6 +1,6 @@
 # Status bar 2: GPU, temperatures, units, and colors past a threshold
 
-Status: planned 2026-10-22, revised the same day with the user's answers and the unit settings. Against `main` at `0ddf91d`, where device-ui S1 to S6 are merged. Device-ui S7 is built on its branch, first as `3e30f9a` and since revised to the layout below. Starts after `plans/device-ui.md` S8 passes. No slice started.
+Status: complete 2026-10-22. B1 to B7 are on `main`, and B8 is the docs and results commit. The results are in [Results (2026-10-22)](#results-2026-10-22). Against `main` at `0ddf91d`, where device-ui S1 to S6 are merged. Device-ui S7 is built on its branch, first as `3e30f9a` and since revised to the layout below. Starts after `plans/device-ui.md` S8 passes.
 
 **Device-ui S7 has built the bar's layout. This plan doesn't move it.** Left to right: CPU, RAM, GPU and NET groups, spaced equally, then the date and time flush right in an area reserved for `Wed 24 May 04:44`. The bar is drawn in Roboto Mono 24, with Montserrat 24 as the fallback for `°` and the arrows. Each value is right-aligned in a fixed number of cells, and each net rate gets 6 cells, sized for `999.9M`. The GPU group reads `GPU --`. S7 measures each group's worst string when the bar is created and works out the gaps from them (`ui.c` `bar_create` on S7's branch). So B7 changes the worst strings, the groups get their new widths, and the gaps shrink to fit. B7 only adds GPU busy, temperatures, the unit forms and colors to groups that already exist.
 
@@ -519,6 +519,69 @@ Run on the board and this desktop, the daemon and firmware from the same commit.
 
 - **Q1** With every unit form sized in, the gaps between groups shrink from S7's 20 px to 8 px, under one cell. Accept that, or buy space back? **Recommended: drop the space between the two rates** (`▼999.9Mi▲999.9Mi`; the `▲` separates them), which gives 11 px gaps. Keep the `°C`/`°F` letter, since a bare `°` no longer says which unit. Revisit after B8 step 8's photo.
 - **Q2** Offer bits per second (`9.6Mb`, 1000-based) as a third rate unit? **Recommended: yes.** It costs no width, since `999.9Mb` fits the same 7 cells as binary's `999.9Mi`, and link speeds are quoted in bits. The cost is one more case in the formatter, the threshold factor (125,000 bytes per Mb) and the form. Binary bits (`Mib`) aren't offered. If no, `net_unit` is `si` or `binary`, and nothing else changes.
+
+## Results (2026-10-22)
+
+Results of V0 and B8. The B8 checks ran on the desktop and on the board, with the daemon and firmware from the same commit. The items marked UNVERIFIED are the operator's observations from that run. The docs pass didn't re-read them.
+
+### V0 vetting record: nvml-wrapper 0.13.0
+
+`cargo add nvml-wrapper@=0.13.0 --no-default-features` locked exactly 8 new packages. `ident_case` and `strsim` were already in the lock and were reused, so nothing extra came in. Every lock checksum matches the downloaded `.crate`. `cargo tree -i` shows that each package is reached only through nvml-wrapper.
+
+| Package | Version | License | Owners (publisher) | Released | Advisories | Source checked | Build script |
+|---|---|---|---|---|---|---|---|
+| nvml-wrapper | 0.13.0 | MIT OR Apache-2.0 | Cldfire, brayniac, swlynch99 (brayniac) | 2026-08-31 | none | yes: tag v0.13.0 = vcs sha 2bbb28e | none (`build = false`) |
+| nvml-wrapper-sys | 0.10.0 | MIT OR Apache-2.0 | Cldfire, brayniac (brayniac) | 2026-08-31 | none | yes: same tag and sha; bindings.rs identical | none |
+| wrapcenum-derive | 0.4.1 | MIT/Apache-2.0 | Cldfire, brayniac (Cldfire) | 2024-02-10 | none | yes: tag v0.4.1 = vcs sha 9899d1e; CRLF only | none (proc macro, read) |
+| static_assertions | 1.1.0 | MIT OR Apache-2.0 | nvzqz | 2019-11-03 | none | n/a (crates.io only) | none |
+| libloading | 0.8.9 (beside 0.7.4) | ISC | nagisa | 2025-09-21 | none | n/a | none (`build = false`) |
+| darling | 0.20.11 (beside 0.24.1) | MIT | TedDriggs | 2025-03-28 | none | n/a | none |
+| darling_core | 0.20.11 | MIT | TedDriggs | 2025-03-28 | none | n/a; no fs/env/process/net | none |
+| darling_macro | 0.20.11 | MIT | TedDriggs | 2025-03-28 | none | n/a; read, token generation only | none |
+
+- The publisher of nvml-wrapper 0.13.0 is brayniac, one of the crate's co-owners. brayniac also published 0.10.0 of nvml-wrapper-sys, by merging PR #145 to main. The tag points at that merge, and it matches the published source. The packaging differs only in the normalized Cargo.toml, the generated lock, README.md copied from the repo root, and `nvml.h`, which the crate leaves out.
+- No version is yanked, and osv.dev and the RustSec advisory-db (640bf5a, 2026-10-22) list no advisory for these names.
+- Both proc macros, wrapcenum-derive and darling_macro, were read in full. They only parse and quote tokens.
+- nvml-wrapper-sys has no `#[link`. It loads `libnvidia-ml.so.1` with `libloading`, unless `lib_path()` names another file.
+- Size: the release build grew by 150,784 bytes (about 147 KiB), from 14,892,168 to 15,042,952 bytes, with a probe that calls B4's APIs. The dependency alone changes nothing. `NEEDED` lists the same 14 libraries before and after, with no `libnvidia-ml`.
+
+**Verdict: PASS.**
+
+### B4 real read
+
+On the desktop, the RTX 4070 read through NVML showed busy at 0 to 13% and temperature at 34 to 35 °C. UNVERIFIED (operator's run).
+
+### Board geometry
+
+The bar's log line from the board: `cpu 12/168 ram 220/96 gpu 356/168 net 564/216 clock 820/192, gap 40`. UNVERIFIED for the log line itself, which the docs pass didn't read. The numbers add up:
+
+- Left to right: 12 + 168 + 40 + 96 + 40 + 168 + 40 + 216 + 40 + 192 + 12 = 1024 px, the board's width.
+- 168 px is 14 cells of 12 px, the CPU and GPU worst case `CPU 100% 302°F`. 96 px is 8 cells, `RAM 100%`.
+- The 40 px gaps are equal, and no `bar slot overflow` line was logged. UNVERIFIED (operator's run).
+
+### NVML while the board is connected
+
+The dev daemon held 23 `/dev/nvidia*` descriptors. The docs pass counted the same 23 in `/proc/<pid>/fd` of that daemon. UNVERIFIED for the connection state (operator's run).
+
+### Panel checks
+
+All passed. UNVERIFIED (the user's checks, not re-run by the docs pass):
+
+- CPU and GPU temperatures and busy shares show on the bar, and GPU load is visible.
+- The °F switch moved the steps 85 and 95 to 185 and 203, and switching back restored them.
+- The binary and bits rates show with no shift in the bar.
+- The GPU select lists Auto (RTX 4070) and the AMD iGPU, and switching to the AMD iGPU works.
+- A RAM step turned the value red within 2 s, and it went back to grey with Use defaults.
+- The save bar's wording for a bar-only save was checked.
+- A refused `at` of 400 showed under its row.
+
+### Not run
+
+- Comparing the CPU temperature with `sensors` (B8 step 3).
+- Comparing the rates in each unit with `ip -s link` deltas (B8 step 4).
+- A host without the NVIDIA driver. CI's missing-library test (B4) is the evidence.
+- The memory run with the pages fixtures (B8 step 9).
+- The photo of the widest bar (B8 step 8). Q1 is moot at 40 px gaps.
 
 ## Critique log
 
