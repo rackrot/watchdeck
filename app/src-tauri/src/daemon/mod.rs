@@ -3,7 +3,9 @@
 pub mod actions;
 pub mod config;
 mod fonts_gen;
+pub mod gpu;
 pub mod hoststats;
+pub mod hwmon;
 pub mod icons;
 pub mod mdns;
 pub mod pairing;

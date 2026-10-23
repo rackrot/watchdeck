@@ -62,6 +62,18 @@ export const importIcon = () => invoke<string | null>("import_icon");
 /** The files in the icons directory that a button's `icon` could name. */
 export const listIcons = () => invoke<string[]>("list_icons");
 
+/** Mirrors `GpuInfo` in `src-tauri/src/daemon/gpu.rs`. `id` is the PCI address. */
+export type GpuInfo = {
+  id: string;
+  name: string;
+  driver: string | null;
+  readable: boolean;
+  boot_vga: boolean;
+};
+/** `auto` is the id the status bar's `auto` picks now, or null if no GPU is readable. */
+export type GpuList = { gpus: GpuInfo[]; auto: string | null };
+export const listGpus = () => invoke<GpuList>("list_gpus");
+
 /** Mirrors `ActionResult` in `src-tauri/src/daemon/actions.rs`: what a device would be told. */
 export type ActionResult = {
   ok: boolean;

@@ -1,6 +1,6 @@
 //! Tauri commands for the window. They only forward to the daemon, which owns the rules.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -9,6 +9,7 @@ use tauri_plugin_dialog::DialogExt;
 
 use crate::daemon::actions::ActionResult;
 use crate::daemon::config::{Config, Configs, StatusBarConfig, StatusBarDefaults};
+use crate::daemon::gpu::GpuList;
 use crate::daemon::pairing::{Pairing, PairingState};
 use crate::daemon::secrets::Secrets;
 use crate::daemon::server::{DeviceInfo, Devices};
@@ -166,6 +167,12 @@ pub fn config_dir(daemon: State<'_, Daemon>) -> String {
 pub async fn list_icons(daemon: State<'_, Daemon>) -> Result<Vec<String>, String> {
     let configs = daemon.configs.clone();
     blocking(move || configs.list_icons()).await?
+}
+
+/// The host's GPUs and which one `auto` picks, for the status bar form.
+#[tauri::command]
+pub async fn list_gpus() -> Result<GpuList, String> {
+    blocking(|| GpuList::scan(Path::new("/sys"), Path::new("/proc"))).await
 }
 
 /// Runs button `button`'s action from the live config, as a device press would, and returns what

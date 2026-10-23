@@ -268,6 +268,7 @@ pub fn run() {
             commands::delete_secret,
             commands::import_icon,
             commands::list_icons,
+            commands::list_gpus,
             commands::test_action,
             commands::tile_values,
             commands::config_dir,
