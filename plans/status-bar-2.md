@@ -515,6 +515,8 @@ Run on the board and this desktop, the daemon and firmware from the same commit.
 
 ## Open questions
 
+**Settled 2026-10-22, when the plan started.** Q2: yes, bits are the third rate unit (the recommendation). Q1 is moot. S7 moved the bar to Roboto Mono Regular 20 (12 px cells, with `°` in the font, 18 px arrows), 12 px margins and a 192 px clock. B7's worst groups become CPU and GPU 168 (`CPU 100% 302°F`, 14 cells), RAM 96, and NET 216 (`▼999.9Mi ▲999.9Mi`). That is 648 px of the 808 left of the clock, so the 4 gaps are 40 px each and the space between the rates stays. B7 takes these numbers over the Bar budget table above, which assumed the 24 px font.
+
 - **Q1** With every unit form sized in, the gaps between groups shrink from S7's 20 px to 8 px, under one cell. Accept that, or buy space back? **Recommended: drop the space between the two rates** (`▼999.9Mi▲999.9Mi`; the `▲` separates them), which gives 11 px gaps. Keep the `°C`/`°F` letter, since a bare `°` no longer says which unit. Revisit after B8 step 8's photo.
 - **Q2** Offer bits per second (`9.6Mb`, 1000-based) as a third rate unit? **Recommended: yes.** It costs no width, since `999.9Mb` fits the same 7 cells as binary's `999.9Mi`, and link speeds are quoted in bits. The cost is one more case in the formatter, the threshold factor (125,000 bytes per Mb) and the form. Binary bits (`Mib`) aren't offered. If no, `net_unit` is `si` or `binary`, and nothing else changes.
 
