@@ -2,6 +2,8 @@
 //! arguments (`/sys`, `/proc`), so tests build fake trees. Card numbers (`card0`) are never used:
 //! they say nothing about which GPU is which. NVIDIA readings come from NVML, not from here.
 
+pub mod nvidia;
+
 use std::fs;
 use std::path::Path;
 
