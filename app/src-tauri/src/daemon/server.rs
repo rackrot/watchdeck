@@ -26,11 +26,11 @@ use time::OffsetDateTime;
 
 use super::actions::{ActionResult, Actions, Run, MAX_RUNNING};
 use super::config::{Action, Layout, Live, MAX_COLS, MAX_ROWS};
-use super::hoststats::{self, HostStats};
+use super::hoststats::{self, HostSources, HostStats};
 use super::protocol::{
-    decode_hex, encode_hex, valid_device_id, ErrorCode, Message, Report, Token, CAPS, CAP_FONTS,
-    CAP_PAGES, CAP_STATUS_BAR, ICON_ID_BYTES, MAX_MESSAGE_BYTES, MAX_REPORTS_PER_SESSION,
-    TOKEN_BYTES, VERSION,
+    decode_hex, encode_hex, valid_device_id, Colors, ErrorCode, Message, Report, Token, CAPS,
+    CAP_FONTS, CAP_PAGES, CAP_STATUS_BAR, ICON_ID_BYTES, MAX_MESSAGE_BYTES,
+    MAX_REPORTS_PER_SESSION, TOKEN_BYTES, VERSION,
 };
 use super::store::Store;
 use super::tiles::{self, Sent, Tiles, Values};
@@ -128,19 +128,21 @@ struct Registry {
 impl Server {
     /// Sessions show the layout of the live config in `config`, and push it again whenever it
     /// changes. Presses run through `actions`, which also poll the config's tiles for as long as
-    /// a session is open. Must run inside a tokio runtime.
+    /// a session is open. The status bar's host stats are read from `sources`. Must run inside a
+    /// tokio runtime.
     pub async fn bind(
         addr: impl ToSocketAddrs,
         tls: Arc<ServerConfig>,
         store: Store,
         config: watch::Receiver<Arc<Live>>,
         actions: Actions,
+        sources: HostSources,
     ) -> io::Result<Self> {
         let hostname = gethostname::gethostname().to_string_lossy().into_owned();
         let (events, _) = broadcast::channel(64);
         let listener = TcpListener::bind(addr).await?;
         let (connected, polling) = watch::channel(0);
-        let stats = hoststats::spawn(polling.clone());
+        let stats = hoststats::spawn(polling.clone(), config.clone(), sources);
         let tiles = tiles::spawn(actions.clone(), config.clone(), polling);
         Ok(Self {
             listener,
@@ -970,6 +972,10 @@ fn icon_ids(ids: &[String]) -> Option<Vec<[u8; ICON_ID_BYTES]>> {
 const MAX_WIRE_INT: u64 = (1 << 53) - 1;
 /// The widest UTC offset the wire carries, in seconds either way (`site/src/protocol.md`).
 const MAX_UTC_OFFSET: i32 = 64_800;
+/// The wire's range for a temperature in whole °C.
+const TEMP_RANGE: std::ops::RangeInclusive<i32> = -40..=150;
+/// The largest `0xRRGGBB`.
+const MAX_COLOR: u32 = 0xFF_FFFF;
 
 /// A `stats` frame for one reading. A field outside its wire range is left out, and so is each
 /// pair that is half missing or breaks its rule, so the device never refuses the frame.
@@ -981,6 +987,22 @@ fn stats_frame(stats: HostStats, time: u64, utc_offset: Option<i32>) -> Message 
     let net = stats
         .net
         .filter(|n| n.rx <= MAX_WIRE_INT && n.tx <= MAX_WIRE_INT);
+    // A sensor reading 511 °C or -273 °C costs its value, never the frame.
+    let gpu = stats.gpu.unwrap_or_default();
+    let gpu_busy = gpu.busy.filter(|busy| *busy <= 100);
+    let cpu_temp = stats.cpu_temp.filter(|t| TEMP_RANGE.contains(t));
+    let gpu_temp = gpu.temp.filter(|t| TEMP_RANGE.contains(t));
+    // A color goes with its value, and only if it is a color.
+    let color = |c: Option<u32>, shown: bool| c.filter(|c| shown && *c <= MAX_COLOR);
+    let colors = Colors {
+        cpu: color(stats.colors.cpu, cpu.is_some()),
+        mem: color(stats.colors.mem, mem.is_some()),
+        gpu: color(stats.colors.gpu, gpu_busy.is_some()),
+        cpu_temp: color(stats.colors.cpu_temp, cpu_temp.is_some()),
+        gpu_temp: color(stats.colors.gpu_temp, gpu_temp.is_some()),
+        net_rx: color(stats.colors.net_rx, net.is_some()),
+        net_tx: color(stats.colors.net_tx, net.is_some()),
+    };
     Message::Stats {
         time,
         utc_offset: utc_offset.filter(|o| (-MAX_UTC_OFFSET..=MAX_UTC_OFFSET).contains(o)),
@@ -989,13 +1011,12 @@ fn stats_frame(stats: HostStats, time: u64, utc_offset: Option<i32>) -> Message 
         mem_total: mem.map(|m| m.total),
         net_rx: net.map(|n| n.rx),
         net_tx: net.map(|n| n.tx),
-        // The GPU, temperatures, units and colors are B5's to fill in.
-        gpu: None,
-        cpu_temp: None,
-        gpu_temp: None,
-        temp_unit: None,
-        net_unit: None,
-        colors: None,
+        gpu: gpu_busy,
+        cpu_temp,
+        gpu_temp,
+        temp_unit: Some(stats.units.temp),
+        net_unit: Some(stats.units.net),
+        colors: (colors != Colors::default()).then_some(colors),
     }
 }
 
@@ -1014,7 +1035,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::super::gpu::GpuReading;
     use super::super::hoststats::{Mem, Net};
+    use super::super::protocol::{NetUnit, TempUnit};
+    use super::super::units::Units;
     use super::*;
 
     fn cpu_of(msg: Message) -> Option<u32> {
@@ -1051,6 +1075,7 @@ mod tests {
                 total: 20,
             }),
             net: Some(Net { rx: 5, tx: 6 }),
+            ..HostStats::default()
         }
     }
 
@@ -1070,8 +1095,8 @@ mod tests {
                 gpu: None,
                 cpu_temp: None,
                 gpu_temp: None,
-                temp_unit: None,
-                net_unit: None,
+                temp_unit: Some(TempUnit::C),
+                net_unit: Some(NetUnit::Si),
                 colors: None,
             }
         );
@@ -1093,8 +1118,8 @@ mod tests {
                 gpu: None,
                 cpu_temp: None,
                 gpu_temp: None,
-                temp_unit: None,
-                net_unit: None,
+                temp_unit: Some(TempUnit::C),
+                net_unit: Some(NetUnit::Si),
                 colors: None,
             }
         );
@@ -1112,6 +1137,7 @@ mod tests {
                 rx: MAX_WIRE_INT,
                 tx: 0,
             }),
+            ..HostStats::default()
         };
         let msg = stats_frame(edge, 1, Some(MAX_UTC_OFFSET));
         assert_eq!(cpu_of(msg.clone()), Some(100));
@@ -1135,6 +1161,7 @@ mod tests {
                 rx: 1,
                 tx: MAX_WIRE_INT + 1,
             }),
+            ..HostStats::default()
         };
         let msg = stats_frame(bad, 1, Some(MAX_UTC_OFFSET + 1));
         let Message::Stats { utc_offset, .. } = msg.clone() else {
@@ -1175,5 +1202,115 @@ mod tests {
             ..HostStats::default()
         };
         assert_eq!(net_of(stats_frame(one_over, 1, None)), None);
+    }
+
+    /// The GPU, temperature and color fields of a frame.
+    fn bar_of(msg: Message) -> (Option<u32>, Option<i32>, Option<i32>, Option<Colors>) {
+        let Message::Stats {
+            gpu,
+            cpu_temp,
+            gpu_temp,
+            colors,
+            ..
+        } = msg
+        else {
+            panic!("expected a stats frame")
+        };
+        (gpu, cpu_temp, gpu_temp, colors)
+    }
+
+    fn sensors(cpu_temp: i32, busy: u32, gpu_temp: i32) -> HostStats {
+        HostStats {
+            cpu_temp: Some(cpu_temp),
+            gpu: Some(GpuReading {
+                busy: Some(busy),
+                temp: Some(gpu_temp),
+            }),
+            ..HostStats::default()
+        }
+    }
+
+    #[test]
+    fn temperatures_and_gpu_pass_through_inside_their_ranges() {
+        for edge in [-40, 150] {
+            let got = bar_of(stats_frame(sensors(edge, 100, edge), 1, None));
+            assert_eq!(got, (Some(100), Some(edge), Some(edge), None));
+        }
+    }
+
+    #[test]
+    fn a_bad_sensor_costs_its_value_and_its_color_and_never_the_frame() {
+        let colors = Colors {
+            cpu_temp: Some(1),
+            gpu_temp: Some(2),
+            gpu: Some(3),
+            ..Colors::default()
+        };
+        for (cpu_temp, busy, gpu_temp, left) in [
+            (511, 50, 40, (Some(50), None, Some(40))),
+            (151, 50, 40, (Some(50), None, Some(40))),
+            (-41, 50, 40, (Some(50), None, Some(40))),
+            (60, 50, 511, (Some(50), Some(60), None)),
+            (60, 101, -273, (None, Some(60), None)),
+        ] {
+            let stats = HostStats {
+                colors,
+                ..sensors(cpu_temp, busy, gpu_temp)
+            };
+            let (gpu, cpu_t, gpu_t, got) = bar_of(stats_frame(stats, 1, None));
+            assert_eq!((gpu, cpu_t, gpu_t), left, "{cpu_temp} {busy} {gpu_temp}");
+            let got = got.unwrap_or_default();
+            assert_eq!(got.cpu_temp.is_some(), cpu_t.is_some());
+            assert_eq!(got.gpu_temp.is_some(), gpu_t.is_some());
+            assert_eq!(got.gpu.is_some(), gpu.is_some());
+        }
+    }
+
+    #[test]
+    fn a_color_over_ffffff_is_left_out_and_an_empty_colors_object_is_not_sent() {
+        let stats = |cpu_color| HostStats {
+            cpu: Some(50),
+            colors: Colors {
+                cpu: Some(cpu_color),
+                ..Colors::default()
+            },
+            ..HostStats::default()
+        };
+        let (_, _, _, colors) = bar_of(stats_frame(stats(0x1000000), 1, None));
+        assert_eq!(colors, None);
+        let (_, _, _, colors) = bar_of(stats_frame(stats(0xFFFFFF), 1, None));
+        assert_eq!(colors.unwrap().cpu, Some(0xFFFFFF));
+        // A color for a value that is not there.
+        let orphan = HostStats {
+            colors: Colors {
+                mem: Some(5),
+                ..Colors::default()
+            },
+            ..HostStats::default()
+        };
+        assert_eq!(bar_of(stats_frame(orphan, 1, None)).3, None);
+    }
+
+    #[test]
+    fn both_units_are_always_sent() {
+        let stats = HostStats {
+            units: Units {
+                temp: TempUnit::F,
+                net: NetUnit::Bits,
+            },
+            ..HostStats::default()
+        };
+        let Message::Stats {
+            temp_unit,
+            net_unit,
+            ..
+        } = stats_frame(stats, 1, None)
+        else {
+            panic!("expected a stats frame")
+        };
+        assert_eq!(
+            (temp_unit, net_unit),
+            (Some(TempUnit::F), Some(NetUnit::Bits))
+        );
     }
 }

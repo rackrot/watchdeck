@@ -31,10 +31,13 @@ use tokio_tungstenite::tungstenite::Message as Ws;
 use tokio_tungstenite::{client_async, connect_async, WebSocketStream};
 use watchdeck_lib::daemon::actions::{ActionResult, Actions};
 use watchdeck_lib::daemon::config::{self, Configs};
+use watchdeck_lib::daemon::gpu::nvidia::fake::FakeNvidia;
+use watchdeck_lib::daemon::gpu::GpuReading;
+use watchdeck_lib::daemon::hoststats::HostSources;
 use watchdeck_lib::daemon::pairing::{Pairing, PairingState};
 use watchdeck_lib::daemon::protocol::{
-    decode_hex, encode_hex, pairing_code, Button, ErrorCode, IconFrame, Message, Report, TileState,
-    Token,
+    decode_hex, encode_hex, pairing_code, Button, Colors, ErrorCode, IconFrame, Message, NetUnit,
+    Report, TempUnit, TileState, Token,
 };
 use watchdeck_lib::daemon::secrets::Secrets;
 use watchdeck_lib::daemon::server::{DaemonEvent, DeviceInfo, Devices, Server};
@@ -129,6 +132,43 @@ struct Daemon {
     secrets: Arc<Secrets>,
     /// The config dir, which is also where shell actions run.
     dir: tempfile::TempDir,
+    /// The NVML every test daemon reads its NVIDIA GPU through, and counts opens of.
+    nvidia: FakeNvidia,
+    /// The sysfs tree the daemon reads. Held so it outlives the daemon.
+    _sys: tempfile::TempDir,
+}
+
+const NVIDIA: &str = "0000:01:00.0";
+const AMD: &str = "0000:75:00.0";
+
+/// This desktop in miniature, so a test never reads the real `/sys`: an NVIDIA boot GPU, an AMD
+/// iGPU with its sensors, and k10temp reading 64 C.
+fn sys_tree() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let put = |rel: &str, text: &str| {
+        let path = tmp.path().join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    for (id, driver, boot) in [(NVIDIA, "nvidia", "1"), (AMD, "amdgpu", "0")] {
+        let dev = format!("bus/pci/devices/{id}");
+        put(&format!("{dev}/class"), "0x030000\n");
+        put(&format!("{dev}/boot_vga"), &format!("{boot}\n"));
+        std::os::unix::fs::symlink(
+            format!("../../../../bus/pci/drivers/{driver}"),
+            tmp.path().join(&dev).join("driver"),
+        )
+        .unwrap();
+    }
+    put(&format!("bus/pci/devices/{AMD}/gpu_busy_percent"), "7\n");
+    let hwmon = format!("bus/pci/devices/{AMD}/hwmon/hwmon8");
+    put(&format!("{hwmon}/name"), "amdgpu\n");
+    put(&format!("{hwmon}/temp1_label"), "edge\n");
+    put(&format!("{hwmon}/temp1_input"), "39000\n");
+    put("class/hwmon/hwmon4/name", "k10temp\n");
+    put("class/hwmon/hwmon4/temp1_label", "Tctl\n");
+    put("class/hwmon/hwmon4/temp1_input", "64000\n");
+    tmp
 }
 
 impl Daemon {
@@ -153,9 +193,30 @@ async fn start_with(pair_addr: SocketAddr, window: Duration, config: &str) -> Da
     let actions = Actions::new(secrets.clone(), dir.path().to_path_buf()).unwrap();
     let tls = identity().server_config().unwrap();
     let store = Store::load(dir.path()).unwrap();
-    let server = Server::bind("127.0.0.1:0", tls, store, configs.subscribe(), actions)
-        .await
-        .unwrap();
+    let sys = sys_tree();
+    let nvidia = FakeNvidia::new().with_gpu(
+        NVIDIA,
+        "NVIDIA GeForce RTX 4070",
+        GpuReading {
+            busy: Some(23),
+            temp: Some(41),
+        },
+    );
+    let sources = HostSources {
+        proc_root: concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/proc/docker").into(),
+        sys_root: sys.path().into(),
+        nvidia: Arc::new(nvidia.clone()),
+    };
+    let server = Server::bind(
+        "127.0.0.1:0",
+        tls,
+        store,
+        configs.subscribe(),
+        actions,
+        sources,
+    )
+    .await
+    .unwrap();
     let devices = server.devices();
     devices.pair(DEVICE, Sha256::digest(TOKEN).into()).unwrap();
     let pairing = Pairing::new(
@@ -173,6 +234,8 @@ async fn start_with(pair_addr: SocketAddr, window: Duration, config: &str) -> Da
         configs,
         secrets,
         dir,
+        nvidia,
+        _sys: sys,
     };
     tokio::spawn(server.run());
     daemon
@@ -2963,4 +3026,155 @@ async fn a_session_opened_after_the_others_closed_gets_no_earlier_reading() {
         "a reading came {:?} after the hello",
         at - sent
     );
+}
+
+/// What a `stats` frame holds beyond the `/proc` values.
+#[derive(Debug, PartialEq)]
+struct Bar {
+    cpu_temp: Option<i32>,
+    gpu: Option<u32>,
+    gpu_temp: Option<i32>,
+    temp_unit: Option<TempUnit>,
+    net_unit: Option<NetUnit>,
+    colors: Option<Colors>,
+}
+
+fn bar_of(msg: Message) -> Bar {
+    let Message::Stats {
+        cpu_temp,
+        gpu,
+        gpu_temp,
+        temp_unit,
+        net_unit,
+        colors,
+        ..
+    } = msg
+    else {
+        panic!("expected a stats frame, got {msg:?}")
+    };
+    Bar {
+        cpu_temp,
+        gpu,
+        gpu_temp,
+        temp_unit,
+        net_unit,
+        colors,
+    }
+}
+
+async fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !done() {
+        assert!(
+            Instant::now() < deadline,
+            "{what} did not happen within 2 s"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_status_bar_session_gets_gpu_temperatures_and_units_from_the_fixtures() {
+    let daemon = start().await;
+    let mut c = status_session(daemon.addr, &["status_bar"]).await;
+    let (msg, _) = next_stats(&mut c, Duration::from_secs(2)).await;
+    // 49 percent of memory is under every default step.
+    assert_eq!(
+        bar_of(msg),
+        Bar {
+            cpu_temp: Some(64),
+            gpu: Some(23),
+            gpu_temp: Some(41),
+            temp_unit: Some(TempUnit::C),
+            net_unit: Some(NetUnit::Si),
+            colors: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_mem_step_at_one_colors_mem_in_the_frame() {
+    let config =
+        format!("{CONFIG}\n[status_bar.thresholds]\nmem = [{{ at = 1, color = \"#102030\" }}]\n");
+    let daemon = start_configured(&config).await;
+    let mut c = status_session(daemon.addr, &["status_bar"]).await;
+    let (msg, _) = next_stats(&mut c, Duration::from_secs(2)).await;
+    assert_eq!(
+        bar_of(msg).colors,
+        Some(Colors {
+            mem: Some(0x102030),
+            ..Colors::default()
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_status_bar_only_edit_sends_no_layout_and_the_next_frames_carry_it() {
+    let daemon = start().await;
+    let mut c = status_session(daemon.addr, &["status_bar"]).await;
+    next_stats(&mut c, Duration::from_secs(2)).await;
+
+    // Units and a step together: 41 C is 106 F.
+    let edited = format!(
+        "{CONFIG}\n[status_bar]\ntemp_unit = \"f\"\nnet_unit = \"bits\"\n\n\
+         [status_bar.thresholds]\ngpu_temp = [{{ at = 106, color = \"#abcdef\" }}]\n"
+    );
+    assert_eq!(daemon.reconfigure(&edited), Ok(true));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut carried = None;
+    while let Ok(msg) = tokio::time::timeout_at(deadline, recv(&mut c)).await {
+        assert!(!matches!(msg, Message::Layout { .. }), "{msg:?}");
+        if matches!(msg, Message::Stats { .. }) {
+            let bar = bar_of(msg);
+            if bar.temp_unit == Some(TempUnit::F) {
+                carried = Some(bar);
+            }
+        }
+    }
+    let bar = carried.expect("no frame carried the edit within 2 s");
+    assert_eq!(bar.net_unit, Some(NetUnit::Bits));
+    assert_eq!(
+        bar.colors,
+        Some(Colors {
+            gpu_temp: Some(0xabcdef),
+            ..Colors::default()
+        })
+    );
+}
+
+#[tokio::test]
+async fn nvml_is_open_only_while_a_device_is_connected() {
+    let daemon = start().await;
+    assert_eq!(daemon.nvidia.opens(), 0, "nothing opens before a session");
+    let mut c = status_session(daemon.addr, &["status_bar"]).await;
+    next_stats(&mut c, Duration::from_secs(2)).await;
+    assert_eq!(daemon.nvidia.opens(), 1);
+    assert_eq!(daemon.nvidia.shutdowns(), 0);
+
+    drop(c);
+    wait_until_disconnected(&daemon.devices).await;
+    wait_for("NVML shutting down", || daemon.nvidia.shutdowns() == 1).await;
+}
+
+#[tokio::test]
+async fn picking_the_amd_by_address_reads_sysfs_and_shuts_nvml_down() {
+    let daemon = start().await;
+    let mut c = status_session(daemon.addr, &["status_bar"]).await;
+    next_stats(&mut c, Duration::from_secs(2)).await;
+
+    let edited = format!("{CONFIG}\n[status_bar]\ngpu = \"{AMD}\"\n");
+    assert_eq!(daemon.reconfigure(&edited), Ok(true));
+    // The first frame after the edit may predate it; one of the next two has the AMD.
+    let mut got = None;
+    for _ in 0..3 {
+        let bar = bar_of(next_stats(&mut c, Duration::from_secs(3)).await.0);
+        if bar.gpu == Some(7) {
+            got = Some(bar);
+            break;
+        }
+    }
+    let bar = got.expect("no frame read the AMD");
+    assert_eq!(bar.gpu_temp, Some(39));
+    wait_for("NVML shutting down", || daemon.nvidia.shutdowns() == 1).await;
 }

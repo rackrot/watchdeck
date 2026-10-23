@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use daemon::actions::Actions;
 use daemon::config::Configs;
+use daemon::hoststats::HostSources;
 use daemon::mdns::{self, MdnsStatus};
 use daemon::pairing::{Pairing, PAIR_PORT, PAIR_WINDOW};
 use daemon::secrets::Secrets;
@@ -140,6 +141,7 @@ pub fn run() {
                 store,
                 configs.subscribe(),
                 actions,
+                HostSources::system(),
             ))?;
             log::info!("listening on {} (wss)", server.local_addr()?);
             tauri::async_runtime::spawn(configs.clone().watch_files());

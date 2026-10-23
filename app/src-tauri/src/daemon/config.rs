@@ -547,7 +547,7 @@ fn font_error(what: &str, font: &str) -> Option<String> {
 }
 
 /// `#rrggbb` as `0xRRGGBB`.
-fn color(text: &str) -> Option<u32> {
+pub fn color(text: &str) -> Option<u32> {
     let hex = text.strip_prefix('#')?;
     if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;

@@ -1,6 +1,7 @@
 //! The device-facing daemon. Nothing in here imports `tauri`, so tests run headless.
 
 pub mod actions;
+pub mod alerts;
 pub mod config;
 mod fonts_gen;
 pub mod gpu;

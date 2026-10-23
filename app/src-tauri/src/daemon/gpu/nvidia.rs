@@ -23,17 +23,12 @@ use nvml_wrapper::error::NvmlError;
 use nvml_wrapper::Nvml;
 use tokio::sync::watch;
 
+/// One GPU's busy share and temperature; either is `None` when the GPU doesn't support it.
+use super::GpuReading as Gpu;
+
 /// The name the dynamic loader is asked for. Many distributions ship the unversioned
 /// `libnvidia-ml.so` only in a development package.
 const LIBRARY: &str = "libnvidia-ml.so.1";
-
-/// Busy share (0 to 100) and temperature in whole °C of one GPU. Either part is `None` when the
-/// GPU doesn't support it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Gpu {
-    pub busy: Option<u32>,
-    pub temp: Option<u32>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NvidiaError {
@@ -168,7 +163,9 @@ impl Nvidia for Open {
         })?;
         Ok(Gpu {
             busy: optional(device.utilization_rates().map(|u| u.gpu))?,
-            temp: optional(device.temperature(TemperatureSensor::Gpu))?,
+            // Saturates, so a value no sensor gives still reaches the caller's range guard.
+            temp: optional(device.temperature(TemperatureSensor::Gpu))?
+                .map(|t| i32::try_from(t).unwrap_or(i32::MAX)),
         })
     }
 }
@@ -578,7 +575,7 @@ mod tests {
         }
     }
 
-    fn card(busy: Option<u32>, temp: Option<u32>) -> FakeNvidia {
+    fn card(busy: Option<u32>, temp: Option<i32>) -> FakeNvidia {
         FakeNvidia::new().with_gpu(PCI, "NVIDIA GeForce RTX 4070", Gpu { busy, temp })
     }
 
