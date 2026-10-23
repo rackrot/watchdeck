@@ -22,6 +22,7 @@ use super::icons::{self, IconSet, Icons};
 use super::protocol::{encode_hex, Button, IconFrame, Message};
 use super::secrets::Secrets;
 use super::store::write_private;
+use super::units::{fit_steps, Metric, NetUnit, TempUnit, Units};
 
 pub const FILE: &str = "config.toml";
 pub const MAX_COLS: u32 = 8;
@@ -80,6 +81,287 @@ pub struct Config {
     pub pages: Vec<PageConfig>,
     #[serde(default, rename = "button")]
     pub buttons: Vec<ButtonConfig>,
+    /// The status bar's GPU, units and color steps. It never reaches a layout. Last, because TOML
+    /// wants the tables that hold arrays of tables after the plain ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_bar: Option<StatusBarConfig>,
+}
+
+/// `[status_bar]`. Every key is a plain string, as `bg` and `font` are, so a bad value gets the
+/// rule's message from [`Config::check`] and not a decode error.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatusBarConfig {
+    /// `auto` (the default), `off`, or a PCI address such as `0000:01:00.0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<String>,
+    /// `c` (the default) or `f`. The temperature steps are in this unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temp_unit: Option<String>,
+    /// `si` (the default), `binary` or `bits`. The rate steps are in MB/s, MiB/s or Mb/s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_unit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thresholds: Option<Thresholds>,
+}
+
+/// Each metric's color steps. A key that is absent takes the default steps for the configured
+/// unit. `[]` means never colored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Thresholds {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<Vec<Step>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem: Option<Vec<Step>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<Vec<Step>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_temp: Option<Vec<Step>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_temp: Option<Vec<Step>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_rx: Option<Vec<Step>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_tx: Option<Vec<Step>>,
+}
+
+/// A value at or past `at`, in the metric's display unit, is drawn in `color`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Step {
+    pub at: i64,
+    /// `#rrggbb`.
+    pub color: String,
+}
+
+/// At most this many steps for a metric.
+pub const MAX_STEPS: usize = 3;
+const AMBER: &str = "#ffb300";
+const RED: &str = "#e53935";
+
+impl Thresholds {
+    pub fn get(&self, metric: Metric) -> Option<&Vec<Step>> {
+        match metric {
+            Metric::Cpu => &self.cpu,
+            Metric::Mem => &self.mem,
+            Metric::Gpu => &self.gpu,
+            Metric::CpuTemp => &self.cpu_temp,
+            Metric::GpuTemp => &self.gpu_temp,
+            Metric::NetRx => &self.net_rx,
+            Metric::NetTx => &self.net_tx,
+        }
+        .as_ref()
+    }
+
+    fn slot(&mut self, metric: Metric) -> &mut Option<Vec<Step>> {
+        match metric {
+            Metric::Cpu => &mut self.cpu,
+            Metric::Mem => &mut self.mem,
+            Metric::Gpu => &mut self.gpu,
+            Metric::CpuTemp => &mut self.cpu_temp,
+            Metric::GpuTemp => &mut self.gpu_temp,
+            Metric::NetRx => &mut self.net_rx,
+            Metric::NetTx => &mut self.net_tx,
+        }
+    }
+
+    /// The steps a metric without a key gets, for temperature unit `temp`. Every metric is
+    /// `Some`, so the editor shows the defaults whichever key the file leaves out.
+    pub fn defaults(temp: TempUnit) -> Self {
+        let steps = |steps: &[(i64, &str)]| {
+            Some(
+                steps
+                    .iter()
+                    .map(|&(at, color)| Step {
+                        at,
+                        color: color.into(),
+                    })
+                    .collect(),
+            )
+        };
+        let (cpu_temp, gpu_temp) = match temp {
+            TempUnit::C => ([(85, AMBER), (95, RED)], [(84, AMBER), (90, RED)]),
+            TempUnit::F => ([(185, AMBER), (203, RED)], [(183, AMBER), (194, RED)]),
+        };
+        Self {
+            cpu: steps(&[(90, AMBER)]),
+            mem: steps(&[(80, AMBER), (90, RED)]),
+            gpu: steps(&[]),
+            cpu_temp: steps(&cpu_temp),
+            gpu_temp: steps(&gpu_temp),
+            net_rx: steps(&[]),
+            net_tx: steps(&[]),
+        }
+    }
+}
+
+/// The default steps for both temperature units, which `get_config` hands the editor so
+/// TypeScript holds no copy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StatusBarDefaults {
+    pub c: Thresholds,
+    pub f: Thresholds,
+}
+
+impl Default for StatusBarDefaults {
+    fn default() -> Self {
+        Self {
+            c: Thresholds::defaults(TempUnit::C),
+            f: Thresholds::defaults(TempUnit::F),
+        }
+    }
+}
+
+/// What `status_bar.gpu` asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GpuChoice {
+    Auto,
+    Off,
+    /// A PCI address as `dddd:bb:dd.f`, lowercase hex.
+    Pci(String),
+}
+
+impl GpuChoice {
+    /// `None` if `text` is neither `auto`, `off` nor a PCI address.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "auto" => Some(Self::Auto),
+            "off" => Some(Self::Off),
+            _ => {
+                let hex = |part: &str| {
+                    part.bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                };
+                // dddd:bb:dd.f
+                let ok = text.len() == 12
+                    && text.is_char_boundary(4)
+                    && text.as_bytes()[4] == b':'
+                    && text.as_bytes()[7] == b':'
+                    && text.as_bytes()[10] == b'.'
+                    && [&text[..4], &text[5..7], &text[8..10], &text[11..]]
+                        .into_iter()
+                        .all(hex);
+                ok.then(|| Self::Pci(text.to_string()))
+            }
+        }
+    }
+}
+
+fn temp_unit_error(text: &str) -> String {
+    format!("status_bar.temp_unit {text:?} is not c or f")
+}
+
+fn net_unit_error(text: &str) -> String {
+    format!("status_bar.net_unit {text:?} is not si, binary or bits")
+}
+
+impl StatusBarConfig {
+    /// Every rule this table breaks. A metric's range depends on the unit it is counted in, so a
+    /// refused unit leaves that metric's range unchecked.
+    fn check(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if let Some(gpu) = self
+            .gpu
+            .as_deref()
+            .filter(|g| GpuChoice::parse(g).is_none())
+        {
+            errors.push(format!(
+                "status_bar.gpu {gpu:?} is not auto, off or a PCI address such as 0000:01:00.0"
+            ));
+        }
+        let temp = self
+            .temp_unit
+            .as_deref()
+            .map(|text| TempUnit::parse(text).ok_or_else(|| errors.push(temp_unit_error(text))));
+        let net = self
+            .net_unit
+            .as_deref()
+            .map(|text| NetUnit::parse(text).ok_or_else(|| errors.push(net_unit_error(text))));
+        // Absent is the default unit; a refused one is `None`.
+        let temp = temp.map_or(Some(TempUnit::default()), Result::ok);
+        let net = net.map_or(Some(NetUnit::default()), Result::ok);
+
+        let Some(thresholds) = &self.thresholds else {
+            return errors;
+        };
+        for metric in Metric::ALL {
+            let Some(steps) = thresholds.get(metric) else {
+                continue;
+            };
+            let key = metric.key();
+            let mut error =
+                |problem: String| errors.push(format!("status_bar.thresholds.{key}: {problem}"));
+            if steps.len() > MAX_STEPS {
+                error(format!("{} steps, at most {MAX_STEPS}", steps.len()));
+            }
+            let range = metric.range(temp, net);
+            for step in steps {
+                if let Some((range, unit)) = range.as_ref().filter(|(r, _)| !r.contains(&step.at)) {
+                    error(format!(
+                        "at {} is outside {} to {} {unit}",
+                        step.at,
+                        range.start(),
+                        range.end()
+                    ));
+                }
+                if color(&step.color).is_none() {
+                    error(format!("color {:?} is not #rrggbb", step.color));
+                }
+            }
+            for pair in steps.windows(2).filter(|p| p[1].at <= p[0].at) {
+                error(format!(
+                    "steps must rise, {} then {}",
+                    pair[0].at, pair[1].at
+                ));
+            }
+        }
+        errors
+    }
+
+    /// This table with its units changed to `temp_unit` and `net_unit` and the steps counted in
+    /// them, for the editor's unit switch. A metric whose unit didn't change keeps its steps as
+    /// they are; a metric with no key keeps having none, since its defaults follow the unit.
+    /// Converted steps are clamped to the new range and made to rise (see [`fit_steps`]).
+    pub fn convert(&self, temp_unit: &str, net_unit: &str) -> Result<Self, String> {
+        let from = Units {
+            temp: (self.temp_unit.as_deref()).map_or(Ok(TempUnit::default()), |t| {
+                TempUnit::parse(t).ok_or_else(|| temp_unit_error(t))
+            })?,
+            net: (self.net_unit.as_deref()).map_or(Ok(NetUnit::default()), |n| {
+                NetUnit::parse(n).ok_or_else(|| net_unit_error(n))
+            })?,
+        };
+        let to = Units {
+            temp: TempUnit::parse(temp_unit).ok_or_else(|| temp_unit_error(temp_unit))?,
+            net: NetUnit::parse(net_unit).ok_or_else(|| net_unit_error(net_unit))?,
+        };
+        let mut next = self.clone();
+        next.temp_unit = Some(to.temp.key().into());
+        next.net_unit = Some(to.net.key().into());
+        let Some(thresholds) = &mut next.thresholds else {
+            return Ok(next);
+        };
+        for metric in Metric::ALL {
+            let Some(steps) = thresholds.slot(metric).as_mut() else {
+                continue;
+            };
+            let converted: Option<Vec<i64>> = (steps.iter())
+                .map(|step| metric.convert(step.at, from, to))
+                .collect();
+            // `None` for a metric the change leaves alone, and for one with no steps.
+            let (Some(mut ats), Some((range, _))) =
+                (converted, metric.range(Some(to.temp), Some(to.net)))
+            else {
+                continue;
+            };
+            fit_steps(&mut ats, &range);
+            for (step, at) in steps.iter_mut().zip(ats) {
+                step.at = at;
+            }
+        }
+        Ok(next)
+    }
 }
 
 /// A page of the grid. Buttons name theirs with `page`.
@@ -394,6 +676,7 @@ impl Config {
             },
             pages: Vec::new(),
             buttons: Vec::new(),
+            status_bar: None,
         }
     }
 
@@ -540,6 +823,9 @@ impl Config {
             errors.push(format!(
                 "{tiles} tiles across all pages, at most {MAX_TILES}"
             ));
+        }
+        if let Some(status_bar) = &self.status_bar {
+            errors.extend(status_bar.check());
         }
         errors
     }
@@ -2422,6 +2708,338 @@ action = { kind = "shell", argv = ["true"] }
             config,
             icons: IconSet::new(),
         }
+    }
+
+    // ---- [status_bar] ----
+
+    /// The example with `[status_bar]` text appended.
+    fn with_bar(bar: &str) -> String {
+        format!("{EXAMPLE}\n{bar}\n")
+    }
+
+    /// Steps for metric `key`, as an inline array in a `[status_bar.thresholds]` table.
+    fn with_steps(unit_keys: &str, key: &str, steps: &str) -> String {
+        with_bar(&format!(
+            "[status_bar]\n{unit_keys}\n[status_bar.thresholds]\n{key} = {steps}"
+        ))
+    }
+
+    const FULL_BAR: &str = r##"
+[status_bar]
+gpu = "0000:01:00.0"
+temp_unit = "f"
+net_unit = "bits"
+
+[status_bar.thresholds]
+cpu = [{ at = 90, color = "#ffb300" }]
+mem = [{ at = 80, color = "#ffb300" }, { at = 90, color = "#e53935" }]
+gpu = []
+cpu_temp = [{ at = 185, color = "#ffb300" }, { at = 203, color = "#e53935" }]
+gpu_temp = [{ at = 183, color = "#ffb300" }]
+net_rx = [{ at = 800, color = "#ffb300" }]
+net_tx = []
+"##;
+
+    #[test]
+    fn a_status_bar_with_every_key_passes() {
+        let config = parse(&with_bar(FULL_BAR), &names()).unwrap();
+        let bar = config.status_bar.as_ref().unwrap();
+        assert_eq!(bar.gpu.as_deref(), Some("0000:01:00.0"));
+        let th = bar.thresholds.as_ref().unwrap();
+        assert_eq!(th.mem.as_ref().unwrap().len(), 2);
+        assert_eq!(th.gpu, Some(Vec::new()), "[] is not the same as absent");
+        // The example has no [status_bar], and still loads as before.
+        assert_eq!(parse(EXAMPLE, &names()).unwrap().status_bar, None);
+        // An empty table and an absent one differ, and so do [] and an absent key.
+        let empty = parse(&with_bar("[status_bar]"), &names()).unwrap();
+        assert_eq!(empty.status_bar, Some(StatusBarConfig::default()));
+        let none = parse(&with_steps("", "net_rx", "[]"), &names()).unwrap();
+        let th = none.status_bar.unwrap().thresholds.unwrap();
+        assert_eq!((th.net_rx, th.net_tx), (Some(Vec::new()), None));
+    }
+
+    #[test]
+    fn the_status_bar_rules_say_what_is_wrong() {
+        let bar = |keys: &str| with_bar(&format!("[status_bar]\n{keys}"));
+        for gpu in [
+            "x",
+            "0000:01:00.0 ",
+            "0000:01:00",
+            "0000:0G:00.0",
+            "0000:01:00.0Z",
+            "AUTO",
+        ] {
+            assert_refused(
+                &bar(&format!("gpu = {gpu:?}")),
+                &format!(
+                    "status_bar.gpu {gpu:?} is not auto, off or a PCI address such as 0000:01:00.0"
+                ),
+            );
+        }
+        assert_refused(
+            &bar("gpu = \"0000:01:00.A\""),
+            "status_bar.gpu \"0000:01:00.A\" is not auto",
+        );
+        for gpu in ["auto", "off", "0000:01:00.0", "75aa:ff:1f.7"] {
+            parse(&bar(&format!("gpu = {gpu:?}")), &names()).unwrap();
+        }
+        assert_refused(
+            &bar("temp_unit = \"k\""),
+            "status_bar.temp_unit \"k\" is not c or f",
+        );
+        assert_refused(
+            &bar("net_unit = \"x\""),
+            "status_bar.net_unit \"x\" is not si, binary or bits",
+        );
+        let at = |at: i64| format!("[{{ at = {at}, color = \"#112233\" }}]");
+        assert_refused(
+            &with_steps("", "mem", &at(0)),
+            "status_bar.thresholds.mem: at 0 is outside 1 to 100 %",
+        );
+        assert_refused(
+            &with_steps("temp_unit = \"f\"", "cpu_temp", &at(400)),
+            "status_bar.thresholds.cpu_temp: at 400 is outside 34 to 302 °F",
+        );
+        assert_refused(
+            &with_steps("", "gpu_temp", &at(151)),
+            "status_bar.thresholds.gpu_temp: at 151 is outside 1 to 150 °C",
+        );
+        assert_refused(
+            &with_steps("net_unit = \"binary\"", "net_tx", &at(100_001)),
+            "status_bar.thresholds.net_tx: at 100001 is outside 1 to 100000 MiB/s",
+        );
+        let four = "[{ at = 1, color = \"#112233\" }, { at = 2, color = \"#112233\" }, \
+                    { at = 3, color = \"#112233\" }, { at = 4, color = \"#112233\" }]";
+        assert_refused(
+            &with_steps("", "mem", four),
+            "status_bar.thresholds.mem: 4 steps, at most 3",
+        );
+        parse(
+            &with_steps(
+                "",
+                "mem",
+                &four.replace(", { at = 4, color = \"#112233\" }", ""),
+            ),
+            &names(),
+        )
+        .unwrap();
+        assert_refused(
+            &with_steps(
+                "",
+                "mem",
+                "[{ at = 90, color = \"#112233\" }, { at = 80, color = \"#112233\" }]",
+            ),
+            "status_bar.thresholds.mem: steps must rise, 90 then 80",
+        );
+        assert_refused(
+            &with_steps(
+                "",
+                "mem",
+                "[{ at = 80, color = \"#112233\" }, { at = 80, color = \"#112233\" }]",
+            ),
+            "status_bar.thresholds.mem: steps must rise, 80 then 80",
+        );
+        assert_refused(
+            &with_steps("", "mem", "[{ at = 80, color = \"red\" }]"),
+            "status_bar.thresholds.mem: color \"red\" is not #rrggbb",
+        );
+    }
+
+    #[test]
+    fn the_status_bar_refuses_unknown_keys_and_a_refused_unit_hides_only_its_range() {
+        assert_refused(
+            &with_bar("[status_bar]\nfont = \"x\""),
+            "unknown field `font`",
+        );
+        assert_refused(
+            &with_bar("[status_bar.thresholds]\nram = []"),
+            "unknown field `ram`",
+        );
+        assert_refused(
+            &with_steps(
+                "",
+                "mem",
+                "[{ at = 80, color = \"#112233\", name = \"x\" }]",
+            ),
+            "unknown field `name`",
+        );
+        // With temp_unit refused, 400 isn't also called out of range, but a net range still is.
+        let errors = errors(&with_bar(
+            "[status_bar]\ntemp_unit = \"k\"\n[status_bar.thresholds]\n\
+             cpu_temp = [{ at = 400, color = \"#112233\" }]\n\
+             net_rx = [{ at = 0, color = \"#112233\" }]",
+        ));
+        assert_eq!(errors.len(), 2, "{errors:?}");
+    }
+
+    #[test]
+    fn the_ranges_follow_the_units() {
+        let step = |unit: &str, key: &str, at: i64| {
+            parse(
+                &with_steps(
+                    unit,
+                    key,
+                    &format!("[{{ at = {at}, color = \"#112233\" }}]"),
+                ),
+                &names(),
+            )
+        };
+        assert!(step("temp_unit = \"f\"", "cpu_temp", 190).is_ok());
+        assert!(step("temp_unit = \"c\"", "cpu_temp", 190).is_err());
+        assert!(step("", "cpu_temp", 190).is_err());
+        assert!(step("net_unit = \"bits\"", "net_rx", 500_000).is_ok());
+        assert!(step("net_unit = \"si\"", "net_rx", 500_000).is_err());
+        assert!(step("net_unit = \"bits\"", "net_rx", 800_001).is_err());
+        assert!(step("temp_unit = \"f\"", "cpu_temp", 33).is_err());
+        assert!(step("temp_unit = \"f\"", "gpu_temp", 34).is_ok());
+    }
+
+    #[test]
+    fn the_default_steps_follow_the_temperature_unit() {
+        let ats = |th: &Thresholds, m: Metric| -> Vec<i64> {
+            th.get(m).unwrap().iter().map(|s| s.at).collect()
+        };
+        let both = StatusBarDefaults::default();
+        for (th, cpu, gpu) in [
+            (&both.c, [85, 95], [84, 90]),
+            (&both.f, [185, 203], [183, 194]),
+        ] {
+            assert_eq!(ats(th, Metric::CpuTemp), cpu);
+            assert_eq!(ats(th, Metric::GpuTemp), gpu);
+            assert_eq!(ats(th, Metric::Cpu), [90]);
+            assert_eq!(ats(th, Metric::Mem), [80, 90]);
+            for m in [Metric::Gpu, Metric::NetRx, Metric::NetTx] {
+                assert_eq!(th.get(m), Some(&Vec::new()), "{m:?}");
+            }
+        }
+        // The defaults pass the rules for their own unit.
+        for (th, unit) in [(both.c.clone(), "c"), (both.f.clone(), "f")] {
+            let config = Config {
+                status_bar: Some(StatusBarConfig {
+                    temp_unit: Some(unit.into()),
+                    thresholds: Some(th),
+                    ..Default::default()
+                }),
+                ..Config::empty()
+            };
+            assert_eq!(config.check(&names()), Vec::<String>::new());
+        }
+        assert_eq!(both.c.cpu_temp.as_ref().unwrap()[1].color, "#e53935");
+        assert_eq!(both.c.cpu_temp.as_ref().unwrap()[0].color, "#ffb300");
+    }
+
+    /// A bar with the given units and steps for one metric.
+    fn bar_with(temp: &str, net: &str, set: impl FnOnce(&mut Thresholds)) -> StatusBarConfig {
+        let mut th = Thresholds::default();
+        set(&mut th);
+        StatusBarConfig {
+            temp_unit: Some(temp.into()),
+            net_unit: Some(net.into()),
+            thresholds: Some(th),
+            ..Default::default()
+        }
+    }
+
+    fn steps(ats: &[i64]) -> Option<Vec<Step>> {
+        Some(
+            ats.iter()
+                .map(|&at| Step {
+                    at,
+                    color: "#112233".into(),
+                })
+                .collect(),
+        )
+    }
+
+    fn ats(steps: &Option<Vec<Step>>) -> Vec<i64> {
+        steps.as_ref().unwrap().iter().map(|s| s.at).collect()
+    }
+
+    #[test]
+    fn convert_status_bar_converts_temperatures() {
+        let c = bar_with("c", "si", |t| t.cpu_temp = steps(&[85]));
+        let f = c.convert("f", "si").unwrap();
+        assert_eq!(f.temp_unit.as_deref(), Some("f"));
+        assert_eq!(ats(&f.thresholds.as_ref().unwrap().cpu_temp), [185]);
+        let back = f.convert("c", "si").unwrap();
+        assert_eq!(back, c);
+        // 84 and 85 °F are both 29 °C: the higher one moves up.
+        let two = bar_with("f", "si", |t| t.gpu_temp = steps(&[84, 85]));
+        let c = two.convert("c", "si").unwrap();
+        assert_eq!(ats(&c.thresholds.as_ref().unwrap().gpu_temp), [29, 30]);
+        // Out of the new range: clamped (302 °F is 150 °C, 34 °F is 1 °C, 33 °F is 1 °C).
+        let edge = bar_with("f", "si", |t| t.cpu_temp = steps(&[33, 400]));
+        let c = edge.convert("c", "si").unwrap();
+        assert_eq!(ats(&c.thresholds.as_ref().unwrap().cpu_temp), [1, 150]);
+        let edge = bar_with("c", "si", |t| t.cpu_temp = steps(&[1, 150]));
+        let f = edge.convert("f", "si").unwrap();
+        assert_eq!(ats(&f.thresholds.as_ref().unwrap().cpu_temp), [34, 302]);
+    }
+
+    #[test]
+    fn convert_status_bar_converts_rates_and_leaves_the_rest() {
+        let bar = bar_with("c", "si", |t| {
+            t.net_rx = steps(&[100]);
+            t.net_tx = Some(Vec::new());
+            t.mem = steps(&[90]);
+            t.cpu_temp = steps(&[85]);
+        });
+        let bin = bar.convert("c", "binary").unwrap();
+        let th = bin.thresholds.as_ref().unwrap();
+        assert_eq!(ats(&th.net_rx), [95]);
+        assert_eq!(th.net_tx, Some(Vec::new()), "[] stays []");
+        assert_eq!(th.gpu, None, "an absent key stays absent");
+        assert_eq!(ats(&th.mem), [90]);
+        assert_eq!(ats(&th.cpu_temp), [85], "the temperature didn't change");
+        assert_eq!(
+            ats(&bin.convert("c", "si").unwrap().thresholds.unwrap().net_rx),
+            [100]
+        );
+        let bits = bar.convert("c", "bits").unwrap();
+        assert_eq!(ats(&bits.thresholds.unwrap().net_rx), [800]);
+        // Units absent in the draft count as c and si.
+        let bare = StatusBarConfig::default().convert("f", "bits").unwrap();
+        assert_eq!(
+            (
+                bare.temp_unit.as_deref(),
+                bare.net_unit.as_deref(),
+                bare.thresholds
+            ),
+            (Some("f"), Some("bits"), None)
+        );
+        assert!(bar.convert("k", "si").unwrap_err().contains("temp_unit"));
+        assert!(bar.convert("c", "x").unwrap_err().contains("net_unit"));
+    }
+
+    #[test]
+    fn a_status_bar_only_change_leaves_the_layout_equal() {
+        let before = parse(EXAMPLE, &names()).unwrap();
+        let after = parse(&with_bar(FULL_BAR), &names()).unwrap();
+        assert_ne!(before, after);
+        assert_eq!(live(before).layout(), live(after).layout());
+    }
+
+    #[test]
+    fn the_status_bar_survives_a_save_and_parse() {
+        let config = parse(&with_bar(FULL_BAR), &names()).unwrap();
+        let saved = toml::to_string(&config).unwrap();
+        assert_eq!(parse(&saved, &names()).unwrap(), config, "{saved}");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let configs = open(tmp.path());
+        let loaded = configs.status().borrow().revision.clone();
+        let mut config = configs.current().config.clone();
+        config.status_bar = parse(&with_bar(FULL_BAR), &names()).unwrap().status_bar;
+        let revision = configs.save(config.clone(), &loaded).unwrap();
+        let text = fs::read_to_string(tmp.path().join(FILE)).unwrap();
+        assert_eq!(parse(&text, &Ok(Vec::new())).unwrap(), config, "{text}");
+        assert_eq!(configs.current().config, config);
+        assert_eq!(configs.reload(), Ok(false), "{revision}");
+        // A second save of the reloaded config keeps every key.
+        let again = configs
+            .save(configs.current().config.clone(), &revision)
+            .unwrap();
+        assert_eq!(again, revision);
     }
 
     // ---- The file ----

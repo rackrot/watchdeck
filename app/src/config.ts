@@ -55,6 +55,39 @@ export type PageConfig = {
   label?: string;
 };
 
+/** A value at or past `at`, in the metric's display unit, is drawn in `color` (`#rrggbb`). */
+export type Step = { at: number; color: string };
+
+/** The status bar's metrics, as the wire and `[status_bar.thresholds]` name them. */
+export type Metric =
+  | "cpu"
+  | "mem"
+  | "gpu"
+  | "cpu_temp"
+  | "gpu_temp"
+  | "net_rx"
+  | "net_tx";
+
+/** Up to 3 steps with `at` rising. An absent key takes the defaults; `[]` is never colored. */
+export type Thresholds = { [M in Metric]?: Step[] };
+
+export type TempUnit = "c" | "f";
+export type NetUnit = "si" | "binary" | "bits";
+
+/** `[status_bar]`. Absent keys take their defaults. */
+export type StatusBarConfig = {
+  /** `"auto"`, `"off"`, or a PCI address such as `0000:01:00.0`. Absent: auto. */
+  gpu?: string;
+  /** The temperature steps are in this unit. Absent: `c`. */
+  temp_unit?: TempUnit;
+  /** The rate steps are in MB/s (`si`), MiB/s (`binary`) or Mb/s (`bits`). Absent: `si`. */
+  net_unit?: NetUnit;
+  thresholds?: Thresholds;
+};
+
+/** The steps a metric without a key gets, for each temperature unit (`ConfigView`). */
+export type StatusBarDefaults = Record<TempUnit, Required<Thresholds>>;
+
 export type Config = {
   version: number;
   /** `font` is the grid's default font id. Absent: Montserrat. */
@@ -63,6 +96,8 @@ export type Config = {
   page?: PageConfig[];
   /** The TOML array of tables is `[[button]]`. */
   button: ButtonConfig[];
+  /** Never part of a layout. A layout edit must carry it along, since a save rewrites the file. */
+  status_bar?: StatusBarConfig;
 };
 
 /** `get_config`, and the `config-status` event without the config. */
@@ -77,7 +112,11 @@ export type ConfigStatus = {
  * `get_config`. `loaded` is false when no good config has loaded since the app started, so
  * `config` is an empty grid and not any version of the file.
  */
-export type ConfigView = ConfigStatus & { config: Config; loaded: boolean };
+export type ConfigView = ConfigStatus & {
+  config: Config;
+  loaded: boolean;
+  status_bar_defaults: StatusBarDefaults;
+};
 
 export const METHODS = [
   "GET",

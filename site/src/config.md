@@ -156,6 +156,59 @@ Swipe up on the grid to open settings. A swipe counts when it moves at least 200
 
 Until the first layout arrives, and while the device is unpaired, it shows the status screen instead: the Wi-Fi, SD, USB, touch and daemon lines, with Licenses and, while paired, Forget pairing.
 
+### Status bar settings
+
+An optional `[status_bar]` table chooses the GPU, the units the bar shows, and the colors values take past a threshold. It changes nothing in the grid: a save or edit that touches only `[status_bar]` pushes no layout to a device.
+
+```toml
+[status_bar]
+gpu = "auto"        # "auto", "off", or a PCI address such as "0000:01:00.0"
+temp_unit = "c"     # "c" or "f". The temperature steps below are in this unit
+net_unit = "si"     # "si" (1.2M), "binary" (1.1Mi) or "bits" (9.6Mb). The rate steps are in MB/s, MiB/s or Mb/s
+
+[status_bar.thresholds]
+mem = [{ at = 80, color = "#ffb300" }, { at = 90, color = "#e53935" }]
+cpu_temp = [{ at = 85, color = "#ffb300" }, { at = 95, color = "#e53935" }]
+net_rx = []         # never colored
+```
+
+The window writes the same steps as `[[status_bar.thresholds.mem]]` tables when it saves. Both forms parse the same.
+
+| Key | Rule |
+|---|---|
+| `gpu` | `auto` (default), `off`, or a PCI address as `dddd:bb:dd.f` in lowercase hex, such as `0000:01:00.0` |
+| `temp_unit` | `c` (default) or `f`. The bar shows `64°C` or `147°F`; the letter is always shown |
+| `net_unit` | `si` (default): bytes with 1000-based prefixes, `1.2M`. `binary`: bytes with 1024-based prefixes, `1.1Mi`. `bits`: bits with 1000-based prefixes, `9.6Mb`. Bytes carry no `B`, and bits always carry their `b`, so the two never look alike |
+| `thresholds` | A table of up to 3 steps for each metric, below |
+
+Temperatures arrive from the sensors in whole °C. The device converts to °F to show them, rounding to the nearest degree (0 °C is 32 °F, 64 °C is 147 °F). A rate is shown in the chosen unit, divided by 1000 (1024 for `binary`) until it is under 1000, then one decimal, cut and not rounded, so `1.25 MB/s` shows `1.2M`. `binary` changes prefix at 1000, not 1024, so `1000 KiB/s` shows `0.9Mi`.
+
+#### Thresholds
+
+Each metric takes `[{ at = N, color = "#rrggbb" }, ...]`, up to 3 steps with `at` rising. A value at or past a step's `at` is drawn in that step's color, and the highest step it reaches wins. The number is judged as the bar shows it, in the units you chose: with `temp_unit = "f"`, a step at 190 turns red exactly when the bar shows 190°F or more, and a RAM share is cut to a whole percent first.
+
+| Key | Counted in | `at` | Default steps |
+|---|---|---|---|
+| `cpu` | % busy | 1 to 100 | 90 amber |
+| `mem` (RAM on the bar) | % used | 1 to 100 | 80 amber, 90 red |
+| `gpu` | % busy | 1 to 100 | none |
+| `cpu_temp` | °C or °F | 1 to 150 (°C), 34 to 302 (°F) | 85 amber, 95 red (°C); 185, 203 (°F) |
+| `gpu_temp` | °C or °F | 1 to 150 (°C), 34 to 302 (°F) | 84 amber, 90 red (°C); 183, 194 (°F) |
+| `net_rx`, `net_tx` | MB/s (`si`), MiB/s (`binary`) or Mb/s (`bits`) | 1 to 100000 (`si`, `binary`), 1 to 800000 (`bits`) | none |
+
+- Amber is `#ffb300` and red `#e53935`. The metric names are the wire's, so RAM is `mem`.
+- A metric without a key takes its defaults for the configured unit. `[]` means it is never colored, which differs from leaving the key out.
+- Hysteresis: once a step is reached it holds until the value falls below `at` minus a margin: 2 for percent and °C, 4 for °F (about 2 °C, since a °F step is about 1.8 °C), and a tenth of `at` for rates. A value that blinks around a step doesn't flicker. Changing the config, units included, starts every metric afresh.
+- An error names the key: `status_bar.thresholds.cpu_temp: at 400 is outside 34 to 302 °F`, `status_bar.thresholds.mem: 4 steps, at most 3`, `status_bar.thresholds.mem: steps must rise, 90 then 80`, `status_bar.thresholds.mem: color "red" is not #rrggbb`, `status_bar.temp_unit "k" is not c or f`. Unknown keys are errors, as everywhere in the file.
+- **Editing a unit by hand changes what the steps mean.** The steps are counted in the unit the file names, and nothing converts them when you edit `temp_unit` or `net_unit` in a text editor. The ranges catch some of it (a 190 left behind after a switch back to `c` is outside 1 to 150), but not all: 85 is valid in both. The Status bar form in the window converts the steps when you change a unit there.
+
+#### Which GPU
+
+- `auto` picks the GPU the machine booted its console on (`boot_vga`), else the one with the lowest PCI address, among those the app can read (NVIDIA through its driver, AMD through `amdgpu`). On a desktop with a discrete card that is the discrete card.
+- `off` shows `GPU --`.
+- An address that names no GPU, or one that can't be read, is not a config error, since an external GPU can be unplugged. The bar shows `GPU --` and the app logs it once.
+- On a laptop with a hybrid GPU, `auto` usually picks the integrated GPU. Naming the NVIDIA card by address keeps it awake while a device is connected, because reading it opens the driver.
+
 ## Icons
 
 A button can show a picture above its label. The picture is a PNG, JPEG, WebP or SVG file in `$XDG_CONFIG_HOME/watchdeck/icons/`, and `icon` names the file:

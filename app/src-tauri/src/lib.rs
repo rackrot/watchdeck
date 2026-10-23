@@ -262,6 +262,7 @@ pub fn run() {
             commands::cancel_pairing,
             commands::get_config,
             commands::save_config,
+            commands::convert_status_bar,
             commands::list_secrets,
             commands::set_secret,
             commands::delete_secret,

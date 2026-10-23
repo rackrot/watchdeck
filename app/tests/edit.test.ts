@@ -818,3 +818,41 @@ test("a move swaps within a page, and a cell on another page is not in the way",
   assert.equal(buttonAt(pagedConfig, 0, [0, 0], 0), undefined);
   assert.equal(buttonAt(pagedConfig, 1, [1, 0]), undefined);
 });
+
+test("every layout edit keeps status_bar in the draft, and a status_bar edit is no layout change", () => {
+  const status_bar: Config["status_bar"] = {
+    gpu: "off",
+    temp_unit: "f",
+    net_unit: "bits",
+    thresholds: {
+      mem: [{ at: 90, color: "#e53935" }],
+      net_rx: [],
+    },
+  };
+  const withBar: Config = { ...pagedConfig, status_bar };
+  const edits: Config[] = [
+    moveButton(withBar, 0, [1, 0]),
+    addPage(withBar),
+    renamePage(withBar, 0, "Home"),
+    movePage(withBar, 0, 1),
+    removePage(withBar, 1),
+    withGridFont(withBar, "inter"),
+  ];
+  for (const edited of edits) {
+    assert.deepEqual(edited.status_bar, status_bar);
+  }
+  // Dropping to one page strips the page keys and still keeps the bar.
+  assert.deepEqual(
+    removePage(removePage(withBar, 1), 0).status_bar,
+    status_bar,
+  );
+
+  const changed: Config = {
+    ...withBar,
+    status_bar: { ...status_bar, temp_unit: "c" },
+  };
+  assert.equal(layoutChanged(withBar, changed), false);
+  assert.equal(layoutChanged(pagedConfig, withBar), false);
+  const devices = [{ id: "d", connected: true, caps: ["pages", "fonts"] }];
+  assert.deepEqual(layoutTargets(withBar, changed, devices), []);
+});

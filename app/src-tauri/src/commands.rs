@@ -8,7 +8,7 @@ use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::daemon::actions::ActionResult;
-use crate::daemon::config::{Config, Configs};
+use crate::daemon::config::{Config, Configs, StatusBarConfig, StatusBarDefaults};
 use crate::daemon::pairing::{Pairing, PairingState};
 use crate::daemon::secrets::Secrets;
 use crate::daemon::server::{DeviceInfo, Devices};
@@ -76,6 +76,9 @@ pub struct ConfigView {
     errors: Vec<String>,
     /// False if no good config has loaded since the app started, so `config` is an empty grid.
     loaded: bool,
+    /// The steps a status bar metric without a key gets, for each temperature unit, so the editor
+    /// holds no copy.
+    status_bar_defaults: StatusBarDefaults,
 }
 
 #[tauri::command]
@@ -86,7 +89,19 @@ pub fn get_config(daemon: State<'_, Daemon>) -> ConfigView {
         revision: status.revision,
         errors: status.errors,
         loaded: status.loaded,
+        status_bar_defaults: StatusBarDefaults::default(),
     }
+}
+
+/// `bar` with its units changed to `temp_unit` and `net_unit` and its steps converted to match,
+/// for the status bar form. Nothing is saved.
+#[tauri::command]
+pub fn convert_status_bar(
+    bar: StatusBarConfig,
+    temp_unit: String,
+    net_unit: String,
+) -> Result<StatusBarConfig, String> {
+    bar.convert(&temp_unit, &net_unit)
 }
 
 /// Checks and writes the config. Returns the new revision, or every rule it breaks, in which

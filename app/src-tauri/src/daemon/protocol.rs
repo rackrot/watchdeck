@@ -6,6 +6,9 @@ use std::sync::{Arc, OnceLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+// How the device shows temperatures and rates. The values in `stats` stay in °C and bytes per second.
+pub use super::units::{NetUnit, TempUnit};
+
 pub const VERSION: u32 = 1;
 
 /// The capabilities a session keeps from `hello.caps`; any other name is dropped.
@@ -86,26 +89,6 @@ pub struct Button {
 pub enum TileState {
     Ok,
     Bad,
-}
-
-/// How the device shows temperatures. The values in `stats` stay in °C.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TempUnit {
-    C,
-    F,
-}
-
-/// How the device shows network rates. The values in `stats` stay in bytes per second.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum NetUnit {
-    /// Bytes with 1000-based prefixes, `1.2M`.
-    Si,
-    /// Bytes with 1024-based prefixes, `1.1Mi`.
-    Binary,
-    /// Bits with 1000-based prefixes, `9.6Mb`.
-    Bits,
 }
 
 /// The colors of the values past a threshold, as `0xRRGGBB`. A value at its normal color has no

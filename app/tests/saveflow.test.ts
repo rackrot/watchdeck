@@ -12,7 +12,22 @@ import {
 } from "../src/saveflow.ts";
 
 const config: Config = { version: 1, layout: { cols: 5, rows: 3 }, button: [] };
-const view: ConfigView = { config, revision: "r1", errors: [], loaded: true };
+const noSteps = {
+  cpu: [],
+  mem: [],
+  gpu: [],
+  cpu_temp: [],
+  gpu_temp: [],
+  net_rx: [],
+  net_tx: [],
+};
+const view: ConfigView = {
+  config,
+  revision: "r1",
+  errors: [],
+  loaded: true,
+  status_bar_defaults: { c: noSteps, f: noSteps },
+};
 
 test("the draft is dirty only when it differs from what was loaded", () => {
   assert.equal(isDirty(structuredClone(config), view), false);
