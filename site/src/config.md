@@ -210,7 +210,7 @@ Each metric takes `[{ at = N, color = "#rrggbb" }, ...]`, up to 3 steps with `at
 
 - Amber is `#ffb300` and red `#e53935`. The metric names are the wire's, so RAM is `mem`.
 - A metric without a key takes its defaults for the configured unit. `[]` means it is never colored, which differs from leaving the key out.
-- Hysteresis: once a step is reached it holds until the value falls below `at` minus a margin: 2 for percent and °C, 4 for °F (about 2 °C, since a °F step is about 1.8 °C), and a tenth of `at` for rates. A value that blinks around a step doesn't flicker. Changing the config, units included, starts every metric afresh.
+- Hysteresis: once a step is reached it holds until the value falls below `at` minus a margin: 2 for percent and °C, 4 for °F (about 2 °C, since a °C is about 1.8 °F), and a tenth of `at` for rates. A value that blinks around a step doesn't flicker. A change to the units or steps, or the last device disconnecting, starts every metric afresh.
 - An error names the key: `status_bar.thresholds.cpu_temp: at 400 is outside 34 to 302 °F`, `status_bar.thresholds.mem: 4 steps, at most 3`, `status_bar.thresholds.mem: steps must rise, 90 then 80`, `status_bar.thresholds.mem: color "red" is not #rrggbb`, `status_bar.temp_unit "k" is not c or f`. Unknown keys are errors, as everywhere in the file.
 - **Editing a unit by hand changes what the steps mean.** The steps are counted in the unit the file names, and nothing converts them when you edit `temp_unit` or `net_unit` in a text editor. The ranges catch some of it (a 190 left behind after a switch back to `c` is outside 1 to 150), but not all: 85 is valid in both. The Status bar form in the window converts the steps when you change a unit there.
 
@@ -218,7 +218,7 @@ Each metric takes `[{ at = N, color = "#rrggbb" }, ...]`, up to 3 steps with `at
 
 - `auto` picks the GPU the machine booted its console on (`boot_vga`), else the one with the lowest PCI address, among those the app can read (NVIDIA through its driver, AMD through `amdgpu`). On a desktop with a discrete card that is the discrete card.
 - `off` shows `GPU --`.
-- An address that names no GPU, or one that can't be read, is not a config error, since an external GPU can be unplugged. The bar shows `GPU --`, and the app logs the reason at info level each time a session starts.
+- An address that names no GPU, or one that can't be read, is not a config error, since an external GPU can be unplugged. The bar shows `GPU --`, and the app logs why when the bar's sampling starts or the setting changes.
 - On a laptop with a hybrid GPU, `auto` usually picks the integrated GPU. Naming the NVIDIA card by address keeps it awake while a device is connected, because reading it opens the driver.
 - Reading an AMD dGPU's sysfs each second may wake it if it is runtime-suspended. The daemon makes those reads while a device is connected and the AMD GPU is the one picked, whether by `auto` or by address. A read that takes longer than 500 ms leaves the CPU temperature and that GPU's values as `--` for that tick, and the next tick waits for the same read rather than starting another.
 - The daemon opens NVML only while a device is connected and the selected GPU is NVIDIA. While it is open, the daemon holds the driver's `/dev/nvidia*` files. They close when the last device disconnects, or when the selection moves to another GPU.
