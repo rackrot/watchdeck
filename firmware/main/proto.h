@@ -102,7 +102,31 @@ typedef struct {
     uint8_t c_host[PROTO_HASH_LEN];
 } proto_pair_offer_t;
 
+typedef enum {
+    PROTO_TEMP_C,
+    PROTO_TEMP_F,
+} proto_temp_unit_t;
+
+typedef enum {
+    PROTO_NET_SI,
+    PROTO_NET_BINARY,
+    PROTO_NET_BITS,
+} proto_net_unit_t;
+
+// The index of each value in a `stats` frame's colors, and its bit in colors_mask.
+typedef enum {
+    PROTO_COLOR_CPU,
+    PROTO_COLOR_MEM,
+    PROTO_COLOR_GPU,
+    PROTO_COLOR_CPU_TEMP,
+    PROTO_COLOR_GPU_TEMP,
+    PROTO_COLOR_NET_RX,
+    PROTO_COLOR_NET_TX,
+    PROTO_COLOR_COUNT,
+} proto_color_t;
+
 // A `stats` frame. Each has_ flag says its field was sent; the pairs come together or not at all.
+// Temperatures are whole °C and rates bytes per second, whatever the units say.
 typedef struct {
     uint64_t time; // the host's clock, Unix seconds
     bool has_utc_offset;
@@ -113,8 +137,18 @@ typedef struct {
     uint64_t mem_used;
     uint64_t mem_total;
     bool has_net;
-    uint64_t net_rx; // bytes per second
+    uint64_t net_rx;
     uint64_t net_tx;
+    bool has_gpu;
+    uint8_t gpu; // percent busy, the selected GPU
+    bool has_cpu_temp;
+    int16_t cpu_temp;
+    bool has_gpu_temp;
+    int16_t gpu_temp;
+    proto_temp_unit_t temp_unit;        // C when absent
+    proto_net_unit_t net_unit;          // SI when absent
+    uint32_t colors[PROTO_COLOR_COUNT]; // 0xRRGGBB, valid where colors_mask has the value's bit
+    uint8_t colors_mask;
 } proto_stats_t;
 
 // A validated icon frame. `pixels` points into the frame, which the caller still owns.

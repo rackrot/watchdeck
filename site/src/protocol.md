@@ -431,7 +431,7 @@ The device updates the button's text and color in place and doesn't rebuild the 
 ### `stats` (daemon → device)
 
 ```json
-{"t":"stats","time":1792692433,"utc_offset":-14400,"cpu":12,"mem_used":10522394624,"mem_total":33395638272,"net_rx":125000,"net_tx":34000}
+{"t":"stats","time":1792692433,"utc_offset":-14400,"cpu":12,"cpu_temp":64,"gpu":23,"gpu_temp":41,"mem_used":10522394624,"mem_total":33395638272,"net_rx":125000,"net_tx":34000,"temp_unit":"c","net_unit":"si","colors":{"cpu":16757504}}
 ```
 
 | Field | Type | Meaning |
@@ -439,13 +439,20 @@ The device updates the button's text and color in place and doesn't rebuild the 
 | `time` | int | Required. The daemon host's clock when the frame was sent, Unix seconds, 0 to 2^53 - 1 |
 | `utc_offset` | int | Optional. The host's local offset from UTC in seconds, -64800 to 64800. Absent: the device shows UTC |
 | `cpu` | int | Optional. Busy share of all CPUs since the last frame, 0 to 100. Absent on the first frame |
+| `cpu_temp` | int | Optional. The CPU's temperature in whole °C, -40 to 150 |
+| `gpu` | int | Optional. Busy share of the selected GPU, 0 to 100 |
+| `gpu_temp` | int | Optional. The selected GPU's temperature in whole °C, -40 to 150 |
 | `mem_used`, `mem_total` | int | Optional, both or neither. Bytes, used = total minus available. `mem_used` at most `mem_total`. Each 0 to 2^53 - 1 |
 | `net_rx`, `net_tx` | int | Optional, both or neither. Bytes per second received and sent on the host's default-route interface since the last frame. Each 0 to 2^53 - 1 |
+| `temp_unit` | string | Optional. `"c"` or `"f"`: how the device shows temperatures. Absent: `"c"`. The temperature values stay in °C |
+| `net_unit` | string | Optional. `"si"`, `"binary"` or `"bits"`: how the device shows rates. Absent: `"si"`. The rate values stay in bytes per second |
+| `colors` | object | Optional. Each key is a value past a threshold: `cpu`, `mem`, `gpu`, `cpu_temp`, `gpu_temp`, `net_rx` or `net_tx`. Its value is the color to draw that value in, a whole `0xRRGGBB` number, 0 to 16777215. Absent or empty: every value keeps the bar's color |
 
 The daemon sends `stats` once a second, and only to a session whose `hello` names `status_bar` in [`caps`](#hello-device--daemon), and only after `welcome`. It never sends one between the pages of a [set](#pages).
 
-- **Refused**: a field of the wrong type (a fraction in an int field, a string, `null`), a value out of its range, a missing `time`, a `mem_*` or `net_*` field without its partner, or `mem_used` above `mem_total`. The device logs the frame and drops it. The link stays up.
-- **Unknown fields** are ignored.
+- **Refused**: a field of the wrong type (a fraction in an int field, a string, `null`), a value out of its range, a missing `time`, a `mem_*` or `net_*` field without its partner, or `mem_used` above `mem_total`. Also a unit string that isn't in its list (`"F"` is not `"f"`), and a `colors` that isn't an object or has a known key whose value isn't a whole number in range. The device logs the frame and drops it. The link stays up.
+- **Ignored**: unknown fields and unknown keys in `colors`. A `colors` entry for a value the frame doesn't send (a `gpu` color with no `gpu`) is accepted and does nothing.
+- `gpu`, `cpu_temp` and `gpu_temp` are independent: a GPU with no temperature sensor still sends its `gpu` busy share.
 - The device logs each valid `stats` at debug level, not in the INFO line it logs for other messages, since a frame arrives every second. The firmware compiles debug logs out (`CONFIG_LOG_MAXIMUM_LEVEL=3`), so seeing them needs a rebuild with debug enabled. A refused `stats` gets the INFO line.
 
 ### `report` (device → daemon)

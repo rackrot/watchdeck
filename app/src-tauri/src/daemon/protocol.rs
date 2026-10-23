@@ -88,6 +88,46 @@ pub enum TileState {
     Bad,
 }
 
+/// How the device shows temperatures. The values in `stats` stay in °C.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TempUnit {
+    C,
+    F,
+}
+
+/// How the device shows network rates. The values in `stats` stay in bytes per second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetUnit {
+    /// Bytes with 1000-based prefixes, `1.2M`.
+    Si,
+    /// Bytes with 1024-based prefixes, `1.1Mi`.
+    Binary,
+    /// Bits with 1000-based prefixes, `9.6Mb`.
+    Bits,
+}
+
+/// The colors of the values past a threshold, as `0xRRGGBB`. A value at its normal color has no
+/// entry, and an absent key is left out of the frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Colors {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_temp: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_temp: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_rx: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_tx: Option<u32>,
+}
+
 /// A device's token as sent in `hello`: 64 lowercase hex digits. Debug never prints it.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -193,6 +233,24 @@ pub enum Message {
         /// Bytes per second sent on the default-route interface. Needs `net_rx`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         net_tx: Option<u64>,
+        /// Busy share of the selected GPU, 0 to 100.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gpu: Option<u32>,
+        /// The CPU's temperature in whole °C, -40 to 150.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cpu_temp: Option<i32>,
+        /// The selected GPU's temperature in whole °C, -40 to 150.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gpu_temp: Option<i32>,
+        /// How the device shows temperatures. Absent means °C.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        temp_unit: Option<TempUnit>,
+        /// How the device shows network rates. Absent means SI.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        net_unit: Option<NetUnit>,
+        /// The color of each value past a threshold. Absent means every value keeps the bar's color.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        colors: Option<Colors>,
     },
     /// A crash or abnormal reset from an earlier boot. Unchecked until [`Report::check`] passes.
     Report(Report),
@@ -523,7 +581,7 @@ mod tests {
     use serde_json::Value;
 
     // The fixtures are the JSON examples from site/src/protocol.md.
-    const FIXTURES: [&str; 20] = [
+    const FIXTURES: [&str; 21] = [
         include_str!("../../tests/fixtures/hello.json"),
         include_str!("../../tests/fixtures/welcome.json"),
         include_str!("../../tests/fixtures/error.json"),
@@ -537,6 +595,7 @@ mod tests {
         include_str!("../../tests/fixtures/tile.json"),
         include_str!("../../tests/fixtures/stats.json"),
         include_str!("../../tests/fixtures/stats_min.json"),
+        include_str!("../../tests/fixtures/stats_colors.json"),
         include_str!("../../tests/fixtures/report.json"),
         include_str!("../../tests/fixtures/report_ack.json"),
         include_str!("../../tests/fixtures/pair_req.json"),
@@ -554,6 +613,39 @@ mod tests {
             let expected: Value = serde_json::from_str(fixture).unwrap();
             assert_eq!(serde_json::to_value(&msg).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn stats_units_and_colors_are_typed_and_an_unknown_unit_is_refused() {
+        let Message::Stats {
+            temp_unit,
+            net_unit,
+            colors,
+            ..
+        } = serde_json::from_str(include_str!("../../tests/fixtures/stats_colors.json")).unwrap()
+        else {
+            panic!("expected a stats frame")
+        };
+        assert_eq!(temp_unit, Some(TempUnit::F));
+        assert_eq!(net_unit, Some(NetUnit::Bits));
+        assert_eq!(colors.and_then(|c| c.gpu_temp), Some(2001125));
+
+        let min = include_str!("../../tests/fixtures/stats_min.json");
+        let Message::Stats {
+            temp_unit,
+            net_unit,
+            colors,
+            ..
+        } = serde_json::from_str(min).unwrap()
+        else {
+            panic!("expected a stats frame")
+        };
+        assert_eq!((temp_unit, net_unit, colors), (None, None, None));
+
+        let bad = r#"{"t":"stats","time":1,"temp_unit":"k"}"#;
+        assert!(serde_json::from_str::<Message>(bad).is_err());
+        let bad = r#"{"t":"stats","time":1,"net_unit":"mib"}"#;
+        assert!(serde_json::from_str::<Message>(bad).is_err());
     }
 
     #[test]

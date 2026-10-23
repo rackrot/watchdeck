@@ -1,0 +1,24 @@
+{
+  "t": "stats",
+  "time": 1792692434,
+  "utc_offset": 3600,
+  "cpu": 97,
+  "cpu_temp": 88,
+  "gpu": 100,
+  "gpu_temp": 84,
+  "mem_used": 91000000000,
+  "mem_total": 98495209472,
+  "net_rx": 125000000,
+  "net_tx": 34000000,
+  "temp_unit": "f",
+  "net_unit": "bits",
+  "colors": {
+    "cpu": 16757504,
+    "mem": 15022389,
+    "gpu": 2001125,
+    "cpu_temp": 15022389,
+    "gpu_temp": 2001125,
+    "net_rx": 4431943,
+    "net_tx": 16757504
+  }
+}

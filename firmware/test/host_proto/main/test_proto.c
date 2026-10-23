@@ -783,8 +783,15 @@ void test_hello_with_three_caps_and_a_32_character_fw_is_219_bytes(void)
 
 // The fixtures in app/src-tauri/tests/fixtures/, which the daemon round-trips.
 static const char STATS_FULL[] =
-    "{\"t\":\"stats\",\"time\":1792692433,\"utc_offset\":-14400,\"cpu\":12,\"mem_used\":10522394624,"
-    "\"mem_total\":33395638272,\"net_rx\":125000,\"net_tx\":34000}";
+    "{\"t\":\"stats\",\"time\":1792692433,\"utc_offset\":-14400,\"cpu\":12,\"cpu_temp\":64,\"gpu\":23,"
+    "\"gpu_temp\":41,\"mem_used\":10522394624,\"mem_total\":33395638272,\"net_rx\":125000,\"net_tx\":34000,"
+    "\"temp_unit\":\"c\",\"net_unit\":\"si\",\"colors\":{\"cpu\":16757504}}";
+static const char STATS_COLORS[] =
+    "{\"t\":\"stats\",\"time\":1792692434,\"utc_offset\":3600,\"cpu\":97,\"cpu_temp\":88,\"gpu\":100,"
+    "\"gpu_temp\":84,\"mem_used\":91000000000,\"mem_total\":98495209472,\"net_rx\":125000000,"
+    "\"net_tx\":34000000,\"temp_unit\":\"f\",\"net_unit\":\"bits\",\"colors\":{\"cpu\":16757504,"
+    "\"mem\":15022389,\"gpu\":2001125,\"cpu_temp\":15022389,\"gpu_temp\":2001125,\"net_rx\":4431943,"
+    "\"net_tx\":16757504}}";
 static const char STATS_MIN[] = "{\"t\":\"stats\",\"time\":1792692433}";
 
 // Parse a stats message whose body is `fields`, the members after "t".
@@ -809,6 +816,35 @@ void test_stats_full_fixture_has_every_field(void)
     TEST_ASSERT_TRUE(msg.stats.has_net);
     TEST_ASSERT_EQUAL_UINT64(125000, msg.stats.net_rx);
     TEST_ASSERT_EQUAL_UINT64(34000, msg.stats.net_tx);
+    TEST_ASSERT_TRUE(msg.stats.has_gpu);
+    TEST_ASSERT_EQUAL_UINT8(23, msg.stats.gpu);
+    TEST_ASSERT_TRUE(msg.stats.has_cpu_temp);
+    TEST_ASSERT_EQUAL_INT16(64, msg.stats.cpu_temp);
+    TEST_ASSERT_TRUE(msg.stats.has_gpu_temp);
+    TEST_ASSERT_EQUAL_INT16(41, msg.stats.gpu_temp);
+    TEST_ASSERT_EQUAL(PROTO_TEMP_C, msg.stats.temp_unit);
+    TEST_ASSERT_EQUAL(PROTO_NET_SI, msg.stats.net_unit);
+    TEST_ASSERT_EQUAL_UINT8(1u << PROTO_COLOR_CPU, msg.stats.colors_mask);
+    TEST_ASSERT_EQUAL_UINT32(16757504u, msg.stats.colors[PROTO_COLOR_CPU]);
+}
+
+void test_stats_colors_fixture_has_every_unit_and_color(void)
+{
+    TEST_ASSERT_EQUAL(ESP_OK, proto_parse(STATS_COLORS, strlen(STATS_COLORS), &msg));
+    TEST_ASSERT_EQUAL(PROTO_MSG_STATS, msg.type);
+    TEST_ASSERT_EQUAL(PROTO_TEMP_F, msg.stats.temp_unit);
+    TEST_ASSERT_EQUAL(PROTO_NET_BITS, msg.stats.net_unit);
+    TEST_ASSERT_EQUAL_UINT8(100, msg.stats.gpu);
+    TEST_ASSERT_EQUAL_INT16(88, msg.stats.cpu_temp);
+    TEST_ASSERT_EQUAL_INT16(84, msg.stats.gpu_temp);
+    TEST_ASSERT_EQUAL_UINT8(0x7F, msg.stats.colors_mask);
+    TEST_ASSERT_EQUAL_UINT32(16757504u, msg.stats.colors[PROTO_COLOR_CPU]);
+    TEST_ASSERT_EQUAL_UINT32(15022389u, msg.stats.colors[PROTO_COLOR_MEM]);
+    TEST_ASSERT_EQUAL_UINT32(2001125u, msg.stats.colors[PROTO_COLOR_GPU]);
+    TEST_ASSERT_EQUAL_UINT32(15022389u, msg.stats.colors[PROTO_COLOR_CPU_TEMP]);
+    TEST_ASSERT_EQUAL_UINT32(2001125u, msg.stats.colors[PROTO_COLOR_GPU_TEMP]);
+    TEST_ASSERT_EQUAL_UINT32(4431943u, msg.stats.colors[PROTO_COLOR_NET_RX]);
+    TEST_ASSERT_EQUAL_UINT32(16757504u, msg.stats.colors[PROTO_COLOR_NET_TX]);
 }
 
 void test_stats_time_only_leaves_every_optional_field_out(void)
@@ -820,6 +856,12 @@ void test_stats_time_only_leaves_every_optional_field_out(void)
     TEST_ASSERT_FALSE(msg.stats.has_cpu);
     TEST_ASSERT_FALSE(msg.stats.has_mem);
     TEST_ASSERT_FALSE(msg.stats.has_net);
+    TEST_ASSERT_FALSE(msg.stats.has_gpu);
+    TEST_ASSERT_FALSE(msg.stats.has_cpu_temp);
+    TEST_ASSERT_FALSE(msg.stats.has_gpu_temp);
+    TEST_ASSERT_EQUAL(PROTO_TEMP_C, msg.stats.temp_unit);
+    TEST_ASSERT_EQUAL(PROTO_NET_SI, msg.stats.net_unit);
+    TEST_ASSERT_EQUAL_UINT8(0, msg.stats.colors_mask);
 }
 
 void test_stats_time_absent_or_null_is_refused(void)
@@ -887,6 +929,103 @@ void test_stats_unknown_fields_are_ignored(void)
     TEST_ASSERT_EQUAL(ESP_OK, stats_with("\"time\":5,\"extra\":[1,{\"x\":2}],\"cpu_avg\":3"));
     TEST_ASSERT_EQUAL_UINT64(5, msg.stats.time);
     TEST_ASSERT_FALSE(msg.stats.has_cpu);
+}
+
+void test_stats_gpu_0_and_100_accepted_and_101_minus_1_or_a_fraction_refused(void)
+{
+    TEST_ASSERT_EQUAL(ESP_OK, stats_with("\"time\":1,\"gpu\":0"));
+    TEST_ASSERT_EQUAL(ESP_OK, stats_with("\"time\":1,\"gpu\":100"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"gpu\":101"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"gpu\":-1"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"gpu\":23.5"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"gpu\":null"));
+}
+
+void test_stats_cpu_temp_minus_40_to_150_accepted_and_outside_refused(void)
+{
+    TEST_ASSERT_EQUAL(ESP_OK, stats_with("\"time\":1,\"cpu_temp\":-40"));
+    TEST_ASSERT_EQUAL_INT16(-40, msg.stats.cpu_temp);
+    TEST_ASSERT_EQUAL(ESP_OK, stats_with("\"time\":1,\"cpu_temp\":150"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"cpu_temp\":-41"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"cpu_temp\":151"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"cpu_temp\":64.5"));
+}
+
+void test_stats_gpu_temp_minus_40_to_150_accepted_and_outside_refused(void)
+{
+    TEST_ASSERT_EQUAL(ESP_OK, stats_with("\"time\":1,\"gpu_temp\":-40"));
+    TEST_ASSERT_EQUAL_INT16(-40, msg.stats.gpu_temp);
+    TEST_ASSERT_EQUAL(ESP_OK, stats_with("\"time\":1,\"gpu_temp\":150"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"gpu_temp\":-41"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"gpu_temp\":151"));
+}
+
+void test_stats_gpu_and_its_temperatures_are_independent(void)
+{
+    TEST_ASSERT_EQUAL(ESP_OK, stats_with("\"time\":1,\"gpu_temp\":41"));
+    TEST_ASSERT_FALSE(msg.stats.has_gpu);
+    TEST_ASSERT_TRUE(msg.stats.has_gpu_temp);
+    TEST_ASSERT_EQUAL(ESP_OK, stats_with("\"time\":1,\"gpu\":23"));
+    TEST_ASSERT_TRUE(msg.stats.has_gpu);
+    TEST_ASSERT_FALSE(msg.stats.has_gpu_temp);
+    TEST_ASSERT_EQUAL(ESP_OK, stats_with("\"time\":1,\"cpu_temp\":64"));
+    TEST_ASSERT_FALSE(msg.stats.has_gpu);
+    TEST_ASSERT_TRUE(msg.stats.has_cpu_temp);
+}
+
+void test_stats_temp_unit_accepts_only_c_and_f(void)
+{
+    TEST_ASSERT_EQUAL(ESP_OK, stats_with("\"time\":1,\"temp_unit\":\"c\""));
+    TEST_ASSERT_EQUAL(PROTO_TEMP_C, msg.stats.temp_unit);
+    TEST_ASSERT_EQUAL(ESP_OK, stats_with("\"time\":1,\"temp_unit\":\"f\""));
+    TEST_ASSERT_EQUAL(PROTO_TEMP_F, msg.stats.temp_unit);
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"temp_unit\":\"F\""));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"temp_unit\":\"k\""));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"temp_unit\":1"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"temp_unit\":null"));
+}
+
+void test_stats_net_unit_accepts_si_binary_and_bits_only(void)
+{
+    TEST_ASSERT_EQUAL(ESP_OK, stats_with("\"time\":1,\"net_unit\":\"si\""));
+    TEST_ASSERT_EQUAL(PROTO_NET_SI, msg.stats.net_unit);
+    TEST_ASSERT_EQUAL(ESP_OK, stats_with("\"time\":1,\"net_unit\":\"binary\""));
+    TEST_ASSERT_EQUAL(PROTO_NET_BINARY, msg.stats.net_unit);
+    TEST_ASSERT_EQUAL(ESP_OK, stats_with("\"time\":1,\"net_unit\":\"bits\""));
+    TEST_ASSERT_EQUAL(PROTO_NET_BITS, msg.stats.net_unit);
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"net_unit\":\"mib\""));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"net_unit\":\"binaryx\""));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"net_unit\":2"));
+}
+
+void test_stats_colors_as_an_object_of_whole_rgb_values(void)
+{
+    TEST_ASSERT_EQUAL(ESP_OK, stats_with("\"time\":1,\"colors\":{}"));
+    TEST_ASSERT_EQUAL_UINT8(0, msg.stats.colors_mask);
+    TEST_ASSERT_EQUAL(ESP_OK, stats_with("\"time\":1,\"colors\":{\"extra\":5}"));
+    TEST_ASSERT_EQUAL_UINT8(0, msg.stats.colors_mask);
+    TEST_ASSERT_EQUAL(ESP_OK, stats_with("\"time\":1,\"colors\":{\"cpu\":16777215}"));
+    TEST_ASSERT_EQUAL_UINT32(16777215u, msg.stats.colors[PROTO_COLOR_CPU]);
+    TEST_ASSERT_EQUAL(ESP_OK, stats_with("\"time\":1,\"colors\":{\"cpu\":0,\"gpu_temp\":5}"));
+    TEST_ASSERT_EQUAL_UINT8((1u << PROTO_COLOR_CPU) | (1u << PROTO_COLOR_GPU_TEMP), msg.stats.colors_mask);
+}
+
+void test_stats_colors_that_are_not_an_object_or_not_whole_rgb_are_refused(void)
+{
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"colors\":[16757504]"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"colors\":\"#ffb300\""));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"colors\":null"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"colors\":{\"cpu\":16777216}"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"colors\":{\"cpu\":-1}"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"colors\":{\"cpu\":\"#ffb300\"}"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, stats_with("\"time\":1,\"colors\":{\"cpu\":null}"));
+}
+
+void test_stats_color_for_a_gpu_with_no_gpu_field_is_accepted_and_kept(void)
+{
+    TEST_ASSERT_EQUAL(ESP_OK, stats_with("\"time\":1,\"colors\":{\"gpu\":2001125}"));
+    TEST_ASSERT_FALSE(msg.stats.has_gpu);
+    TEST_ASSERT_EQUAL_UINT8(1u << PROTO_COLOR_GPU, msg.stats.colors_mask);
 }
 
 void app_main(void)
@@ -971,6 +1110,16 @@ void app_main(void)
     RUN_TEST(test_stats_net_rx_without_net_tx_is_refused);
     RUN_TEST(test_stats_fraction_in_an_int_field_is_refused);
     RUN_TEST(test_stats_unknown_fields_are_ignored);
+    RUN_TEST(test_stats_colors_fixture_has_every_unit_and_color);
+    RUN_TEST(test_stats_gpu_0_and_100_accepted_and_101_minus_1_or_a_fraction_refused);
+    RUN_TEST(test_stats_cpu_temp_minus_40_to_150_accepted_and_outside_refused);
+    RUN_TEST(test_stats_gpu_temp_minus_40_to_150_accepted_and_outside_refused);
+    RUN_TEST(test_stats_gpu_and_its_temperatures_are_independent);
+    RUN_TEST(test_stats_temp_unit_accepts_only_c_and_f);
+    RUN_TEST(test_stats_net_unit_accepts_si_binary_and_bits_only);
+    RUN_TEST(test_stats_colors_as_an_object_of_whole_rgb_values);
+    RUN_TEST(test_stats_colors_that_are_not_an_object_or_not_whole_rgb_are_refused);
+    RUN_TEST(test_stats_color_for_a_gpu_with_no_gpu_field_is_accepted_and_kept);
     test_grid_run();
     test_pageset_run();
     test_hoststat_run();

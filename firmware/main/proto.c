@@ -420,6 +420,54 @@ static esp_err_t parse_tile(const cJSON *root, proto_tile_t *out)
     return ESP_OK;
 }
 
+// Read a unit field from `names`, giving its index in `*out`. Absent leaves `*out` as the caller set it. A
+// non-string, or a string not in `names`, is refused.
+static bool get_unit(const cJSON *obj, const char *key, const char *const names[], size_t n, int *out)
+{
+    if (!cJSON_GetObjectItemCaseSensitive(obj, key)) {
+        return true;
+    }
+    char s[8] = "";
+    if (!get_str(obj, key, s, sizeof(s), true)) {
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(s, names[i]) == 0) {
+            *out = (int)i;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Read the colors object. Each known key that is present must be a whole 0xRRGGBB, and unknown keys are
+// ignored. An empty object is valid and sets no bits.
+static esp_err_t parse_stats_colors(const cJSON *root, proto_stats_t *out)
+{
+    static const char *const keys[PROTO_COLOR_COUNT] = {"cpu",      "mem",    "gpu",   "cpu_temp",
+                                                        "gpu_temp", "net_rx", "net_tx"};
+    out->colors_mask = 0;
+    const cJSON *colors = cJSON_GetObjectItemCaseSensitive(root, "colors");
+    if (!colors) {
+        return ESP_OK;
+    }
+    if (!cJSON_IsObject(colors)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    for (int i = 0; i < PROTO_COLOR_COUNT; i++) {
+        if (!cJSON_GetObjectItemCaseSensitive(colors, keys[i])) {
+            continue;
+        }
+        double c;
+        if (!get_whole(colors, keys[i], 0, 0xFFFFFF, &c)) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        out->colors[i] = (uint32_t)c;
+        out->colors_mask |= (uint8_t)(1u << i);
+    }
+    return ESP_OK;
+}
+
 static esp_err_t parse_stats(const cJSON *root, proto_stats_t *out)
 {
     double v;
@@ -461,7 +509,44 @@ static esp_err_t parse_stats(const cJSON *root, proto_stats_t *out)
     out->has_net = has_net;
     out->net_rx = net[0];
     out->net_tx = net[1];
-    return ESP_OK;
+
+    // GPU busy and the two temperatures are independent, so a GPU without a sensor still shows its busy share.
+    out->has_gpu = cJSON_GetObjectItemCaseSensitive(root, "gpu") != NULL;
+    if (out->has_gpu) {
+        if (!get_whole(root, "gpu", 0, 100, &v)) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        out->gpu = (uint8_t)v;
+    }
+
+    out->has_cpu_temp = cJSON_GetObjectItemCaseSensitive(root, "cpu_temp") != NULL;
+    if (out->has_cpu_temp) {
+        if (!get_whole(root, "cpu_temp", -40, 150, &v)) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        out->cpu_temp = (int16_t)v;
+    }
+
+    out->has_gpu_temp = cJSON_GetObjectItemCaseSensitive(root, "gpu_temp") != NULL;
+    if (out->has_gpu_temp) {
+        if (!get_whole(root, "gpu_temp", -40, 150, &v)) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        out->gpu_temp = (int16_t)v;
+    }
+
+    static const char *const temp_names[] = {"c", "f"};
+    static const char *const net_names[] = {"si", "binary", "bits"};
+    int temp_unit = PROTO_TEMP_C;
+    int net_unit = PROTO_NET_SI;
+    if (!get_unit(root, "temp_unit", temp_names, 2, &temp_unit) ||
+        !get_unit(root, "net_unit", net_names, 3, &net_unit)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    out->temp_unit = (proto_temp_unit_t)temp_unit;
+    out->net_unit = (proto_net_unit_t)net_unit;
+
+    return parse_stats_colors(root, out);
 }
 
 static esp_err_t parse_pair_offer(const cJSON *root, proto_pair_offer_t *out)

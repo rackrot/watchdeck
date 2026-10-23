@@ -989,6 +989,13 @@ fn stats_frame(stats: HostStats, time: u64, utc_offset: Option<i32>) -> Message 
         mem_total: mem.map(|m| m.total),
         net_rx: net.map(|n| n.rx),
         net_tx: net.map(|n| n.tx),
+        // The GPU, temperatures, units and colors are B5's to fill in.
+        gpu: None,
+        cpu_temp: None,
+        gpu_temp: None,
+        temp_unit: None,
+        net_unit: None,
+        colors: None,
     }
 }
 
@@ -1060,6 +1067,12 @@ mod tests {
                 mem_total: Some(20),
                 net_rx: Some(5),
                 net_tx: Some(6),
+                gpu: None,
+                cpu_temp: None,
+                gpu_temp: None,
+                temp_unit: None,
+                net_unit: None,
+                colors: None,
             }
         );
     }
@@ -1077,6 +1090,12 @@ mod tests {
                 mem_total: None,
                 net_rx: None,
                 net_tx: None,
+                gpu: None,
+                cpu_temp: None,
+                gpu_temp: None,
+                temp_unit: None,
+                net_unit: None,
+                colors: None,
             }
         );
     }

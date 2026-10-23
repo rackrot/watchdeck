@@ -3,8 +3,16 @@
   "time": 1792692433,
   "utc_offset": -14400,
   "cpu": 12,
+  "cpu_temp": 64,
+  "gpu": 23,
+  "gpu_temp": 41,
   "mem_used": 10522394624,
   "mem_total": 33395638272,
   "net_rx": 125000,
-  "net_tx": 34000
+  "net_tx": 34000,
+  "temp_unit": "c",
+  "net_unit": "si",
+  "colors": {
+    "cpu": 16757504
+  }
 }
