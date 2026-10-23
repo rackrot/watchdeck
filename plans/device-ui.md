@@ -1,6 +1,6 @@
 # Device UI: a status bar, and settings behind a long swipe up
 
-Status: S1 to S7 built on `main` (through `0a12633`), against the plan as revised 2026-10-22. S8's docs are updated; the hardware run and its results section are still to come.
+Status: S1 to S7 built on `main` (through `0a12633`), against the plan as revised 2026-10-22. S8's docs are updated and its hardware run is recorded in "S8 results", with four checks left for the user's go-ahead.
 
 Gives the paired screen's top 204 px back to the buttons. Before this plan, a paired board shows five status lines (Wi-Fi, SD, USB, Touch, Daemon), a Licenses button and a Forget pairing button above the grid. After this plan:
 
@@ -336,6 +336,19 @@ Run on the board with the dev daemon, both built from the same commit. Every fla
 
 - **Docs**: `site/src/protocol.md` finished; `site/src/config.md` (the bar, the long swipe, where Licenses lives now, `:212` and `:218`); `site/src/wifi.md` (the status lines show until the first layout and while unpaired, then in settings); `README.md:83` (Forget pairing is in settings: swipe up); `CLAUDE.md` (Hardware facts: the screen modes, the long swipe, the settings page deleting the grid; Daemon facts: `status_bar`, `stats` once a second while a session is open, `/proc` sources, the local offset); a results section in this plan.
 - **Acceptance**: every step passes or its failure is recorded with a decision.
+
+### S8 results (2026-10-22)
+
+Board on `main` at `0a12633` (the docs commits since change no code), dev daemon from the same tree, serial log captured with pyserial while the user touched the board.
+
+- **User checks on the panel**: the long swipe up opens settings, settings closes, page swipes still turn pages, and the bar's layout, fixed-width values and arrows look right.
+- **Settings open and close, 7 rounds**: open 10 to 20 ms after the swipe, page rebuilt on close in 20 ms. LVGL pool at "page built" 19,088 bytes after every round (no drift), 16,192 with settings open, largest free block 43,304 after every close.
+- **Page switch**, 2-page 5×5 set with icons at the new 52 px box: 5 to 20 ms, against pages S8's 60 to 105 ms. A layout push of 2 pages applied, and its 5 icons arrived in about 300 ms.
+- **Presses**: 4 presses, 4 results, none from a swipe. Pool peak 28,404 of 62,420 bytes with a multi-line result shown.
+- **Internal heap**: minimum free 289,836 bytes over the run.
+- **RSSI**: read in 12.6 ms (`RSSI read took 12629 us`), under the 20 ms bound, so it stays on the link task.
+- **Bar**: groups at `cpu 12/156 ram 220/96 gpu 368/156 net 576/192 clock 820/192`, gaps 52, margins 12, text y 7, no overflow warning. Stats flowed (checked with a temporary log of the bar texts in S7).
+- **Not run**: stopping the daemon (values to `--`, clock keeps time), boot without Wi-Fi, the worst icon set (4 pages of 5×2), and the time zone change. They disturb the user's dev setup; each waits for the user's go-ahead.
 
 ## Risks
 
