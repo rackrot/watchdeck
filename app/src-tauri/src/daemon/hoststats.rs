@@ -267,8 +267,17 @@ struct Bar {
     /// What `selected` was resolved for. `None` after a period ends.
     resolved_for: Option<GpuChoice>,
     selected: Selected,
+    /// The sysfs read of an earlier tick that hasn't finished.
+    sysfs: Option<tokio::task::JoinHandle<SysfsRead>>,
+    /// Whether the stall of `sysfs` has been logged.
+    sysfs_stuck: bool,
     alerts: Alerts,
 }
+
+/// The CPU temperature and, for an AMD selection, the GPU's reading.
+type SysfsRead = (Option<i32>, Option<GpuReading>);
+/// How long a tick waits for its sysfs read before it publishes without it.
+const SYSFS_WAIT: Duration = Duration::from_millis(500);
 
 impl Bar {
     fn new(config: watch::Receiver<Arc<Live>>, sources: HostSources, timings: Timings) -> Self {
@@ -279,6 +288,8 @@ impl Bar {
             nvidia: NvidiaReader::new(sources.nvidia, timings),
             resolved_for: None,
             selected: Selected::Nothing,
+            sysfs: None,
+            sysfs_stuck: false,
             alerts: Alerts::default(),
         }
     }
@@ -301,12 +312,16 @@ impl Bar {
     fn end(&mut self) {
         self.selected = Selected::Nothing;
         self.resolved_for = None;
+        // A read still blocked is left to finish on its own; the next period starts a new one.
+        self.sysfs = None;
         self.alerts = Alerts::default();
     }
 
     async fn resolve(&mut self, choice: GpuChoice) {
-        // The old one goes first, so a switch away from NVIDIA shuts NVML down.
+        // The old one goes first, so a switch away from NVIDIA shuts NVML down. A read in flight
+        // was for the old selection.
         self.selected = Selected::Nothing;
+        self.sysfs = None;
         self.resolved_for = Some(choice.clone());
         if choice == GpuChoice::Off {
             return;
@@ -346,21 +361,37 @@ impl Bar {
             self.resolve(choice).await;
         }
 
-        // sysfs reads block, so they run on the blocking pool.
+        // sysfs reads block, so they run on the blocking pool. A read that takes longer than
+        // `SYSFS_WAIT` (a GPU waking from runtime suspend) gives no values this tick and is
+        // awaited again on the next, and no second one starts meanwhile.
         let sys = self.sys_root.clone();
         let amd = match &self.selected {
             Selected::Amd(pci) => Some(pci.clone()),
             _ => None,
         };
-        let (cpu_temp, amd) = tokio::task::spawn_blocking(move || {
-            (
-                hwmon::cpu_temp(&sys),
-                amd.map(|pci| gpu::read_amd(&sys, &pci)),
-            )
-        })
-        .await
-        .inspect_err(|e| log::warn!("host stats: reading sysfs: {e}"))
-        .unwrap_or_default();
+        let read = self.sysfs.get_or_insert_with(|| {
+            tokio::task::spawn_blocking(move || {
+                (
+                    hwmon::cpu_temp(&sys),
+                    amd.map(|pci| gpu::read_amd(&sys, &pci)),
+                )
+            })
+        });
+        let (cpu_temp, amd) = match tokio::time::timeout(SYSFS_WAIT, read).await {
+            Ok(joined) => {
+                self.sysfs = None;
+                self.sysfs_stuck = false;
+                joined
+                    .inspect_err(|e| log::warn!("host stats: reading sysfs: {e}"))
+                    .unwrap_or_default()
+            }
+            Err(_) => {
+                if !std::mem::replace(&mut self.sysfs_stuck, true) {
+                    log::warn!("host stats: a sysfs read is taking over {SYSFS_WAIT:?}");
+                }
+                (None, None)
+            }
+        };
 
         // Asked on every tick, since that is what starts a thread that waited for the last one.
         let gpu = match &self.selected {
@@ -984,6 +1015,68 @@ mod tests {
         assert_eq!(stats.units.temp, crate::daemon::units::TempUnit::F);
         assert_eq!(stats.units.net, crate::daemon::units::NetUnit::Bits);
         assert_eq!(stats.colors.cpu_temp, Some(0x123456));
+    }
+
+    /// A sysfs read that blocks, as an AMD dGPU waking from runtime suspend does: `temp1_input`
+    /// becomes a FIFO nobody writes to, so opening it for reading waits.
+    #[tokio::test]
+    async fn a_blocked_sysfs_read_costs_its_values_but_not_the_tick_or_the_end_of_the_period() {
+        let (sys, fake) = (sys_tree(), fake_nvidia());
+        let input = sys.path().join("devices/class/hwmon/hwmon4/temp1_input");
+        std::fs::remove_file(&input).unwrap();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&input)
+            .status()
+            .unwrap()
+            .success());
+        let _release = Release(input);
+        let (_config_tx, config) = watch::channel(Arc::new(Live::empty()));
+        let (count, polling) = watch::channel(1usize);
+        let sources = HostSources {
+            proc_root: format!("{PROC}/docker").into(),
+            sys_root: sys.path().into(),
+            nvidia: Arc::new(fake.clone()),
+        };
+        let mut out = spawn(polling, config, sources);
+
+        // Readings keep coming, without the temperature, one tick apart or a little more.
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(4), out.changed())
+                .await
+                .expect("no reading while a sysfs read is blocked")
+                .unwrap();
+            let stats = out.borrow_and_update().unwrap();
+            assert!(stats.mem.is_some());
+            assert_eq!(stats.cpu_temp, None);
+        }
+        until("NVML to open", || fake.opens() == 1).await;
+
+        // The period still ends: NVML shuts down and the reading goes away.
+        count.send_replace(0);
+        until("NVML to shut down", || fake.shutdowns() == 1).await;
+        until("the reading to clear", || out.borrow().is_none()).await;
+    }
+
+    /// Frees a reader blocked in `open` on a FIFO when dropped, also when the test panics, since
+    /// the runtime waits for blocking threads when it shuts down. A write-only non-blocking open
+    /// fails until a reader waits, so it is tried for up to a second.
+    struct Release(std::path::PathBuf);
+
+    impl Drop for Release {
+        fn drop(&mut self) {
+            use std::os::unix::fs::OpenOptionsExt;
+            const O_NONBLOCK: i32 = 0o4000; // Linux
+            for _ in 0..20 {
+                let opened = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(O_NONBLOCK)
+                    .open(&self.0);
+                if opened.is_ok() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
