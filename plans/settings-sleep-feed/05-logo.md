@@ -57,7 +57,7 @@ Today the app has Tauri's default icons, the Vite favicon and a text-only wordma
 - `mise run logo:gen` regenerates every output from `logo/`, and `logo:check` passes in CI's lint job.
 - The app shows the new icon in the taskbar, the tray and the installer; the favicon and the header use the mark; the template's `react.svg`, `vite.svg` and `tauri.svg` are gone.
 - A visible start shows the splash until the config loads.
-- The board shows the mark on boot, and on the sleep screen when no image is set, recolored to `fg`.
+- The board shows the mark on boot, and on the sleep screen when no image is set, in its own two colors (I4, not recolored).
 - Flash grows by under 32 KB for the device asset.
 
 ## Slices
@@ -87,8 +87,8 @@ Today the app has Tauri's default icons, the Vite favicon and a text-only wordma
 
 ### L4 Device boot logo and default sleep art
 
-- **Files**: `ui.c` (a boot view from `ui_init`: the mark, "watchdeck" in Montserrat 32, the firmware version in 24; shown for at least 1.2 s and at most 3 s, then status mode, so status texts are never hidden longer), `sleep.c` (the mark in place of P1's placeholder, recolored to `fg`).
-- **Acceptance (batch B)**: the boot view shows after the panel comes up and gives way to status mode within 3 s; the default sleep screen shows the mark in `fg`; the pool at "page built" doesn't move (the boot view is deleted).
+- **Files**: `ui.c` (a boot view from `ui_init`: the mark, "watchdeck" in Montserrat 32, the firmware version in 24; shown for at least 1.2 s and at most 3 s, then status mode, so status texts are never hidden longer), `sleep.c` (the mark in place of P1's placeholder, in its own two colors).
+- **Acceptance (batch B)**: the boot view shows after the panel comes up and gives way to status mode within 3 s; the default sleep screen shows the two-color mark, legible on the configured `bg`; the pool at "page built" doesn't move (the boot view is deleted).
 - **Cheapest check**: `mise run fw:build`, then batch B.
 - **Owner**: mechanical, firmware.
 
