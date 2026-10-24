@@ -5,6 +5,7 @@
 #include <strings.h>
 
 #include "crash.h"
+#include "diag.h"
 #include "display.h"
 #include "esp_app_desc.h"
 #include "esp_check.h"
@@ -24,6 +25,7 @@
 #include "mbedtls/x509.h"
 #include "mdns.h"
 #include "icons.h"
+#include "logcap.h"
 #include "model.h"
 #include "pageset.h"
 #include "pairing.h"
@@ -606,6 +608,7 @@ static void drop_client(void)
 // Drop the session and back off, showing `reason` on the status line.
 static void lost_as(const char *why, const char *reason)
 {
+    diag_count(DIAG_LINK_DROP, why);
     ESP_LOGW(TAG, "link lost: %s", why);
     drop_client();
     if (s.cbs.on_down) {
@@ -776,6 +779,7 @@ static void set_paired(bool paired)
 {
     bool was_paired = s.paired;
     s.paired = paired;
+    logcap_set_token(paired ? s.pairing->token : NULL); // so the log ring redacts it
     if (paired) {
         if (proto_fp(s.pairing->cert_pem, s.fp) != ESP_OK) {
             s.fp[0] = '\0'; // matches no instance, so the status will say why
@@ -1053,6 +1057,7 @@ static bool handle_icon_frame(uint8_t *frame, size_t len)
 // Drop the link over a broken set, so the next session sends a complete one. The backoff grows until a set completes.
 static void set_broken(const char *why)
 {
+    diag_count(DIAG_SET_BROKEN, why);
     ESP_LOGW(TAG, "layout set broken: %s", why);
     s.set_broke = true;
     lost_as("layout set broken", "layout set broken");
@@ -1418,6 +1423,7 @@ static void link_task(void *arg)
             } else if (pageset_expired(&s.set, now)) {
                 set_broken("still incomplete 5 s after its first page");
             } else if (s.n_want > 0 && now > s.want_deadline_ms) {
+                diag_count(DIAG_ICON_TIMEOUT, "icon_get unanswered");
                 ESP_LOGW(TAG, "icon_get timed out with %u icon(s) not received", (unsigned)s.n_want);
                 s.n_missed += s.n_want;
                 request_icons();

@@ -14,6 +14,8 @@
 void test_grid_run(void);     // test_grid.c
 void test_pageset_run(void);  // test_pageset.c
 void test_hoststat_run(void); // test_hoststat.c
+void test_logring_run(void);  // test_logring.c
+void test_diag_run(void);     // test_diag.c
 
 static uint8_t frame[PROTO_MAX_ICON_FRAME];
 static char json[8192];
@@ -1123,6 +1125,8 @@ void app_main(void)
     test_grid_run();
     test_pageset_run();
     test_hoststat_run();
+    test_logring_run();
+    test_diag_run();
 
     // Returning from app_main does not end a linux-target process, so the failure count becomes the exit status.
     exit(UNITY_END());
