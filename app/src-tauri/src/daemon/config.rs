@@ -19,7 +19,7 @@ use tokio::sync::watch;
 
 use super::fonts_gen::FONT_IDS;
 use super::icons::{self, IconSet, Icons};
-use super::protocol::{encode_hex, Button, IconFrame, Message, Sleep};
+use super::protocol::{encode_hex, Button, IconFrame, Message, NoteLevel, Sleep};
 use super::screens::{self, ScreenImage, Screens};
 use super::secrets::Secrets;
 use super::store::write_private;
@@ -542,43 +542,153 @@ pub enum IntegrationConfig {
         json_pointer: Option<String>,
         source: Action,
     },
+    /// An instant query against a Prometheus server, polled and shown as a card.
+    Prometheus {
+        id: String,
+        label: String,
+        /// The server's base URL, such as `http://prom.lan:9090`. The daemon adds
+        /// `/api/v1/query?query=...` and encodes the query.
+        url: String,
+        query: String,
+        every_s: u64,
+        /// Digits after the point, 0 to 3. Absent: the value as Prometheus gives it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decimals: Option<u8>,
+        /// Text after the value, such as `%`. At most 7 printable ASCII characters.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        suffix: String,
+        /// The card is bad when the value is above this. A `Number`, not an `f64`, so the config
+        /// stays `Eq`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bad_above: Option<serde_json::Number>,
+        /// The card is bad when the value is below this.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bad_below: Option<serde_json::Number>,
+        /// Header name -> the name of a secret in `secrets.toml`, as an HTTP action's.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        secret_headers: BTreeMap<String, String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        insecure_http: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        insecure_tls: bool,
+        /// The whole request's limit, at most the lesser of 30 and `every_s`, so a slow server
+        /// can't hold one of the two feed slots past its period. Absent: 10, or `every_s` if less.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_s: Option<u64>,
+    },
+    /// Alerts from a Grafana webhook contact point, shown as notes. Sent with `token_secret`'s
+    /// token, like [`Push`](Self::Push).
+    Grafana {
+        id: String,
+        label: String,
+        /// The name of a secret in `secrets.toml`, at least 32 characters.
+        token_secret: String,
+        /// The level of an alert by its `severity` label, over the built-in `critical` to error
+        /// and `warning` to warn. Any other severity is info.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        levels: BTreeMap<String, NoteLevel>,
+    },
 }
+
+/// The longest query, in bytes. It goes into a URL.
+const MAX_QUERY_BYTES: usize = 2000;
+const MAX_SUFFIX: usize = 7;
+const MAX_DECIMALS: u8 = 3;
+/// A Prometheus query's timeout never passes this, nor its `every_s`.
+const MAX_QUERY_TIMEOUT_S: u64 = 30;
+/// The longest severity name `levels` may use.
+const MAX_SEVERITY: usize = 31;
 
 impl IntegrationConfig {
     pub fn id(&self) -> &str {
         match self {
-            Self::Push { id, .. } | Self::Stat { id, .. } => id,
+            Self::Push { id, .. }
+            | Self::Stat { id, .. }
+            | Self::Prometheus { id, .. }
+            | Self::Grafana { id, .. } => id,
         }
     }
 
     /// The name notes and cards show for this source.
     pub fn label(&self) -> &str {
         match self {
-            Self::Push { label, .. } | Self::Stat { label, .. } => label,
+            Self::Push { label, .. }
+            | Self::Stat { label, .. }
+            | Self::Prometheus { label, .. }
+            | Self::Grafana { label, .. } => label,
         }
+    }
+
+    /// The secret that holds the token a sender must present, for the kinds that get requests.
+    pub fn token_secret(&self) -> Option<&str> {
+        match self {
+            Self::Push { token_secret, .. } | Self::Grafana { token_secret, .. } => {
+                Some(token_secret)
+            }
+            Self::Stat { .. } | Self::Prometheus { .. } => None,
+        }
+    }
+
+    /// The request a `prometheus` integration makes, as the HTTP action that runs it. An
+    /// unparsable `url` is kept as it is, for the action's own rules to refuse.
+    pub fn prometheus_action(&self) -> Option<Action> {
+        let Self::Prometheus {
+            url,
+            query,
+            secret_headers,
+            insecure_http,
+            insecure_tls,
+            timeout_s,
+            every_s,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let full = match reqwest::Url::parse(url) {
+            Ok(mut u) => {
+                if let Ok(mut path) = u.path_segments_mut() {
+                    path.pop_if_empty().extend(["api", "v1", "query"]);
+                }
+                u.query_pairs_mut().append_pair("query", query);
+                u.into()
+            }
+            Err(_) => url.clone(),
+        };
+        Some(Action::Http {
+            method: "GET".into(),
+            url: full,
+            body: None,
+            headers: BTreeMap::new(),
+            secret_headers: secret_headers.clone(),
+            insecure_http: *insecure_http,
+            insecure_tls: *insecure_tls,
+            timeout_s: timeout_s.unwrap_or_else(|| DEFAULT_TIMEOUT_S.min(*every_s)),
+        })
     }
 
     /// Whether this one counts against the card limit. Matched without a wildcard, so a new
     /// kind must decide here.
     pub fn is_card(&self) -> bool {
         match self {
-            Self::Push { .. } => false,
-            Self::Stat { .. } => true,
+            Self::Push { .. } | Self::Grafana { .. } => false,
+            Self::Stat { .. } | Self::Prometheus { .. } => true,
         }
     }
 
     fn uses_secret(&self, name: &str) -> bool {
         match self {
-            Self::Push { token_secret, .. } => token_secret == name,
+            Self::Push { token_secret, .. } | Self::Grafana { token_secret, .. } => {
+                token_secret == name
+            }
             Self::Stat { source, .. } => action_uses_secret(source, name),
+            Self::Prometheus { secret_headers, .. } => secret_headers.values().any(|s| s == name),
         }
     }
 
     /// Every rule this integration breaks, each message prefixed with its id.
     fn check(&self, secrets: &SecretSizes) -> Vec<String> {
-        let (id, label) = match self {
-            Self::Push { id, label, .. } | Self::Stat { id, label, .. } => (id, label),
-        };
+        let (id, label) = (self.id(), self.label());
         let mut problems = Vec::new();
         if !id_ok(id) || id.len() > MAX_INTEGRATION_ID {
             problems.push(format!(
@@ -591,20 +701,41 @@ impl IntegrationConfig {
             ));
         }
         match self {
-            Self::Push { token_secret, .. } => match secrets {
-                Ok(sizes) => match sizes.get(token_secret) {
-                    None => problems.push(format!(
-                        "token_secret {token_secret:?} is not in secrets.toml"
+            Self::Push { token_secret, .. } | Self::Grafana { token_secret, .. } => {
+                match secrets {
+                    Ok(sizes) => match sizes.get(token_secret) {
+                        None => problems.push(format!(
+                            "token_secret {token_secret:?} is not in secrets.toml"
+                        )),
+                        Some(bytes) if *bytes < MIN_TOKEN_BYTES => problems.push(format!(
+                            "token {token_secret:?} is shorter than {MIN_TOKEN_BYTES} characters"
+                        )),
+                        Some(_) => {}
+                    },
+                    Err(e) => problems.push(format!(
+                        "token_secret {token_secret:?} is set, but secrets.toml can't be read: {e}"
                     )),
-                    Some(bytes) if *bytes < MIN_TOKEN_BYTES => problems.push(format!(
-                        "token {token_secret:?} is shorter than {MIN_TOKEN_BYTES} characters"
-                    )),
-                    Some(_) => {}
-                },
-                Err(e) => problems.push(format!(
-                    "token_secret {token_secret:?} is set, but secrets.toml can't be read: {e}"
-                )),
-            },
+                }
+                if let Self::Grafana { levels, .. } = self {
+                    let mut seen = HashSet::new();
+                    for severity in levels.keys() {
+                        // Severities match without regard to case, so these would be one key.
+                        if !seen.insert(severity.to_ascii_lowercase()) {
+                            problems.push(format!(
+                                "levels: {severity:?} is listed twice; severities ignore case"
+                            ));
+                        }
+                        if severity.is_empty()
+                            || severity.len() > MAX_SEVERITY
+                            || !printable_ascii(severity)
+                        {
+                            problems.push(format!(
+                                "levels: a severity is 1 to {MAX_SEVERITY} printable ASCII characters"
+                            ));
+                        }
+                    }
+                }
+            }
             Self::Stat {
                 every_s,
                 json_pointer,
@@ -621,6 +752,46 @@ impl IntegrationConfig {
                         .into_iter()
                         .map(|problem| format!("source: {problem}")),
                 );
+            }
+            Self::Prometheus {
+                url,
+                query,
+                every_s,
+                decimals,
+                suffix,
+                timeout_s,
+                ..
+            } => {
+                problems.extend(every_s_error("every_s", *every_s));
+                let most = MAX_QUERY_TIMEOUT_S.min(*every_s);
+                if timeout_s.is_some_and(|t| t > most) {
+                    problems.push(format!(
+                        "timeout_s is over {most}, the lesser of {MAX_QUERY_TIMEOUT_S} and every_s: \
+                         a query must end before the next one starts"
+                    ));
+                }
+                if query.trim().is_empty() || query.len() > MAX_QUERY_BYTES || query.contains('\0')
+                {
+                    problems.push(format!(
+                        "query must be 1 to {MAX_QUERY_BYTES} bytes of text, with no NUL"
+                    ));
+                }
+                if decimals.is_some_and(|d| d > MAX_DECIMALS) {
+                    problems.push(format!("decimals is over {MAX_DECIMALS}"));
+                }
+                if suffix.len() > MAX_SUFFIX || !printable_ascii(suffix) {
+                    problems.push(format!(
+                        "suffix: at most {MAX_SUFFIX} printable ASCII characters"
+                    ));
+                }
+                if reqwest::Url::parse(url)
+                    .is_ok_and(|u| u.query().is_some() || u.fragment().is_some())
+                {
+                    problems.push("url is the server's base, with no query or fragment".into());
+                }
+                if let Some(action) = self.prometheus_action() {
+                    problems.extend(action.check(secrets));
+                }
             }
         }
         problems
@@ -1151,11 +1322,9 @@ impl Config {
                     integration.id()
                 ));
             }
-            if let IntegrationConfig::Push {
-                id, token_secret, ..
-            } = integration
-            {
-                if let Some(first) = tokens.insert(token_secret.as_str(), id.as_str()) {
+            if let Some(token_secret) = integration.token_secret() {
+                let id = integration.id();
+                if let Some(first) = tokens.insert(token_secret, id) {
                     errors.push(format!(
                         "integration {id:?}: token_secret {token_secret:?} is already used by {first:?}"
                     ));
@@ -3631,8 +3800,8 @@ source = { kind = "http", method = "GET", url = "http://nas.lan/api/load" }
             .unwrap_err()
             .iter()
             .any(|e| e.contains("can't be read")));
-        // A kind that is not one of the two is a decode error.
-        let kind = with_new("[[integration]]\nid = \"x\"\nkind = \"prometheus\"\nlabel = \"x\"\n");
+        // A kind that is not one of the four is a decode error.
+        let kind = with_new("[[integration]]\nid = \"x\"\nkind = \"nagios\"\nlabel = \"x\"\n");
         assert!(parse(&kind, &sizes()).is_err());
         // Unknown keys are refused for each kind.
         let extra = with_new("[[integration]]\nid = \"x\"\nkind = \"push\"\nlabel = \"x\"\ntoken_secret = \"push-ha\"\nevery_s = 3\n");
@@ -3687,6 +3856,172 @@ source = { kind = "http", method = "GET", url = "http://nas.lan/api/load" }
             &sizes(),
         )
         .unwrap();
+    }
+
+    /// A prometheus integration `id` with `extra` keys after the required ones.
+    fn prom_table(id: &str, extra: &str) -> String {
+        format!(
+            "[[integration]]\nid = \"{id}\"\nkind = \"prometheus\"\nlabel = \"Prom\"\n\
+             url = \"http://prom.lan:9090\"\nquery = \"up\"\nevery_s = 30\n{extra}"
+        )
+    }
+
+    #[test]
+    fn the_prometheus_and_grafana_kinds_with_every_key_pass() {
+        let text = format!(
+            "{}{}",
+            prom_table(
+                "cpu",
+                "decimals = 1\nsuffix = \"%\"\nbad_above = 90\nbad_below = 0.5\n\
+                 secret_headers = { Authorization = \"push-ha\" }\ninsecure_http = true\n\
+                 timeout_s = 5\n"
+            ),
+            "[[integration]]\nid = \"graf\"\nkind = \"grafana\"\nlabel = \"Grafana\"\n\
+             token_secret = \"push-ha\"\nlevels = { page = \"error\", minor = \"ok\" }\n"
+        );
+        let config = parse(&with_new(&text), &sizes()).unwrap();
+        let [IntegrationConfig::Prometheus {
+            bad_above,
+            bad_below,
+            ..
+        }, IntegrationConfig::Grafana { levels, .. }] = config.integrations.as_slice()
+        else {
+            panic!("{:?}", config.integrations);
+        };
+        assert_eq!(bad_above.as_ref().unwrap().as_f64(), Some(90.0));
+        assert_eq!(bad_below.as_ref().unwrap().as_f64(), Some(0.5));
+        assert_eq!(levels["page"], NoteLevel::Error);
+        // Saved and read back, the config is the same.
+        let saved = toml::to_string(&config).unwrap();
+        assert_eq!(parse(&saved, &sizes()).unwrap(), config);
+        // Prometheus is a card source, Grafana is not.
+        assert_eq!(
+            config
+                .integrations
+                .iter()
+                .map(|i| i.is_card())
+                .collect::<Vec<_>>(),
+            [true, false]
+        );
+    }
+
+    #[test]
+    fn the_prometheus_rules_say_what_is_wrong() {
+        let refused = |extra: &str, expected: &str| {
+            assert_refused(&with_new(&prom_table("cpu", extra)), expected)
+        };
+        refused("decimals = 4", "integration \"cpu\": decimals is over 3");
+        refused(
+            "suffix = \"12345678\"",
+            "integration \"cpu\": suffix: at most 7 printable ASCII characters",
+        );
+        refused(
+            "suffix = \"\\u00b0C\"",
+            "suffix: at most 7 printable ASCII characters",
+        );
+        refused("timeout_s = 0", "integration \"cpu\": timeout_s is 0");
+        refused(
+            "timeout_s = 31",
+            "timeout_s is over 30, the lesser of 30 and every_s",
+        );
+        // every_s 30 allows 30; every_s 5 allows 5, and its default stays under that.
+        parse(&with_new(&prom_table("cpu", "timeout_s = 30")), &sizes()).unwrap();
+        let quick = prom_table("cpu", "").replace("every_s = 30", "every_s = 5");
+        parse(&with_new(&quick), &sizes()).unwrap();
+        assert_refused(
+            &with_new(&format!("{quick}timeout_s = 6\n")),
+            "timeout_s is over 5, the lesser of 30 and every_s",
+        );
+        let two = prom_table("cpu", "").replace("every_s = 30", "every_s = 2");
+        let Some(Action::Http { timeout_s, .. }) =
+            parse(&with_new(&two), &sizes()).unwrap().integrations[0].prometheus_action()
+        else {
+            panic!("an http action");
+        };
+        assert_eq!(timeout_s, 2, "the default is the lesser of 10 and every_s");
+        refused(
+            "insecure_tls = true",
+            "insecure_tls only applies to https:// urls",
+        );
+        refused(
+            "secret_headers = { Authorization = \"nope\" }",
+            "header \"Authorization\" uses secret \"nope\", which is not in secrets.toml",
+        );
+        refused(
+            "secret_headers = { Authorization = \"push-ha\" }",
+            "secret_headers would cross the network in the clear over http://",
+        );
+        refused("bad_above = \"x\"", "expected a JSON number");
+        refused("method = \"POST\"", "unknown field `method`");
+        let with = |from: &str, to: &str| prom_table("cpu", "").replace(from, to);
+        for (text, expected) in [
+            (
+                with("every_s = 30", "every_s = 1"),
+                "every_s is 1, expected 2 to 86400",
+            ),
+            (
+                with("query = \"up\"", "query = \" \""),
+                "query must be 1 to 2000 bytes",
+            ),
+            (
+                with("http://prom.lan:9090", "http://prom.lan:9090/?a=b"),
+                "url is the server's base, with no query or fragment",
+            ),
+            (
+                with("http://prom.lan:9090", "ftp://prom.lan"),
+                "url is not http:// or https://",
+            ),
+            (
+                with("http://prom.lan:9090", "prom.lan:9090"),
+                "url is not http:// or https://",
+            ),
+            (
+                with(
+                    "query = \"up\"",
+                    &format!("query = \"{}\"", "q".repeat(2001)),
+                ),
+                "query must be 1 to 2000 bytes",
+            ),
+        ] {
+            assert_refused(&with_new(&text), expected);
+        }
+        // No error repeats the url, which may carry a token.
+        let bad =
+            with_new(&prom_table("cpu", "").replace("http://prom.lan:9090", "http://u:tok123@"));
+        let errors = errors(&bad);
+        assert!(!errors.is_empty());
+        assert!(errors.iter().all(|e| !e.contains("tok123")), "{errors:?}");
+    }
+
+    #[test]
+    fn the_grafana_rules_say_what_is_wrong() {
+        let table = |extra: &str| {
+            format!(
+                "[[integration]]\nid = \"graf\"\nkind = \"grafana\"\nlabel = \"G\"\n\
+                 token_secret = \"push-ha\"\n{extra}"
+            )
+        };
+        let graf = |extra: &str| with_new(&table(extra));
+        parse(&graf(""), &sizes()).unwrap();
+        assert_refused(
+            &graf("levels = { page = \"loud\" }"),
+            "unknown variant `loud`",
+        );
+        assert_refused(
+            &graf("levels = { \"\" = \"warn\" }"),
+            "levels: a severity is 1 to 31",
+        );
+        assert_refused(&graf("every_s = 3"), "unknown field `every_s`");
+        assert_refused(
+            &graf("levels = { page = \"error\", PAGE = \"warn\" }"),
+            "levels: \"page\" is listed twice; severities ignore case",
+        );
+        // A grafana integration and a push integration can't share a token either.
+        let both = format!("{}{}", push_table("a", "A", "push-ha"), table(""));
+        assert_refused(
+            &with_new(&both),
+            "integration \"graf\": token_secret \"push-ha\" is already used by \"a\"",
+        );
     }
 
     #[test]

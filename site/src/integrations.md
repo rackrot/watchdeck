@@ -4,8 +4,10 @@ A right swipe on page 1 of the board shows the feed page: notes (notifications) 
 
 - A `stat` integration polls a command or a URL and shows the value as a card.
 - A `push` integration takes notes and cards that scripts, cron jobs and Home Assistant send to the daemon's push API, over HTTP or with the `watchdeck` command.
+- A `prometheus` integration runs a query against a Prometheus server and shows the value as a card.
+- A `grafana` integration takes the alerts of a Grafana webhook contact point and shows them as notes.
 
-This page covers the push API, the `watchdeck` command and the LAN option.
+This page covers the push API, the `watchdeck` command and the LAN option, then the [`prometheus`](#prometheus) and [`grafana`](#grafana) integrations.
 
 ## A push integration and its token
 
@@ -73,7 +75,7 @@ Every error answer is JSON, `{"error": "<reason>"}`.
 | `404` | No such note or card, or a method the route doesn't take |
 | `408` | The body took more than 5 s after the headers |
 | `409` | The integration has its 4 cards, all 8 card slots are taken, or all 32 notes are other integrations' |
-| `413` | The body is over 8 KB (8192 bytes) |
+| `413` | The body is over 8 KB (8192 bytes), or over 64 KB on `/v1/grafana` |
 | `429` | Too many requests (see the limits) |
 
 ### Limits
@@ -216,6 +218,84 @@ An automation's or a script's action then calls it:
     level: ok
 ```
 
+## Prometheus
+
+A `prometheus` integration runs one instant query every `every_s` seconds (2 to 86400) and shows the first value as a card. It sends `GET <url>/api/v1/query?query=<the query, URL-encoded>`, so `url` is the server's base, such as `http://prom.lan:9090` (a path prefix such as `http://host/prometheus` is kept), with no query or fragment of its own.
+
+```toml
+[[integration]]
+id = "cpu"
+kind = "prometheus"
+label = "CPU"
+url = "http://prom.lan:9090"
+query = '100 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100'
+every_s = 30
+decimals = 1
+suffix = "%"
+bad_above = 90
+```
+
+| Key | Needed | Meaning |
+|---|---|---|
+| `url`, `query`, `every_s`, `label`, `id` | yes | The server's base URL, the PromQL expression (up to 2000 bytes), the period, and the card's name |
+| `decimals` | no | 0 to 3 digits after the point. Without it, the value shows as Prometheus gives it |
+| `suffix` | no | Up to 7 printable ASCII characters after the value, such as `%`, or a space and `MB` |
+| `bad_above`, `bad_below` | no | The card is bad when the value is above the first or below the second. Whole or decimal numbers |
+| `secret_headers` | no | Header name to the name of a secret in `secrets.toml`, as an HTTP action's, such as `{ Authorization = "prom-token" }` for a server behind a bearer token |
+| `insecure_http`, `insecure_tls`, `timeout_s` | no | As an HTTP action's: `insecure_http` lets `secret_headers` cross the network over plain `http://`, `insecure_tls` accepts a self-signed certificate on `https://`, and `timeout_s` bounds the whole request: at most 30 and at most `every_s`, default 10 or `every_s` if less |
+
+- The query must return one series, or a scalar. A `scalar` shows its value, and a `vector` its one series. A vector of several series is bad, with `N series, expected 1` (aggregate with `sum`, `avg` or `topk(1, ...)`). A `matrix` or a `string` result is bad, with a reason on the card.
+- A value of `NaN` or `±Inf` shows as it is, in the unknown color, since no threshold can judge it. With `bad_above` or `bad_below` set, it is bad.
+- The card is bad, with "no data", when the query returns no series. When the server answers with an error status, it is bad with the status and the reason from the body: Prometheus answers `400`, `422` and `503` with `{"status":"error","errorType":...,"error":...}`, so the card reads `HTTP 400: parse error at char 5 ...`. The board's card value holds 15 characters, so a long reason is cut. When the server can't be reached it is bad with the failure (`request failed: ...`, `timed out after 10 s`). Prometheus's `error` text also shows when it answers `200` with `"status":"error"`.
+- Header values from `secret_headers` are blanked from anything the card shows. The URL never appears in an error.
+- The polls run in the same slots as the other polled integrations and the tiles: at most 2 at a time, so a query that ran out its `timeout_s` holds one of the two until then, which is why the timeout can't pass the period. A poll that finds both taken is skipped. After three polls in a row that couldn't run, the card turns unknown.
+
+## Grafana
+
+A `grafana` integration shows Grafana-managed alerts as notes. It is a push kind: Grafana's webhook contact point POSTs its alerts to the push API, with the integration's token, and the daemon turns each alert into a note.
+
+```toml
+[[integration]]
+id = "graf"
+kind = "grafana"
+label = "Grafana"
+token_secret = "push-grafana"
+levels = { page = "error" }       # optional
+```
+
+Add the token as for a push integration: a secret of at least 32 characters. It can't be shared with another push or grafana integration.
+
+### The contact point
+
+In Grafana, under Alerting, Contact points, add a contact point of type Webhook:
+
+| Setting | Value |
+|---|---|
+| URL | `http://127.0.0.1:47822/v1/grafana` when Grafana runs on the same machine as the app (not in a container, where `127.0.0.1` is the container). Otherwise turn on [`lan`](#from-another-host) and use `https://desktop.lan:47823/v1/grafana` |
+| HTTP method | `POST` (`PUT` works too) |
+| Authorization header: scheme | `Bearer` (the default) |
+| Authorization header: credentials | the token, the value of the secret `token_secret` names |
+
+Grafana verifies the certificate on an `https://` URL, and the daemon's is self-signed and names no host. Use the loopback URL where you can. Otherwise use the contact point's TLS setting for a self-signed certificate if your Grafana version has one, knowing that anyone on the LAN who can intercept the traffic then gets the token.
+
+Leave Grafana's "Max Alerts" at 0, or at a number you accept: alerts past it are never sent. Use the contact point's Test button: it sends a test alert, which shows as a note.
+
+### What an alert becomes
+
+- **A firing alert** adds a note with the id `graf/<fingerprint>`, so the notifications Grafana repeats while an alert fires replace one note and don't pile up. The note stays for the default 1 day, and Grafana's repeat keeps it fresh.
+- **A resolved alert** removes the note. Resolving an alert whose note is gone already (dismissed on a board, expired, or lost to a daemon restart) is not an error.
+- The **title** is `labels.alertname`, followed by a colon, a space and `annotations.summary` when there is one. The **body** is `annotations.description`.
+- The **level** comes from the `severity` label, not case-sensitively: `critical` is `error`, `warning` is `warn`, and anything else, or none, is `info`. `levels` adds to this or changes it: each key is a severity, each value `info`, `ok`, `warn` or `error`. Two keys that differ only in case are refused.
+- Only `alerts` is required in the payload. Other fields, at the top and in an alert, are ignored if the daemon doesn't know them, since Grafana adds fields. A body without `alerts`, with invalid JSON, or with an alert whose `status` isn't `firing` or `resolved` is a `400`. An alert with no usable fingerprint gets an id from a hash of its labels, so alerts of one rule with different labels stay separate notes. One bad alert refuses the whole payload.
+- The route takes bodies up to 64 KB, not the 8 KB of the others, because a payload carries every alert of a group (about 1 KB each). The integration's limits apply: at most 16 notes, and an alert past that replaces the oldest of the integration's own, so a flood can't push out another integration's notes.
+
 ## Adding a source
 
 For developers: every source is a `kind` in `IntegrationConfig` (`daemon/config.rs`) with its rules in `check`, and one implementation of `Connector` (a polled source) or `Receiver` (a push source) in `daemon/integrations/`, built by one arm of `build`. A `Receiver` names the first path segments it answers under `/v1/` in `routes()`, and the listener refuses a token on any other route. The `stat` source (`integrations/stat.rs`) is the smallest polled example, and `push` (`integrations/push.rs`) the receiving one. Nothing in the feed store, the sessions or the board changes for a new source.
+
+The two interfaces have a few hooks beyond that, each with a default for a source that doesn't need it:
+
+- A `Connector` that needs the whole reply of an HTTP request, not a tile's one value, takes the `Fetch` trait's `fetch` instead of `Sample`, which runs the request in a feed slot with the actions' client, timeouts and redaction. `prometheus` is the example: its config builds the request as an HTTP action (`IntegrationConfig::prometheus_action`).
+- A `Receiver` that needs bodies bigger than 8 KB overrides `max_body_bytes`. The listener reads the bigger body only after the token has picked the integration. `grafana` is the example.
+- A `Receiver` that reports the end of something, such as a resolved alert, returns `Update::ClearNote` instead of `Update::RemoveNote`, which removes the note without a `404` when it is already gone.
+- A kind with a token names it in `IntegrationConfig::token_secret`, which is what the listener and the shared-token rule read.

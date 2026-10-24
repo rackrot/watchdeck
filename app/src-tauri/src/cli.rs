@@ -257,7 +257,8 @@ fn token_from_files(dir: &Path, integration: Option<&str>) -> Result<String, Str
             IntegrationConfig::Push {
                 id, token_secret, ..
             } => Some((id.as_str(), token_secret.as_str())),
-            IntegrationConfig::Stat { .. } => None,
+            // The CLI posts notes and cards, which only a push integration answers.
+            _ => None,
         })
         .collect();
     let (id, secret) = match (integration, pushes.as_slice()) {

@@ -8,27 +8,34 @@
 //!
 //! Adding a source is a `kind` in [`IntegrationConfig`] with its rules, an implementation of one
 //! of the two traits, and one arm in [`build`]. Nothing in the store, the sessions or the board
-//! changes.
+//! changes. A connector that needs the whole HTTP reply, as `prometheus` does, runs it through
+//! [`Fetch`]; a receiver that needs a bigger body than the push API's 8 KB, as `grafana` does,
+//! says so with [`Receiver::max_body_bytes`].
 
+mod grafana;
+mod prometheus;
 mod push;
 mod stat;
 
 use std::collections::HashMap;
-use std::future::pending;
+use std::future::{pending, Future};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
+use serde_json::Number;
 use tokio::sync::watch;
 use tokio::time::{sleep, sleep_until, Instant};
 
 pub use stat::FeedSlots;
 
-use super::config::{IntegrationConfig, Live};
+use super::actions::Ran;
+use super::config::{Action, IntegrationConfig, Live};
 use super::feed::{
     Applied, Card, FeedStore, Snapshot, SourceInfo, StoreError, Update, MAX_SOURCE_CARDS,
 };
 use super::protocol::Feed;
+use super::push::MAX_BODY_BYTES;
 use super::tiles::{Sample, Task, COOLDOWN, STALE_AFTER};
 
 /// A polled source.
@@ -99,6 +106,25 @@ pub trait Receiver: Send + Sync + 'static {
     /// What a request changes. The caller applies the updates in order and stops at the first
     /// that fails.
     fn accept(&self, req: &PushRequest) -> Result<Vec<Update>, PushError>;
+
+    /// The largest body the listener reads for this kind, read only from an authenticated
+    /// caller. Over it is a 413.
+    fn max_body_bytes(&self) -> usize {
+        MAX_BODY_BYTES
+    }
+}
+
+/// Runs an HTTP request in one of the feed's slots, for a connector that reads the reply itself.
+/// [`Sample`] is the tile-shaped path, which only returns a value. A test stands in its own.
+pub trait Fetch: Clone + Send + Sync + 'static {
+    /// `None` when no slot is free: the poll could not run.
+    fn fetch(&self, id: &str, action: &Action) -> impl Future<Output = Option<Ran>> + Send;
+}
+
+impl Fetch for FeedSlots {
+    async fn fetch(&self, id: &str, action: &Action) -> Option<Ran> {
+        self.run(id, action).await
+    }
 }
 
 #[derive(Clone)]
@@ -109,9 +135,36 @@ pub enum Source {
 
 /// The registry: the source for `config`, one arm per kind. `sampler` takes the readings of the
 /// kinds that run a command or a request.
-pub fn build<S: Sample>(config: &IntegrationConfig, sampler: &S) -> Source {
+pub fn build<S: Sample + Fetch>(config: &IntegrationConfig, sampler: &S) -> Source {
     match config {
         IntegrationConfig::Push { .. } => Source::Push(Arc::new(push::Routes)),
+        IntegrationConfig::Grafana { levels, .. } => {
+            Source::Push(Arc::new(grafana::Grafana::new(levels)))
+        }
+        IntegrationConfig::Prometheus {
+            id,
+            label,
+            every_s,
+            decimals,
+            suffix,
+            bad_above,
+            bad_below,
+            ..
+        } => Source::Polled(Arc::new(prometheus::Prometheus::new(
+            sampler.clone(),
+            id,
+            label,
+            *every_s,
+            config
+                .prometheus_action()
+                .expect("a prometheus integration has its action"),
+            prometheus::Display {
+                decimals: *decimals,
+                suffix: suffix.clone(),
+                bad_above: bad_above.as_ref().and_then(Number::as_f64),
+                bad_below: bad_below.as_ref().and_then(Number::as_f64),
+            },
+        ))),
         IntegrationConfig::Stat {
             id,
             label,
@@ -180,6 +233,13 @@ impl FeedHandle {
             .collect()
     }
 
+    /// The most body bytes the listener reads for the integration `integration`.
+    pub fn body_limit(&self, integration: &str) -> usize {
+        (self.receivers.lock().expect("receivers poisoned"))
+            .get(integration)
+            .map_or(MAX_BODY_BYTES, |r| r.max_body_bytes())
+    }
+
     /// Whether the push integration `integration` answers `path` (under `/v1/`), by its first
     /// segment. False for an integration that isn't a push one.
     pub fn answers(&self, integration: &str, path: &str) -> bool {
@@ -210,7 +270,7 @@ impl Integrations {
 /// Builds the sources of the live `config` and polls the polled ones while `connected` (the
 /// number of devices with a session) is above 0. The store knows the configured sources before
 /// this returns. Must run inside a tokio runtime.
-pub fn spawn<S: Sample>(
+pub fn spawn<S: Sample + Fetch>(
     sampler: S,
     config: watch::Receiver<Arc<Live>>,
     connected: watch::Receiver<usize>,
@@ -251,7 +311,7 @@ struct Manager<S> {
     starts: Starts,
 }
 
-impl<S: Sample> Manager<S> {
+impl<S: Sample + Fetch> Manager<S> {
     async fn run(
         mut self,
         mut config: watch::Receiver<Arc<Live>>,
@@ -509,6 +569,19 @@ mod tests {
                 text: n.to_string(),
                 state: self.state.lock().unwrap().unwrap_or(TileState::Ok),
             })
+        }
+    }
+
+    // The manager tests poll `stat` sources only, so a fetch has nothing to run.
+    impl Fetch for Fake {
+        async fn fetch(&self, _: &str, _: &Action) -> Option<Ran> {
+            None
+        }
+    }
+
+    impl Fetch for Slow {
+        async fn fetch(&self, _: &str, _: &Action) -> Option<Ran> {
+            None
         }
     }
 
