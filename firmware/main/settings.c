@@ -22,6 +22,7 @@
 // needs nothing else.
 static const settings_tab_t TABS[] = {
     {"Status", tab_status_build, tab_status_tick, tab_status_leave},
+    {"Wi-Fi", tab_wifi_build, tab_wifi_tick, tab_wifi_leave},
     {"Logs", tab_logs_build, tab_logs_tick, tab_logs_leave},
     {"Errors", tab_errors_build, tab_errors_tick, tab_errors_leave},
 };
@@ -111,7 +112,7 @@ static void page_gesture(lv_event_t *e)
 // viewer, and the Wi-Fi editor, which holds a half-typed password and may wait on a trial connect.
 static bool idle_blocked(void)
 {
-    return ui_licenses_open();
+    return ui_licenses_open() || tab_wifi_editing();
 }
 
 static void page_tick(lv_timer_t *timer)
