@@ -3,6 +3,7 @@
 
 #include "settings.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "display.h"
@@ -20,6 +21,8 @@
 // needs nothing else.
 static const settings_tab_t TABS[] = {
     {"Status", tab_status_build, tab_status_tick, tab_status_leave},
+    {"Logs", tab_logs_build, tab_logs_tick, tab_logs_leave},
+    {"Errors", tab_errors_build, tab_errors_tick, tab_errors_leave},
 };
 #define TAB_COUNT (sizeof(TABS) / sizeof(TABS[0]))
 
@@ -120,6 +123,111 @@ static void page_tick(lv_timer_t *timer)
     }
     if (TABS[s_tab].tick) {
         TABS[s_tab].tick();
+    }
+}
+
+/* ---- Log lines, shared by the Logs and Errors tabs ---- */
+
+static lv_style_t s_style_error, s_style_warn;
+static bool s_styles_ready;
+static lv_obj_t *s_line_modal; // on the top layer, NULL while closed
+// What the modal's labels point at, so the pool holds none of the text.
+static char s_line_head[48];
+static char s_line_text[LOGRING_TEXT_MAX + 1];
+
+lv_obj_t *settings_log_line_create(lv_obj_t *parent, int x, int y, int w, int h, lv_event_cb_t on_tap, void *user_data)
+{
+    if (!s_styles_ready) {
+        lv_style_init(&s_style_error);
+        lv_style_set_text_color(&s_style_error, lv_palette_lighten(LV_PALETTE_RED, 2));
+        lv_style_init(&s_style_warn);
+        lv_style_set_text_color(&s_style_warn, lv_palette_lighten(LV_PALETTE_YELLOW, 1));
+        s_styles_ready = true;
+    }
+    lv_obj_t *label = lv_label_create(parent);
+    lv_label_set_recolor(label, false); // log text can hold '#', which would start recolor markup
+    lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_20, 0);
+    lv_obj_set_size(label, w, h);
+    lv_obj_set_pos(label, x, y);
+    lv_obj_set_clickable(label, true);
+    lv_obj_add_event_cb(label, on_tap, LV_EVENT_CLICKED, user_data);
+    lv_label_set_text_static(label, "");
+    return label;
+}
+
+void settings_log_line_set(lv_obj_t *label, const logring_line_t *line)
+{
+    lv_obj_remove_style(label, &s_style_error, 0);
+    lv_obj_remove_style(label, &s_style_warn, 0);
+    if (!line) {
+        lv_label_set_text_static(label, "");
+        return;
+    }
+    if (line->level == 'E') {
+        lv_obj_add_style(label, &s_style_error, 0);
+    } else if (line->level == 'W') {
+        lv_obj_add_style(label, &s_style_warn, 0);
+    }
+    lv_label_set_text_static(label, line->text);
+}
+
+static void line_modal_tapped(lv_event_t *e)
+{
+    (void)e;
+    lv_obj_delete_async(s_line_modal); // from inside its own event
+    s_line_modal = NULL;
+}
+
+void settings_log_line_open(const logring_line_t *line)
+{
+    if (s_line_modal) {
+        return;
+    }
+    snprintf(s_line_head, sizeof(s_line_head), "%c  %u.%03u s since boot  #%u", line->level,
+             (unsigned)(line->ms / 1000), (unsigned)(line->ms % 1000), (unsigned)line->seq);
+    strlcpy(s_line_text, line->text, sizeof(s_line_text));
+
+    s_line_modal = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(s_line_modal);
+    lv_obj_set_size(s_line_modal, GRID_SCREEN_W, GRID_SCREEN_H);
+    lv_obj_set_style_bg_color(s_line_modal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_line_modal, LV_OPA_70, 0);
+    lv_obj_set_clickable(s_line_modal, true); // keeps taps off the page below
+    lv_obj_add_event_cb(s_line_modal, line_modal_tapped, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *card = lv_obj_create(s_line_modal);
+    lv_obj_set_size(card, GRID_SCREEN_W - 80, LV_SIZE_CONTENT);
+    lv_obj_set_style_max_height(card, GRID_SCREEN_H - 60, 0);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, lv_palette_darken(LV_PALETTE_GREY, 4), 0);
+    lv_obj_set_style_border_width(card, 0, 0);
+    lv_obj_set_style_radius(card, 16, 0);
+    lv_obj_set_style_pad_all(card, 24, 0);
+    lv_obj_set_style_pad_row(card, 12, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scrollable(card, false);
+    lv_obj_set_clickable(card, false); // the tap lands on the dim layer below
+
+    lv_obj_t *head = lv_label_create(card);
+    lv_label_set_recolor(head, false);
+    lv_obj_set_width(head, LV_PCT(100));
+    lv_obj_set_style_text_color(head, lv_palette_lighten(LV_PALETTE_GREY, 1), 0);
+    lv_label_set_text_static(head, s_line_head);
+
+    lv_obj_t *text = lv_label_create(card);
+    lv_label_set_recolor(text, false);
+    lv_obj_set_width(text, LV_PCT(100));
+    lv_label_set_long_mode(text, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(text, lv_color_white(), 0);
+    lv_label_set_text_static(text, s_line_text);
+}
+
+void settings_log_line_close(void)
+{
+    if (s_line_modal) {
+        lv_obj_delete(s_line_modal);
+        s_line_modal = NULL;
     }
 }
 
