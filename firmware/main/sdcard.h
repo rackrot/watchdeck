@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 #include "sdmmc_cmd.h"
@@ -35,8 +36,9 @@ sdcard_owner_t sdcard_owner(void);
 /** The initialised card, valid after sdcard_mount() found one (also while shared). */
 sdmmc_card_t *sdcard_card(void);
 
-// The calls below run on the svc task only, like every card access after boot (svc.h), so none of them races a
-// cardfs call or another of them.
+// The calls below run on the svc task only (they assert it), like every card access after boot (svc.h), so none of
+// them races another. Each detaches cardfs before it unmounts (cardfs_detach), so a cardfs call from any task either
+// finished before the unmount or returns ESP_ERR_INVALID_STATE without touching FatFs.
 
 /**
  * Unmount and mount the card again, then cardfs_set_writable(true) and cardfs_recover. What cardfs needs after a
@@ -52,7 +54,8 @@ esp_err_t sdcard_remount(void);
 void sdcard_note_failure(const char *what, esp_err_t err);
 
 /**
- * For the USB share: refuse cardfs writes (waits for a call in progress), unmount and unregister the file system.
+ * For the USB share: detach cardfs (waits for a call in progress; from then on every cardfs call, reads included,
+ * returns ESP_ERR_INVALID_STATE), unmount and unregister the file system.
  * The card and the SDMMC host stay initialised (the host is shared with ESP-Hosted). The owner stays DEVICE until
  * sdcard_set_shared; if the share fails, sdcard_remount takes the card back. ESP_ERR_INVALID_STATE: not DEVICE.
  */
@@ -60,3 +63,9 @@ esp_err_t sdcard_release_fs(void);
 
 /** The card is mapped to USB: SHARED until the next reboot. */
 void sdcard_set_shared(void);
+
+/**
+ * Totals since boot of the read-back that checks every multi-block write (IDF 6.1 can report a failed one as
+ * written; see sdcard.c): sectors read back and the microseconds it took.
+ */
+void sdcard_write_check_stats(uint64_t *sectors, uint64_t *us);

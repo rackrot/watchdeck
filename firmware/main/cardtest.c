@@ -116,13 +116,14 @@ static void on_entry(const char *name, size_t size, bool is_dir, void *ctx)
     }
     char rel[32];
     snprintf(rel, sizeof(rel), "watchdeck/%s", name);
+    // Logged before the delete, so the verdict survives a cut during it.
     const esp_err_t verdict = cardfs_verify(rel, size, digest, sizeof(digest));
-    const esp_err_t removed = cardfs_remove(rel);
-    ESP_LOGW(TAG, "  left over: %s is %s; deleted: %s", rel,
+    ESP_LOGW(TAG, "  left over: %s (%u bytes) is %s", rel, (unsigned)size,
              verdict == ESP_OK                ? "valid"
-             : verdict == ESP_ERR_INVALID_CRC ? "invalid"
-                                              : esp_err_to_name(verdict),
-             esp_err_to_name(removed));
+             : verdict == ESP_ERR_INVALID_CRC ? "invalid (size or hash)"
+                                              : esp_err_to_name(verdict));
+    const esp_err_t removed = cardfs_remove(rel);
+    ESP_LOGW(TAG, "  deleted %s: %s", rel, esp_err_to_name(removed));
 }
 
 // Reads selftest.cfg and checks every byte against its counter. Sets s_base.
@@ -158,6 +159,8 @@ static void round_job(void *arg)
 {
     const unsigned round = (unsigned)(uintptr_t)arg;
     const uint32_t counter = s_base + round;
+    uint64_t check_sectors0, check_us0;
+    sdcard_write_check_stats(&check_sectors0, &check_us0);
 
     const size_t cfg_len = cfg_build(counter, s_cfg);
     int64_t start = esp_timer_get_time();
@@ -211,6 +214,13 @@ static void round_job(void *arg)
     ESP_LOGI(TAG, "card self-test %u/%u ok (%s %u bytes in %lu ms; %s %u bytes in %lu ms, read back in %lu ms)", round,
              ROUNDS, CFG, (unsigned)cfg_len, (unsigned long)cfg_ms, rel, (unsigned)bin_len, (unsigned long)bin_ms,
              (unsigned long)verify_ms);
+    uint64_t check_sectors, check_us;
+    sdcard_write_check_stats(&check_sectors, &check_us);
+    ESP_LOGI(TAG,
+             "card self-test %u/%u: the writes' read-back check (sdcard.c, IDF 6.1 multi-block bug) took %lu ms "
+             "for %lu sectors, inside the write times above",
+             round, ROUNDS, (unsigned long)((check_us - check_us0) / 1000),
+             (unsigned long)(check_sectors - check_sectors0));
     if (bin_ms > 3000) {
         ESP_LOGW(TAG, "a 1 MiB write over 3 s is a finding (01-groundwork.md, risks)");
     }

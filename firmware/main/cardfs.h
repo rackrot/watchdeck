@@ -31,8 +31,14 @@
 // before the board mounts the card again, has that edit replaced by the write the cut interrupted.
 //
 // Boot order, after the card is mounted read-write and before anything else touches it: cardfs_init, then
-// cardfs_set_writable(true), then cardfs_recover. Before USB takes the card: cardfs_set_writable(false), which waits
-// for a call in progress. Every call takes one mutex.
+// cardfs_set_writable(true), then cardfs_recover. Before the volume is unmounted (a remount, or USB taking the card):
+// cardfs_detach, which waits for a call in progress; after a new mount, cardfs_attach then cardfs_set_writable(true).
+// Every call takes one mutex.
+//
+// While detached (the card is shared over USB, between the unmount and mount of a remount, or after a remount
+// failed), every call that touches the card, reads included, returns ESP_ERR_INVALID_STATE without touching it.
+// So ESP_ERR_NOT_FOUND from cardfs_read, cardfs_verify or cardfs_list always means the card is mounted and the file
+// is absent, and ESP_ERR_INVALID_STATE means the card isn't there to ask (sdcard_owner() says why).
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -74,25 +80,35 @@ esp_err_t cardfs_fat_prepare(void *ctx);
 esp_err_t cardfs_fat_room(const char *dir, const uint8_t *runs, size_t n, void *ctx);
 
 // Sets the root (e.g. "/sdcard", at most 15 characters) and the volume (copied; vol->ctx is kept), creates the
-// mutex, clears the taint and runs vol->prepare, returning its error. Writes are refused until
+// mutex, attaches, clears the taint and runs vol->prepare, returning its error. Writes are refused until
 // cardfs_set_writable(true).
 esp_err_t cardfs_init(const char *root, const cardfs_volume_t *vol);
 
 // Allows or refuses writes, removes and recovery. Waits for a call in progress to finish. false also clears the
-// taint. true runs vol->prepare first and stays unwritable if it fails, returning its error.
+// taint. true runs vol->prepare first and stays unwritable if it fails, returning its error; while detached it
+// returns ESP_ERR_INVALID_STATE.
 esp_err_t cardfs_set_writable(bool writable);
 bool cardfs_writable(void);
 
-// True from a failed card access until cardfs_set_writable(false) or cardfs_init. A writer that gets
+// Before the caller unmounts the volume: waits for a call in progress, then refuses every call that touches the card
+// (ESP_ERR_INVALID_STATE) until cardfs_attach. Also turns writes off and clears the taint. No call can be inside
+// FatFs once this returns, so the unmount can't free a volume under one.
+void cardfs_detach(void);
+
+// After the caller has mounted the volume again: calls touch the card again. Writes stay off until
+// cardfs_set_writable(true). ESP_ERR_INVALID_STATE: cardfs_init never ran.
+esp_err_t cardfs_attach(void);
+
+// True from a failed card access until cardfs_set_writable(false), cardfs_detach or cardfs_init. A writer that gets
 // ESP_ERR_INVALID_STATE while this holds has the card remounted (sdcard_note_failure) before it writes again.
 bool cardfs_tainted(void);
 
 // The allowlist. Lowercase only: FAT is case-insensitive, so other casings are refused, not folded.
 bool cardfs_name_ok(const char *rel);
 
-// Replaces a small file through its intent record. rel is "wifi.txt", "watchdeck/sleep.cfg" or
-// "watchdeck/selftest.cfg" (the card self-test's). First resolves a
-// record an earlier failed write left, and refuses if that fails, so a pending write is never lost to a new one.
+// Replaces a small file through its intent record. rel is "wifi.txt", "watchdeck/sleep.cfg", or, in a
+// CONFIG_WATCHDECK_TEST_CARD build, "watchdeck/selftest.cfg". First resolves a record an earlier failed write left,
+// and refuses if that fails, so a pending write is never lost to a new one.
 // ESP_ERR_INVALID_ARG: rel isn't a small file. ESP_ERR_INVALID_SIZE: len > CARDFS_SMALL_MAX.
 // ESP_ERR_INVALID_STATE: not writable, or tainted. CARDFS_ERR_DIR_FULL: see above; nothing written.
 // ESP_ERR_NO_MEM: nothing written. ESP_FAIL: an I/O error; rel is as an earlier write left it, or new once
@@ -106,11 +122,13 @@ esp_err_t cardfs_write_small(const char *rel, const void *data, size_t len);
 // otherwise.
 esp_err_t cardfs_write_new(const char *rel, const void *data, size_t len);
 
-// Reads rel whole into buf. ESP_ERR_NOT_FOUND: absent. ESP_ERR_INVALID_SIZE: larger than cap.
+// Reads rel whole into buf. ESP_ERR_NOT_FOUND: the card is mounted and rel is absent. ESP_ERR_INVALID_SIZE: larger
+// than cap. ESP_ERR_INVALID_STATE: detached (shared over USB, remounting, or no card), so nothing is known.
 esp_err_t cardfs_read(const char *rel, void *buf, size_t cap, size_t *len);
 
 // Checks that rel is len bytes long and that its SHA-256 starts with digest (digest_len 1 to 32).
 // ESP_OK: valid. ESP_ERR_NOT_FOUND: absent. ESP_ERR_INVALID_CRC: wrong size or hash. ESP_FAIL: unreadable.
+// ESP_ERR_INVALID_STATE: detached.
 esp_err_t cardfs_verify(const char *rel, size_t len, const uint8_t *digest, size_t digest_len);
 
 // Deletes rel. ESP_ERR_NOT_FOUND: absent. ESP_ERR_INVALID_STATE: not writable, or tainted.
@@ -119,7 +137,7 @@ esp_err_t cardfs_remove(const char *rel);
 // Calls cb for every entry of watchdeck/, including names the allowlist refuses (a file a person copied there) and
 // the empty intent records. The entries are read first and cb runs after the mutex is released, so cb may call
 // cardfs. ESP_ERR_NOT_FOUND: no watchdeck/ directory. ESP_ERR_NO_MEM, or ESP_FAIL on a read or stat error: cb is
-// never called.
+// never called. ESP_ERR_INVALID_STATE: detached.
 typedef void (*cardfs_list_cb_t)(const char *name, size_t size, bool is_dir, void *ctx);
 esp_err_t cardfs_list(cardfs_list_cb_t cb, void *ctx);
 

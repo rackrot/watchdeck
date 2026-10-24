@@ -181,10 +181,14 @@ void test_cardfs_write_small_replaces_a_file(void)
     TEST_ASSERT_EQUAL(ESP_OK, cardfs_write_small("watchdeck/sleep.cfg", "{}", 2));
     TEST_ASSERT_EQUAL_STRING("{}", slurp("watchdeck/sleep.cfg"));
     TEST_ASSERT_EQUAL_STRING("", slurp("watchdeck/sleep.new"));
-    // The card self-test's small file (CONFIG_WATCHDECK_TEST_CARD) has its own record.
+#if CONFIG_WATCHDECK_TEST_CARD // set for this test app (CMakeLists.txt), as in the self-test firmware
+    // The card self-test's small file has its own record.
     TEST_ASSERT_EQUAL(ESP_OK, cardfs_write_small("watchdeck/selftest.cfg", "selftest 1\n", 11));
     TEST_ASSERT_EQUAL_STRING("selftest 1\n", slurp("watchdeck/selftest.cfg"));
     TEST_ASSERT_EQUAL_STRING("", slurp("watchdeck/selftest.new"));
+#else
+#error "host_proto builds cardfs.c with CONFIG_WATCHDECK_TEST_CARD so the self-test row is covered"
+#endif
 }
 
 void test_cardfs_write_small_refuses_other_names_and_sizes(void)
@@ -245,6 +249,61 @@ void test_cardfs_failed_access_stops_writes_until_writes_are_turned_off_and_on(v
     TEST_ASSERT_EQUAL(ESP_OK, cardfs_set_writable(true));
     TEST_ASSERT_EQUAL(ESP_OK, cardfs_write_small("watchdeck/sleep.cfg", "{}", 2));
     TEST_ASSERT_EQUAL(ESP_OK, cardfs_remove("watchdeck/b.bin"));
+}
+
+static void tally_entry(const char *name, size_t size, bool is_dir, void *ctx)
+{
+    (*(int *)ctx)++;
+}
+
+// Detached (shared, or between an unmount and a mount) every call that touches the card says INVALID_STATE, never
+// NOT_FOUND, so a caller can tell "the card isn't there" from "the file is absent".
+void test_cardfs_detached_refuses_reads_and_writes_until_attached(void)
+{
+    fresh_root();
+    plant_str("wifi.txt", "Home\n");
+    make_dir("watchdeck");
+    cardfs_detach();
+    TEST_ASSERT_FALSE(cardfs_writable());
+    char buf[16];
+    size_t len;
+    const uint8_t digest[1] = {0};
+    int n = 0;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, cardfs_read("wifi.txt", buf, sizeof(buf), &len));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, cardfs_read("watchdeck/none.cfg", buf, sizeof(buf), &len));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, cardfs_verify("wifi.txt", 5, digest, 1));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, cardfs_list(tally_entry, &n));
+    TEST_ASSERT_EQUAL(0, n);
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, cardfs_write_small("wifi.txt", "New\n", 4));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, cardfs_write_new("watchdeck/a.bin", "x", 1));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, cardfs_remove("wifi.txt"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, cardfs_recover());
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, cardfs_set_writable(true));
+    TEST_ASSERT_EQUAL_STRING("Home\n", slurp("wifi.txt"));
+
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_attach());
+    TEST_ASSERT_FALSE(cardfs_writable()); // writes wait for set_writable(true)
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_read("wifi.txt", buf, sizeof(buf), &len));
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND, cardfs_read("watchdeck/none.cfg", buf, sizeof(buf), &len));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, cardfs_write_small("wifi.txt", "New\n", 4));
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_set_writable(true));
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_write_small("wifi.txt", "New\n", 4));
+    TEST_ASSERT_EQUAL_STRING("New\n", slurp("wifi.txt"));
+}
+
+// A detach also clears a taint: the remount it brackets is what the taint asks for.
+void test_cardfs_detach_and_attach_clear_a_taint(void)
+{
+    fresh_root();
+    make_dir("watchdeck");
+    make_dir("watchdeck/wifi.new");
+    TEST_ASSERT_EQUAL(ESP_FAIL, cardfs_write_small("wifi.txt", "New\n", 4));
+    TEST_ASSERT_TRUE(cardfs_tainted());
+    cardfs_detach();
+    TEST_ASSERT_FALSE(cardfs_tainted());
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_attach());
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_set_writable(true));
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_write_small("watchdeck/sleep.cfg", "{}", 2));
 }
 
 static int s_prepare_calls;
@@ -619,6 +678,8 @@ void test_cardfs_run(void)
     RUN_TEST(test_cardfs_write_while_not_writable_fails_and_keeps_the_old_bytes);
     RUN_TEST(test_cardfs_write_whose_record_cannot_be_created_keeps_the_old_file);
     RUN_TEST(test_cardfs_failed_access_stops_writes_until_writes_are_turned_off_and_on);
+    RUN_TEST(test_cardfs_detached_refuses_reads_and_writes_until_attached);
+    RUN_TEST(test_cardfs_detach_and_attach_clear_a_taint);
     RUN_TEST(test_cardfs_init_needs_a_volume_and_runs_its_prepare);
     RUN_TEST(test_cardfs_record_that_cannot_be_hashed_is_kept);
     RUN_TEST(test_cardfs_room_is_asked_for_each_new_entry_in_order);

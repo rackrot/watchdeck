@@ -15,6 +15,7 @@ typedef struct {
 } job_t;
 
 static QueueHandle_t s_queue;
+static TaskHandle_t s_task;
 
 static void svc_task(void *unused)
 {
@@ -42,12 +43,17 @@ esp_err_t svc_start(void)
         return ESP_ERR_NO_MEM;
     }
     s_queue = queue;
-    if (xTaskCreate(svc_task, "svc", SVC_STACK, NULL, SVC_PRIO, NULL) != pdPASS) {
+    if (xTaskCreate(svc_task, "svc", SVC_STACK, NULL, SVC_PRIO, &s_task) != pdPASS) {
         s_queue = NULL;
         vQueueDelete(queue);
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
+}
+
+bool svc_on_task(void)
+{
+    return s_task && xTaskGetCurrentTaskHandle() == s_task;
 }
 
 esp_err_t svc_post(svc_job_t fn, void *arg)

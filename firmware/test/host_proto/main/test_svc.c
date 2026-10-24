@@ -1,4 +1,5 @@
 // Host tests for svc.c on the linux FreeRTOS port: jobs run in order, and a full queue refuses at once.
+#include <stdbool.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -72,9 +73,27 @@ void test_svc_full_queue_refuses_without_blocking(void)
     TEST_ASSERT_EQUAL_STRING("1234567", s_order);
 }
 
+static bool s_on_task;
+
+static void note_task(void *arg)
+{
+    s_on_task = svc_on_task();
+    xSemaphoreGive(s_done);
+}
+
+void test_svc_on_task_is_true_only_in_a_job(void)
+{
+    TEST_ASSERT_FALSE(svc_on_task());
+    s_on_task = false;
+    TEST_ASSERT_EQUAL(ESP_OK, svc_post(note_task, NULL));
+    wait_done();
+    TEST_ASSERT_TRUE(s_on_task);
+}
+
 void test_svc_run(void)
 {
     RUN_TEST(test_svc_post_before_start_is_refused);
     RUN_TEST(test_svc_runs_jobs_in_order);
     RUN_TEST(test_svc_full_queue_refuses_without_blocking);
+    RUN_TEST(test_svc_on_task_is_true_only_in_a_job);
 }

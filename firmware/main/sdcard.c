@@ -1,5 +1,6 @@
 #include "sdcard.h"
 
+#include <assert.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -11,14 +12,18 @@
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_vfs_fat.h"
 #include "ff.h"
 #include "sdmmc_cmd.h"
+#include "svc.h"
 
 #define SD_CLK_GPIO 43
 #define SD_CMD_GPIO 44
 #define SD_D0_GPIO 39
 #define TEXT_MAX 64
+#define VERIFY_SECTORS 8 // the read-back of a multi-block write goes in pieces this big (4 KiB)
+#define GPT_RESERVED 33  // sectors the GPT keeps at the end of the disk (backup entries and header)
 
 static const char *TAG = "sdcard";
 
@@ -35,6 +40,9 @@ static double s_gb;
 static volatile sdcard_owner_t s_owner = SDCARD_NO_CARD;
 static char s_text[TEXT_MAX];
 static sdcard_owner_cb_t s_owner_cb;
+static uint8_t *s_verify_buf; // VERIFY_SECTORS sectors of internal DMA RAM, from the first mount on
+static bool s_verify_logged;
+static volatile uint64_t s_verify_sectors, s_verify_us;
 
 static const cardfs_volume_t s_volume = {
     .prepare = cardfs_fat_prepare,
@@ -61,6 +69,39 @@ static DRESULT part_disk_read(unsigned char pdrv, unsigned char *buf, uint32_t s
     return RES_OK;
 }
 
+// Reads back a multi-block write and compares it, because IDF 6.1 can report a failed one as written:
+// sdmmc_write_sectors_dma (components/sdmmc/sdmmc_cmd.c:578-601) overwrites the write's error with the result of
+// its ACMD22 "how many blocks were written" query and returns that, so a failed CMD25 whose ACMD22 succeeds returns
+// ESP_OK. A single block (CMD24) returns its own error, so it isn't read back. Drop this once upstream returns the
+// write's error. Runs under FatFs's volume lock, the only user of s_verify_buf.
+static DRESULT verify_written(const unsigned char *buf, uint32_t sector, UINT count)
+{
+    const int64_t start = esp_timer_get_time();
+    const size_t ss = s_card->csd.sector_size;
+    for (UINT done = 0; done < count;) {
+        const UINT n = count - done < VERIFY_SECTORS ? count - done : VERIFY_SECTORS;
+        const size_t lba = s_part_first_lba + sector + done;
+        esp_err_t err = sdmmc_read_sectors(s_card, s_verify_buf, lba, n);
+        if (err == ESP_OK && memcmp(s_verify_buf, buf + (size_t)done * ss, n * ss) != 0) {
+            err = ESP_ERR_INVALID_CRC;
+        }
+        if (err != ESP_OK) {
+            diag_count(DIAG_CARD_ERROR, err == ESP_ERR_INVALID_CRC ? "a write didn't reach the card" : "write check");
+            if (!s_verify_logged) {
+                s_verify_logged = true;
+                ESP_LOGE(TAG, "write check at card lba %u (sector %lu of %u x%u): %s", (unsigned)lba,
+                         (unsigned long)(sector + done), (unsigned)sector, count,
+                         err == ESP_ERR_INVALID_CRC ? "the card holds other bytes" : esp_err_to_name(err));
+            }
+            return RES_ERROR;
+        }
+        done += n;
+    }
+    s_verify_sectors += count;
+    s_verify_us += (uint64_t)(esp_timer_get_time() - start);
+    return RES_OK;
+}
+
 static DRESULT part_disk_write(unsigned char pdrv, const unsigned char *buf, uint32_t sector, UINT count)
 {
     if (sector >= s_part_sectors || count > s_part_sectors - sector) {
@@ -73,7 +114,7 @@ static DRESULT part_disk_write(unsigned char pdrv, const unsigned char *buf, uin
         ESP_LOGE(TAG, "write sector %lu x%u: %s", (unsigned long)sector, count, esp_err_to_name(err));
         return RES_ERROR;
     }
-    return RES_OK;
+    return count > 1 ? verify_written(buf, sector, count) : RES_OK;
 }
 
 static DRESULT part_disk_ioctl(unsigned char pdrv, unsigned char cmd, void *buf)
@@ -117,8 +158,11 @@ static esp_err_t find_partition(sdmmc_card_t *card)
 
     esp_err_t err = sdmmc_read_sectors(card, buf, 1, 1);
     if (err == ESP_OK && memcmp(buf, "EFI PART", 8) == 0) {
-        uint64_t entries_lba = le32(buf + 72) | (uint64_t)le32(buf + 76) << 32;
-        if (entries_lba == 0 || entries_lba >= card->csd.capacity) {
+        const uint64_t capacity = card->csd.capacity;
+        const uint64_t entries_lba = le32(buf + 72) | (uint64_t)le32(buf + 76) << 32;
+        // The entry array's length: entry count times entry size, in whole sectors.
+        const uint64_t entries_end = entries_lba + ((uint64_t)le32(buf + 80) * le32(buf + 84) + 511) / 512;
+        if (entries_lba < 2 || entries_lba >= capacity) {
             ESP_LOGE(TAG, "GPT entry table LBA out of range");
             err = ESP_ERR_NOT_SUPPORTED;
         } else {
@@ -127,7 +171,9 @@ static esp_err_t find_partition(sdmmc_card_t *card)
         if (err == ESP_OK) {
             uint64_t first = le32(buf + 32) | (uint64_t)le32(buf + 36) << 32;
             uint64_t last = le32(buf + 40) | (uint64_t)le32(buf + 44) << 32;
-            if (first == 0 || first > last || last >= card->csd.capacity) {
+            // Never over the GPT itself: the primary header and entries before it, the backup ones after it.
+            if (first < 34 || first < entries_end || first > last || capacity <= GPT_RESERVED ||
+                last >= capacity - GPT_RESERVED) {
                 ESP_LOGE(TAG, "unusable first GPT entry");
                 err = ESP_ERR_NOT_SUPPORTED;
             } else {
@@ -165,6 +211,9 @@ static esp_err_t init_card(void)
     ESP_RETURN_ON_ERROR(sdmmc_card_init(&host, s_card), TAG, "card init");
     s_card_ready = true;
     ESP_RETURN_ON_ERROR(find_partition(s_card), TAG, "partition lookup");
+    s_verify_buf =
+        heap_caps_aligned_alloc(64, VERIFY_SECTORS * s_card->csd.sector_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    ESP_RETURN_ON_FALSE(s_verify_buf, ESP_ERR_NO_MEM, TAG, "no mem for the write check");
     s_gb = (double)s_card->csd.capacity * s_card->csd.sector_size / (1024.0 * 1024.0 * 1024.0);
     return ESP_OK;
 }
@@ -187,6 +236,7 @@ static esp_err_t mount_fs(void)
         FRESULT res = f_mount(fs, s_drive, 1);
         if (res != FR_OK) {
             ESP_LOGE(TAG, "f_mount failed: FRESULT %d", res);
+            f_mount(NULL, s_drive, 0); // FatFs keeps the FATFS registered even when the mount fails
             esp_vfs_fat_unregister_path(SDCARD_MOUNT_POINT);
             err = ESP_FAIL;
         }
@@ -214,6 +264,7 @@ static void unmount_fs(void)
     ESP_LOGI(TAG, "unmounted %s", SDCARD_MOUNT_POINT);
 }
 
+static esp_err_t remount(void);
 static void set_state(sdcard_owner_t owner, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
 static void set_state(sdcard_owner_t owner, const char *fmt, ...)
@@ -286,9 +337,9 @@ esp_err_t sdcard_mount(char *msg, size_t msg_len)
     s_owner = SDCARD_DEVICE;
     const esp_err_t why = open_store(true);
     if (why == ESP_OK && cardfs_tainted()) {
-        // Once: no card job runs yet, so the remount can't race one. It sets the state either way.
+        // Once, from app_main: no card job runs yet. It sets the state either way.
         ESP_LOGW(TAG, "a card access failed during recovery, mounting again");
-        err = sdcard_remount();
+        err = remount();
     } else {
         set_mounted(why);
     }
@@ -311,12 +362,20 @@ sdmmc_card_t *sdcard_card(void)
     return s_card_ready ? s_card : NULL;
 }
 
-esp_err_t sdcard_remount(void)
+void sdcard_write_check_stats(uint64_t *sectors, uint64_t *us)
+{
+    *sectors = s_verify_sectors;
+    *us = s_verify_us;
+}
+
+// Unmounts and mounts again with cardfs detached in between, so no cardfs call is inside FatFs while f_mount(NULL)
+// drops the volume. A failed mount leaves cardfs detached: its calls say ESP_ERR_INVALID_STATE.
+static esp_err_t remount(void)
 {
     if (s_owner != SDCARD_DEVICE) {
         return ESP_ERR_INVALID_STATE;
     }
-    cardfs_set_writable(false); // waits for a call in progress; clears the taint
+    cardfs_detach(); // waits for a call in progress; clears the taint
     unmount_fs();
     esp_err_t err = mount_fs();
     if (err != ESP_OK) {
@@ -326,12 +385,20 @@ esp_err_t sdcard_remount(void)
         return err;
     }
     ESP_LOGI(TAG, "mounted %s again", SDCARD_MOUNT_POINT);
+    cardfs_attach();
     set_mounted(open_store(false));
     return ESP_OK;
 }
 
+esp_err_t sdcard_remount(void)
+{
+    assert(svc_on_task());
+    return remount();
+}
+
 void sdcard_note_failure(const char *what, esp_err_t err)
 {
+    assert(svc_on_task());
     const bool tainted = cardfs_tainted();
     if (err == ESP_ERR_INVALID_STATE && !tainted) {
         ESP_LOGW(TAG, "%s: the card isn't writable now (%s)", what, s_text);
@@ -346,16 +413,17 @@ void sdcard_note_failure(const char *what, esp_err_t err)
     }
     if (tainted && s_owner == SDCARD_DEVICE) {
         ESP_LOGW(TAG, "mounting the card again so writes can go on");
-        sdcard_remount();
+        remount();
     }
 }
 
 esp_err_t sdcard_release_fs(void)
 {
+    assert(svc_on_task());
     if (s_owner != SDCARD_DEVICE) {
         return ESP_ERR_INVALID_STATE;
     }
-    cardfs_set_writable(false);
+    cardfs_detach(); // waits for a call in progress; every later one says ESP_ERR_INVALID_STATE
     unmount_fs();
     return ESP_OK;
 }
