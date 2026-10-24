@@ -297,6 +297,18 @@ export function layoutTargets(
 export const barChanged = (a: Config, b: Config): boolean =>
   canon(a.status_bar ?? null) !== canon(b.status_bar ?? null);
 
+/** Whether going from `a` to `b` changes `[sleep]`, which, like `[status_bar]`, never changes a layout. */
+export const sleepChanged = (a: Config, b: Config): boolean =>
+  canon(a.sleep ?? null) !== canon(b.sleep ?? null);
+
+/**
+ * Whether going from `a` to `b` changes the feed's sources, `[push]` or `[[integration]]`. Those
+ * never change a layout either.
+ */
+export const feedChanged = (a: Config, b: Config): boolean =>
+  canon([a.push ?? null, a.integration ?? []]) !==
+  canon([b.push ?? null, b.integration ?? []]);
+
 /**
  * `bar` without parts that say nothing: a unit that is the default, a `thresholds` table with no
  * keys, and a bar with no keys.

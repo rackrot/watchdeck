@@ -56,6 +56,10 @@ export type ErrorMap = {
   pages: Map<string, string[]>;
   /** Messages about `[status_bar]`, by the field of the status bar form. */
   statusBar: StatusBarErrors;
+  /** Messages about `[sleep]`. */
+  sleep: string[];
+  /** By integration id. Every message is about one integration. */
+  integrations: Map<string, string[]>;
 };
 
 export const emptyErrors = (): ErrorMap => ({
@@ -64,6 +68,8 @@ export const emptyErrors = (): ErrorMap => ({
   buttons: new Map(),
   pages: new Map(),
   statusBar: {},
+  sleep: [],
+  integrations: new Map(),
 });
 
 export const hasErrors = (map: ErrorMap): boolean =>
@@ -71,7 +77,9 @@ export const hasErrors = (map: ErrorMap): boolean =>
   map.general.length > 0 ||
   map.buttons.size > 0 ||
   map.pages.size > 0 ||
-  Object.keys(map.statusBar).length > 0;
+  Object.keys(map.statusBar).length > 0 ||
+  map.sleep.length > 0 ||
+  map.integrations.size > 0;
 
 function addStatusBarError(
   map: ErrorMap,
@@ -225,6 +233,9 @@ export function mapErrors(
   for (const message of messages) {
     const button = message.match(/^button ("(?:[^"\\]|\\.)*"): (.*)$/s);
     const page = message.match(/^page ("(?:[^"\\]|\\.)*"): (.*)$/s);
+    const integration = message.match(
+      /^integration ("(?:[^"\\]|\\.)*"): (.*)$/s,
+    );
     if (page) {
       const id = unquote(page[1]);
       if (pageIds && !pageIds.includes(id)) {
@@ -244,6 +255,14 @@ export function mapErrors(
     } else if (message.startsWith("status_bar.")) {
       const [field, text] = statusBarField(message);
       addStatusBarError(map, field, text);
+    } else if (message.startsWith("sleep.")) {
+      map.sleep.push(message);
+    } else if (integration) {
+      const id = unquote(integration[1]);
+      map.integrations.set(id, [
+        ...(map.integrations.get(id) ?? []),
+        integration[2],
+      ]);
     } else if (
       /^(layout\.(cols|rows|font)|version) |^\d+ pages, at most |^\d+ tiles across all pages, at most /.test(
         message,
