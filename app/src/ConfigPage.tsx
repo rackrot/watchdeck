@@ -19,6 +19,7 @@ import {
 import {
   barChanged,
   buttonAt,
+  feedChanged,
   layoutTargets,
   pageCount,
   pageIndexOf,
@@ -33,6 +34,7 @@ import {
   mapErrors,
   numberErrors,
 } from "./errors";
+import FeedForm from "./FeedForm";
 import GridEditor from "./GridEditor";
 import { useIconUrls, useScreenUrls, useTileReadings } from "./hooks";
 import PageTabs from "./PageTabs";
@@ -67,21 +69,41 @@ type Saved = {
   sleep: boolean;
   /** Connected devices that name the "sleep" capability, which are the ones sent that frame. */
   sleepDevices: number;
+  /** The save changed `[push]` or an `[[integration]]`: no layout, only the feed. */
+  feed: boolean;
+  /** Connected devices that name the "feed" capability, which are the ones sent its snapshots. */
+  feedDevices: number;
 };
+
+/**
+ * A feed edit reaches a connected device within this long: the daemon applies a save at once, and
+ * a snapshot goes out twice a second at most.
+ */
+const FEED_WITHIN_S = 2;
 
 /** A `[status_bar]` edit reaches a connected device within this long: the config poll and the next tick. */
 const BAR_WITHIN_S = 2;
 
 export default function ConfigPage({
+  active,
   secrets,
+  onSecretsChanged,
   onConfigLoaded,
 }: {
+  /** The Layout panel is the one showing. A hidden panel stays mounted, so it must not hold a token. */
+  active: boolean;
   secrets: string[];
+  /** Re-reads the secret names, after the Feed tab stored a token. */
+  onSecretsChanged: () => void;
   onConfigLoaded: () => void;
 }) {
   const [view, setView] = useState<ConfigView | null>(null);
   const [draft, setDraft] = useState<Config | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
+  // The Feed tab replaces the grid editor while it is open. It shows once the config has an
+  // integration, or once the user adds one, and stays until the page is left.
+  const [feedAdded, setFeedAdded] = useState(false);
+  const [feedTab, setFeedTab] = useState(false);
   // The status bar and sleep screen forms take the button form's place, so a button and a form are
   // never both open, nor are the two forms.
   const [panel, setPanel] = useState<"bar" | "sleep" | null>(null);
@@ -230,9 +252,12 @@ export default function ConfigPage({
   const repair = view.errors.length > 0;
   const pages = pageCount(draft);
   const page = Math.min(pageIdx, pages - 1);
+  const feedShown = feedAdded || (draft.integration?.length ?? 0) > 0;
+  const feedOpen = feedTab && feedShown;
 
   /** Applies a change to the pages, and shows page `to`. A selection that isn't on it is dropped. */
   function changePages(next: Config, to: number) {
+    setFeedTab(false);
     const keep =
       selected !== null &&
       next.button.length === draft?.button.length &&
@@ -266,6 +291,9 @@ export default function ConfigPage({
           list.map((m) => `status_bar.${field}: ${m}`),
         ),
         ...Object.values(numbers.sleep).flat(),
+        ...[...numbers.integrations].flatMap(([id, list]) =>
+          list.map((m) => `${id}: ${m}`),
+        ),
       ]);
       return;
     }
@@ -296,6 +324,8 @@ export default function ConfigPage({
         bar: barChanged(view.config, draft),
         sleep: sleepSent(view.config, draft),
         sleepDevices: connected.filter((d) => d.caps.includes("sleep")).length,
+        feed: feedChanged(view.config, draft),
+        feedDevices: connected.filter((d) => d.caps.includes("feed")).length,
       });
     } catch (e) {
       const messages = Array.isArray(e) ? (e as string[]) : [String(e)];
@@ -304,6 +334,7 @@ export default function ConfigPage({
           messages,
           draft.button.map((b) => b.id),
           (draft.page ?? []).map((p) => p.id),
+          (draft.integration ?? []).map((i) => i.id),
         ),
       );
       setRefused(messages);
@@ -457,119 +488,149 @@ export default function ConfigPage({
         errors={errors.pages}
         onChange={changePages}
         onSelect={(to) => changePages(draft, to)}
-      />
-
-      <GridEditor
-        config={draft}
-        page={page}
-        selected={selected}
-        errors={errors.buttons}
-        gridProblems={errors.grid}
-        readings={readings}
-        iconUrl={iconUrl}
-        onSelect={(index) => {
+        feedShown={feedShown}
+        feedOpen={feedOpen}
+        feedBad={errors.integrations.size > 0}
+        onFeed={() => {
+          setFeedAdded(true);
+          setFeedTab(true);
           setPanel(null);
-          setSelected(index);
-        }}
-        onChange={set}
-        onAdd={(pos) => {
-          const home = draft.page?.[page]?.id;
-          set({
-            ...draft,
-            button: [...draft.button, newButton(draft, pos, home)],
-          });
-          setPanel(null);
-          setSelected(draft.button.length);
-        }}
-        statusBarOpen={statusBarOpen}
-        statusBarProblems={Object.keys(errors.statusBar).length > 0}
-        onStatusBar={() => {
-          setPanel(statusBarOpen ? null : "bar");
-          setSelected(null);
-        }}
-        sleepOpen={sleepOpen}
-        sleepProblems={Object.keys(errors.sleep).length > 0}
-        onSleep={() => {
-          setPanel(sleepOpen ? null : "sleep");
           setSelected(null);
         }}
       />
 
-      {sleepOpen ? (
-        <SleepForm
+      {feedOpen ? (
+        <FeedForm
+          // A fresh form after the draft is replaced, so its rows start from it.
           key={formKey}
-          sleep={draft.sleep}
-          errors={errors.sleep}
-          images={screenFiles}
-          imageError={screenError}
-          screenUrl={screenUrl}
-          onImport={pickScreenImage}
-          onChange={(sleep) => {
-            const { sleep: _, ...rest } = draft;
-            set(sleep === undefined ? rest : { ...rest, sleep });
-          }}
-        />
-      ) : statusBarOpen ? (
-        <StatusBarForm
-          key={formKey}
-          bar={draft.status_bar}
-          defaults={view.status_bar_defaults}
-          errors={errors.statusBar}
-          onChange={(status_bar) => {
-            const { status_bar: _, ...rest } = draft;
-            set(status_bar === undefined ? rest : { ...rest, status_bar });
-          }}
-        />
-      ) : button ? (
-        <ButtonForm
-          // A fresh form per button, and after the draft is replaced, so its rows start from it.
-          key={`${formKey}:${selected}`}
-          button={button}
-          gridFont={draft.layout.font}
-          pages={(draft.page ?? []).map((p) => ({
-            id: p.id,
-            name: pageName(p),
-          }))}
-          pageId={draft.page?.[pageIndexOf(draft, button)]?.id ?? ""}
-          occupant={(id) =>
-            buttonAt(
-              draft,
-              draft.page?.findIndex((p) => p.id === id) ?? 0,
-              button.pos,
-              selected ?? undefined,
-            )?.id
-          }
-          errors={errors.buttons.get(button.id) ?? {}}
+          active={active}
+          config={draft}
+          saved={view.config}
+          diskMoved={diskChanged}
+          errors={errors.integrations}
           secrets={secrets}
-          icons={icons}
-          iconUrl={iconUrl}
-          iconError={iconError}
-          testBlock={testBlock(button, view.config, diskChanged)}
-          onImportIcon={pickIcon}
+          onChange={set}
           onLocalProblems={setLocal}
-          onChange={(next) => {
-            set({
-              ...draft,
-              button: draft.button.map((b, i) => (i === selected ? next : b)),
-            });
-            // A button moved to another page takes the grid with it.
-            if (next.page !== button.page) {
-              const to = draft.page?.findIndex((p) => p.id === next.page) ?? -1;
-              if (to >= 0) {
-                setPageIdx(to);
-              }
-            }
-          }}
-          onDelete={() => {
-            set({
-              ...draft,
-              button: draft.button.filter((_, i) => i !== selected),
-            });
-            setSelected(null);
-          }}
+          onSecretsChanged={onSecretsChanged}
         />
       ) : (
-        <p className="muted hint">Select a button to edit it.</p>
+        <>
+          <GridEditor
+            config={draft}
+            page={page}
+            selected={selected}
+            errors={errors.buttons}
+            gridProblems={errors.grid}
+            readings={readings}
+            iconUrl={iconUrl}
+            onSelect={(index) => {
+              setPanel(null);
+              setSelected(index);
+            }}
+            onChange={set}
+            onAdd={(pos) => {
+              const home = draft.page?.[page]?.id;
+              set({
+                ...draft,
+                button: [...draft.button, newButton(draft, pos, home)],
+              });
+              setPanel(null);
+              setSelected(draft.button.length);
+            }}
+            statusBarOpen={statusBarOpen}
+            statusBarProblems={Object.keys(errors.statusBar).length > 0}
+            onStatusBar={() => {
+              setPanel(statusBarOpen ? null : "bar");
+              setSelected(null);
+            }}
+            sleepOpen={sleepOpen}
+            sleepProblems={Object.keys(errors.sleep).length > 0}
+            onSleep={() => {
+              setPanel(sleepOpen ? null : "sleep");
+              setSelected(null);
+            }}
+          />
+
+          {sleepOpen ? (
+            <SleepForm
+              key={formKey}
+              sleep={draft.sleep}
+              errors={errors.sleep}
+              images={screenFiles}
+              imageError={screenError}
+              screenUrl={screenUrl}
+              onImport={pickScreenImage}
+              onChange={(sleep) => {
+                const { sleep: _, ...rest } = draft;
+                set(sleep === undefined ? rest : { ...rest, sleep });
+              }}
+            />
+          ) : statusBarOpen ? (
+            <StatusBarForm
+              key={formKey}
+              bar={draft.status_bar}
+              defaults={view.status_bar_defaults}
+              errors={errors.statusBar}
+              onChange={(status_bar) => {
+                const { status_bar: _, ...rest } = draft;
+                set(status_bar === undefined ? rest : { ...rest, status_bar });
+              }}
+            />
+          ) : button ? (
+            <ButtonForm
+              // A fresh form per button, and after the draft is replaced, so its rows start from it.
+              key={`${formKey}:${selected}`}
+              button={button}
+              gridFont={draft.layout.font}
+              pages={(draft.page ?? []).map((p) => ({
+                id: p.id,
+                name: pageName(p),
+              }))}
+              pageId={draft.page?.[pageIndexOf(draft, button)]?.id ?? ""}
+              occupant={(id) =>
+                buttonAt(
+                  draft,
+                  draft.page?.findIndex((p) => p.id === id) ?? 0,
+                  button.pos,
+                  selected ?? undefined,
+                )?.id
+              }
+              errors={errors.buttons.get(button.id) ?? {}}
+              secrets={secrets}
+              icons={icons}
+              iconUrl={iconUrl}
+              iconError={iconError}
+              testBlock={testBlock(button, view.config, diskChanged)}
+              onImportIcon={pickIcon}
+              onLocalProblems={setLocal}
+              onChange={(next) => {
+                set({
+                  ...draft,
+                  button: draft.button.map((b, i) =>
+                    i === selected ? next : b,
+                  ),
+                });
+                // A button moved to another page takes the grid with it.
+                if (next.page !== button.page) {
+                  const to =
+                    draft.page?.findIndex((p) => p.id === next.page) ?? -1;
+                  if (to >= 0) {
+                    setPageIdx(to);
+                  }
+                }
+              }}
+              onDelete={() => {
+                set({
+                  ...draft,
+                  button: draft.button.filter((_, i) => i !== selected),
+                });
+                setSelected(null);
+              }}
+            />
+          ) : (
+            <p className="muted hint">Select a button to edit it.</p>
+          )}
+        </>
       )}
     </div>
   );
@@ -622,15 +683,17 @@ function SavedStatus({
       </span>
     );
   });
-  // A bar or sleep edit pushes no layout, so "the layout is unchanged" would only confuse beside its line.
+  // A bar, sleep or feed edit pushes no layout, so "the layout is unchanged" would only confuse beside its line.
   const note =
     saved.targets.length > 0 ||
-    ((saved.bar || saved.sleep) && saved.connected > 0)
+    ((saved.bar || saved.sleep || saved.feed) && saved.connected > 0)
       ? null
       : saved.connected === 0
-        ? saved.sleep
-          ? "no device connected, so it gets the sleep screen when it connects"
-          : "no device connected, so it gets the layout when it connects"
+        ? saved.feed
+          ? "no device connected, so it gets the feed when it connects"
+          : saved.sleep
+            ? "no device connected, so it gets the sleep screen when it connects"
+            : "no device connected, so it gets the layout when it connects"
         : "the layout is unchanged, so devices keep it";
   return (
     <>
@@ -649,6 +712,16 @@ function SavedStatus({
           </span>
         ) : (
           <span className="chip bad">firmware has no sleep screen</span>
+        ))}
+      {saved.feed &&
+        saved.connected > 0 &&
+        (saved.feedDevices > 0 ? (
+          <span className="chip ok">
+            feed sources applied, no layout sent; a board follows within{" "}
+            {FEED_WITHIN_S} s (a new polled card fills after its first poll)
+          </span>
+        ) : (
+          <span className="chip bad">firmware has no feed page</span>
         ))}
       {lines}
       {note && <span className="muted">{note}</span>}

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ButtonConfig, Config } from "../src/config.ts";
 import {
+  addIntegration,
   addPage,
   barChanged,
   buttonAt,
@@ -9,9 +10,11 @@ import {
   canon,
   duplicateNames,
   feedChanged,
+  integrationIdProblem,
   layoutChanged,
   layoutTargets,
   moveButton,
+  moveIntegration,
   movePage,
   pageCount,
   pageIndexOf,
@@ -19,17 +22,27 @@ import {
   parseWhole,
   pruneBar,
   recordToRows,
+  removeIntegration,
   removePage,
   renamePage,
   rowsToRecord,
+  setIntegration,
   sleepChanged,
   sleepSent,
   withGpu,
   withGridFont,
+  withIntegrationId,
+  withPushLan,
   withSleep,
   withSteps,
 } from "../src/edit.ts";
-import { hasErrors, mapErrors, numberErrors, unquote } from "../src/errors.ts";
+import {
+  hasErrors,
+  integrationFields,
+  mapErrors,
+  numberErrors,
+  unquote,
+} from "../src/errors.ts";
 import { resolveFonts } from "../src/fonts.ts";
 
 const button = (id: string, pos: [number, number]): ButtonConfig => ({
@@ -1138,4 +1151,229 @@ test("a step's at that isn't a whole number is reported before the call", () => 
     });
   }
   assert.equal(hasErrors(numberErrors(config)), false);
+});
+
+// ---- The Feed tab ----
+
+const everyCap = [
+  { id: "d", connected: true, caps: ["pages", "fonts", "sleep", "feed"] },
+  { id: "e", connected: true, caps: [] },
+];
+
+test("an integrations-only edit is a feed change with no layout, bar or sleep change and no target", () => {
+  const edits: [string, (c: Config) => Config][] = [
+    ["add a push source", (c) => addIntegration(c, "push")],
+    ["add a stat card", (c) => addIntegration(c, "stat")],
+    ["turn the LAN on", (c) => withPushLan(c, true)],
+    ["rename a source", (c) => withIntegrationId(c, 0, "renamed")],
+    ["reorder", (c) => moveIntegration(c, 0, 1)],
+    ["remove one", (c) => removeIntegration(c, 0)],
+  ];
+  const before = addIntegration(addIntegration(config, "push"), "stat");
+  for (const [what, edit] of edits) {
+    const after = edit(before);
+    assert.equal(feedChanged(before, after), true, what);
+    assert.equal(layoutChanged(before, after), false, what);
+    assert.equal(barChanged(before, after), false, what);
+    assert.equal(sleepChanged(before, after), false, what);
+    assert.equal(sleepSent(before, after), false, what);
+    assert.deepEqual(layoutTargets(before, after, everyCap), [], what);
+  }
+  // A layout edit is not a feed edit, so the two kinds of save word themselves apart.
+  const moved = moveButton(before, 0, [2, 2]);
+  assert.equal(feedChanged(before, moved), false);
+  assert.equal(layoutChanged(before, moved), true);
+});
+
+test("integrations are added with free ids, moved, set, and removed, the key going with the last", () => {
+  let c = addIntegration(config, "push");
+  c = addIntegration(c, "push");
+  c = addIntegration(c, "stat");
+  assert.deepEqual(
+    c.integration?.map((i) => [i.kind, i.id]),
+    [
+      ["push", "push-1"],
+      ["push", "push-2"],
+      ["stat", "stat-3"],
+    ],
+  );
+  // A new push source names the secret its token will be stored as.
+  const first = c.integration?.[0];
+  assert.equal(first?.kind === "push" && first.token_secret, "push-push-1");
+
+  // An id that is taken is skipped.
+  const gap = removeIntegration(c, 0);
+  assert.deepEqual(
+    addIntegration(gap, "push").integration?.map((i) => i.id),
+    ["push-2", "stat-3", "push-3"],
+  );
+
+  assert.deepEqual(
+    moveIntegration(c, 0, 1).integration?.map((i) => i.id),
+    ["push-2", "push-1", "stat-3"],
+  );
+  assert.equal(moveIntegration(c, 0, -1), c);
+  assert.equal(moveIntegration(c, 2, 1), c);
+
+  // Removing the last one leaves the config as it was, since Rust writes no empty array.
+  let none = c;
+  for (let i = 0; i < 3; i++) {
+    none = removeIntegration(none, 0);
+  }
+  assert.equal("integration" in none, false);
+  assert.equal(canon(none), canon(config));
+  assert.equal(feedChanged(none, config), false);
+});
+
+test("a push source's token secret follows its id only while it is the conventional one", () => {
+  const c = addIntegration(config, "push");
+  const renamed = withIntegrationId(c, 0, "ha");
+  const ha = renamed.integration?.[0];
+  assert.deepEqual(ha, {
+    kind: "push",
+    id: "ha",
+    label: "Push",
+    token_secret: "push-ha",
+  });
+  // One that was pointed at a secret of its own keeps it.
+  const own = setIntegration(c, 0, {
+    kind: "push",
+    id: "push-1",
+    label: "x",
+    token_secret: "shared",
+  });
+  const kept = withIntegrationId(own, 0, "ha").integration?.[0];
+  assert.equal(kept?.kind === "push" && kept.token_secret, "shared");
+  // A stat card has no secret, and just takes the id.
+  const stat = withIntegrationId(addIntegration(config, "stat"), 0, "load");
+  assert.equal(stat.integration?.[0].id, "load");
+});
+
+test("[push] lan is set on, and removed with its table when it goes off", () => {
+  assert.deepEqual(withPushLan(config, true).push, { lan: true });
+  assert.equal("push" in withPushLan(withPushLan(config, true), false), false);
+  assert.equal(canon(withPushLan(config, false)), canon(config));
+});
+
+test("an integration id is checked as the daemon checks it, and a push id may not hold a dot", () => {
+  const c = (...ids: [string, "push" | "stat"][]): Config =>
+    ids.reduce(
+      (acc, [id, kind]) =>
+        withIntegrationId(
+          addIntegration(acc, kind),
+          acc.integration?.length ?? 0,
+          id,
+        ),
+      config,
+    );
+  const problem = (id: string, kind: "push" | "stat" = "push") =>
+    integrationIdProblem(c([id, kind]), 0);
+  assert.equal(problem("ha"), null);
+  assert.equal(problem("a-b_c"), null);
+  assert.equal(problem("a".repeat(31)), null);
+  const shape = "id must be 1 to 31 letters, digits, '_', '-' or '.'";
+  assert.equal(problem(""), shape);
+  assert.equal(problem("a".repeat(32)), shape);
+  assert.equal(problem("a b"), shape);
+  assert.equal(problem("é"), shape);
+  // A dot is fine for a stat card, and not for a push one: its secret is push-<id>.
+  assert.equal(problem("a.b", "stat"), null);
+  assert.ok(problem("a.b")?.includes("push-<id>"));
+  assert.equal(
+    integrationIdProblem(c(["ha", "push"], ["ha", "stat"]), 1),
+    'integration ids must be unique: "ha"',
+  );
+});
+
+test("a save's integration messages land under their integration id, by field", () => {
+  const ids = ["ha", "load", 'a"b'];
+  const map = mapErrors(
+    [
+      'integration "ha": token_secret "push-ha" is not in secrets.toml',
+      'integration "ha": token "push-ha" is shorter than 32 characters',
+      'integration "load": every_s is 1, expected 2 to 86400',
+      'integration "load": json_pointer must start with \'/\', like "/state"',
+      'integration "load": source: url "ftp://x" is not http or https',
+      'integration "load": source: timeout_s is 0, expected 1 to 600',
+      'integration "load": source: "bad name" is not a valid header name',
+      // Rust prints the id with {:?}, so a quote in it is escaped.
+      'integration "a\\"b": label: at most 23 printable ASCII characters',
+      // Not about one integration: the general list, whole.
+      "3 integrations, at most 2",
+    ],
+    [],
+    [],
+    ids,
+  );
+  assert.deepEqual([...map.integrations.keys()], ["ha", "load", 'a"b']);
+  assert.equal(map.integrations.get("ha")?.length, 2);
+  assert.equal(map.integrations.get("load")?.length, 5);
+  assert.deepEqual(map.integrations.get('a"b'), [
+    "label: at most 23 printable ASCII characters",
+  ]);
+  assert.deepEqual(map.general, ["3 integrations, at most 2"]);
+  assert.equal(map.buttons.size, 0);
+
+  // Each message goes to the field that shows it.
+  const ha = integrationFields(map.integrations.get("ha") ?? []);
+  assert.deepEqual(Object.keys(ha), ["token"]);
+  assert.equal(ha.token?.length, 2);
+  const load = integrationFields(map.integrations.get("load") ?? []);
+  assert.deepEqual(load.every_s, ["every_s is 1, expected 2 to 86400"]);
+  assert.equal(load.json_pointer?.length, 1);
+  assert.deepEqual(load["source.url"], [
+    'source: url "ftp://x" is not http or https',
+  ]);
+  assert.deepEqual(load["source.timeout_s"], [
+    "source: timeout_s is 0, expected 1 to 600",
+  ]);
+  // A bare header name shows under both header tables, as a button's does.
+  assert.equal(load["source.headers"]?.length, 1);
+  assert.equal(load["source.secret_headers"]?.length, 1);
+  assert.deepEqual(
+    integrationFields(["id must be 1 to 31 letters, digits, '_', '-' or '.'"]),
+    { id: ["id must be 1 to 31 letters, digits, '_', '-' or '.'"] },
+  );
+  assert.deepEqual(integrationFields(["something new"]), {
+    integration: ["something new"],
+  });
+});
+
+test("a message about an integration the draft no longer has stays whole, in general", () => {
+  const map = mapErrors(
+    ['integration "gone": label: at most 23 printable ASCII characters'],
+    [],
+    [],
+    ["ha"],
+  );
+  assert.equal(map.integrations.size, 0);
+  assert.deepEqual(map.general, [
+    'integration "gone": label: at most 23 printable ASCII characters',
+  ]);
+  // Without the draft's ids, as the bucket tests above call it, the message is routed by id alone.
+  assert.equal(
+    mapErrors(['integration "gone": x']).integrations.get("gone")?.length,
+    1,
+  );
+});
+
+test("a stat card's interval that isn't a whole number is reported before the call", () => {
+  const stat = addIntegration(config, "stat");
+  assert.equal(hasErrors(numberErrors(stat)), false);
+  const first = stat.integration?.[0];
+  assert.equal(first?.kind, "stat");
+  if (first?.kind !== "stat") {
+    return;
+  }
+  const bad = setIntegration(stat, 0, { ...first, every_s: Number.NaN });
+  assert.deepEqual(numberErrors(bad).integrations.get("stat-1"), [
+    "every_s must be a whole number",
+  ]);
+  const slow = setIntegration(stat, 0, {
+    ...first,
+    source: { kind: "shell", argv: ["true"], timeout_s: 1.5 },
+  });
+  assert.deepEqual(numberErrors(slow).integrations.get("stat-1"), [
+    "source: timeout_s must be a whole number",
+  ]);
 });

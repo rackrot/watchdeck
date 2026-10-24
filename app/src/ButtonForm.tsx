@@ -1,9 +1,17 @@
 import { useCallback, useEffect, useState } from "react";
 import ActionForm from "./ActionForm";
-import { type ActionResult, testAction } from "./api";
+import { testAction } from "./api";
 import { type ButtonConfig, newShell } from "./config";
 import type { ActionField, FieldErrors } from "./errors";
-import { ColorField, Field, FontSelect, NumberField, Problems } from "./fields";
+import {
+  ColorField,
+  Field,
+  FontSelect,
+  NumberField,
+  Problems,
+  TestOutcome,
+  type TestState,
+} from "./fields";
 import { DEFAULT_FONT, resolveFonts } from "./fonts";
 
 const MAX_LABEL_BYTES = 47;
@@ -82,9 +90,7 @@ export default function ButtonForm({
     set({ page: id });
   }
   const [testing, setTesting] = useState(false);
-  const [test, setTest] = useState<
-    { result: ActionResult } | { error: string } | null
-  >(null);
+  const [test, setTest] = useState<TestState>(null);
   async function runTest() {
     setTesting(true);
     setTest(null);
@@ -243,20 +249,7 @@ export default function ButtonForm({
           </button>
           {testBlock && <span className="muted hint">{testBlock}</span>}
         </div>
-        {test && "error" in test && (
-          <p className="problems" role="alert">
-            {test.error}
-          </p>
-        )}
-        {test && "result" in test && (
-          <div role="status">
-            <span className={`chip ${test.result.ok ? "ok" : "bad"}`}>
-              {test.result.ok ? "ok" : "failed"}: {test.result.summary}
-              {test.result.ms > 0 && ` (${test.result.ms} ms)`}
-            </span>
-            {test.result.text && <pre className="mono">{test.result.text}</pre>}
-          </div>
-        )}
+        <TestOutcome test={test} />
       </section>
 
       <section>

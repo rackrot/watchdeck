@@ -1,5 +1,6 @@
 import { type ReactNode, useEffect, useState } from "react";
-import { parseWhole } from "./edit";
+import type { ActionResult } from "./api";
+import { parseDecimal, parseWhole } from "./edit";
 import { DEFAULT_FONT, FONTS, fontInfo } from "./fonts";
 
 /** Rust's complaints about one field, under it. */
@@ -40,6 +41,82 @@ export function Field({
       {children}
       <Problems list={problems} />
     </label>
+  );
+}
+
+/** What a Test button last got: the daemon's result, or why the call failed. Null before any. */
+export type TestState = { result: ActionResult } | { error: string } | null;
+
+/** The outcome of a Test under its button: a chip with the summary, and the output if there is any. */
+export function TestOutcome({ test }: { test: TestState }) {
+  if (!test) {
+    return null;
+  }
+  if ("error" in test) {
+    return (
+      <p className="problems" role="alert">
+        {test.error}
+      </p>
+    );
+  }
+  const { result } = test;
+  return (
+    <div role="status">
+      <span className={`chip ${result.ok ? "ok" : "bad"}`}>
+        {result.ok ? "ok" : "failed"}: {result.summary}
+        {result.ms > 0 && ` (${result.ms} ms)`}
+      </span>
+      {result.text && <pre className="mono">{result.text}</pre>}
+    </div>
+  );
+}
+
+/** What was typed in an optional number field: undefined when empty, else the number or NaN. */
+const parseOptional = (text: string, whole: boolean): number | undefined =>
+  text.trim() === ""
+    ? undefined
+    : whole
+      ? parseWhole(text)
+      : parseDecimal(text);
+
+/**
+ * A number that may be left unset: empty text hands up undefined, and the caller then drops the
+ * key. `whole` takes only whole numbers, else a decimal may be typed. Anything else is NaN, which
+ * the save reports.
+ */
+export function OptionalNumber({
+  value,
+  whole,
+  placeholder,
+  onChange,
+}: {
+  value: number | undefined;
+  whole: boolean;
+  placeholder?: string;
+  onChange: (value: number | undefined) => void;
+}) {
+  const [text, setText] = useState(value === undefined ? "" : String(value));
+  useEffect(() => {
+    setText((typed) =>
+      Object.is(parseOptional(typed, whole), value)
+        ? typed
+        : value === undefined
+          ? ""
+          : String(value),
+    );
+  }, [value, whole]);
+  return (
+    <input
+      className="mono"
+      inputMode={whole ? "numeric" : "decimal"}
+      placeholder={placeholder}
+      value={text}
+      aria-invalid={(value !== undefined && Number.isNaN(value)) || undefined}
+      onChange={(e) => {
+        setText(e.currentTarget.value);
+        onChange(parseOptional(e.currentTarget.value, whole));
+      }}
+    />
   );
 }
 

@@ -63,6 +63,52 @@ export type TileReading = {
 };
 export const tileValues = () => invoke<TileReading[]>("tile_values");
 
+/** Mirrors `FeedCard` in `src-tauri/src/daemon/protocol.rs`. */
+export type FeedCard = {
+  id: string;
+  label: string;
+  value: string;
+  state: "ok" | "bad" | "unknown";
+};
+
+/** Mirrors `FeedNote`. `at` is Unix seconds. */
+export type FeedNote = {
+  id: string;
+  title: string;
+  body: string;
+  level: "info" | "ok" | "warn" | "error";
+  /** The integration's label. */
+  src: string;
+  at: number;
+};
+
+/** Mirrors `Feed`: what the boards get, and what the `feed-changed` event carries. */
+export type Feed = {
+  /** Configured integrations. Zero means a board shows no -1 page. */
+  sources: number;
+  cards: FeedCard[];
+  notes: FeedNote[];
+};
+export const EMPTY_FEED: Feed = { sources: 0, cards: [], notes: [] };
+export const feedSnapshot = () => invoke<Feed>("feed_snapshot");
+
+/**
+ * Makes a new token for push integration `id`, stores it as the secret `push-<id>` (replacing any
+ * earlier one) and resolves to it. This is the only time the app ever sees it.
+ */
+export const createPushToken = (id: string) =>
+  invoke<string>("create_push_token", { id });
+
+/** The base64 SHA-256 of the daemon certificate's public key, for `curl --pinnedpubkey sha256//...`. */
+export const pushPin = () => invoke<string>("push_pin");
+
+/**
+ * Runs stat integration `id`'s saved source once and returns the card it would show: `summary`
+ * is the value and `ok` its state. Nothing is stored and no device is told.
+ */
+export const testIntegration = (id: string) =>
+  invoke<ActionResult>("test_integration", { id });
+
 /** Opens the native file dialog in the daemon, imports the pick, and returns its name or null. */
 export const importIcon = () => invoke<string | null>("import_icon");
 

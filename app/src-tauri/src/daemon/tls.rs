@@ -99,6 +99,18 @@ impl Identity {
         fingerprint(self.cert_pem.as_bytes())
     }
 
+    /// What a client pins with `curl --pinnedpubkey sha256//<this>`: SHA-256 over the cert's
+    /// SubjectPublicKeyInfo, in base64. It is not [`Identity::fp`], which hashes the PEM text.
+    pub fn spki_pin(&self) -> io::Result<String> {
+        let spki = spki_of(self.cert.as_ref()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{CERT_FILE}: no public key"),
+            )
+        })?;
+        Ok(base64(&Sha256::digest(spki)))
+    }
+
     /// A server config presenting this identity on the aws-lc-rs provider. Fails if the key
     /// does not match the cert.
     pub fn server_config(&self) -> Result<Arc<ServerConfig>, rustls::Error> {
@@ -116,6 +128,72 @@ fn fingerprint(pem: &[u8]) -> String {
         .take(FP_HEX_LEN / 2)
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+/// The first DER element of `der` and what follows it. Tags are one byte, as in every certificate.
+fn der_element(der: &[u8]) -> Option<(&[u8], &[u8])> {
+    let first = *der.get(1)?;
+    let (header, len) = if first < 0x80 {
+        (2, usize::from(first))
+    } else {
+        let n = usize::from(first & 0x7f);
+        if n == 0 || n > 4 {
+            return None;
+        }
+        let len = der
+            .get(2..2 + n)?
+            .iter()
+            .fold(0, |len, b| len << 8 | usize::from(*b));
+        (2 + n, len)
+    };
+    let end = header.checked_add(len)?;
+    Some((der.get(..end)?, der.get(end..)?))
+}
+
+/// The inside of the DER element `element` (its header cut off).
+fn der_content(element: &[u8]) -> Option<&[u8]> {
+    let header = if element.get(1)? & 0x80 == 0 {
+        2
+    } else {
+        2 + usize::from(element[1] & 0x7f)
+    };
+    element.get(header..)
+}
+
+/// The SubjectPublicKeyInfo element of the DER certificate `cert`, header included:
+/// Certificate, then tbsCertificate, then [0] version (optional), serial, signature, issuer,
+/// validity and subject, and the next element is the key.
+fn spki_of(cert: &[u8]) -> Option<&[u8]> {
+    let (cert, _) = der_element(cert)?;
+    let (tbs, _) = der_element(der_content(cert)?)?;
+    let mut rest = der_content(tbs)?;
+    if *rest.first()? == 0xa0 {
+        rest = der_element(rest)?.1;
+    }
+    for _ in 0..5 {
+        rest = der_element(rest)?.1;
+    }
+    Some(der_element(rest)?.0)
+}
+
+/// `bytes` in standard base64 with padding.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(ALPHABET[(n >> (18 - 6 * i) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// A new self-signed P-256 identity, as (cert PEM, PKCS#8 key PEM).
@@ -172,6 +250,54 @@ mod tests {
         // printf abc | sha256sum. The firmware's PROTO_FP_LEN pins the 16.
         let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
         assert_eq!(fingerprint(b"abc"), digest[..16]);
+    }
+
+    #[test]
+    fn base64_pads_to_four_characters() {
+        // Cases from RFC 4648 section 10, and bytes that reach the last two characters of the alphabet.
+        for (plain, want) in [
+            (&b""[..], ""),
+            (b"foobar", "Zm9vYmFy"),
+            (&[0xff], "/w=="),
+            (&[0xff, 0xfe], "//4="),
+            (&[0xff, 0xfe, 0xfd], "//79"),
+            (&[0, 1, 2, 3], "AAECAw=="),
+        ] {
+            assert_eq!(base64(plain), want, "{plain:?}");
+        }
+    }
+
+    #[test]
+    fn the_pin_is_what_openssl_prints_for_the_certs_public_key() {
+        // A P-256 cert made with openssl, and the value from the command in integrations.md:
+        // openssl x509 -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64
+        const CERT: &str = "308201863082012da00302010202140b2c68d2e5623e6817bc9fb64cff59b95b1d5a2d300a06082a8648ce3d04030230193117301506035504030c0e77617463686465636b2074657374301e170d3236313032343038353930335a170d3336313032313038353930335a30193117301506035504030c0e77617463686465636b20746573743059301306072a8648ce3d020106082a8648ce3d03010703420004e00175d1c5866bf9e86452de88b22b87a8fd440dfbd05285802fe94ee93e67200ae4adff6814beaf1d932a6510105bf9cdc5f1fb09f569a15f604e2e9b8f6a9aa3533051301d0603551d0e04160414a75c7f2b5d0e64a5ec9c6536ffb0c69b8ca761a5301f0603551d23041830168014a75c7f2b5d0e64a5ec9c6536ffb0c69b8ca761a5300f0603551d130101ff040530030101ff300a06082a8648ce3d040302034700304402204a575d64bacd1089a68ebc16bf55426ed7ec12adea49fab0dc088194a5539421022056d63263791d3996414ba68307c296f0e03b73344b58ddbc37a09a5805e3ca12";
+        let cert: [u8; 394] = crate::daemon::protocol::decode_hex(CERT).unwrap();
+        let spki = spki_of(&cert).unwrap();
+        // 26 bytes of algorithm header and the 65-byte uncompressed point.
+        assert_eq!(spki.len(), 91);
+        assert_eq!(
+            base64(&Sha256::digest(spki)),
+            "AEbieqLeox6HTs7OZ6IBiNqljUizeJNR/17UJHurBI8="
+        );
+        // Cut anywhere, a certificate gives no key and never panics.
+        for cut in 0..cert.len() {
+            assert!(spki_of(&cert[..cut]).is_none(), "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn the_pin_of_a_generated_identity_is_the_hash_of_its_key() {
+        use rcgen::PublicKeyData;
+        let tmp = tempfile::tempdir().unwrap();
+        let identity = Identity::load_or_create(tmp.path()).unwrap();
+        let key =
+            KeyPair::from_pem(&fs::read_to_string(tmp.path().join(KEY_FILE)).unwrap()).unwrap();
+        let want = base64(&Sha256::digest(key.subject_public_key_info()));
+        let pin = identity.spki_pin().unwrap();
+        assert_eq!(pin, want);
+        // 32 bytes of hash: 43 characters and one padding.
+        assert!(pin.len() == 44 && pin.ends_with('='), "{pin}");
     }
 
     #[test]

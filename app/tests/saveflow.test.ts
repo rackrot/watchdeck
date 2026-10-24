@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { ButtonConfig, Config, ConfigView } from "../src/config.ts";
+import type {
+  ButtonConfig,
+  Config,
+  ConfigView,
+  IntegrationConfig,
+} from "../src/config.ts";
 import {
   diskChanged,
+  integrationTestBlock,
   isDirty,
   ownStatus,
   pushOutcome,
@@ -128,6 +134,35 @@ test("a button can be tested only when the draft matches the saved one", () => {
     ),
     "the file moved, so the live action may differ from the form",
   );
+});
+
+test("a stat integration can be tested only when the draft matches the saved one", () => {
+  const stat: IntegrationConfig = {
+    kind: "stat",
+    id: "load",
+    label: "Load",
+    every_s: 15,
+    source: { kind: "shell", argv: ["uptime"], timeout_s: 5 },
+  };
+  const saved: Config = { ...config, integration: [stat] };
+  assert.equal(integrationTestBlock(structuredClone(stat), saved, false), null);
+  assert.ok(
+    integrationTestBlock({ ...stat, id: "new" }, saved, false)?.includes(
+      "Save the integration",
+    ),
+  );
+  assert.ok(
+    integrationTestBlock({ ...stat, every_s: 30 }, saved, false)?.includes(
+      "Save your changes",
+    ),
+  );
+  assert.ok(
+    integrationTestBlock(structuredClone(stat), saved, true)?.includes(
+      "changed on disk",
+    ),
+  );
+  // No integration is saved at all.
+  assert.ok(integrationTestBlock(stat, config, false)?.includes("Save the"));
 });
 
 test("a push is sent, waiting or late", () => {

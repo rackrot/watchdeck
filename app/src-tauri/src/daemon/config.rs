@@ -1807,6 +1807,31 @@ impl Configs {
         self.screens.list()
     }
 
+    /// Runs `write`, which replaces secret `name`, unless the live config has a user of it other
+    /// than integration `owner`: a button that sends it as a header would then send the new value
+    /// to its server. The error names the users. The config lock is held, as in `delete_secret`.
+    pub fn replace_secret_of<T>(
+        &self,
+        name: &str,
+        owner: &str,
+        write: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let _read = self.locked();
+        let own = format!("integration {owner}");
+        let users: Vec<_> = (self.current().secret_users(name).into_iter())
+            .filter(|user| *user != own)
+            .collect();
+        if !users.is_empty() {
+            return Err(format!(
+                "Secret {name:?} is already used by {}, and a new token would replace what it \
+                 sends. Change {} first.",
+                users.join(", "),
+                if users.len() == 1 { "it" } else { "them" }
+            ));
+        }
+        write()
+    }
+
     /// Removes secret `name`, unless the live config still uses it, since the next reload would
     /// then refuse that config. The error names the buttons. The config lock is held so a save
     /// can't go live with the secret between the check and the removal.
@@ -4174,6 +4199,47 @@ source = { kind = "http", method = "GET", url = "http://nas.lan/api/load" }
         let err = configs.delete_secret("nas-token").unwrap_err();
         assert!(err.contains("used by integration load."), "{err}");
         assert_eq!(secrets.names().unwrap(), ["nas-token", "push-ha"]);
+    }
+
+    #[test]
+    fn replacing_a_secret_is_refused_when_another_source_sends_it_but_not_for_its_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let secrets = Arc::new(Secrets::new(tmp.path()));
+        secrets.set("push-ha", &"a".repeat(40)).unwrap();
+        secrets.set("push-load", &"b".repeat(40)).unwrap();
+        let configs = Configs::open(tmp.path(), secrets.clone()).unwrap();
+        let revision = configs.status().borrow().revision.clone();
+        let text = format!(
+            "{BARE}{}{}",
+            push_table("ha", "HA", "push-ha"),
+            stat_table(
+                "load",
+                "30",
+                "/load",
+                r#"{ kind = "http", method = "GET", url = "https://nas.lan/", secret_headers = { Authorization = "push-load" } }"#,
+            )
+        );
+        configs
+            .save(parse(&text, &secrets.sizes()).unwrap(), &revision)
+            .unwrap();
+
+        // The owner's own token is fair game.
+        assert_eq!(configs.replace_secret_of("push-ha", "ha", || Ok(1)), Ok(1));
+        // A stat source that sends the secret as a header is not.
+        let err = configs
+            .replace_secret_of("push-load", "x", || Ok(()))
+            .unwrap_err();
+        assert!(err.contains("used by integration load"), "{err}");
+        // Nor is the owner's token when the id asking is another's.
+        let err = configs
+            .replace_secret_of("push-ha", "other", || Ok(()))
+            .unwrap_err();
+        assert!(err.contains("used by integration ha"), "{err}");
+        // A secret nobody uses is free.
+        assert_eq!(
+            configs.replace_secret_of("push-new", "new", || Ok(2)),
+            Ok(2)
+        );
     }
 
     // ---- The file ----

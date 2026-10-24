@@ -5,6 +5,7 @@ import type {
   Config,
   ConfigStatus,
   ConfigView,
+  IntegrationConfig,
 } from "./config.ts";
 import { canon, pageCount } from "./edit.ts";
 
@@ -75,6 +76,27 @@ export function testBlock(
   return canon(live) === canon(button)
     ? null
     : "Save your changes first. A test runs the saved action.";
+}
+
+/**
+ * Why a stat or prometheus `integration` can't be tested yet, or null if it can: as for a button, a
+ * test runs what was saved, so the draft must match the live config's integration with that id.
+ */
+export function integrationTestBlock(
+  integration: IntegrationConfig,
+  saved: Config,
+  diskMoved: boolean,
+): string | null {
+  if (diskMoved) {
+    return "config.toml changed on disk; reload first.";
+  }
+  const live = (saved.integration ?? []).find((i) => i.id === integration.id);
+  if (!live) {
+    return "Save the integration first. A test runs the saved source.";
+  }
+  return canon(live) === canon(integration)
+    ? null
+    : "Save your changes first. A test runs the saved source.";
 }
 
 export type PushOutcome =

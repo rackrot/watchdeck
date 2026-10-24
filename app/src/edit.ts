@@ -4,13 +4,19 @@
 import type {
   ButtonConfig,
   Config,
+  IntegrationConfig,
   Metric,
   PageConfig,
   SleepConfig,
   StatusBarConfig,
   Step,
 } from "./config";
-import { SLEEP_DEFAULTS } from "./config.ts";
+import {
+  MAX_INTEGRATION_ID,
+  newShell,
+  SLEEP_DEFAULTS,
+  tokenSecretFor,
+} from "./config.ts";
 import { DEFAULT_FONT, resolveFonts } from "./fonts.ts";
 import { SLEEP_ELEMENTS } from "./preview.ts";
 
@@ -46,6 +52,44 @@ export function duplicateNames(rows: Row[]): string[] {
 /** A whole number from what was typed, or NaN, which `numberErrors` reports. */
 export function parseWhole(text: string): number {
   return /^\d+$/.test(text.trim()) ? Number(text) : Number.NaN;
+}
+
+/**
+ * Names that more than one row uses once case is ignored, as grafana's `levels` severities are, in
+ * the case of their first use.
+ */
+export function caseDuplicateNames(rows: Row[]): string[] {
+  const first = new Map<string, string>();
+  const dupes = new Set<string>();
+  for (const { name } of rows) {
+    const earlier = first.get(name.toLowerCase());
+    if (earlier === undefined) {
+      first.set(name.toLowerCase(), name);
+    } else {
+      dupes.add(earlier);
+    }
+  }
+  return [...dupes];
+}
+
+/** A number, whole or decimal, from what was typed, or NaN, which `numberErrors` reports. */
+export function parseDecimal(text: string): number {
+  return /^-?\d+(\.\d+)?$/.test(text.trim()) ? Number(text) : Number.NaN;
+}
+
+/**
+ * `item` with `key` set to `value`, or without the key when `value` is undefined or empty text, so
+ * an unset optional setting stays out of the saved file.
+ */
+export function withOptional<T extends object, K extends keyof T>(
+  item: T,
+  key: K,
+  value: T[K] | undefined | "",
+): T {
+  const { [key]: _, ...rest } = item;
+  return (
+    value === undefined || value === "" ? rest : { ...rest, [key]: value }
+  ) as T;
 }
 
 /** The most pages a config can have (`MAX_PAGES` in config.rs). */
@@ -353,6 +397,152 @@ export function withSleep(
 export const feedChanged = (a: Config, b: Config): boolean =>
   canon([a.push ?? null, a.integration ?? []]) !==
   canon([b.push ?? null, b.integration ?? []]);
+
+/** An id like `push-2` that no integration has. */
+function freeIntegrationId(
+  taken: IntegrationConfig[],
+  kind: IntegrationConfig["kind"],
+): string {
+  const ids = new Set(taken.map((i) => i.id));
+  let n = taken.length + 1;
+  while (ids.has(`${kind}-${n}`)) {
+    n++;
+  }
+  return `${kind}-${n}`;
+}
+
+/** A new integration of `kind` with id `id`. */
+function newIntegration(
+  kind: IntegrationConfig["kind"],
+  id: string,
+): IntegrationConfig {
+  switch (kind) {
+    case "push":
+      return { kind, id, label: "Push", token_secret: tokenSecretFor(id) };
+    case "grafana":
+      return { kind, id, label: "Grafana", token_secret: tokenSecretFor(id) };
+    case "stat":
+      return { kind, id, label: "Stat", every_s: 15, source: newShell() };
+    case "prometheus":
+      return {
+        kind,
+        id,
+        label: "Prometheus",
+        url: "http://localhost:9090",
+        query: "up",
+        every_s: 30,
+      };
+    default: {
+      const unhandled: never = kind;
+      return unhandled;
+    }
+  }
+}
+
+/**
+ * `config` with a new integration of `kind` at the end. A push or grafana one names the secret
+ * `push-<id>`, which does not exist until its token is generated.
+ */
+export function addIntegration(
+  config: Config,
+  kind: IntegrationConfig["kind"],
+): Config {
+  const list = config.integration ?? [];
+  const id = freeIntegrationId(list, kind);
+  return { ...config, integration: [...list, newIntegration(kind, id)] };
+}
+
+/** `config` with integration `index` replaced. */
+export function setIntegration(
+  config: Config,
+  index: number,
+  next: IntegrationConfig,
+): Config {
+  return {
+    ...config,
+    integration: (config.integration ?? []).map((i, j) =>
+      j === index ? next : i,
+    ),
+  };
+}
+
+/** `config` without integration `index`. The key goes with the last one, as Rust leaves it out. */
+export function removeIntegration(config: Config, index: number): Config {
+  const { integration: _, ...rest } = config;
+  const list = (config.integration ?? []).filter((_i, j) => j !== index);
+  return list.length > 0 ? { ...rest, integration: list } : rest;
+}
+
+/** `config` with integration `index` moved one place earlier (-1) or later (1). Past either end it stays. */
+export function moveIntegration(
+  config: Config,
+  index: number,
+  by: -1 | 1,
+): Config {
+  const list = [...(config.integration ?? [])];
+  const to = index + by;
+  if (to < 0 || to >= list.length) {
+    return config;
+  }
+  [list[index], list[to]] = [list[to], list[index]];
+  return { ...config, integration: list };
+}
+
+/** `config` with `[push] lan` set. Off removes the table when nothing else is in it. */
+export function withPushLan(config: Config, lan: boolean): Config {
+  const { push, ...rest } = config;
+  const { lan: _, ...others } = push ?? {};
+  if (lan) {
+    return { ...rest, push: { ...others, lan } };
+  }
+  return Object.keys(others).length > 0 ? { ...rest, push: others } : rest;
+}
+
+/**
+ * `config` with integration `index` given a new id. A push or grafana integration whose
+ * `token_secret` is the conventional `push-<old id>` follows to `push-<new id>`, so the secret that
+ * Generate token stores is the one it names. One with a secret of its own keeps it.
+ */
+export function withIntegrationId(
+  config: Config,
+  index: number,
+  id: string,
+): Config {
+  const current = (config.integration ?? [])[index];
+  const next =
+    (current.kind === "push" || current.kind === "grafana") &&
+    current.token_secret === tokenSecretFor(current.id)
+      ? { ...current, id, token_secret: tokenSecretFor(id) }
+      : { ...current, id };
+  return setIntegration(config, index, next);
+}
+
+/**
+ * Why `id` can't name integration `index`, or null. It holds the daemon's rules for the id: 1 to
+ * 31 letters, digits, `_`, `-` or `.`, and no other integration's. A push one also can't hold a
+ * `.`, because its token is the secret `push-<id>` and a secret name has none.
+ */
+export function integrationIdProblem(
+  config: Config,
+  index: number,
+): string | null {
+  const list = config.integration ?? [];
+  const { id, kind } = list[index];
+  if (
+    id === "" ||
+    id.length > MAX_INTEGRATION_ID ||
+    !/^[A-Za-z0-9_.-]+$/.test(id)
+  ) {
+    return `id must be 1 to ${MAX_INTEGRATION_ID} letters, digits, '_', '-' or '.'`;
+  }
+  if ((kind === "push" || kind === "grafana") && id.includes(".")) {
+    return `A ${kind} integration's id can't hold '.': its token is stored as the secret push-<id>, and a secret name has only letters, digits, '_' and '-'.`;
+  }
+  if (list.some((other, j) => j !== index && other.id === id)) {
+    return `integration ids must be unique: "${id}"`;
+  }
+  return null;
+}
 
 /**
  * `bar` without parts that say nothing: a unit that is the default, a `thresholds` table with no

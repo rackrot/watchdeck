@@ -149,6 +149,86 @@ export const sleepTextAlign = (anchor: string): "left" | "center" | "right" =>
       ? "center"
       : "left";
 
+// The -1 page, mirroring firmware/main/feedfmt.h and .c (the row count and the age text) and
+// feedpage.c (the geometry): 1024 x 556 under the bar, cards in rows of four, then the note rows.
+export const FEED_AREA_H = 556;
+export const FEED_PAD = 8;
+export const FEED_CARD_H = 112;
+export const FEED_CARD_GAP = 8;
+export const FEED_CARDS_PER_ROW = 4;
+export const FEED_NOTE_H = 56;
+export const FEED_MORE_H = 32;
+/** feedpage.c: the cards and rows keep this much from the page's sides. */
+export const FEED_SIDE = 12;
+export const FEED_CARD_W = 244;
+/** A row's height: the pitch less a 4 px gap. */
+export const FEED_ROW_H = FEED_NOTE_H - 4;
+export const FEED_EDGE_W = 8;
+export const FEED_ROW_PAD = 12;
+export const FEED_AGE_W = 72;
+export const FEED_SRC_W = 270;
+export const FEED_META_GAP = 8;
+/** The row's width, and the title's: what is left of it after the edge, the insets and the meta labels. */
+export const FEED_ROW_W = SCREEN_W - 2 * FEED_SIDE;
+export const FEED_TITLE_W =
+  FEED_ROW_W -
+  FEED_EDGE_W -
+  2 * FEED_ROW_PAD -
+  FEED_SRC_W -
+  FEED_META_GAP -
+  FEED_AGE_W -
+  FEED_META_GAP;
+
+/** The y of the first note row: under the card rows, if there are cards (`feedpage_fill`). */
+export function feedNotesTop(cards: number): number {
+  if (cards === 0) {
+    return FEED_PAD;
+  }
+  const cardRows = Math.ceil(cards / FEED_CARDS_PER_ROW);
+  return (
+    FEED_PAD +
+    cardRows * FEED_CARD_H +
+    (cardRows - 1) * FEED_CARD_GAP +
+    FEED_PAD
+  );
+}
+
+/**
+ * How many note rows the page draws, and how many notes the "+N more" line stands for
+ * (`feedfmt_note_rows`): all of them if they fit, else the rows that fit beside the line.
+ */
+export function feedNoteRows(
+  cards: number,
+  notes: number,
+): { rows: number; more: number } {
+  const below = FEED_AREA_H - feedNotesTop(cards);
+  const fit = below > 0 ? Math.floor(below / FEED_NOTE_H) : 0;
+  if (notes <= fit) {
+    return { rows: notes, more: 0 };
+  }
+  const rows =
+    below > FEED_MORE_H ? Math.floor((below - FEED_MORE_H) / FEED_NOTE_H) : 0;
+  return { rows, more: notes - rows };
+}
+
+/** A note's age (`feedfmt_age`): "now", "5 min", "2 h", "3 d". Empty without a clock or a time. */
+export function feedAge(at: number, now: number, haveClock = true): string {
+  if (!haveClock || at === 0) {
+    return "";
+  }
+  const s = now > at ? now - at : 0;
+  if (s < 60) {
+    return "now";
+  }
+  if (s < 3600) {
+    return `${Math.floor(s / 60)} min`;
+  }
+  if (s < 86400) {
+    return `${Math.floor(s / 3600)} h`;
+  }
+  return `${Math.min(999, Math.floor(s / 86400))} d`;
+}
+
 /**
  * A tile button wears its configured color only while ok. Before its first reading it is grey and
  * when bad it is red (ui.c `tile_bg`: lv_palette_darken of GREY and RED, level 2), which the CSS
