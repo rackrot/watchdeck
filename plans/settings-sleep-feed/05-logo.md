@@ -67,6 +67,7 @@ Today the app has Tauri's default icons, the Vite favicon and a text-only wordma
 - **Acceptance**: the user picks one, or names changes and a second round runs once.
 - **Cheapest check**: the user's look at the sheets.
 - **Owner**: design.
+- **Result (2026-10-23)**: the user picked **A, Deck**: a solid rounded panel with six key holes cut into it, the top-right key filled in `--accent` #38bdf8. The body is #e7edf3 on dark and #0a0d11 on white. In single color the lit key is a solid fill, so the board's A4 bitmap keeps the idea. Below 32 px it reads more as a grid than as keys. The candidates were drawn with rsvg-convert, so L2 checks that resvg renders the mask the same. The source is `logo-a.svg` in the session scratchpad, and L2 copies it to `logo/mark.svg`.
 
 ### L2 Logo asset pipeline
 

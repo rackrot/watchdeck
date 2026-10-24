@@ -8,6 +8,7 @@ import {
   buttonsOnPage,
   canon,
   duplicateNames,
+  feedChanged,
   layoutChanged,
   layoutTargets,
   moveButton,
@@ -21,6 +22,7 @@ import {
   removePage,
   renamePage,
   rowsToRecord,
+  sleepChanged,
   withGpu,
   withGridFont,
   withSteps,
@@ -42,6 +44,63 @@ const config: Config = {
   layout: { cols: 5, rows: 3 },
   button: [button("a", [0, 0]), button("b", [1, 0])],
 };
+
+const withNew: Config = {
+  ...config,
+  sleep: { offline_after_s: 10, backlight: 100 },
+  push: { lan: false },
+  integration: [
+    { kind: "push", id: "ha", label: "HA", token_secret: "push-ha" },
+  ],
+};
+
+test("a button edit keeps [sleep], [push] and [[integration]] in the draft", () => {
+  const moved = moveButton(withNew, 0, [2, 2]);
+  assert.deepEqual(moved.sleep, withNew.sleep);
+  assert.deepEqual(moved.push, withNew.push);
+  assert.deepEqual(moved.integration, withNew.integration);
+});
+
+test("a [sleep] or feed-source change is not a layout change, and each is told apart", () => {
+  const sleep: Config = { ...config, sleep: { backlight: 50 } };
+  assert.equal(layoutChanged(config, sleep), false);
+  assert.equal(sleepChanged(config, sleep), true);
+  assert.equal(feedChanged(config, sleep), false);
+
+  const feed: Config = { ...config, push: { lan: true } };
+  assert.equal(layoutChanged(config, feed), false);
+  assert.equal(feedChanged(config, feed), true);
+  assert.equal(sleepChanged(config, feed), false);
+  assert.deepEqual(
+    layoutTargets(config, feed, [
+      { id: "d", connected: true, caps: ["pages", "fonts"] },
+    ]),
+    [],
+  );
+});
+
+test("the same [sleep] keys in another order are not a change", () => {
+  const a: Config = { ...config, sleep: { fit: "cover", bg: "#000000" } };
+  const b: Config = { ...config, sleep: { bg: "#000000", fit: "cover" } };
+  assert.equal(sleepChanged(a, b), false);
+});
+
+test("sleep and integration messages land in their buckets, and a message with no id stays whole", () => {
+  const map = mapErrors([
+    'sleep.fit "x" is not cover or contain',
+    'integration "ha": token_secret "y" is not in secrets.toml',
+    'integration "ha": label: at most 23 printable ASCII characters',
+    'integration ids must be unique: "ha"',
+  ]);
+  assert.deepEqual(map.sleep, ['sleep.fit "x" is not cover or contain']);
+  assert.deepEqual(map.integrations.get("ha"), [
+    'token_secret "y" is not in secrets.toml',
+    "label: at most 23 printable ASCII characters",
+  ]);
+  assert.deepEqual(map.general, ['integration ids must be unique: "ha"']);
+  assert.equal(hasErrors(map), true);
+  assert.equal(hasErrors(mapErrors([])), false);
+});
 
 test("header rows become a table, dropping blank rows and keeping the last of a repeat", () => {
   assert.equal(rowsToRecord([]), undefined);

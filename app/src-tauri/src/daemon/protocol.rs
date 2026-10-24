@@ -20,6 +20,10 @@ pub const CAP_FONTS: &str = "fonts";
 pub const CAP_PAGES: &str = "pages";
 /// The device reads `stats` frames and shows the host's CPU, memory, network and clock.
 pub const CAP_STATUS_BAR: &str = "status_bar";
+/// The device shows the sleep screen, reads `sleep`, and fetches its image with `asset_get`.
+pub const CAP_SLEEP: &str = "sleep";
+/// The device shows the -1 feed page, reads `feed`, and sends `feed_dismiss`.
+pub const CAP_FEED: &str = "feed";
 
 /// Largest message, and largest frame, in either direction.
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
@@ -36,6 +40,16 @@ const ICON_MAGIC: &[u8; 4] = b"WDI1";
 /// The id and dimensions end here: the id's hash covers the frame from this offset on.
 const ICON_HASHED_FROM: usize = 4 + ICON_ID_BYTES;
 
+/// Bytes in one asset chunk. Every `asset_get` offset is a multiple of it.
+pub const ASSET_CHUNK_BYTES: usize = 262_144;
+/// Bytes in an asset id, which `sleep` and `asset_get` spell as 32 hex digits.
+pub const ASSET_ID_BYTES: usize = 16;
+/// An asset frame's header: `WDA1`, the id, then the chunk's offset as u32 LE.
+pub const ASSET_HEADER_BYTES: usize = 24;
+/// Largest asset frame: the header and one chunk, the same size as an icon frame.
+pub const MAX_ASSET_FRAME_BYTES: usize = ASSET_HEADER_BYTES + ASSET_CHUNK_BYTES;
+const ASSET_MAGIC: &[u8; 4] = b"WDA1";
+
 /// Bytes in a device token, and in SHA-256 digests (`commit`, `c_host`).
 pub const TOKEN_BYTES: usize = 32;
 /// Bytes in each pairing nonce (`n_dev`, `n_host`).
@@ -48,6 +62,23 @@ const REPORT_KINDS: [&str; 2] = ["crash", "reset"];
 const REPORT_REASONS: [&str; 5] = ["panic", "int_wdt", "task_wdt", "wdt", "brownout"];
 const MAX_REPORT_TASK_CHARS: usize = 16;
 const MAX_REPORT_CAUSE_CHARS: usize = 32;
+
+// Limits of the sleep and feed frames, shared with the device's parser (site/src/protocol.md).
+const MAX_RGB: u32 = 0xFF_FFFF;
+const MAX_SLEEP_TEXT_CHARS: usize = 47;
+const MAX_OFFLINE_AFTER_S: u32 = 3600;
+const MAX_BACKLIGHT: u32 = 100;
+const MAX_FEED_SOURCES: u32 = 16;
+const MAX_FEED_CARDS: usize = 8;
+const MAX_FEED_NOTES: usize = 12;
+const MAX_FEED_ID_CHARS: usize = 63;
+const MAX_FEED_LABEL_CHARS: usize = 23;
+const MAX_FEED_VALUE_CHARS: usize = 15;
+const MAX_FEED_TITLE_CHARS: usize = 47;
+const MAX_FEED_BODY_CHARS: usize = 159;
+const MAX_FEED_SRC_CHARS: usize = 23;
+/// The largest whole number a JSON number carries exactly in the device's double.
+const MAX_JSON_INT: u64 = (1 << 53) - 1;
 
 /// First field of the pairing code's input, which binds the code to this protocol version.
 const PAIR_LABEL: &str = "watchdeck-pair-v1";
@@ -235,6 +266,17 @@ pub enum Message {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         colors: Option<Colors>,
     },
+    /// The sleep screen's settings, to a session whose `hello` names [`CAP_SLEEP`]. Check it with
+    /// [`Sleep::check`] before it goes out.
+    Sleep(Sleep),
+    /// The device asks for one chunk of an asset, one at a time. Checked with [`AssetGet::check`].
+    AssetGet(AssetGet),
+    /// The -1 page's snapshot, to a session whose `hello` names [`CAP_FEED`]. It replaces the last
+    /// one. Check it with [`Feed::check`] before it goes out.
+    Feed(Feed),
+    /// The device dismissed a note, which the daemon removes from every board. Checked with
+    /// [`FeedDismiss::check`].
+    FeedDismiss(FeedDismiss),
     /// A crash or abnormal reset from an earlier boot. Unchecked until [`Report::check`] passes.
     Report(Report),
     ReportAck {
@@ -384,6 +426,238 @@ impl fmt::Display for Report {
     }
 }
 
+/// Printable ASCII of at least `min` and at most `max` characters.
+fn text_within(s: &str, min: usize, max: usize) -> bool {
+    s.len() >= min && printable(s, max)
+}
+
+/// The sleep screen. `image` and `text` are optional; every other field is always sent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sleep {
+    /// The image's id: 32 lowercase hex digits, the first 16 bytes of SHA-256 over its pixels.
+    /// Absent means the built-in logo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// The screen's background and text color, `0xRRGGBB`.
+    pub bg: u32,
+    pub fg: u32,
+    /// Each element at most once, in any order.
+    pub show: Vec<SleepShow>,
+    /// Shown when `show` names [`SleepShow::Text`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    pub anchor: SleepAnchor,
+    pub spinner: SleepSpinner,
+    pub spinner_color: u32,
+    /// Seconds without a link before the screen sleeps. 0 means never for a lost link.
+    pub offline_after_s: u32,
+    /// The backlight while asleep, 0 to 100.
+    pub backlight: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SleepShow {
+    Clock,
+    Date,
+    Host,
+    Text,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SleepAnchor {
+    Center,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SleepSpinner {
+    Arc,
+    Dots,
+    Bar,
+    Pulse,
+    #[serde(rename = "none")]
+    Off,
+}
+
+impl Sleep {
+    /// Why this sleep is unacceptable. The text never repeats the frame's values.
+    pub fn check(&self) -> Result<(), String> {
+        if self
+            .image
+            .as_deref()
+            .is_some_and(|id| decode_hex::<ASSET_ID_BYTES>(id).is_none())
+        {
+            return Err("image is not 32 lowercase hex digits".into());
+        }
+        if [self.bg, self.fg, self.spinner_color]
+            .iter()
+            .any(|&color| color > MAX_RGB)
+        {
+            return Err("a color is not 0xRRGGBB".into());
+        }
+        if self
+            .show
+            .iter()
+            .enumerate()
+            .any(|(i, name)| self.show[..i].contains(name))
+        {
+            return Err("show names an element twice".into());
+        }
+        if self
+            .text
+            .as_deref()
+            .is_some_and(|text| !text_within(text, 0, MAX_SLEEP_TEXT_CHARS))
+        {
+            return Err(format!(
+                "text is not printable ASCII of at most {MAX_SLEEP_TEXT_CHARS} characters"
+            ));
+        }
+        if self.offline_after_s > MAX_OFFLINE_AFTER_S {
+            return Err(format!("offline_after_s is not 0 to {MAX_OFFLINE_AFTER_S}"));
+        }
+        if self.backlight > MAX_BACKLIGHT {
+            return Err(format!("backlight is not 0 to {MAX_BACKLIGHT}"));
+        }
+        Ok(())
+    }
+}
+
+/// A request for one chunk of an asset, from the device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetGet {
+    /// The asset's id, 32 lowercase hex digits.
+    pub id: String,
+    /// A multiple of [`ASSET_CHUNK_BYTES`]. Below the image's size, and the id naming the session's
+    /// current image, are checked when the daemon answers, since only then does it know the image.
+    pub offset: u64,
+}
+
+impl AssetGet {
+    /// Why this request is malformed: the id, or an offset that is not a whole chunk. The daemon
+    /// answers a failure with `bad_request` and a close. An offset at or past the image's size
+    /// gets the same, and an id that is not the current image gets no reply.
+    pub fn check(&self) -> Result<(), String> {
+        if decode_hex::<ASSET_ID_BYTES>(&self.id).is_none() {
+            return Err("id is not 32 lowercase hex digits".into());
+        }
+        if !self.offset.is_multiple_of(ASSET_CHUNK_BYTES as u64) {
+            return Err(format!("offset is not a multiple of {ASSET_CHUNK_BYTES}"));
+        }
+        Ok(())
+    }
+}
+
+/// The -1 page's snapshot: the configured sources, up to 8 stat cards and up to 12 notes, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Feed {
+    /// Configured integrations, 0 to 16. Zero means the device shows no -1 page.
+    pub sources: u32,
+    pub cards: Vec<FeedCard>,
+    pub notes: Vec<FeedNote>,
+}
+
+/// A stat card. A device shows any `state` other than `ok` or `bad` as unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeedCard {
+    pub id: String,
+    pub label: String,
+    pub value: String,
+    pub state: CardState,
+}
+
+/// A card's state on the wire. A device shows `unknown`, like any other value it doesn't know,
+/// as unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CardState {
+    Ok,
+    Bad,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteLevel {
+    Info,
+    Ok,
+    Warn,
+    Error,
+}
+
+/// A notification from an integration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeedNote {
+    pub id: String,
+    pub title: String,
+    pub body: String,
+    pub level: NoteLevel,
+    /// The integration's name, for display.
+    pub src: String,
+    /// When it happened, Unix seconds.
+    pub at: u64,
+}
+
+impl Feed {
+    /// Why this snapshot is unacceptable. The text never repeats the snapshot's values.
+    pub fn check(&self) -> Result<(), String> {
+        if self.sources > MAX_FEED_SOURCES {
+            return Err(format!("sources is not 0 to {MAX_FEED_SOURCES}"));
+        }
+        if self.cards.len() > MAX_FEED_CARDS {
+            return Err(format!("more than {MAX_FEED_CARDS} cards"));
+        }
+        for card in &self.cards {
+            if !text_within(&card.id, 1, MAX_FEED_ID_CHARS)
+                || !text_within(&card.label, 0, MAX_FEED_LABEL_CHARS)
+                || !text_within(&card.value, 0, MAX_FEED_VALUE_CHARS)
+            {
+                return Err("a card field is not printable ASCII within its limit".into());
+            }
+        }
+        if self.notes.len() > MAX_FEED_NOTES {
+            return Err(format!("more than {MAX_FEED_NOTES} notes"));
+        }
+        for note in &self.notes {
+            if !text_within(&note.id, 1, MAX_FEED_ID_CHARS)
+                || !text_within(&note.title, 1, MAX_FEED_TITLE_CHARS)
+                || !text_within(&note.body, 0, MAX_FEED_BODY_CHARS)
+                || !text_within(&note.src, 0, MAX_FEED_SRC_CHARS)
+            {
+                return Err("a note field is not printable ASCII within its limit".into());
+            }
+            if note.at > MAX_JSON_INT {
+                return Err("a note's at is past 2^53 - 1".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A notification the device dismissed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeedDismiss {
+    /// The note's id, 1 to 63 printable ASCII characters.
+    pub id: String,
+}
+
+impl FeedDismiss {
+    /// Why this dismissal is unacceptable.
+    pub fn check(&self) -> Result<(), String> {
+        if !text_within(&self.id, 1, MAX_FEED_ID_CHARS) {
+            return Err(format!(
+                "id is not 1 to {MAX_FEED_ID_CHARS} printable ASCII characters"
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// A button icon in the device's pixel format: ARGB8888 as LVGL stores it, which is the bytes
 /// B, G, R, A per pixel with straight alpha. Its id is the first 16 bytes of SHA-256 over the
 /// width and height as u16 LE and then the pixels, so equal pictures share an id.
@@ -499,6 +773,22 @@ impl IconFrame {
     }
 }
 
+/// One chunk of an asset as an asset frame: `WDA1`, the 16-byte id, the offset as u32 LE, then the
+/// bytes. Returns `None` when the chunk is longer than [`ASSET_CHUNK_BYTES`] or the offset does not
+/// fit the u32 on the wire, so a caller's bug can't panic a session task.
+pub fn encode_asset_frame(id: &[u8; ASSET_ID_BYTES], offset: u64, data: &[u8]) -> Option<Vec<u8>> {
+    let offset = u32::try_from(offset).ok()?;
+    if data.len() > ASSET_CHUNK_BYTES {
+        return None;
+    }
+    let mut frame = Vec::with_capacity(ASSET_HEADER_BYTES + data.len());
+    frame.extend_from_slice(ASSET_MAGIC);
+    frame.extend_from_slice(id);
+    frame.extend_from_slice(&offset.to_le_bytes());
+    frame.extend_from_slice(data);
+    Some(frame)
+}
+
 /// `wd-` plus the device's Wi-Fi MAC as 12 lowercase hex digits, exactly as the firmware writes it.
 pub fn valid_device_id(device: &str) -> bool {
     device.strip_prefix("wd-").is_some_and(|mac| {
@@ -564,7 +854,7 @@ mod tests {
     use serde_json::Value;
 
     // The fixtures are the JSON examples from site/src/protocol.md.
-    const FIXTURES: [&str; 21] = [
+    const FIXTURES: [&str; 27] = [
         include_str!("../../tests/fixtures/hello.json"),
         include_str!("../../tests/fixtures/welcome.json"),
         include_str!("../../tests/fixtures/error.json"),
@@ -586,6 +876,12 @@ mod tests {
         include_str!("../../tests/fixtures/pair_nonce.json"),
         include_str!("../../tests/fixtures/pair_reveal.json"),
         include_str!("../../tests/fixtures/pair_result.json"),
+        include_str!("../../tests/fixtures/sleep.json"),
+        include_str!("../../tests/fixtures/sleep_min.json"),
+        include_str!("../../tests/fixtures/asset_get.json"),
+        include_str!("../../tests/fixtures/feed.json"),
+        include_str!("../../tests/fixtures/feed_empty.json"),
+        include_str!("../../tests/fixtures/feed_dismiss.json"),
     ];
 
     #[test]
@@ -1026,5 +1322,240 @@ mod tests {
         let mut frame = two_pixels().encode();
         frame[20..24].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
         assert_eq!(IconFrame::decode(&frame), Err(IconFrameError::BadSize));
+    }
+
+    // ---- Sleep, feed and asset frames ----
+
+    fn parse(text: &str) -> Message {
+        serde_json::from_str(text).unwrap()
+    }
+
+    fn sleep_fixture() -> Sleep {
+        match parse(include_str!("../../tests/fixtures/sleep.json")) {
+            Message::Sleep(sleep) => sleep,
+            other => panic!("not a sleep: {other:?}"),
+        }
+    }
+
+    fn feed_fixture() -> Feed {
+        match parse(include_str!("../../tests/fixtures/feed.json")) {
+            Message::Feed(feed) => feed,
+            other => panic!("not a feed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_sleep_and_feed_fixtures_are_acceptable_and_the_minimal_sleep_is_too() {
+        assert_eq!(sleep_fixture().check(), Ok(()));
+        let min = match parse(include_str!("../../tests/fixtures/sleep_min.json")) {
+            Message::Sleep(sleep) => sleep,
+            other => panic!("not a sleep: {other:?}"),
+        };
+        assert_eq!(min.check(), Ok(()));
+        assert_eq!(feed_fixture().check(), Ok(()));
+        let empty = match parse(include_str!("../../tests/fixtures/feed_empty.json")) {
+            Message::Feed(feed) => feed,
+            other => panic!("not a feed: {other:?}"),
+        };
+        assert_eq!(empty.check(), Ok(()));
+    }
+
+    #[test]
+    fn every_sleep_rule_refuses_its_violation() {
+        let edit = |f: &dyn Fn(&mut Sleep)| {
+            let mut sleep = sleep_fixture();
+            f(&mut sleep);
+            sleep.check().unwrap_err()
+        };
+        for bad in [
+            "5b1f0c7e9d3a2b4c6d8e0f1a2b3c4d5",
+            "5b1f0c7e9d3a2b4c6d8e0f1a2b3c4d5e0",
+            "5B1F0C7E9D3A2B4C6D8E0F1A2B3C4D5E",
+        ] {
+            assert!(
+                edit(&|s| s.image = Some(bad.into())).starts_with("image "),
+                "{bad}"
+            );
+        }
+        assert!(edit(&|s| s.bg = MAX_RGB + 1).starts_with("a color "));
+        assert!(edit(&|s| s.spinner_color = MAX_RGB + 1).starts_with("a color "));
+        assert!(edit(&|s| s.show.push(SleepShow::Clock)).starts_with("show "));
+        assert!(edit(&|s| s.text = Some("a".repeat(48))).starts_with("text "));
+        assert!(edit(&|s| s.text = Some("li\nk".into())).starts_with("text "));
+        assert!(edit(&|s| s.offline_after_s = 3601).starts_with("offline_after_s "));
+        assert!(edit(&|s| s.backlight = 101).starts_with("backlight "));
+        // The edges pass.
+        let mut sleep = sleep_fixture();
+        sleep.text = Some("a".repeat(47));
+        sleep.offline_after_s = 3600;
+        sleep.backlight = 0;
+        assert_eq!(sleep.check(), Ok(()));
+    }
+
+    #[test]
+    fn a_sleep_with_an_unknown_element_or_spinner_does_not_parse() {
+        let text = r#"{"t":"sleep","bg":0,"fg":0,"show":["clock","weather"],"anchor":"center","spinner":"arc","spinner_color":0,"offline_after_s":0,"backlight":0}"#;
+        assert!(serde_json::from_str::<Message>(text).is_err());
+        let text = r#"{"t":"sleep","bg":0,"fg":0,"show":[],"anchor":"center","spinner":"wave","spinner_color":0,"offline_after_s":0,"backlight":0}"#;
+        assert!(serde_json::from_str::<Message>(text).is_err());
+    }
+
+    #[test]
+    fn every_feed_rule_refuses_its_violation() {
+        let edit = |f: &dyn Fn(&mut Feed)| {
+            let mut feed = feed_fixture();
+            f(&mut feed);
+            feed.check().unwrap_err()
+        };
+        assert!(edit(&|f| f.sources = 17).starts_with("sources "));
+        let card = feed_fixture().cards[0].clone();
+        assert!(edit(&|f| f.cards = vec![card.clone(); 9]).starts_with("more than 8 cards"));
+        let note = feed_fixture().notes[0].clone();
+        assert!(edit(&|f| f.notes = vec![note.clone(); 13]).starts_with("more than 12 notes"));
+        assert!(edit(&|f| f.notes[0].title = "t".repeat(48)).starts_with("a note field"));
+        assert!(edit(&|f| f.notes[0].title = String::new()).starts_with("a note field"));
+        assert!(edit(&|f| f.notes[0].body = "b".repeat(160)).starts_with("a note field"));
+        assert!(edit(&|f| f.notes[0].id = "i".repeat(64)).starts_with("a note field"));
+        assert!(edit(&|f| f.cards[0].id = String::new()).starts_with("a card field"));
+        assert!(edit(&|f| f.cards[0].id = "i".repeat(64)).starts_with("a card field"));
+        assert!(edit(&|f| f.cards[0].label = "l".repeat(24)).starts_with("a card field"));
+        assert!(edit(&|f| f.cards[0].value = "v".repeat(16)).starts_with("a card field"));
+        assert!(edit(&|f| f.notes[0].src = "s".repeat(24)).starts_with("a note field"));
+        assert!(edit(&|f| f.notes[0].body = "b\u{e9}".into()).starts_with("a note field"));
+        assert!(edit(&|f| f.notes[0].at = MAX_JSON_INT + 1).starts_with("a note's at"));
+        // A title of 47 and an empty body and src pass.
+        let mut feed = feed_fixture();
+        feed.notes[0].title = "t".repeat(47);
+        feed.notes[0].body = String::new();
+        feed.notes[0].src = String::new();
+        assert_eq!(feed.check(), Ok(()));
+    }
+
+    #[test]
+    fn an_unknown_note_level_does_not_parse() {
+        let text = r#"{"t":"feed","sources":0,"cards":[],"notes":[{"id":"a","title":"b","body":"","level":"debug","src":"","at":1}]}"#;
+        assert!(serde_json::from_str::<Message>(text).is_err());
+    }
+
+    #[test]
+    fn a_fullest_feed_with_every_character_escaped_stays_under_the_text_cap() {
+        // Printable ASCII, so the worst case is a quote, which the JSON escapes to two bytes.
+        let card = FeedCard {
+            id: "\"".repeat(MAX_FEED_ID_CHARS),
+            label: "\"".repeat(MAX_FEED_LABEL_CHARS),
+            value: "\"".repeat(MAX_FEED_VALUE_CHARS),
+            state: CardState::Bad,
+        };
+        let note = FeedNote {
+            id: "\"".repeat(MAX_FEED_ID_CHARS),
+            title: "\"".repeat(MAX_FEED_TITLE_CHARS),
+            body: "\"".repeat(MAX_FEED_BODY_CHARS),
+            level: NoteLevel::Error,
+            src: "\"".repeat(MAX_FEED_SRC_CHARS),
+            at: MAX_JSON_INT,
+        };
+        let feed = Feed {
+            sources: MAX_FEED_SOURCES,
+            cards: vec![card; MAX_FEED_CARDS],
+            notes: vec![note; MAX_FEED_NOTES],
+        };
+        assert_eq!(feed.check(), Ok(()));
+        let text = serde_json::to_string(&Message::Feed(feed)).unwrap();
+        eprintln!("fullest feed frame: {} bytes", text.len());
+        assert!(text.len() < MAX_MESSAGE_BYTES, "{} bytes", text.len());
+    }
+
+    #[test]
+    fn a_card_state_of_unknown_round_trips_and_other_states_do_not_parse() {
+        let card = FeedCard {
+            id: "nas-load".into(),
+            label: "NAS load".into(),
+            value: "0.42".into(),
+            state: CardState::Unknown,
+        };
+        let text = serde_json::to_string(&card).unwrap();
+        assert!(text.contains(r#""state":"unknown""#), "{text}");
+        assert_eq!(serde_json::from_str::<FeedCard>(&text).unwrap(), card);
+        let text = r#"{"id":"a","label":"","value":"","state":"stale"}"#;
+        assert!(serde_json::from_str::<FeedCard>(text).is_err());
+    }
+
+    #[test]
+    fn offline_after_s_must_be_a_whole_number_of_seconds() {
+        for bad in ["-1", "1.5"] {
+            let text = format!(
+                r#"{{"t":"sleep","bg":0,"fg":0,"show":[],"anchor":"center","spinner":"none","spinner_color":0,"offline_after_s":{bad},"backlight":0}}"#
+            );
+            assert!(serde_json::from_str::<Message>(&text).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn asset_get_checks_its_id_and_that_its_offset_is_a_whole_chunk() {
+        let Message::AssetGet(get) = parse(include_str!("../../tests/fixtures/asset_get.json"))
+        else {
+            panic!("not an asset_get")
+        };
+        assert_eq!(get.check(), Ok(()));
+        assert_eq!(get.offset, ASSET_CHUNK_BYTES as u64);
+        let mut bad = get.clone();
+        bad.offset = ASSET_CHUNK_BYTES as u64 + 1;
+        assert!(bad.check().unwrap_err().starts_with("offset "));
+        bad.offset = 0;
+        assert_eq!(bad.check(), Ok(()));
+        for id in [
+            "",
+            "5B1F0C7E9D3A2B4C6D8E0F1A2B3C4D5E",
+            "5b1f0c7e9d3a2b4c6d8e0f1a2b3c4d5",
+        ] {
+            let bad = AssetGet {
+                id: id.into(),
+                offset: 0,
+            };
+            assert!(bad.check().unwrap_err().starts_with("id "), "{id}");
+        }
+    }
+
+    #[test]
+    fn feed_dismiss_checks_its_id_is_1_to_63_printable_characters() {
+        let Message::FeedDismiss(dismiss) =
+            parse(include_str!("../../tests/fixtures/feed_dismiss.json"))
+        else {
+            panic!("not a feed_dismiss")
+        };
+        assert_eq!(dismiss.check(), Ok(()));
+        assert_eq!(FeedDismiss { id: "a".repeat(63) }.check(), Ok(()));
+        for id in ["", &"a".repeat(64), "a\tb", "\u{e9}"] {
+            assert!(FeedDismiss { id: id.into() }.check().is_err(), "{id:?}");
+        }
+    }
+
+    #[test]
+    fn an_asset_frame_is_the_header_then_the_chunk() {
+        let id: [u8; ASSET_ID_BYTES] = std::array::from_fn(|i| 0xa0 + i as u8);
+        let chunk = vec![7u8; ASSET_CHUNK_BYTES];
+        let frame = encode_asset_frame(&id, 262_144, &chunk).unwrap();
+        assert_eq!(frame.len(), MAX_ASSET_FRAME_BYTES);
+        assert_eq!(MAX_ASSET_FRAME_BYTES, MAX_ICON_FRAME_BYTES);
+        assert_eq!(&frame[..4], b"WDA1");
+        assert_eq!(&frame[4..20], id);
+        assert_eq!(&frame[20..24], 262_144u32.to_le_bytes());
+        assert_eq!(&frame[24..], chunk.as_slice());
+
+        // A short last chunk is just shorter.
+        let last = encode_asset_frame(&id, 0, &[1, 2, 3]).unwrap();
+        assert_eq!(last.len(), ASSET_HEADER_BYTES + 3);
+        assert_eq!(&last[20..24], [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn an_asset_frame_refuses_misuse_without_panicking() {
+        let id = [0u8; ASSET_ID_BYTES];
+        assert_eq!(
+            encode_asset_frame(&id, 0, &vec![0; ASSET_CHUNK_BYTES + 1]),
+            None
+        );
+        assert_eq!(encode_asset_frame(&id, u64::from(u32::MAX) + 1, &[1]), None);
+        assert!(encode_asset_frame(&id, u64::from(u32::MAX), &[1]).is_some());
     }
 }

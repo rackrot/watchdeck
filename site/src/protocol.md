@@ -142,7 +142,7 @@ The daemon stores its side before the user answers, so a No leaves a token hash 
 - The daemon is the WebSocket server, and the device is the client.
 - Messages are JSON in text frames. Every message has a string field `t` that names its type.
 - Each message is a single frame of at most 16 KB in either direction, on both ports. The receiver closes the connection on anything larger.
-- The one exception is an [icon frame](#icon-frames), a binary frame from the daemon to the device of at most 262,168 bytes. The device never sends binary frames, and the daemon answers one with `error` `bad_request` and a close.
+- The exceptions are the binary frames from the daemon: an [icon frame](#icon-frames) and an [asset frame](#asset-frames), each at most 262,168 bytes. The device never sends binary frames, and the daemon answers one with `error` `bad_request` and a close.
 - Fragmented messages aren't supported. The device drops every frame without FIN, both the first fragment and its continuation frames, so the daemon must send each message as one frame. The device logs `fragmented message dropped` for the first fragment and keeps the link up, so the message gets no reply.
 - Both sides ignore unknown fields. An unknown `t` is logged and ignored.
 - Liveness uses WebSocket ping frames. The device pings every 10 s and drops the link after 25 s without a pong. The daemon drops a session that has been silent for over 30 s.
@@ -162,6 +162,11 @@ device                      daemon
   |--- icon_get ------------->|   for icons the device doesn't have
   |<-- icon frame (binary) ---|   one per icon
   |<-- stats -----------------|   once a second, with status_bar
+  |<-- sleep ------------------|   with sleep, after the first layout and its tiles
+  |--- asset_get ------------>|   with sleep, one at a time, for the sleep image
+  |<-- asset frame (binary) ---|   one per asset_get
+  |<-- feed ------------------|   with feed, a snapshot that replaces the last
+  |--- feed_dismiss --------->|   when a note is dismissed
   |--- press ---------------->|
   |<-- result ----------------|   exactly one per press
   |--- report --------------->|   a crash or reset from an earlier boot, if the device has one
@@ -202,6 +207,8 @@ device                      daemon
 | `fonts` | Draws the seven fonts listed under [Fonts](#fonts), and reads the font fields of `layout` |
 | `pages` | Assembles a set of up to 4 `layout` pages, shows one at a time, and lays out the shorter grid when a set has 2 or more. See [Pages](#pages) |
 | `status_bar` | Reads `stats` and shows the host's CPU and GPU busy share and temperatures, memory, network rates and the clock in a bar, in the units and colors the frame gives. See [`stats`](#stats-daemon--device) |
+| `sleep` | Shows a sleep screen when the link is lost or the user asks for one. Reads `sleep`, fetches its image with `asset_get` and reads the [asset frames](#asset-frames). See [`sleep`](#sleep-daemon--device) |
+| `feed` | Shows the -1 feed page, of notifications and stat cards. Reads `feed` and sends `feed_dismiss`. See [`feed`](#feed-daemon--device) |
 
 The daemon hashes `token` and compares the result in constant time with the hash it stored for `device`. A missing, malformed or wrong token and an unknown device all get the same `error`, then a close:
 
@@ -455,6 +462,97 @@ The daemon sends `stats` once a second, and only to a session whose `hello` name
 - `gpu`, `cpu_temp` and `gpu_temp` are independent: a GPU with no temperature sensor still sends its `gpu` busy share.
 - The daemon never sends a value outside these ranges. It leaves out that value and its color, so a sensor that reads 511 °C costs one value and not the frame. A `mem_*` pair with a total of 0 is left out too. Every frame carries `temp_unit` and `net_unit`, and `colors` is left out when no color is set.
 - The device logs each valid `stats` at debug level, not in the INFO line it logs for other messages, since a frame arrives every second. The firmware compiles debug logs out (`CONFIG_LOG_MAXIMUM_LEVEL=3`), so seeing them needs a rebuild with debug enabled. A refused `stats` gets the INFO line.
+
+### `sleep` (daemon → device)
+
+```json
+{"t":"sleep","image":"5b1f0c7e9d3a2b4c6d8e0f1a2b3c4d5e","bg":0,"fg":16777215,"show":["clock","date","host"],"text":"Back soon","anchor":"bottom_left","spinner":"arc","spinner_color":3718648,"offline_after_s":10,"backlight":100}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `image` | string | Optional. The image's id, 32 lowercase hex digits: the first 16 bytes of SHA-256 over its pixels. Absent: the built-in logo |
+| `bg`, `fg` | int | `0xRRGGBB`, 0 to 16777215. The screen's background and the text color |
+| `show` | [string] | Required, any of `clock`, `date`, `host` or `text`, each at most once. Unknown names are ignored |
+| `text` | string | Optional. Printable ASCII, at most 47 bytes. Shown when `show` names `text` |
+| `anchor` | string | Required. `center`, `top_left`, `top_right`, `bottom_left` or `bottom_right`: where the elements sit in the image area |
+| `spinner` | string | Required. `arc`, `dots`, `bar`, `pulse` or `none` |
+| `spinner_color` | int | Required. `0xRRGGBB` |
+| `offline_after_s` | int | Required. 0 to 3600. 0: no sleep for a lost link |
+| `backlight` | int | Required. 0 to 100, the backlight while asleep. 0 is off. A device that can't dim treats 1 to 100 as on |
+
+A minimal frame has `show` empty, `anchor` `center`, `spinner` `none` and no `image` or `text`: `{"t":"sleep","bg":0,"fg":0,"show":[],"anchor":"center","spinner":"none","spinner_color":0,"offline_after_s":0,"backlight":0}`.
+
+- The image is always 1024 × 512 RGB565, little-endian, 1,048,576 bytes. The device fetches it with [`asset_get`](#asset_get-device--daemon) when it lacks the `image` id.
+- **Refused**: a field of the wrong type (a fraction in an int field, `null`), a value out of range, an `image` that isn't 32 lowercase hex digits, a `text` of 48 bytes or more or with a character outside printable ASCII, a `show` entry that isn't a string or names an element twice, and an unknown `spinner` or `anchor`. The device logs the frame and drops it, and keeps its current sleep screen. The link stays up.
+- The daemon sends `sleep` after the first `layout` of a session and its `tile` messages, and again when the session's view of `[sleep]` changes. It never sends one between the pages of a [set](#pages).
+
+### `asset_get` (device → daemon)
+
+```json
+{"t":"asset_get","id":"5b1f0c7e9d3a2b4c6d8e0f1a2b3c4d5e","offset":262144}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `id` | string | The asset's id, 32 lowercase hex digits |
+| `offset` | int | A multiple of 262,144. The first chunk is at 0. Below the asset's size is checked when the daemon answers |
+
+- The device keeps one request outstanding, so it sends the next one after the frame for the last.
+- The daemon checks the request in this order. A malformed `id`, or an `offset` that is not a multiple of 262,144, gets `error` `bad_request` and a close. An `offset` at or past the image's size gets the same. An `id` that is not the session's current sleep image gets no reply and the session stays open. Otherwise the daemon answers with one [asset frame](#asset-frames) for the chunk.
+
+### Asset frames
+
+An asset chunk is a binary WebSocket frame from the daemon:
+
+```text
+offset  size    field
+0       4       "WDA1"
+4       16      id
+20      4       offset, u32 LE
+24      n       the chunk's bytes
+```
+
+- Each chunk is 262,144 bytes, except the last one, which is what is left of the asset. A frame is at most 262,168 bytes, the same cap as an [icon frame](#icon-frames).
+- The device checks, in this order, that the frame has a header, that it starts with `WDA1`, that its `id` and `offset` are the ones it asked for, and that its length is exactly the chunk that is left at that offset. A frame that fails any check is dropped and logged. The device checks the SHA-256 of the whole image once the last chunk is in, which is the image's `id`.
+- For example, the chunk at 262,144 starts `57 44 41 31`, then the 16 id bytes, then `00 00 04 00`.
+
+### `feed` (daemon → device)
+
+```json
+{"t":"feed","sources":2,"cards":[{"id":"nas-load","label":"NAS load","value":"0.42","state":"ok"}],"notes":[{"id":"ha/backup","title":"Backup done","body":"Nightly backup finished in 4 min","level":"ok","src":"Home Assistant","at":1792692433}]}
+```
+
+A `feed` is a snapshot that replaces the device's last one.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `sources` | int | Required. 0 to 16: the configured integrations. 0 means the device shows no -1 page |
+| `cards` | [object] | Required. At most 8 stat cards, each with the fields below |
+| `cards[].id` | string | 1 to 63 characters |
+| `cards[].label` | string | At most 23 characters |
+| `cards[].value` | string | At most 15 characters |
+| `cards[].state` | string | `ok`, `bad` or `unknown`. A device shows `unknown`, like any other value, as unknown |
+| `notes` | [object] | Required. At most 12 notes, newest first, each with the fields below |
+| `notes[].id` | string | 1 to 63 characters. Names the note in `feed_dismiss` |
+| `notes[].title` | string | 1 to 47 characters |
+| `notes[].body` | string | At most 159 characters |
+| `notes[].level` | string | `info`, `ok`, `warn` or `error`. Any other value is refused |
+| `notes[].src` | string | The integration's name, at most 23 characters |
+| `notes[].at` | int | Unix seconds, 0 to 2^53 - 1 |
+
+Every string is printable ASCII. A device refuses a `sleep` or `feed` frame with a `\u0000` escape in any string, since it would end the string early, and either frame with a raw or escaped character above 0x7E in a string. An escaped backslash (`\\`) is only a backslash, so `\\u0000` is text. The fullest snapshot, with every string at its limit and every character escaped, stays under 16 KB, the cap of a text frame.
+
+- **Refused**: a field of the wrong type, a count or length over its limit, a string under its minimum or outside printable ASCII, a `level` that isn't in its list, or an `at` past 2^53 - 1. The device logs the frame and drops it, and keeps its last good snapshot.
+- The daemon sends `feed` after the `sleep` message and at the same point in the session, then on each change, at most twice a second. It never sends one between the pages of a [set](#pages).
+
+### `feed_dismiss` (device → daemon)
+
+```json
+{"t":"feed_dismiss","id":"ha/backup"}
+```
+
+`id` is the `id` of a note the device showed, 1 to 63 printable ASCII characters. The daemon removes that note from the feed it sends to every session. An unknown `id` is ignored.
 
 ### `report` (device → daemon)
 

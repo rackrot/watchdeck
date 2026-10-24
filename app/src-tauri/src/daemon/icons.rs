@@ -204,18 +204,25 @@ pub fn box_px(cols: u32, rows: u32, paged: bool) -> u32 {
 /// Why `name` can't name a file in `icons/`, or `None` if it can. It is a plain file name, so
 /// it can't reach outside the directory.
 pub fn name_error(name: &str) -> Option<String> {
-    let plain = !name.is_empty()
+    (!plain_name(name)).then(|| format!("icon must be {}", name_rule(DIR)))
+}
+
+/// The rule `plain_name` checks, worded for a file in `dir`/.
+pub fn name_rule(dir: &str) -> String {
+    format!(
+        "a file name in {dir}/: 1 to {MAX_NAME_BYTES} letters, digits, '_', '-' or '.', not \
+         starting with '.'"
+    )
+}
+
+/// Whether `name` is a plain file name, the rule `screens/` shares with `icons/`.
+pub fn plain_name(name: &str) -> bool {
+    !name.is_empty()
         && name.len() <= MAX_NAME_BYTES
         && !name.starts_with('.')
         && name
             .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'));
-    (!plain).then(|| {
-        format!(
-            "icon must be a file name in {DIR}/: 1 to {MAX_NAME_BYTES} letters, digits, '_', '-' \
-             or '.', not starting with '.'"
-        )
-    })
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
 }
 
 /// Which version of a file a rendered icon came from.
@@ -1323,7 +1330,7 @@ mod tests {
                  action = {{ kind = \"shell\", argv = [\"true\"] }}\n"
             );
         }
-        crate::daemon::config::parse(&text, &Ok(Vec::new())).unwrap()
+        crate::daemon::config::parse(&text, &Ok(std::collections::BTreeMap::new())).unwrap()
     }
 
     #[test]

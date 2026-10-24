@@ -426,7 +426,7 @@ mod tests {
                  tile = {{ every_s = {every_s}, source = {{ kind = \"shell\", argv = [\"true\"] }} }}\n"
             );
         }
-        let config = parse(&text, &Ok(Vec::new())).unwrap();
+        let config = parse(&text, &Ok(BTreeMap::new())).unwrap();
         Arc::new(Live {
             config,
             icons: IconSet::new(),
