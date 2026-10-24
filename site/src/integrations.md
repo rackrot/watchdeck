@@ -242,12 +242,13 @@ bad_above = 90
 | `suffix` | no | Up to 7 printable ASCII characters after the value, such as `%`, or a space and `MB` |
 | `bad_above`, `bad_below` | no | The card is bad when the value is above the first or below the second. Whole or decimal numbers |
 | `secret_headers` | no | Header name to the name of a secret in `secrets.toml`, as an HTTP action's, such as `{ Authorization = "prom-token" }` for a server behind a bearer token |
-| `insecure_http`, `insecure_tls`, `timeout_s` | no | As an HTTP action's: `insecure_http` lets `secret_headers` cross the network over plain `http://`, `insecure_tls` accepts a self-signed certificate on `https://`, and `timeout_s` (1 to 600, default 10) bounds the whole request |
+| `insecure_http`, `insecure_tls`, `timeout_s` | no | As an HTTP action's: `insecure_http` lets `secret_headers` cross the network over plain `http://`, `insecure_tls` accepts a self-signed certificate on `https://`, and `timeout_s` bounds the whole request: at most 30 and at most `every_s`, default 10 or `every_s` if less |
 
-- The query should return one series, or a scalar. A `vector` shows its first series, and a `scalar` its value. A `matrix` or a `string` result is bad, with a reason on the card.
-- The card is bad, with "no data", when the query returns no series. It is bad with the HTTP status (`HTTP 500`) when the server answers with an error, and with the failure (`request failed: ...`, `timed out after 10 s`) when it can't be reached. Prometheus's own `error` text shows when it answers `200` with `"status":"error"`.
+- The query must return one series, or a scalar. A `scalar` shows its value, and a `vector` its one series. A vector of several series is bad, with `N series, expected 1` (aggregate with `sum`, `avg` or `topk(1, ...)`). A `matrix` or a `string` result is bad, with a reason on the card.
+- A value of `NaN` or `±Inf` shows as it is, in the unknown color, since no threshold can judge it. With `bad_above` or `bad_below` set, it is bad.
+- The card is bad, with "no data", when the query returns no series. When the server answers with an error status, it is bad with the status and the reason from the body: Prometheus answers `400`, `422` and `503` with `{"status":"error","errorType":...,"error":...}`, so the card reads `HTTP 400: parse error at char 5 ...`. The board's card value holds 15 characters, so a long reason is cut. When the server can't be reached it is bad with the failure (`request failed: ...`, `timed out after 10 s`). Prometheus's `error` text also shows when it answers `200` with `"status":"error"`.
 - Header values from `secret_headers` are blanked from anything the card shows. The URL never appears in an error.
-- The polls run in the same slots as the other polled integrations and the tiles: at most 2 at a time. After three polls in a row that couldn't run, the card turns unknown.
+- The polls run in the same slots as the other polled integrations and the tiles: at most 2 at a time, so a query that ran out its `timeout_s` holds one of the two until then, which is why the timeout can't pass the period. A poll that finds both taken is skipped. After three polls in a row that couldn't run, the card turns unknown.
 
 ## Grafana
 
@@ -284,8 +285,8 @@ Leave Grafana's "Max Alerts" at 0, or at a number you accept: alerts past it are
 - **A firing alert** adds a note with the id `graf/<fingerprint>`, so the notifications Grafana repeats while an alert fires replace one note and don't pile up. The note stays for the default 1 day, and Grafana's repeat keeps it fresh.
 - **A resolved alert** removes the note. Resolving an alert whose note is gone already (dismissed on a board, expired, or lost to a daemon restart) is not an error.
 - The **title** is `labels.alertname`, followed by a colon, a space and `annotations.summary` when there is one. The **body** is `annotations.description`.
-- The **level** comes from the `severity` label, not case-sensitively: `critical` is `error`, `warning` is `warn`, and anything else, or none, is `info`. `levels` adds to this or changes it: each key is a severity, each value `info`, `ok`, `warn` or `error`.
-- Only `alerts` is required in the payload. Other fields, at the top and in an alert, are ignored if the daemon doesn't know them, since Grafana adds fields. A body without `alerts`, with invalid JSON, or with an alert whose `status` isn't `firing` or `resolved` is a `400`. An alert with no usable fingerprint gets an id from a hash of its name.
+- The **level** comes from the `severity` label, not case-sensitively: `critical` is `error`, `warning` is `warn`, and anything else, or none, is `info`. `levels` adds to this or changes it: each key is a severity, each value `info`, `ok`, `warn` or `error`. Two keys that differ only in case are refused.
+- Only `alerts` is required in the payload. Other fields, at the top and in an alert, are ignored if the daemon doesn't know them, since Grafana adds fields. A body without `alerts`, with invalid JSON, or with an alert whose `status` isn't `firing` or `resolved` is a `400`. An alert with no usable fingerprint gets an id from a hash of its labels, so alerts of one rule with different labels stay separate notes. One bad alert refuses the whole payload.
 - The route takes bodies up to 64 KB, not the 8 KB of the others, because a payload carries every alert of a group (about 1 KB each). The integration's limits apply: at most 16 notes, and an alert past that replaces the oldest of the integration's own, so a flood can't push out another integration's notes.
 
 ## Adding a source

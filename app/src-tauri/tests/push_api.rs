@@ -1051,6 +1051,20 @@ async fn the_grafana_route_takes_64_kb_while_notes_keep_8() {
         body.contains("65536"),
         "the reply names its own limit: {body}"
     );
+    // The larger cap is for an authenticated caller only: without a token the answer is a 401
+    // before any body is judged, even one over 8 KB (and over 64 KB).
+    for len in [9 * 1024, 70 * 1024] {
+        let unauthenticated = send(addr, &raw("POST", "/v1/grafana", None, &padded(len))).await;
+        assert_eq!(unauthenticated, (401, UNAUTHORIZED.to_string()), "{len}");
+    }
+    // A chunked body has no length to check first, so the cap applies as it is read.
+    let chunk = "x".repeat(40 * 1024);
+    let chunked = format!(
+        "POST /v1/grafana HTTP/1.1\r\nHost: watchdeck\r\nAuthorization: Bearer {TOKEN_HA}\r\n\
+         Transfer-Encoding: chunked\r\n\r\n{len:x}\r\n{chunk}\r\n{len:x}\r\n{chunk}\r\n0\r\n\r\n",
+        len = chunk.len()
+    );
+    assert_eq!(send(addr, chunked.as_bytes()).await.0, 413);
     // The same integration's token still has no more than 8 KB elsewhere.
     let over = format!(r#"{{"title":"t","body":"{}"}}"#, "x".repeat(9000));
     assert_eq!(post_note(addr, TOKEN_B, &over).await.0, 413);

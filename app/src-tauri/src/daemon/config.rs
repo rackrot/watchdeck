@@ -571,8 +571,10 @@ pub enum IntegrationConfig {
         insecure_http: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         insecure_tls: bool,
-        #[serde(default = "default_timeout")]
-        timeout_s: u64,
+        /// The whole request's limit, at most the lesser of 30 and `every_s`, so a slow server
+        /// can't hold one of the two feed slots past its period. Absent: 10, or `every_s` if less.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_s: Option<u64>,
     },
     /// Alerts from a Grafana webhook contact point, shown as notes. Sent with `token_secret`'s
     /// token, like [`Push`](Self::Push).
@@ -592,6 +594,8 @@ pub enum IntegrationConfig {
 const MAX_QUERY_BYTES: usize = 2000;
 const MAX_SUFFIX: usize = 7;
 const MAX_DECIMALS: u8 = 3;
+/// A Prometheus query's timeout never passes this, nor its `every_s`.
+const MAX_QUERY_TIMEOUT_S: u64 = 30;
 /// The longest severity name `levels` may use.
 const MAX_SEVERITY: usize = 31;
 
@@ -635,6 +639,7 @@ impl IntegrationConfig {
             insecure_http,
             insecure_tls,
             timeout_s,
+            every_s,
             ..
         } = self
         else {
@@ -658,7 +663,7 @@ impl IntegrationConfig {
             secret_headers: secret_headers.clone(),
             insecure_http: *insecure_http,
             insecure_tls: *insecure_tls,
-            timeout_s: *timeout_s,
+            timeout_s: timeout_s.unwrap_or_else(|| DEFAULT_TIMEOUT_S.min(*every_s)),
         })
     }
 
@@ -712,7 +717,14 @@ impl IntegrationConfig {
                     )),
                 }
                 if let Self::Grafana { levels, .. } = self {
+                    let mut seen = HashSet::new();
                     for severity in levels.keys() {
+                        // Severities match without regard to case, so these would be one key.
+                        if !seen.insert(severity.to_ascii_lowercase()) {
+                            problems.push(format!(
+                                "levels: {severity:?} is listed twice; severities ignore case"
+                            ));
+                        }
                         if severity.is_empty()
                             || severity.len() > MAX_SEVERITY
                             || !printable_ascii(severity)
@@ -747,9 +759,17 @@ impl IntegrationConfig {
                 every_s,
                 decimals,
                 suffix,
+                timeout_s,
                 ..
             } => {
                 problems.extend(every_s_error("every_s", *every_s));
+                let most = MAX_QUERY_TIMEOUT_S.min(*every_s);
+                if timeout_s.is_some_and(|t| t > most) {
+                    problems.push(format!(
+                        "timeout_s is over {most}, the lesser of {MAX_QUERY_TIMEOUT_S} and every_s: \
+                         a query must end before the next one starts"
+                    ));
+                }
                 if query.trim().is_empty() || query.len() > MAX_QUERY_BYTES || query.contains('\0')
                 {
                     problems.push(format!(
@@ -3901,6 +3921,25 @@ source = { kind = "http", method = "GET", url = "http://nas.lan/api/load" }
         );
         refused("timeout_s = 0", "integration \"cpu\": timeout_s is 0");
         refused(
+            "timeout_s = 31",
+            "timeout_s is over 30, the lesser of 30 and every_s",
+        );
+        // every_s 30 allows 30; every_s 5 allows 5, and its default stays under that.
+        parse(&with_new(&prom_table("cpu", "timeout_s = 30")), &sizes()).unwrap();
+        let quick = prom_table("cpu", "").replace("every_s = 30", "every_s = 5");
+        parse(&with_new(&quick), &sizes()).unwrap();
+        assert_refused(
+            &with_new(&format!("{quick}timeout_s = 6\n")),
+            "timeout_s is over 5, the lesser of 30 and every_s",
+        );
+        let two = prom_table("cpu", "").replace("every_s = 30", "every_s = 2");
+        let Some(Action::Http { timeout_s, .. }) =
+            parse(&with_new(&two), &sizes()).unwrap().integrations[0].prometheus_action()
+        else {
+            panic!("an http action");
+        };
+        assert_eq!(timeout_s, 2, "the default is the lesser of 10 and every_s");
+        refused(
             "insecure_tls = true",
             "insecure_tls only applies to https:// urls",
         );
@@ -3973,6 +4012,10 @@ source = { kind = "http", method = "GET", url = "http://nas.lan/api/load" }
             "levels: a severity is 1 to 31",
         );
         assert_refused(&graf("every_s = 3"), "unknown field `every_s`");
+        assert_refused(
+            &graf("levels = { page = \"error\", PAGE = \"warn\" }"),
+            "levels: \"page\" is listed twice; severities ignore case",
+        );
         // A grafana integration and a push integration can't share a token either.
         let both = format!("{}{}", push_table("a", "A", "push-ha"), table(""));
         assert_refused(

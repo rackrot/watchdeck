@@ -88,7 +88,7 @@ impl<S: Fetch> Connector for Prometheus<S> {
                     Err(why) => (why, CardState::Bad),
                 }
             } else {
-                (ran.result.summary.clone(), CardState::Bad)
+                (failure(&ran.result.summary, ran.raw()), CardState::Bad)
             };
             Ok(Snapshot {
                 cards: vec![self.card(&ran.redact(&text), state)],
@@ -111,6 +111,9 @@ fn show(body: &str, display: &Display) -> Result<(String, CardState), String> {
     let sample = match data["resultType"].as_str() {
         Some("vector") => match data["result"].as_array() {
             Some(series) if series.is_empty() => return Ok((NO_DATA.into(), CardState::Bad)),
+            Some(series) if series.len() > 1 => {
+                return Err(format!("{} series, expected 1", series.len()))
+            }
             Some(series) => &series[0]["value"],
             None => return Err("no result list in the reply".into()),
         },
@@ -126,12 +129,32 @@ fn show(body: &str, display: &Display) -> Result<(String, CardState), String> {
         Some(d) if number.is_finite() => format!("{number:.*}", usize::from(d)),
         _ => text.to_string(),
     };
-    let bad = display.bad_above.is_some_and(|limit| number > limit)
-        || display.bad_below.is_some_and(|limit| number < limit);
-    Ok((
-        format!("{shown}{}", display.suffix),
-        if bad { CardState::Bad } else { CardState::Ok },
-    ))
+    let state = if !number.is_finite() {
+        // NaN and the infinities pass no comparison, so a threshold can't vouch for them.
+        if display.bad_above.is_some() || display.bad_below.is_some() {
+            CardState::Bad
+        } else {
+            CardState::Unknown
+        }
+    } else if display.bad_above.is_some_and(|limit| number > limit)
+        || display.bad_below.is_some_and(|limit| number < limit)
+    {
+        CardState::Bad
+    } else {
+        CardState::Ok
+    };
+    Ok((format!("{shown}{}", display.suffix), state))
+}
+
+/// What a non-2xx reply says: its status line, and the `error` Prometheus puts in the body (it
+/// answers 400, 422 and 503 with `{"status":"error","errorType":...,"error":...}`). Anything
+/// taken from the body is redacted by the caller, and the store cuts the card's text.
+fn failure(summary: &str, body: &str) -> String {
+    let reply: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    match reply["error"].as_str().filter(|e| !e.trim().is_empty()) {
+        Some(error) => format!("{summary}: {}", error.trim()),
+        None => summary.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -282,13 +305,53 @@ mod tests {
         .await;
         assert_eq!(
             shown(&card(&server.url, "").await),
-            ("HTTP 500", CardState::Bad)
+            ("HTTP 500: boom", CardState::Bad)
         );
+        // Prometheus answers 400, 422 and 503 with its reason in the body. The server's own text
+        // is redacted like any other, and the store cuts what the card can't hold.
+        let parse = serve(
+            "400 Bad Request",
+            &format!(
+                r#"{{"status":"error","errorType":"bad_data","error":"parse error at char 5 {SECRET}"}}"#
+            ),
+        )
+        .await;
+        let refused = card(&parse.url, "secret_headers = { Authorization = \"tok\" }").await;
+        assert_eq!(refused.state, CardState::Bad);
+        assert_eq!(refused.value, "HTTP 400: parse error at char 5 <secret>");
         let gone = serve("503 Service Unavailable", "").await;
         assert_eq!(
             shown(&card(&gone.url, "").await),
             ("HTTP 503", CardState::Bad)
         );
+    }
+
+    #[tokio::test]
+    async fn several_series_are_bad_and_a_non_finite_value_is_unknown_unless_a_threshold_is_set() {
+        let two = serve(
+            "200 OK",
+            r#"{"status":"success","data":{"resultType":"vector","result":[
+                {"metric":{},"value":[1,"1"]},{"metric":{},"value":[1,"2"]}]}}"#,
+        )
+        .await;
+        assert_eq!(
+            shown(&card(&two.url, "").await),
+            ("2 series, expected 1", CardState::Bad)
+        );
+        for (value, keys, state) in [
+            ("NaN", "", CardState::Unknown),
+            ("+Inf", "suffix = \"%\"", CardState::Unknown),
+            ("NaN", "bad_above = 90", CardState::Bad),
+            ("-Inf", "bad_below = 0", CardState::Bad),
+        ] {
+            let body = format!(
+                r#"{{"status":"success","data":{{"resultType":"scalar","result":[1,"{value}"]}}}}"#
+            );
+            let server = serve("200 OK", &body).await;
+            let card = card(&server.url, keys).await;
+            assert_eq!(card.state, state, "{value} {keys}");
+            assert!(card.value.starts_with(value), "{card:?}");
+        }
     }
 
     #[tokio::test]

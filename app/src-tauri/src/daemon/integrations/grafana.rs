@@ -75,7 +75,7 @@ impl Alert {
         self.annotations.get(name).map_or("", |v| v.trim())
     }
 
-    /// The fingerprint when it is a plain id, else a hash of it and the alert's name, so any
+    /// The fingerprint when it is a plain id, else a hash of it and the alert's labels, so any
     /// payload gives an id the wire accepts and the same alert gives the same one.
     fn id(&self) -> String {
         let plain = !self.fingerprint.is_empty()
@@ -87,8 +87,14 @@ impl Alert {
         }
         let mut hash = Sha256::new();
         hash.update(&self.fingerprint);
-        hash.update([0]);
-        hash.update(self.label("alertname"));
+        // Every label, in order, so two alerts of one rule with different labels stay two notes.
+        let labels: BTreeMap<&String, &String> = self.labels.iter().collect();
+        for (name, value) in labels {
+            hash.update([0]);
+            hash.update(name);
+            hash.update([0]);
+            hash.update(value);
+        }
         encode_hex(&hash.finalize()[..8])
     }
 
@@ -218,6 +224,12 @@ mod tests {
         let second = grafana.accept(&req(body)).unwrap();
         let id = put(&first[0]).id.clone().unwrap();
         assert_eq!(first, second);
+        // Another alert of the same rule, with other labels, is another note.
+        let other = r#"{"alerts":[{"status":"firing","fingerprint":"a b/ü","labels":{"alertname":"X","zone":"eu"}}]}"#;
+        assert_ne!(
+            put(&grafana.accept(&req(other)).unwrap()[0]).id,
+            Some(id.clone())
+        );
         assert_eq!(id.len(), 16);
         assert!(id.bytes().all(|c| c.is_ascii_hexdigit()), "{id}");
     }
