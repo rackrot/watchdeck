@@ -542,9 +542,16 @@ pub enum IntegrationConfig {
 }
 
 impl IntegrationConfig {
-    fn id(&self) -> &str {
+    pub fn id(&self) -> &str {
         match self {
             Self::Push { id, .. } | Self::Stat { id, .. } => id,
+        }
+    }
+
+    /// The name notes and cards show for this source.
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Push { label, .. } | Self::Stat { label, .. } => label,
         }
     }
 

@@ -3,11 +3,13 @@
 pub mod actions;
 pub mod alerts;
 pub mod config;
+pub mod feed;
 mod fonts_gen;
 pub mod gpu;
 pub mod hoststats;
 pub mod hwmon;
 pub mod icons;
+pub mod integrations;
 pub mod mdns;
 pub mod pairing;
 pub mod protocol;

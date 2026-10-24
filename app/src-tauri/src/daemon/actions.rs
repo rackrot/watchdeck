@@ -20,7 +20,11 @@ use super::secrets::{Secret, Secrets};
 pub const MAX_RUNNING: usize = 8;
 /// Tile polls take at most this many of those, so a press always finds two free.
 pub const MAX_TILE_RUNNING: usize = 6;
+/// Feed polls take at most this many of the tile slots, so tiles keep `MAX_TILE_RUNNING` minus
+/// this.
+pub const MAX_FEED_RUNNING: usize = 2;
 const TILE_PREFIX: &str = "tile:";
+const FEED_PREFIX: &str = "feed:";
 /// The result text is the last 1 KB of output.
 const TEXT_BYTES: usize = 1024;
 const SUMMARY_BYTES: usize = 96;
@@ -137,16 +141,29 @@ impl Actions {
     /// round. At most [`MAX_TILE_RUNNING`] polls run at once, which leaves presses two slots.
     pub fn start_tile(&self, id: &str) -> Result<Run, ActionResult> {
         let mut running = self.0.running.lock().expect("running set poisoned");
-        let polling = running
-            .iter()
-            .filter(|k| k.starts_with(TILE_PREFIX))
-            .count();
-        if polling >= MAX_TILE_RUNNING {
+        if polls(&running, &[TILE_PREFIX, FEED_PREFIX]) >= MAX_TILE_RUNNING {
             return Err(ActionResult::failed(format!(
                 "busy: {MAX_TILE_RUNNING} tile polls are running"
             )));
         }
         self.claim(&mut running, &format!("{TILE_PREFIX}{id}"))
+    }
+
+    /// Claims the feed source `id` for a poll. A feed poll takes one of the tile slots, and at
+    /// most [`MAX_FEED_RUNNING`] run at once, so tiles always keep the rest.
+    pub fn start_feed(&self, id: &str) -> Result<Run, ActionResult> {
+        let mut running = self.0.running.lock().expect("running set poisoned");
+        if polls(&running, &[FEED_PREFIX]) >= MAX_FEED_RUNNING {
+            return Err(ActionResult::failed(format!(
+                "busy: {MAX_FEED_RUNNING} feed polls are running"
+            )));
+        }
+        if polls(&running, &[TILE_PREFIX, FEED_PREFIX]) >= MAX_TILE_RUNNING {
+            return Err(ActionResult::failed(format!(
+                "busy: {MAX_TILE_RUNNING} tile polls are running"
+            )));
+        }
+        self.claim(&mut running, &format!("{FEED_PREFIX}{id}"))
     }
 
     /// Claims `button` for a run, or says why it can't start: it is already running, or
@@ -218,6 +235,14 @@ impl Run {
     }
 }
 
+/// How many of the running keys start with one of `prefixes`.
+fn polls(running: &HashSet<String>, prefixes: &[&str]) -> usize {
+    running
+        .iter()
+        .filter(|k| prefixes.iter().any(|p| k.starts_with(p)))
+        .count()
+}
+
 impl Drop for Run {
     fn drop(&mut self) {
         let mut running = self.actions.0.running.lock().expect("running set poisoned");
@@ -281,6 +306,35 @@ mod tests {
         actions
             .start("a")
             .expect("the button is free once its run ends");
+    }
+
+    #[test]
+    fn feed_polls_take_two_of_the_six_tile_slots() {
+        let actions = actions();
+        let feeds: Vec<Run> = (0..MAX_FEED_RUNNING)
+            .map(|i| actions.start_feed(&format!("f{i}")).unwrap())
+            .collect();
+        let busy = actions
+            .start_feed("more")
+            .err()
+            .expect("a third is refused");
+        assert_eq!(busy.summary, "busy: 2 feed polls are running");
+        // Tiles keep four of their six, and the presses keep their two.
+        let tiles: Vec<Run> = (0..MAX_TILE_RUNNING - MAX_FEED_RUNNING)
+            .map(|i| actions.start_tile(&format!("t{i}")).unwrap())
+            .collect();
+        assert!(actions.start_tile("more").is_err());
+        let presses = (
+            actions.start("press-a").unwrap(),
+            actions.start("press-b").unwrap(),
+        );
+        drop((feeds, tiles, presses));
+        // A feed poll is refused while six tile polls run, too.
+        let tiles: Vec<Run> = (0..MAX_TILE_RUNNING)
+            .map(|i| actions.start_tile(&format!("t{i}")).unwrap())
+            .collect();
+        assert!(actions.start_feed("f").is_err());
+        drop(tiles);
     }
 
     #[test]

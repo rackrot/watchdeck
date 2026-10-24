@@ -21,9 +21,9 @@ use super::protocol::TileState;
 pub const MAX_TEXT: usize = 64;
 /// A tile is polled again at least this long after its last poll started, whatever pokes it. A
 /// device can press as fast as it likes, and a reconnect restarts every poller.
-const COOLDOWN: Duration = Duration::from_secs(MIN_EVERY_S);
+pub(crate) const COOLDOWN: Duration = Duration::from_secs(MIN_EVERY_S);
 /// This many polls in a row that could not start mark the tile stale.
-const STALE_AFTER: u32 = 3;
+pub(crate) const STALE_AFTER: u32 = 3;
 const STALE: &str = "stale";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,16 +94,16 @@ impl Sample for Actions {
 }
 
 /// Aborts its task when dropped, so a stopped tile's poll is cancelled mid-run.
-struct Task(Option<JoinHandle<()>>);
+pub(crate) struct Task(Option<JoinHandle<()>>);
 
 impl Task {
-    fn new(handle: JoinHandle<()>) -> Self {
+    pub(crate) fn new(handle: JoinHandle<()>) -> Self {
         Self(Some(handle))
     }
 
     /// Aborts the task and hands back its handle. The task's future, and what it holds (such as
     /// a run's claim on its tile), is gone only once the handle has resolved.
-    fn stop(mut self) -> JoinHandle<()> {
+    pub(crate) fn stop(mut self) -> JoinHandle<()> {
         let handle = self.0.take().expect("a task is stopped once");
         handle.abort();
         handle
@@ -345,7 +345,7 @@ async fn poll<S: Sample>(
 /// source is its first line of output if it printed one. The output is parsed as it was read,
 /// then what was picked is redacted, then made printable: redacting first would miss a secret
 /// that the reply escaped and the pointer then decodes.
-fn reading(tile: &TileConfig, ran: &Ran) -> TileValue {
+pub(crate) fn reading(tile: &TileConfig, ran: &Ran) -> TileValue {
     let bad = |text: &str| TileValue {
         text: shown(text),
         state: TileState::Bad,
