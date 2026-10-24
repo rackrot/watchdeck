@@ -3,7 +3,7 @@ include(${CMAKE_CURRENT_LIST_DIR}/fonts/fonts.cmake) # WD_FONT_SRCS, generated b
 include(${CMAKE_CURRENT_LIST_DIR}/font_licenses.cmake) # WD_FONT_LICENSES_TXT, from fonts/
 
 idf_component_register(SRCS "main.c" "display.c" "touch.c" "ui.c" "grid.c" "proto.c" "pageset.c" "hoststat.c" "model.c" "icons.c" "pairing.c" "link.c" "sdcard.c" "wifi.c"
-                            "usb.c" "crash.c" "font_ids.c" "fonts.c" "font_licenses.c" ${WD_FONT_SRCS}
+                            "wifitxt.c" "cardfs.c" "svc.c" "usb.c" "crash.c" "font_ids.c" "fonts.c" "font_licenses.c" ${WD_FONT_SRCS}
                        INCLUDE_DIRS "."
                        EMBED_TXTFILES ${WD_FONT_LICENSES_TXT}
                        PRIV_REQUIRES esp_lcd esp_hw_support esp_driver_gpio fatfs sdmmc
