@@ -2,24 +2,18 @@
 
 #include <string.h>
 
+#include "freertos/FreeRTOS.h"
+
 static struct {
     uint32_t count;
     char reason[DIAG_REASON_MAX];
 } s_entry[DIAG_KINDS];
 
-// One spin flag for all entries: the critical section is a short copy and the callers are rare events.
-static volatile char s_lock;
+// One lock for all entries: the critical section is a short copy and the callers are rare events.
+static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 
-static void lock(void)
-{
-    while (__atomic_test_and_set(&s_lock, __ATOMIC_ACQUIRE)) {
-    }
-}
-
-static void unlock(void)
-{
-    __atomic_clear(&s_lock, __ATOMIC_RELEASE);
-}
+#define lock() portENTER_CRITICAL(&s_mux)
+#define unlock() portEXIT_CRITICAL(&s_mux)
 
 void diag_count(diag_kind_t kind, const char *reason)
 {
@@ -70,8 +64,13 @@ const char *wifi_reason_name(int code)
     switch (code) {
     case 2:
         return "authentication expired";
+    case 3:
+    case 8:
+        return "access point left";
     case 15:
         return "wrong password?";
+    case 200:
+        return "beacon timeout";
     case 201:
         return "network not found";
     case 202:

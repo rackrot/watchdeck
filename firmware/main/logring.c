@@ -42,7 +42,7 @@ static size_t advance(const logring_t *r, size_t pos, size_t n)
 
 bool logring_init(logring_t *r, uint8_t *buf, size_t cap)
 {
-    if (!r || !buf || cap < LOGRING_MIN_CAP) {
+    if (!r || !buf || cap < LOGRING_MIN_CAP || cap > LOGRING_MAX_CAP) {
         return false;
     }
     memset(r, 0, sizeof(*r));
@@ -55,7 +55,7 @@ bool logring_init(logring_t *r, uint8_t *buf, size_t cap)
 static void set_secret(char *dst, const char *src)
 {
     size_t n = src ? strlen(src) : 0;
-    if (n < LOGRING_SECRET_MIN) {
+    if (n < LOGRING_WHOLE_MIN) {
         n = 0;
     } else if (n > LOGRING_SECRET_MAX) {
         n = LOGRING_SECRET_MAX;
@@ -71,17 +71,20 @@ void logring_set_token(logring_t *r, const char *token_hex)
     set_secret(r->token, token_hex);
 }
 
-void logring_set_password(logring_t *r, const char *pass)
+void logring_set_password(logring_t *r, int slot, const char *pass)
 {
-    set_secret(r->pass, pass);
+    if (slot >= 0 && slot < LOGRING_PASS_SLOTS) {
+        set_secret(r->pass[slot], pass);
+    }
 }
 
 /* ---- Redaction ---- */
 
 #define MARK_LEN (sizeof(LOGRING_REDACTED) - 1)
 
-// Replace text[at..at+n) with the marker, keeping the text under cap - 1 bytes. Returns the new length.
-static size_t put_marker(char *text, size_t len, size_t cap, size_t at, size_t n)
+// Replace text[at..at+n) with the marker, keeping the text under cap - 1 bytes; a cut sets *truncated. Returns the
+// new length.
+static size_t put_marker(char *text, size_t len, size_t cap, bool *truncated, size_t at, size_t n)
 {
     const size_t limit = cap - 1;
     const size_t tail = len - at - n;
@@ -93,6 +96,9 @@ static size_t put_marker(char *text, size_t len, size_t cap, size_t at, size_t n
     } else if (at + MARK_LEN + tail > limit) {
         tail_kept = limit - at - MARK_LEN;
     }
+    if (marker < MARK_LEN || tail_kept < tail) {
+        *truncated = true;
+    }
     memmove(text + at + MARK_LEN, text + at + n, tail_kept); // before the marker, which overlaps the old tail
     memcpy(text + at, LOGRING_REDACTED, marker);
     const size_t out = at + marker + tail_kept;
@@ -100,12 +106,12 @@ static size_t put_marker(char *text, size_t len, size_t cap, size_t at, size_t n
     return out;
 }
 
-static size_t redact_whole(char *text, size_t len, size_t cap, const char *s)
+static size_t redact_whole(char *text, size_t len, size_t cap, bool *truncated, const char *s)
 {
     const size_t sl = strlen(s);
     for (size_t i = 0; i + sl <= len;) {
         if (text[i] == s[0] && memcmp(text + i, s, sl) == 0) {
-            len = put_marker(text, len, cap, i, sl);
+            len = put_marker(text, len, cap, truncated, i, sl);
             i += MARK_LEN;
         } else {
             i++;
@@ -114,28 +120,30 @@ static size_t redact_whole(char *text, size_t len, size_t cap, const char *s)
     return len;
 }
 
-// The longest tail of text that is a proper prefix of s, at least LOGRING_SECRET_MIN long.
-static size_t redact_tail(char *text, size_t len, size_t cap, const char *s)
+// The longest tail of text that is a proper prefix of s, at least LOGRING_PREFIX_MIN long.
+static size_t redact_tail(char *text, size_t len, size_t cap, bool *truncated, const char *s)
 {
     const size_t sl = strlen(s);
-    for (size_t k = sl - 1 < len ? sl - 1 : len; k >= LOGRING_SECRET_MIN; k--) {
+    for (size_t k = sl - 1 < len ? sl - 1 : len; k >= LOGRING_PREFIX_MIN; k--) {
         if (memcmp(text + len - k, s, k) == 0) {
-            return put_marker(text, len, cap, len - k, k);
+            return put_marker(text, len, cap, truncated, len - k, k);
         }
     }
     return len;
 }
 
-size_t logring_redact(char *text, size_t len, size_t cap, bool truncated, const char *a, const char *b)
+size_t logring_redact(char *text, size_t len, size_t cap, bool *truncated, const char *const secrets[], size_t n)
 {
-    const char *secrets[2] = {a, b};
-    for (int pass = 0; pass < 2; pass++) {
-        for (int i = 0; i < 2; i++) {
-            const char *s = secrets[i];
-            if (!s || strlen(s) < LOGRING_SECRET_MIN) {
-                continue;
+    for (size_t i = 0; i < n; i++) {
+        if (secrets[i] && strlen(secrets[i]) >= LOGRING_WHOLE_MIN) {
+            len = redact_whole(text, len, cap, truncated, secrets[i]);
+        }
+    }
+    if (*truncated) { // after every whole match, since a marker can be what cut the text
+        for (size_t i = 0; i < n; i++) {
+            if (secrets[i] && strlen(secrets[i]) >= LOGRING_WHOLE_MIN) {
+                len = redact_tail(text, len, cap, truncated, secrets[i]);
             }
-            len = pass == 0 ? redact_whole(text, len, cap, s) : truncated ? redact_tail(text, len, cap, s) : len;
         }
     }
     return len;
@@ -143,15 +151,14 @@ size_t logring_redact(char *text, size_t len, size_t cap, bool truncated, const 
 
 /* ---- Storing ---- */
 
-// In place: drop ANSI colour sequences and the trailing line end, make the rest printable ASCII, cut. Returns the
-// length.
+// In place: drop ANSI colour sequences and the trailing line end, make the rest printable ASCII. Returns the length.
 static size_t clean(char *text, size_t len)
 {
     while (len > 0 && (text[len - 1] == '\n' || text[len - 1] == '\r')) {
         len--;
     }
     size_t out = 0;
-    for (size_t i = 0; i < len && out < LOGRING_TEXT_MAX; i++) {
+    for (size_t i = 0; i < len; i++) {
         const unsigned char c = (unsigned char)text[i];
         if (c == 0x1b) {
             if (i + 1 < len && text[i + 1] == '[') {
@@ -185,9 +192,12 @@ static void drop_oldest(logring_t *r)
     r->count--;
 }
 
-void logring_append(logring_t *r, char *text, size_t len, uint32_t ms)
+// Cut a clean line to LOGRING_TEXT_MAX and append it.
+static void store(logring_t *r, const char *text, size_t len, uint32_t ms)
 {
-    len = clean(text, len);
+    if (len > LOGRING_TEXT_MAX) {
+        len = LOGRING_TEXT_MAX;
+    }
     const size_t need = LOGRING_HEADER + len;
     while (r->used + need > r->cap) {
         drop_oldest(r);
@@ -200,9 +210,17 @@ void logring_append(logring_t *r, char *text, size_t len, uint32_t ms)
     const size_t tail = advance(r, r->head, r->used);
     ring_put(r, tail, raw, sizeof(raw));
     ring_put(r, advance(r, tail, sizeof(raw)), text, len);
+    if (r->next_seq % LOGRING_STEP == 0) {
+        r->cp[r->next_seq / LOGRING_STEP % LOGRING_IDX_N] = (uint32_t)tail;
+    }
     r->used += need;
     r->count++;
     r->next_seq++;
+}
+
+void logring_append(logring_t *r, char *text, size_t len, uint32_t ms)
+{
+    store(r, text, clean(text, len), ms);
 }
 
 bool logring_capture(logring_t *r, char *text, size_t cap, int ret, uint32_t ms)
@@ -210,10 +228,12 @@ bool logring_capture(logring_t *r, char *text, size_t cap, int ret, uint32_t ms)
     if (ret < 0) {
         return false;
     }
-    const bool truncated = (size_t)ret >= cap;
-    const size_t len = truncated ? cap - 1 : (size_t)ret;
-    const size_t out = logring_redact(text, len, cap, truncated, r->token, r->pass);
-    logring_append(r, text, out, ms);
+    bool truncated = (size_t)ret >= cap;
+    size_t len = truncated ? cap - 1 : (size_t)ret;
+    len = clean(text, len); // before redaction, so an escape code inside a secret can't hide it
+    const char *const secrets[] = {r->token, r->pass[0], r->pass[1]};
+    len = logring_redact(text, len, cap, &truncated, secrets, 3);
+    store(r, text, len, ms);
     return true;
 }
 
@@ -224,9 +244,28 @@ uint32_t logring_next_seq(const logring_t *r)
     return r->next_seq;
 }
 
+uint32_t logring_oldest_seq(const logring_t *r)
+{
+    return r->next_seq - r->count;
+}
+
 uint32_t logring_count(const logring_t *r)
 {
     return r->count;
+}
+
+// The offset of the record with sequence number `seq`, or of the nearest held record before it that a checkpoint or
+// the head names. `*at` is that record's sequence number. seq must be below next_seq.
+static size_t seek(const logring_t *r, uint32_t seq, uint32_t *at)
+{
+    const uint32_t oldest = logring_oldest_seq(r);
+    const uint32_t cp = seq - seq % LOGRING_STEP;
+    if (cp > oldest) {
+        *at = cp;
+        return r->cp[cp / LOGRING_STEP % LOGRING_IDX_N];
+    }
+    *at = oldest;
+    return r->head;
 }
 
 static bool wanted(const rec_hdr_t *h, bool errors_only)
@@ -246,9 +285,13 @@ static void copy_out(const logring_t *r, size_t pos, const rec_hdr_t *h, logring
 
 size_t logring_read_from(const logring_t *r, uint32_t from_seq, bool errors_only, logring_line_t *out, size_t max)
 {
+    if (from_seq >= r->next_seq || r->count == 0) {
+        return 0;
+    }
+    uint32_t seq;
+    size_t pos = seek(r, from_seq, &seq);
     size_t n = 0;
-    size_t pos = r->head;
-    for (uint32_t i = 0; i < r->count && n < max; i++) {
+    for (; seq < r->next_seq && n < max; seq++) {
         const rec_hdr_t h = get_hdr(r, pos);
         if (h.seq >= from_seq && wanted(&h, errors_only)) {
             copy_out(r, pos, &h, &out[n++]);
@@ -260,21 +303,35 @@ size_t logring_read_from(const logring_t *r, uint32_t from_seq, bool errors_only
 
 size_t logring_read_before(const logring_t *r, uint32_t before_seq, bool errors_only, logring_line_t *out, size_t max)
 {
-    size_t matches = 0;
-    size_t pos = r->head;
-    for (uint32_t i = 0; i < r->count; i++) {
-        const rec_hdr_t h = get_hdr(r, pos);
-        if (h.seq < before_seq && wanted(&h, errors_only)) {
-            matches++;
-        }
-        pos = advance(r, pos, LOGRING_HEADER + h.len);
+    if (before_seq > r->next_seq) {
+        before_seq = r->next_seq;
     }
-    size_t skip = matches > max ? matches - max : 0;
+    if (r->count == 0 || before_seq <= logring_oldest_seq(r)) {
+        return 0;
+    }
+    uint32_t seq;
+    size_t pos;
+    size_t skip = 0;
+    uint32_t first = 0; // lines below this are before the page; seek may start up to a step earlier
+    if (errors_only) {  // the matching lines can be anywhere: count them, then skip all but the last `max`
+        size_t matches = 0;
+        pos = r->head;
+        for (seq = logring_oldest_seq(r); seq < before_seq; seq++) {
+            const rec_hdr_t h = get_hdr(r, pos);
+            matches += wanted(&h, true);
+            pos = advance(r, pos, LOGRING_HEADER + h.len);
+        }
+        skip = matches > max ? matches - max : 0;
+        pos = r->head;
+        seq = logring_oldest_seq(r);
+    } else {
+        first = before_seq > max ? before_seq - (uint32_t)max : 1;
+        pos = seek(r, first, &seq);
+    }
     size_t n = 0;
-    pos = r->head;
-    for (uint32_t i = 0; i < r->count && n < max; i++) {
+    for (; seq < before_seq && n < max; seq++) {
         const rec_hdr_t h = get_hdr(r, pos);
-        if (h.seq < before_seq && wanted(&h, errors_only)) {
+        if (seq >= first && wanted(&h, errors_only)) {
             if (skip) {
                 skip--;
             } else {

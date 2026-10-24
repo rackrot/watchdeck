@@ -4,8 +4,8 @@
 #include <stdint.h>
 
 /*
- * Counters for the failures the Errors tab lists, each with the reason of the latest one. Pure (C11 atomics only), so
- * the host tests compile it. Any task may call diag_count.
+ * Counters for the failures the Errors tab lists, each with the reason of the latest one. Pure but for a FreeRTOS
+ * critical section (the linux target has one), so the host tests compile it. Any task may call diag_count.
  */
 
 typedef enum {

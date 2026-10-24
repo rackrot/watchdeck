@@ -23,11 +23,16 @@
 #define LOGCAP_RING_BYTES (64 * 1024)
 
 // The first line of app_main. Allocates the ring, then installs the hook, so the hook never sees an unready ring.
-// On failure no hook is installed and the log goes to the UART alone.
+// On failure no hook is installed and the log goes to the UART alone. A second call returns ESP_ERR_INVALID_STATE.
+// Nothing else may call esp_log_set_vprintf.
 esp_err_t logcap_init(void);
 
-// Secrets the hook redacts. NULL or "" clears. A password under 4 characters is not kept. Both are copied.
+// Secrets the hook redacts. NULL or "" clears. A password under 8 characters is not kept (WPA's minimum; an open
+// network has none), so a short one is not redacted. All are copied. The candidate password is for a trial connect:
+// set it before the trial starts, and clear it when the trial ends (the saved one then goes through
+// logcap_set_password).
 void logcap_set_password(const char *pass);
+void logcap_set_candidate_password(const char *pass);
 void logcap_set_token(const uint8_t token[PROTO_TOKEN_LEN]);
 
 // Lines the hook could not store (a formatter error). A full ring is not a drop: it overwrites the oldest.
@@ -36,6 +41,9 @@ uint32_t logcap_dropped(void);
 // The sequence number the next line will get; 1 until the first line. Pass it to logcap_read_before for the newest
 // page.
 uint32_t logcap_next_seq(void);
+
+// The oldest sequence number still held (equal to logcap_next_seq() when the ring is empty).
+uint32_t logcap_oldest_seq(void);
 
 // Paging for the Logs tab, as logring_read_from and logring_read_before, under the ring's lock. `out` holds `max`
 // lines.

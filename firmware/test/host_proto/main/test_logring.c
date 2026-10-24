@@ -192,47 +192,102 @@ static void init_secrets(void)
     token[64] = '\0';
 }
 
-void test_logring_redact_replaces_whole_secrets(void)
-{
-    char t[LOGRING_FMT_BUF];
-    snprintf(t, sizeof(t), "a %s b %s c %s", token, password, token);
-    const size_t n = logring_redact(t, strlen(t), sizeof(t), false, token, password);
-    TEST_ASSERT_EQUAL_STRING("a <redacted> b <redacted> c <redacted>", t);
-    TEST_ASSERT_EQUAL(strlen(t), n);
-}
-
-void test_logring_redact_a_short_password_is_left_alone(void)
-{
-    char t[LOGRING_FMT_BUF] = "pass abc here";
-    TEST_ASSERT_EQUAL(13, logring_redact(t, 13, sizeof(t), true, "abc", NULL));
-    TEST_ASSERT_EQUAL_STRING("pass abc here", t);
-    fresh(sizeof(store));
-    logring_set_password(&ring, "abc");
-    TEST_ASSERT_EQUAL_STRING("", ring.pass);
-    logring_set_password(&ring, "abcd");
-    TEST_ASSERT_EQUAL_STRING("abcd", ring.pass);
-    logring_set_password(&ring, NULL);
-    TEST_ASSERT_EQUAL_STRING("", ring.pass);
-}
-
-void test_logring_redact_growth_stays_inside_the_buffer(void)
-{
-    char t[16] = "aaaa aaaa aaaa";
-    const size_t n = logring_redact(t, 14, sizeof(t), false, "aaaa", NULL);
-    TEST_ASSERT_TRUE(n <= sizeof(t) - 1);
-    TEST_ASSERT_EQUAL(n, strlen(t));
-    TEST_ASSERT_EQUAL_MEMORY(MARK, t, MARK_N);
-}
-
 // The stored line must not end in, or hold, 4 or more characters of the secret.
 static void assert_no_secret(const char *line, const char *secret)
 {
     const size_t len = strlen(line);
     const size_t sl = strlen(secret);
     TEST_ASSERT_NULL(strstr(line, secret));
-    for (size_t k = LOGRING_SECRET_MIN; k < sl && k <= len; k++) {
+    for (size_t k = LOGRING_PREFIX_MIN; k < sl && k <= len; k++) {
         TEST_ASSERT_TRUE(memcmp(line + len - k, secret, k) != 0);
     }
+}
+
+// logring_redact over two secrets; *truncated is updated in place.
+static size_t redact2(char *t, size_t len, size_t cap, bool *truncated, const char *a, const char *b)
+{
+    const char *const secrets[] = {a, b};
+    return logring_redact(t, len, cap, truncated, secrets, 2);
+}
+
+void test_logring_redact_replaces_whole_secrets(void)
+{
+    char t[LOGRING_FMT_BUF];
+    snprintf(t, sizeof(t), "a %s b %s c %s", token, password, token);
+    bool tr = false;
+    const size_t n = redact2(t, strlen(t), sizeof(t), &tr, token, password);
+    TEST_ASSERT_EQUAL_STRING("a <redacted> b <redacted> c <redacted>", t);
+    TEST_ASSERT_EQUAL(strlen(t), n);
+    TEST_ASSERT_FALSE(tr);
+}
+
+void test_logring_redact_a_short_password_is_left_alone(void)
+{
+    // Under 8 characters nothing matches, not even a cut-off prefix.
+    char t[LOGRING_FMT_BUF] = "pass wifi here wifi";
+    bool tr = true;
+    TEST_ASSERT_EQUAL(19, redact2(t, 19, sizeof(t), &tr, "wifi", "abcdefg"));
+    TEST_ASSERT_EQUAL_STRING("pass wifi here wifi", t);
+    fresh(sizeof(store));
+    logring_set_password(&ring, 0, "abcdefg");
+    TEST_ASSERT_EQUAL_STRING("", ring.pass[0]);
+    logring_set_password(&ring, 0, "abcdefgh");
+    TEST_ASSERT_EQUAL_STRING("abcdefgh", ring.pass[0]);
+    logring_set_password(&ring, 1, "candidate1");
+    TEST_ASSERT_EQUAL_STRING("candidate1", ring.pass[1]);
+    TEST_ASSERT_EQUAL_STRING("abcdefgh", ring.pass[0]);
+    logring_set_password(&ring, 0, NULL);
+    TEST_ASSERT_EQUAL_STRING("", ring.pass[0]);
+    logring_set_password(&ring, 2, "ignored slot"); // out of range
+}
+
+void test_logring_both_password_slots_are_redacted(void)
+{
+    fresh(sizeof(store));
+    logring_set_password(&ring, 0, "oldpass-1");
+    logring_set_password(&ring, 1, "newpass-2");
+    char buf[LOGRING_FMT_BUF];
+    snprintf(buf, sizeof(buf), "try oldpass-1 then newpass-2");
+    TEST_ASSERT_TRUE(logring_capture(&ring, buf, sizeof(buf), (int)strlen(buf), 0));
+    TEST_ASSERT_EQUAL_STRING("try <redacted> then <redacted>", newest().text);
+}
+
+void test_logring_redact_growth_stays_inside_the_buffer(void)
+{
+    char t[30] = "aaaaaaaa aaaaaaaa aaaaaaaa";
+    bool tr = false;
+    const size_t n = redact2(t, 26, sizeof(t), &tr, "aaaaaaaa", NULL);
+    TEST_ASSERT_TRUE(n <= sizeof(t) - 1);
+    TEST_ASSERT_EQUAL(n, strlen(t));
+    TEST_ASSERT_EQUAL_MEMORY(MARK, t, MARK_N);
+    TEST_ASSERT_TRUE(tr); // the markers pushed the end out of the buffer
+}
+
+void test_logring_redact_growth_cut_can_leave_a_secret_prefix_that_is_then_redacted(void)
+{
+    // 223 bytes: an 8-character secret (it grows by 2), dots, then 7 characters of the password. The growth cuts the
+    // last 2, leaving 5 characters of the password at the end.
+    char t[LOGRING_FMT_BUF];
+    memset(t, '.', 223);
+    memcpy(t, "growthXY", 8);
+    memcpy(t + 223 - 7, password, 7);
+    t[223] = '\0';
+    bool tr = false; // the formatter did not truncate
+    const size_t n = redact2(t, 223, sizeof(t), &tr, "growthXY", password);
+    TEST_ASSERT_TRUE(tr);
+    TEST_ASSERT_EQUAL(n, strlen(t));
+    assert_no_secret(t, password);
+}
+
+void test_logring_an_ansi_code_inside_a_secret_does_not_hide_it(void)
+{
+    fresh(sizeof(store));
+    logring_set_token(&ring, token);
+    logring_set_password(&ring, 0, "Abcd1234");
+    char buf[LOGRING_FMT_BUF];
+    snprintf(buf, sizeof(buf), "pw Abcd\033[0m1234 and tok %.30s\033[1;31m%s end", token, token + 30);
+    TEST_ASSERT_TRUE(logring_capture(&ring, buf, sizeof(buf), (int)strlen(buf), 0));
+    TEST_ASSERT_EQUAL_STRING("pw <redacted> and tok <redacted> end", newest().text);
 }
 
 // Format `pad` dots, the secret and a tail the way vsnprintf into a 224-byte buffer would, and capture it.
@@ -256,14 +311,14 @@ static void redaction_at_every_position(const char *secret)
     for (size_t p = 0; p <= LOGRING_FMT_BUF - 1; p++) {
         fresh(sizeof(store));
         logring_set_token(&ring, token);
-        logring_set_password(&ring, password);
+        logring_set_password(&ring, 0, password);
         capture_at(p, secret);
         const logring_line_t l = newest();
         assert_no_secret(l.text, secret);
         // 4 or more characters of the secret are in the 223-byte text: they must have become the marker, at p
         // (or its first part, when the 159-byte cut ends it)
         const size_t visible = LOGRING_FMT_BUF - 1 - p < sl ? LOGRING_FMT_BUF - 1 - p : sl;
-        if (visible >= LOGRING_SECRET_MIN && p < LOGRING_TEXT_MAX) {
+        if (visible >= LOGRING_PREFIX_MIN && p < LOGRING_TEXT_MAX) {
             const size_t room = LOGRING_TEXT_MAX - p;
             TEST_ASSERT_EQUAL_MEMORY(MARK, l.text + p, room < MARK_N ? room : MARK_N);
         }
@@ -287,16 +342,17 @@ void test_logring_a_cut_off_prefix_under_4_characters_is_left(void)
 {
     char t[LOGRING_FMT_BUF];
     snprintf(t, sizeof(t), "x %.3s", token);
-    TEST_ASSERT_EQUAL(5, logring_redact(t, 5, sizeof(t), true, token, password));
+    bool tr = true;
+    TEST_ASSERT_EQUAL(5, redact2(t, 5, sizeof(t), &tr, token, password));
     snprintf(t, sizeof(t), "x %.4s", token);
-    TEST_ASSERT_EQUAL(2 + MARK_N, logring_redact(t, 6, sizeof(t), true, token, password));
+    TEST_ASSERT_EQUAL(2 + MARK_N, redact2(t, 6, sizeof(t), &tr, token, password));
     TEST_ASSERT_EQUAL_STRING("x " MARK, t);
 }
 
 void test_logring_prefix_is_only_redacted_when_the_text_was_truncated(void)
 {
     fresh(sizeof(store));
-    logring_set_password(&ring, password);
+    logring_set_password(&ring, 0, password);
     char buf[LOGRING_FMT_BUF];
     snprintf(buf, sizeof(buf), "E (1) t: tried Zp9#");
     TEST_ASSERT_TRUE(logring_capture(&ring, buf, sizeof(buf), (int)strlen(buf), 0));
@@ -311,9 +367,64 @@ void test_logring_capture_refuses_a_formatter_error(void)
     TEST_ASSERT_EQUAL(0, logring_count(&ring));
 }
 
+// About 1,300 short records, in a ring that holds them all and in one that wraps: every seq reads back through the
+// checkpoint index, forward and backward, filtered and not.
+static uint8_t big[LOGRING_MAX_CAP];
+
+static void check_many(uint8_t *mem, size_t cap)
+{
+    TEST_ASSERT_TRUE(logring_init(&ring, mem, cap));
+    for (uint32_t n = 1; n <= 1300; n++) {
+        char t[32];
+        snprintf(t, sizeof(t), "%c (%u) m: %u", n % 7 == 0 ? 'E' : 'I', (unsigned)n, (unsigned)n);
+        logring_append(&ring, t, strlen(t), n);
+    }
+    const uint32_t oldest = logring_oldest_seq(&ring);
+    TEST_ASSERT_EQUAL_UINT32(1301, logring_next_seq(&ring));
+    TEST_ASSERT_EQUAL_UINT32(1301 - logring_count(&ring), oldest);
+    for (uint32_t s = oldest; s <= 1300; s++) {
+        TEST_ASSERT_EQUAL(1, logring_read_from(&ring, s, false, page, 1));
+        TEST_ASSERT_EQUAL_UINT32(s, page[0].seq);
+        char want[32];
+        snprintf(want, sizeof(want), "%c (%u) m: %u", s % 7 == 0 ? 'E' : 'I', (unsigned)s, (unsigned)s);
+        TEST_ASSERT_EQUAL_STRING(want, page[0].text);
+        const size_t before = logring_read_before(&ring, s + 1, false, page, 3);
+        TEST_ASSERT_EQUAL(s - oldest + 1 < 3 ? s - oldest + 1 : 3, before);
+        TEST_ASSERT_EQUAL_UINT32(s, page[before - 1].seq);
+        if (before == 3) {
+            TEST_ASSERT_EQUAL_UINT32(s - 2, page[0].seq);
+        }
+    }
+    // errors only: the sevens, found without the index
+    const size_t e = logring_read_before(&ring, 1301, true, page, 4);
+    TEST_ASSERT_EQUAL(4, e);
+    TEST_ASSERT_EQUAL_UINT32(1295, page[3].seq); // 1295 = 7 * 185
+    TEST_ASSERT_EQUAL_UINT32(1274, page[0].seq);
+    TEST_ASSERT_EQUAL(0, logring_read_from(&ring, 1296, true, page, 1)); // the next seven is 1302, past the end
+    TEST_ASSERT_EQUAL(1, logring_read_from(&ring, 1295, true, page, 1));
+}
+
+void test_logring_about_1300_records_read_back_through_the_index(void)
+{
+    check_many(big, sizeof(big));
+    TEST_ASSERT_EQUAL_UINT32(1300, logring_count(&ring));
+}
+
+void test_logring_a_wrapped_ring_of_short_records_reads_back_through_the_index(void)
+{
+    check_many(store, sizeof(store));
+    TEST_ASSERT_TRUE(logring_count(&ring) < 1300);
+    TEST_ASSERT_TRUE(logring_oldest_seq(&ring) > 1);
+}
+
 void test_logring_run(void)
 {
     init_secrets();
+    RUN_TEST(test_logring_about_1300_records_read_back_through_the_index);
+    RUN_TEST(test_logring_a_wrapped_ring_of_short_records_reads_back_through_the_index);
+    RUN_TEST(test_logring_both_password_slots_are_redacted);
+    RUN_TEST(test_logring_redact_growth_cut_can_leave_a_secret_prefix_that_is_then_redacted);
+    RUN_TEST(test_logring_an_ansi_code_inside_a_secret_does_not_hide_it);
     RUN_TEST(test_logring_init_refuses_bad_arguments);
     RUN_TEST(test_logring_levels_from_the_first_character);
     RUN_TEST(test_logring_a_300_byte_line_is_cut_at_159);
