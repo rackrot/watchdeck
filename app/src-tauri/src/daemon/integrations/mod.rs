@@ -76,6 +76,7 @@ impl From<StoreError> for PushError {
             StoreError::UnknownSource => Self::new(404, "no such integration"),
             StoreError::NotFound => Self::new(404, "not found"),
             StoreError::CardsFull => Self::new(409, "all card slots are taken"),
+            StoreError::BadId => Self::new(400, "id is too long"),
         }
     }
 }
@@ -346,13 +347,13 @@ impl<S: Sample> Manager<S> {
             .lock()
             .expect("feed starts poisoned")
             .retain(|id, _| self.built.contains_key(id) && !edited.contains(&id));
+        // Now that no old poll can write, whatever the source shows starts over as what it is
+        // now: pending if still polled, empty if it became a push source, nothing if it's gone.
         for id in &gone {
-            if let Some(Built {
-                source: Source::Polled(connector),
-                ..
-            }) = self.built.get(id)
-            {
-                self.reset_cards(id, connector);
+            match self.built.get(id).map(|b| &b.source) {
+                Some(Source::Polled(connector)) => self.reset_cards(id, connector),
+                Some(Source::Push(_)) => self.store.replace(id, Snapshot::default()),
+                None => {}
             }
         }
 
@@ -416,7 +417,6 @@ async fn poll(id: String, connector: Arc<dyn Connector>, store: Arc<FeedStore>, 
 /// Drops each note when its time is up, so a board doesn't show one past its time until
 /// something else changes.
 async fn expire(store: Arc<FeedStore>) {
-    let mut changes = store.subscribe();
     loop {
         let next = store.next_expiry();
         tokio::select! {
@@ -426,7 +426,7 @@ async fn expire(store: Arc<FeedStore>) {
                     None => pending().await,
                 }
             } => store.sweep(),
-            changed = changes.changed() => if changed.is_err() { return },
+            () = store.deadline_moved() => {}
         }
     }
 }
@@ -699,6 +699,102 @@ mod tests {
                 assert_eq!(e.status, 409);
             }
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_replaced_note_with_a_nearer_deadline_still_expires_on_time() {
+        let rig = rig(PUSH);
+        let put = |ttl: Duration| {
+            let note = crate::daemon::feed::Note {
+                id: Some("a".into()),
+                ttl: Some(ttl),
+                ..crate::daemon::feed::Note::new("same")
+            };
+            rig.feed.post("ha", Update::PutNote(note)).unwrap();
+        };
+        put(Duration::from_secs(24 * 3600));
+        settle().await;
+        // Everything a board sees is the same, so only the deadline moved.
+        let mut rx = rig.feed.subscribe();
+        rx.borrow_and_update();
+        put(Duration::from_secs(30));
+        settle().await;
+        advance(Duration::from_secs(31)).await;
+        settle().await;
+        assert!(rig.feed.snapshot().notes.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_source_that_changes_kind_loses_its_old_card() {
+        let rig = rig(&stat("load", 10));
+        rig.connected.send_replace(1);
+        settle().await;
+        assert_eq!(rig.feed.snapshot().cards.len(), 1);
+        let push = PUSH.replace("\"ha\"", "\"load\"");
+        rig.config.send_replace(live(&push));
+        settle().await;
+        let feed = rig.feed.snapshot();
+        assert_eq!((feed.sources, feed.cards.len()), (1, 0));
+        // And the other way, the card comes back as a placeholder.
+        rig.config.send_replace(live(&stat("load", 10)));
+        settle().await;
+        assert_eq!(rig.feed.snapshot().cards.len(), 1);
+    }
+
+    /// Takes a feed slot for real and holds it for a second, counting how many hold one at once.
+    #[derive(Clone)]
+    struct Slow {
+        actions: crate::daemon::actions::Actions,
+        in_flight: Arc<AtomicUsize>,
+        most: Arc<AtomicUsize>,
+    }
+
+    impl Sample for Slow {
+        async fn sample(&self, id: &str, _: &TileConfig) -> Option<TileValue> {
+            let _run = self.actions.start_feed(id).ok()?;
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most.fetch_max(now, Ordering::SeqCst);
+            sleep(Duration::from_secs(1)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Some(TileValue {
+                text: "1".into(),
+                state: TileState::Ok,
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn at_most_two_feed_polls_run_at_once() {
+        let dir = std::env::temp_dir();
+        let slow = Slow {
+            actions: crate::daemon::actions::Actions::new(
+                Arc::new(crate::daemon::secrets::Secrets::new(&dir)),
+                dir,
+            )
+            .unwrap(),
+            in_flight: Arc::default(),
+            most: Arc::default(),
+        };
+        let text: String = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|id| stat(id, 2))
+            .collect();
+        let (_config, config_rx) = watch::channel(live(&text));
+        let (connected, connected_rx) = watch::channel(1);
+        let integrations = spawn(slow.clone(), config_rx, connected_rx);
+        settle().await;
+        assert_eq!(slow.most.load(Ordering::SeqCst), 2);
+        for _ in 0..4 {
+            advance(Duration::from_secs(1)).await;
+            settle().await;
+        }
+        assert_eq!(slow.most.load(Ordering::SeqCst), 2);
+        // Some polls were refused a slot, so their cards wait; others have read.
+        let states: Vec<CardState> = (integrations.handle().snapshot().cards.iter())
+            .map(|c| c.state)
+            .collect();
+        assert!(states.contains(&CardState::Ok), "{states:?}");
+        drop(connected);
     }
 
     #[tokio::test(start_paused = true)]

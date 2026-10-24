@@ -439,7 +439,7 @@ backlight = 100                    # 0 to 100, the backlight while asleep
 
 Each `[[integration]]` table is a source of notes or cards on the feed page. Its keys:
 
-- `id`: 1 to 63 letters, digits, `_`, `-` or `.`. Two integrations can't share an id.
+- `id`: 1 to 31 letters, digits, `_`, `-` or `.`. Two integrations can't share an id. The id starts every note and card id on the board, which holds 63 characters in all.
 - `label`: printable ASCII, at most 23 characters. It is the source shown on each of its notes and cards.
 - `kind`: `push` or `stat`.
 

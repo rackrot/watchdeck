@@ -3412,6 +3412,21 @@ async fn a_burst_of_notes_is_coalesced_and_the_board_gets_the_newest_twelve() {
 }
 
 #[tokio::test]
+async fn a_feed_session_with_no_integrations_gets_a_first_snapshot_with_no_sources() {
+    let daemon = start().await;
+    let mut c = device_session(daemon.addr, DEVICE, &TOKEN, &["feed"]).await;
+    let first = feed_where(&mut c, 2, |_| true).await;
+    assert_eq!(
+        first,
+        Feed {
+            sources: 0,
+            cards: vec![],
+            notes: vec![]
+        }
+    );
+}
+
+#[tokio::test]
 async fn removing_every_integration_tells_the_board_there_are_none() {
     let daemon = start_feed().await;
     let mut c = device_session(daemon.addr, DEVICE, &TOKEN, &["feed"]).await;

@@ -45,6 +45,8 @@ const MAX_CARD_SOURCES: usize = 8;
 /// A push token, in characters. The daemon generates 64 hex digits.
 const MIN_TOKEN_BYTES: usize = 32;
 const MAX_INTEGRATION_LABEL: usize = 23;
+/// An integration's id, which starts every note and card id on the wire (63 characters in all).
+const MAX_INTEGRATION_ID: usize = 31;
 /// `[sleep]`. The sleep screen's text is in characters the device can draw, at most this many.
 const MAX_SLEEP_TEXT: usize = 47;
 const MAX_OFFLINE_S: i64 = 3600;
@@ -577,9 +579,9 @@ impl IntegrationConfig {
             Self::Push { id, label, .. } | Self::Stat { id, label, .. } => (id, label),
         };
         let mut problems = Vec::new();
-        if !id_ok(id) {
+        if !id_ok(id) || id.len() > MAX_INTEGRATION_ID {
             problems.push(format!(
-                "id must be 1 to {MAX_ID_BYTES} letters, digits, '_', '-' or '.'"
+                "id must be 1 to {MAX_INTEGRATION_ID} letters, digits, '_', '-' or '.'"
             ));
         }
         if label.len() > MAX_INTEGRATION_LABEL || !printable_ascii(label) {
@@ -3529,7 +3531,14 @@ source = { kind = "http", method = "GET", url = "http://nas.lan/api/load" }
     fn the_integration_id_label_and_token_rules_say_what_is_wrong() {
         assert_refused(
             &with_new(&push_table("", "HA", "push-ha")),
-            "integration \"\": id must be 1 to 63 letters, digits, '_', '-' or '.'",
+            "integration \"\": id must be 1 to 31 letters, digits, '_', '-' or '.'",
+        );
+        // 31 fits (it leaves room for "/" and 31 characters of the note's own id); 32 doesn't.
+        let long = |n: usize| with_new(&push_table(&"i".repeat(n), "HA", "push-ha"));
+        assert!(parse(&long(31), &sizes()).is_ok());
+        assert_refused(
+            &long(32),
+            &format!("integration {:?}: id must be 1 to 31", "i".repeat(32)),
         );
         assert_refused(
             &with_new(&push_table("ha", &"x".repeat(24), "push-ha")),

@@ -5,7 +5,7 @@ use std::time::Duration;
 use futures_util::future::BoxFuture;
 
 use super::Connector;
-use crate::daemon::actions::Actions;
+use crate::daemon::actions::{Actions, Ran};
 use crate::daemon::config::{Action, TileConfig};
 use crate::daemon::feed::{Card, Snapshot};
 use crate::daemon::protocol::{CardState, TileState};
@@ -18,16 +18,25 @@ const PENDING: &str = "--";
 #[derive(Clone)]
 pub struct FeedSlots(pub Actions);
 
-impl Sample for FeedSlots {
-    async fn sample(&self, id: &str, tile: &TileConfig) -> Option<TileValue> {
-        let run = match self.0.start_feed(id) {
-            Ok(run) => run,
+impl FeedSlots {
+    /// Runs `action` in one of the feed's slots and returns the whole run, raw output and
+    /// redaction included. `None` when no slot is free. A connector that needs more than a tile's
+    /// one value, such as Prometheus reading a JSON body, runs through this; [`Sample`] is the
+    /// tile-shaped path over it.
+    pub async fn run(&self, id: &str, action: &Action) -> Option<Ran> {
+        match self.0.start_feed(id) {
+            Ok(run) => Some(run.poll(action).await),
             Err(refused) => {
                 log::debug!("feed {id:?}: skipped, {}", refused.summary);
-                return None;
+                None
             }
-        };
-        let ran = run.poll(&tile.source).await;
+        }
+    }
+}
+
+impl Sample for FeedSlots {
+    async fn sample(&self, id: &str, tile: &TileConfig) -> Option<TileValue> {
+        let ran = self.run(id, &tile.source).await?;
         Some(reading(tile, &ran))
     }
 }
@@ -102,7 +111,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::daemon::actions::{ActionResult, Ran};
+    use crate::daemon::actions::ActionResult;
     use crate::daemon::secrets::Secrets;
 
     /// Reads a finished run the way a tile does, whatever `ran` holds.

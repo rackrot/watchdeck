@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 use tokio::time::Instant;
 
 use super::protocol::{
@@ -104,6 +104,8 @@ pub enum StoreError {
     NotFound,
     /// All card slots are taken.
     CardsFull,
+    /// The id would not fit the wire's 63 characters once it follows the source's.
+    BadId,
 }
 
 struct StoredNote {
@@ -135,6 +137,9 @@ struct Inner {
 pub struct FeedStore {
     inner: Mutex<Inner>,
     tx: watch::Sender<Arc<Feed>>,
+    /// Signalled on every change, so the expiry task looks at the earliest deadline again even
+    /// when the snapshot itself is the same.
+    changed: Notify,
 }
 
 impl FeedStore {
@@ -147,6 +152,7 @@ impl FeedStore {
         Arc::new(Self {
             inner: Mutex::new(Inner::default()),
             tx: watch::Sender::new(Arc::new(empty)),
+            changed: Notify::new(),
         })
     }
 
@@ -183,23 +189,28 @@ impl FeedStore {
         if !inner.sources.iter().any(|s| s.id == source) {
             return;
         }
-        inner.cards.insert(source.to_string(), snapshot.cards);
+        let cards = (snapshot.cards.into_iter())
+            .filter(|c| qualify(source, &c.id).is_some())
+            .collect();
+        inner.cards.insert(source.to_string(), cards);
         let listed: Vec<String> = (snapshot.notes.iter())
-            .filter_map(|n| n.id.as_deref())
-            .map(|id| qualify(source, id))
+            .filter_map(|n| qualify(source, n.id.as_deref()?))
             .collect();
         inner
             .notes
             .retain(|n| n.source != source || !n.polled || listed.contains(&n.id));
-        inner.dismissed.retain(|id| listed.contains(id));
+        // Only this source's: another source's dismissed notes aren't listed here.
+        let prefix = format!("{source}/");
+        inner
+            .dismissed
+            .retain(|id| !id.starts_with(&prefix) || listed.contains(id));
         for note in snapshot.notes {
-            let Some(local) = note.id.clone() else {
+            let Some(id) = note.id.as_deref().and_then(|l| qualify(source, l)) else {
                 continue;
             };
-            if inner.dismissed.contains(&qualify(source, &local)) {
-                continue;
+            if !inner.dismissed.contains(&id) {
+                inner.put_note(source, note, true);
             }
-            inner.put_note(source, note, true);
         }
         self.publish(&inner);
     }
@@ -221,9 +232,13 @@ impl FeedStore {
             return Err(StoreError::UnknownSource);
         }
         let applied = match update {
-            Update::PutNote(note) => Applied::Note(inner.put_note(source, note, false)),
+            Update::PutNote(note) => Applied::Note(
+                inner
+                    .put_note(source, note, false)
+                    .ok_or(StoreError::BadId)?,
+            ),
             Update::RemoveNote(local) => {
-                let id = qualify(source, &local);
+                let id = qualify(source, &local).ok_or(StoreError::NotFound)?;
                 let before = inner.notes.len();
                 inner.notes.retain(|n| n.id != id);
                 if inner.notes.len() == before {
@@ -232,6 +247,9 @@ impl FeedStore {
                 Applied::Done
             }
             Update::PutCard(card) => {
+                if qualify(source, &card.id).is_none() {
+                    return Err(StoreError::BadId);
+                }
                 let taken: usize = inner.cards.values().map(Vec::len).sum();
                 let cards = inner.cards.entry(source.to_string()).or_default();
                 match cards.iter_mut().find(|c| c.id == card.id) {
@@ -285,7 +303,13 @@ impl FeedStore {
         self.lock().notes.iter().map(|n| n.expires).min()
     }
 
+    /// Resolves when a change may have moved the earliest deadline.
+    pub async fn deadline_moved(&self) {
+        self.changed.notified().await;
+    }
+
     fn publish(&self, inner: &Inner) {
+        self.changed.notify_one();
         let next = inner.wire(Instant::now());
         if let Err(why) = next.check() {
             log::error!("feed: not publishing a snapshot that breaks the wire rules: {why}");
@@ -302,16 +326,19 @@ impl FeedStore {
 }
 
 impl Inner {
-    /// Adds `note` as `source`'s, or replaces its namesake, newest first. Returns the wire id.
-    fn put_note(&mut self, source: &str, note: Note, polled: bool) -> String {
-        let local = match note.id {
-            Some(id) if !id.is_empty() => id,
-            _ => {
+    /// Adds `note` as `source`'s, or replaces its namesake, newest first. Returns the wire id, or
+    /// `None` when the id doesn't fit. A note without an id gets the next number that is free.
+    fn put_note(&mut self, source: &str, note: Note, polled: bool) -> Option<String> {
+        let id = match note.id.as_deref().filter(|id| !id.is_empty()) {
+            Some(local) => qualify(source, local)?,
+            None => loop {
                 self.numbered += 1;
-                self.numbered.to_string()
-            }
+                let id = qualify(source, &self.numbered.to_string())?;
+                if !self.notes.iter().any(|n| n.id == id) {
+                    break id;
+                }
+            },
         };
-        let id = qualify(source, &local);
         self.notes.retain(|n| n.id != id);
         let ttl = note.ttl.unwrap_or(DEFAULT_TTL).clamp(MIN_TTL, MAX_TTL);
         let title = clean(&note.title, MAX_FEED_TITLE_CHARS);
@@ -333,7 +360,7 @@ impl Inner {
             },
         );
         self.notes.truncate(MAX_STORED_NOTES);
-        id
+        Some(id)
     }
 
     /// The snapshot at `now`: cards in config order, notes newest first, all within the wire's
@@ -345,11 +372,13 @@ impl Inner {
         };
         let cards = (self.sources.iter())
             .flat_map(|s| {
-                (self.cards.get(&s.id).into_iter().flatten()).map(|c| FeedCard {
-                    id: qualify(&s.id, &c.id),
-                    label: clean(&c.label, MAX_FEED_LABEL_CHARS),
-                    value: clean(&c.value, MAX_FEED_VALUE_CHARS),
-                    state: c.state,
+                (self.cards.get(&s.id).into_iter().flatten()).filter_map(|c| {
+                    Some(FeedCard {
+                        id: qualify(&s.id, &c.id)?,
+                        label: clean(&c.label, MAX_FEED_LABEL_CHARS),
+                        value: clean(&c.value, MAX_FEED_VALUE_CHARS),
+                        state: c.state,
+                    })
                 })
             })
             .take(MAX_FEED_CARDS)
@@ -376,17 +405,15 @@ impl Inner {
     }
 }
 
-/// `<source>/<local>` cut to the wire's id limit, or just `source` when `local` is empty.
-fn qualify(source: &str, local: &str) -> String {
-    let local = clean_id(local);
-    if local.is_empty() {
-        return clean_id(source);
-    }
-    clean_id(&format!("{source}/{local}"))
-}
-
-fn clean_id(id: &str) -> String {
-    clean(id, MAX_FEED_ID_CHARS)
+/// `<source>/<local>` made printable, or just `source` when `local` is empty. `None` when it
+/// would pass the wire's id limit: a cut id could collide with another note's.
+fn qualify(source: &str, local: &str) -> Option<String> {
+    let id = if local.is_empty() {
+        clean(source, usize::MAX)
+    } else {
+        clean(&format!("{source}/{local}"), usize::MAX)
+    };
+    (id.len() <= MAX_FEED_ID_CHARS).then_some(id)
 }
 
 /// `text` as one line of printable ASCII, at most `max` characters: whitespace becomes a space and
@@ -569,7 +596,7 @@ mod tests {
             &store,
             "ha",
             Note {
-                id: Some(long.clone()),
+                id: Some("x".into()),
                 title: long.clone(),
                 body: long.clone(),
                 ..Note::new("")
@@ -578,7 +605,6 @@ mod tests {
         let feed = store.snapshot();
         let n = &feed.notes[0];
         assert_eq!(n.id, id);
-        assert_eq!(n.id.len(), MAX_FEED_ID_CHARS);
         assert_eq!(n.title.len(), MAX_FEED_TITLE_CHARS);
         assert_eq!(n.body.len(), MAX_FEED_BODY_CHARS);
         assert!(n.title.starts_with("??  "), "{:?}", n.title);
@@ -691,15 +717,88 @@ mod tests {
     }
 
     #[test]
+    fn an_id_that_would_pass_63_characters_is_refused_not_cut() {
+        let store = store(&["ha"]);
+        // "ha/" and 60 more is 63, which fits; 61 more is not, and a cut would make it a twin of
+        // the 60-character id.
+        let fits = "a".repeat(60);
+        post(&store, "ha", note(&fits, "fits"));
+        let too_long = format!("{fits}b");
+        assert_eq!(
+            store.apply("ha", Update::PutNote(note(&too_long, "no"))),
+            Err(StoreError::BadId)
+        );
+        assert_eq!(
+            store.apply("ha", Update::PutCard(card(&too_long, "1"))),
+            Err(StoreError::BadId)
+        );
+        assert_eq!(
+            store.apply("ha", Update::RemoveNote(too_long.clone())),
+            Err(StoreError::NotFound)
+        );
+        assert_eq!(titles(&store), ["fits"]);
+        // A polled snapshot drops what doesn't fit and keeps the rest.
+        store.replace(
+            "ha",
+            Snapshot {
+                cards: vec![card(&too_long, "1"), card("ok", "2")],
+                notes: vec![note(&too_long, "no")],
+            },
+        );
+        let ids: Vec<String> = store
+            .snapshot()
+            .cards
+            .iter()
+            .map(|c| c.id.clone())
+            .collect();
+        assert_eq!(ids, ["ha/ok"]);
+    }
+
+    #[test]
+    fn a_dismissed_note_of_one_source_survives_another_sources_poll() {
+        let store = store(&["g", "h"]);
+        let listing = Snapshot {
+            cards: vec![],
+            notes: vec![note("alert", "Disk full")],
+        };
+        store.replace("g", listing.clone());
+        assert!(store.dismiss("g/alert"));
+        // h's poll doesn't list g's note, and must not make the store forget the dismissal.
+        store.replace("h", Snapshot::default());
+        store.replace("g", listing);
+        assert!(titles(&store).is_empty());
+    }
+
+    #[test]
+    fn numbering_skips_ids_that_are_taken() {
+        let store = store(&["ha"]);
+        post(&store, "ha", note("1", "mine"));
+        post(&store, "ha", note("3", "also mine"));
+        assert_eq!(post(&store, "ha", Note::new("a")), "ha/2");
+        assert_eq!(post(&store, "ha", Note::new("b")), "ha/4");
+        assert_eq!(titles(&store), ["b", "a", "also mine", "mine"]);
+    }
+
+    #[test]
     fn the_fullest_snapshot_is_under_16_kb() {
-        let store = store(&["a", "b", "c", "d", "e", "f", "g", "h"]);
+        let store = FeedStore::new();
+        let ids = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        // Every source name at its 23-character limit, all quotes.
+        store.set_sources(
+            ids.iter()
+                .map(|id| SourceInfo {
+                    id: id.to_string(),
+                    label: "\"".repeat(23),
+                })
+                .collect(),
+        );
         let quotes = |n| "\"".repeat(n);
-        for id in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+        for id in ids {
             store
                 .apply(
                     id,
                     Update::PutCard(Card {
-                        id: quotes(60),
+                        id: quotes(61),
                         label: quotes(40),
                         value: quotes(40),
                         state: CardState::Bad,
@@ -712,7 +811,7 @@ mod tests {
                 &store,
                 "h",
                 Note {
-                    id: Some(format!("{i}{}", quotes(70))),
+                    id: Some(format!("{i:02}{}", quotes(59))),
                     title: quotes(90),
                     body: quotes(300),
                     level: NoteLevel::Error,
