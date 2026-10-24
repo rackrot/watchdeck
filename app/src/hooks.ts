@@ -1,14 +1,16 @@
 import { listen } from "@tauri-apps/api/event";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   configDir,
   type DeviceInfo,
   iconUrl,
   listDevices,
   listSecrets,
+  screenUrl,
   type TileReading,
   tileValues,
 } from "./api";
+import { SCREEN_W } from "./preview";
 
 /**
  * Subscribes to a daemon event, then reads the state once the listener is in place, so no change
@@ -38,15 +40,37 @@ export const useDevices = (): [DeviceInfo[], string] =>
 export const useTileReadings = (): TileReading[] =>
   useDaemonState("tile-values", tileValues, [])[0];
 
-/** A function from an icon's file name to its URL, or null until the config dir is known. */
-export function useIconUrls(): (name: string) => string | null {
+/** A function from a file name to its URL, or null until the config dir is known. */
+function useFileUrls(
+  url: (dir: string, name: string) => string,
+): (name: string) => string | null {
   const [dir, setDir] = useState<string | null>(null);
   useEffect(() => {
     configDir().then(setDir, (e) => {
       console.error("app config dir:", e);
     });
   }, []);
-  return (name) => (dir === null ? null : iconUrl(dir, name));
+  return (name) => (dir === null ? null : url(dir, name));
+}
+
+export const useIconUrls = () => useFileUrls(iconUrl);
+export const useScreenUrls = () => useFileUrls(screenUrl);
+
+/** The width of an element, kept current. */
+export function useWidth() {
+  const ref = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(SCREEN_W);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) {
+      return;
+    }
+    const watch = new ResizeObserver(() => setWidth(el.clientWidth));
+    watch.observe(el);
+    setWidth(el.clientWidth);
+    return () => watch.disconnect();
+  }, []);
+  return [ref, width] as const;
 }
 
 /** The secret names, and a function that reads them again. */

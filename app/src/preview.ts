@@ -98,6 +98,57 @@ export function iconBox(cols: number, rows: number, paged = false): number {
   return Math.min(cell.w - 2 * ICON_PAD, room - label - ICON_GAP, ICON_MAX);
 }
 
+// The sleep screen, mirroring firmware/main/sleepcfg.c (`sleepcfg_layout`, `sleepcfg_text_align`) and
+// sleep.c: a 1024 x 512 image area with a column of elements, and an 88 px strip below it.
+export const SLEEP_AREA_W = 1024;
+export const SLEEP_AREA_H = 512;
+export const SLEEP_STRIP_H = 88;
+export const SLEEP_MARGIN = 32;
+
+/** The elements, top to bottom (`sleep_el_t`). */
+export const SLEEP_ELEMENTS = ["clock", "date", "host", "text"] as const;
+export type SleepElement = (typeof SLEEP_ELEMENTS)[number];
+
+/** Line heights of lv_font_montserrat_48 for the clock and _32 for the rest (`LV_FONT_MONTSERRAT_*`). */
+export const SLEEP_HEIGHTS = [52, 35, 35, 35] as const;
+
+export type SleepBox = { x: number; y: number; w: number; h: number };
+
+/**
+ * Where each element goes, or null when it isn't shown (it takes no room). `anchor` is a
+ * `[sleep] anchor` name; an unknown one is laid out as the top, like the device's `y` default.
+ * `heights` are the fonts' line heights, in `SLEEP_ELEMENTS` order.
+ */
+export function sleepLayout(
+  shown: readonly boolean[],
+  anchor: string,
+  heights: readonly number[] = SLEEP_HEIGHTS,
+): (SleepBox | null)[] {
+  const columnH = heights.reduce((sum, h, i) => sum + (shown[i] ? h : 0), 0);
+  let y = SLEEP_MARGIN;
+  if (anchor === "bottom_left" || anchor === "bottom_right") {
+    y = SLEEP_AREA_H - SLEEP_MARGIN - columnH;
+  } else if (anchor === "center") {
+    y = Math.trunc((SLEEP_AREA_H - columnH) / 2);
+  }
+  return heights.map((h, i) => {
+    if (!shown[i]) {
+      return null;
+    }
+    const box = { x: SLEEP_MARGIN, y, w: SLEEP_AREA_W - 2 * SLEEP_MARGIN, h };
+    y += h;
+    return box;
+  });
+}
+
+/** How the text sits in its element: left, centered or right. */
+export const sleepTextAlign = (anchor: string): "left" | "center" | "right" =>
+  anchor === "top_right" || anchor === "bottom_right"
+    ? "right"
+    : anchor === "center"
+      ? "center"
+      : "left";
+
 /**
  * A tile button wears its configured color only while ok. Before its first reading it is grey and
  * when bad it is red (ui.c `tile_bg`: lv_palette_darken of GREY and RED, level 2), which the CSS

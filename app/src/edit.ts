@@ -6,6 +6,7 @@ import type {
   Config,
   Metric,
   PageConfig,
+  SleepConfig,
   StatusBarConfig,
   Step,
 } from "./config";
@@ -300,6 +301,20 @@ export const barChanged = (a: Config, b: Config): boolean =>
 /** Whether going from `a` to `b` changes `[sleep]`, which, like `[status_bar]`, never changes a layout. */
 export const sleepChanged = (a: Config, b: Config): boolean =>
   canon(a.sleep ?? null) !== canon(b.sleep ?? null);
+
+/**
+ * `sleep` with the keys of `patch` set. A key set to `undefined` is removed, and a table left with
+ * no keys is removed too, so the file keeps the form it had before it had a `[sleep]`.
+ */
+export function withSleep(
+  sleep: SleepConfig | undefined,
+  patch: { [K in keyof SleepConfig]: SleepConfig[K] | undefined },
+): SleepConfig | undefined {
+  const next = Object.fromEntries(
+    Object.entries({ ...sleep, ...patch }).filter(([, v]) => v !== undefined),
+  );
+  return Object.keys(next).length > 0 ? next : undefined;
+}
 
 /**
  * Whether going from `a` to `b` changes the feed's sources, `[push]` or `[[integration]]`. Those

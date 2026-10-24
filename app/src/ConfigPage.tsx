@@ -3,8 +3,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   getConfig,
   importIcon,
+  importScreenImage,
   listDevices,
   listIcons,
+  listScreenImages,
   saveConfig,
 } from "./api";
 import ButtonForm from "./ButtonForm";
@@ -21,6 +23,8 @@ import {
   pageCount,
   pageIndexOf,
   pageName,
+  sleepChanged,
+  withSleep,
 } from "./edit";
 import {
   type ErrorMap,
@@ -30,9 +34,10 @@ import {
   numberErrors,
 } from "./errors";
 import GridEditor from "./GridEditor";
-import { useIconUrls, useTileReadings } from "./hooks";
+import { useIconUrls, useScreenUrls, useTileReadings } from "./hooks";
 import PageTabs from "./PageTabs";
 import SaveBar from "./SaveBar";
+import SleepForm from "./SleepForm";
 import StatusBarForm from "./StatusBarForm";
 import {
   diskChanged as diskMoved,
@@ -58,17 +63,25 @@ type Saved = {
   connected: number;
   /** The save changed `[status_bar]`, which connected devices pick up without a layout. */
   bar: boolean;
+  /** The save changed `[sleep]`, which connected devices pick up as a `sleep` frame, not a layout. */
+  sleep: boolean;
 };
 
 /** A `[status_bar]` edit reaches a connected device within this long: the config poll and the next tick. */
 const BAR_WITHIN_S = 2;
 
+/** A `[sleep]` edit does too, except for a new image, which the device then downloads. */
+const SLEEP_WITHIN_S = 5;
+
 export default function ConfigPage({ secrets }: { secrets: string[] }) {
   const [view, setView] = useState<ConfigView | null>(null);
   const [draft, setDraft] = useState<Config | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
-  // The status bar form takes the button form's place, so a button and the form are never both open.
-  const [statusBarOpen, setStatusBarOpen] = useState(false);
+  // The status bar and sleep screen forms take the button form's place, so a button and a form are
+  // never both open, nor are the two forms.
+  const [panel, setPanel] = useState<"bar" | "sleep" | null>(null);
+  const statusBarOpen = panel === "bar";
+  const sleepOpen = panel === "sleep";
   // The page the grid shows, from 0. Clamped below, since the draft can lose pages.
   const [pageIdx, setPageIdx] = useState(0);
   const [errors, setErrors] = useState<ErrorMap>(emptyErrors);
@@ -81,6 +94,8 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
   const [onDisk, setOnDisk] = useState<ConfigStatus | null>(null);
   const [iconFiles, setIconFiles] = useState<string[]>([]);
   const [iconError, setIconError] = useState("");
+  const [screenFiles, setScreenFiles] = useState<string[]>([]);
+  const [screenError, setScreenError] = useState("");
   // Messages of the last refused save, whole, so none can go unseen.
   const [refused, setRefused] = useState<string[]>([]);
   // Problems the forms see before any call, such as a header listed twice.
@@ -94,6 +109,7 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
   });
   const readings = useTileReadings();
   const iconUrl = useIconUrls();
+  const screenUrl = useScreenUrls();
 
   const refreshIcons = useCallback(async () => {
     try {
@@ -103,8 +119,17 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
     }
   }, []);
 
+  const refreshScreens = useCallback(async () => {
+    try {
+      setScreenFiles(await listScreenImages());
+    } catch (e) {
+      setScreenError(String(e));
+    }
+  }, []);
+
   const load = useCallback(async () => {
     void refreshIcons();
+    void refreshScreens();
     try {
       const next = await getConfig();
       setView(next);
@@ -122,7 +147,7 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
     } catch (e) {
       setLoadError(String(e));
     }
-  }, [refreshIcons]);
+  }, [refreshIcons, refreshScreens]);
   // Listen first, then read, so no change falls between the two.
   useEffect(() => {
     const listeners = Promise.all([
@@ -228,6 +253,7 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
         ...Object.entries(numbers.statusBar).flatMap(([field, list]) =>
           list.map((m) => `status_bar.${field}: ${m}`),
         ),
+        ...Object.values(numbers.sleep).flat(),
       ]);
       return;
     }
@@ -256,6 +282,7 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
         connected: connected.length,
         targets,
         bar: barChanged(view.config, draft),
+        sleep: sleepChanged(view.config, draft),
       });
     } catch (e) {
       const messages = Array.isArray(e) ? (e as string[]) : [String(e)];
@@ -288,6 +315,19 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
       }
     } catch (e) {
       setIconError(String(e));
+    }
+  }
+
+  async function pickScreenImage() {
+    setScreenError("");
+    try {
+      const name = await importScreenImage();
+      if (name !== null && draft) {
+        await refreshScreens();
+        set({ ...draft, sleep: withSleep(draft.sleep, { image: name }) });
+      }
+    } catch (e) {
+      setScreenError(String(e));
     }
   }
 
@@ -412,7 +452,7 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
         readings={readings}
         iconUrl={iconUrl}
         onSelect={(index) => {
-          setStatusBarOpen(false);
+          setPanel(null);
           setSelected(index);
         }}
         onChange={set}
@@ -422,18 +462,38 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
             ...draft,
             button: [...draft.button, newButton(draft, pos, home)],
           });
-          setStatusBarOpen(false);
+          setPanel(null);
           setSelected(draft.button.length);
         }}
         statusBarOpen={statusBarOpen}
         statusBarProblems={Object.keys(errors.statusBar).length > 0}
         onStatusBar={() => {
-          setStatusBarOpen(!statusBarOpen);
+          setPanel(statusBarOpen ? null : "bar");
+          setSelected(null);
+        }}
+        sleepOpen={sleepOpen}
+        sleepProblems={Object.keys(errors.sleep).length > 0}
+        onSleep={() => {
+          setPanel(sleepOpen ? null : "sleep");
           setSelected(null);
         }}
       />
 
-      {statusBarOpen ? (
+      {sleepOpen ? (
+        <SleepForm
+          key={formKey}
+          sleep={draft.sleep}
+          errors={errors.sleep}
+          images={screenFiles}
+          imageError={screenError}
+          screenUrl={screenUrl}
+          onImport={pickScreenImage}
+          onChange={(sleep) => {
+            const { sleep: _, ...rest } = draft;
+            set(sleep === undefined ? rest : { ...rest, sleep });
+          }}
+        />
+      ) : statusBarOpen ? (
         <StatusBarForm
           key={formKey}
           bar={draft.status_bar}
@@ -546,9 +606,10 @@ function SavedStatus({
       </span>
     );
   });
-  // A bar edit pushes no layout, so "the layout is unchanged" would only confuse beside its line.
+  // A bar or sleep edit pushes no layout, so "the layout is unchanged" would only confuse beside its line.
   const note =
-    saved.targets.length > 0 || (saved.bar && saved.connected > 0)
+    saved.targets.length > 0 ||
+    ((saved.bar || saved.sleep) && saved.connected > 0)
       ? null
       : saved.connected === 0
         ? "no device connected, so it gets the layout when it connects"
@@ -559,6 +620,11 @@ function SavedStatus({
       {saved.bar && saved.connected > 0 && (
         <span className="chip ok">
           status bar settings apply within {BAR_WITHIN_S} s
+        </span>
+      )}
+      {saved.sleep && saved.connected > 0 && (
+        <span className="chip ok">
+          sleep screen settings apply within {SLEEP_WITHIN_S} s
         </span>
       )}
       {lines}

@@ -589,3 +589,188 @@ button.chip.selected {
 .field input[type="checkbox"] {
   width: auto;
 }
+
+/* The sleep screen form: the preview is in the panel's pixels, like .screen. */
+
+.sleep-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.sleep-form fieldset.bare {
+  min-width: 0;
+  border: 0;
+  padding: 0;
+  margin: 0;
+}
+
+.sleep-screen {
+  overflow: hidden;
+}
+
+.sleep-image,
+.sleep-logo {
+  position: absolute;
+  top: 0;
+  left: 0;
+}
+
+.sleep-logo {
+  top: 136px;
+  width: 240px;
+  height: 240px;
+  border-radius: 48px;
+  opacity: 0.35;
+}
+
+.sleep-el {
+  position: absolute;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.sleep-strip {
+  position: absolute;
+  left: 0;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 24px;
+  border-top: 2px dashed rgb(128 128 128 / 0.6);
+  box-sizing: border-box;
+}
+
+.sleep-offline {
+  position: absolute;
+  top: 4px;
+  right: 12px;
+  color: #909090;
+  font:
+    20px system-ui,
+    sans-serif;
+}
+
+.anchor-pad {
+  display: grid;
+  grid-template-columns: repeat(3, 28px);
+  grid-template-rows: repeat(3, 20px);
+  gap: 4px;
+}
+
+.anchor-pad .chip {
+  padding: 0;
+}
+
+.spin {
+  --size: 28px;
+  position: relative;
+  display: inline-block;
+  box-sizing: border-box;
+  width: var(--size);
+  height: var(--size);
+  flex: none;
+}
+
+.spin-swatch {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 28px;
+  margin-right: 6px;
+}
+
+.spin-arc {
+  border: calc(var(--size) / 9) solid transparent;
+  border-top-color: var(--spin);
+  border-right-color: var(--spin);
+  border-radius: 50%;
+  animation: spin-rotate 1s linear infinite;
+}
+
+.spin-dots {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.spin-dots i {
+  width: 26%;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  background: var(--spin);
+  animation: spin-fade 1.2s ease-in-out infinite;
+}
+
+.spin-dots i:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.spin-dots i:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+.spin-bar {
+  width: calc(var(--size) * 1.6);
+  height: calc(var(--size) / 6);
+  overflow: hidden;
+  border-radius: 99px;
+  background: color-mix(in srgb, var(--spin) 25%, transparent);
+}
+
+.spin-bar i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 40%;
+  background: var(--spin);
+  animation: spin-slide 1.1s ease-in-out infinite alternate;
+}
+
+.spin-pulse {
+  border-radius: 50%;
+  background: var(--spin);
+  animation: spin-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes spin-rotate {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes spin-fade {
+  0%,
+  100% {
+    opacity: 0.2;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes spin-slide {
+  to {
+    transform: translateX(150%);
+  }
+}
+
+@keyframes spin-pulse {
+  0%,
+  100% {
+    opacity: 0.3;
+    transform: scale(0.6);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spin,
+  .spin i {
+    animation: none;
+  }
+}
