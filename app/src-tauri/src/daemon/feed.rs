@@ -18,8 +18,13 @@ use super::protocol::{
     MAX_FEED_TITLE_CHARS, MAX_FEED_VALUE_CHARS,
 };
 
-/// Notes the store keeps, newest first. The wire carries the newest `MAX_FEED_NOTES` of them.
+/// Notes the store keeps, newest first. The wire carries `MAX_FEED_NOTES` of them, each source
+/// getting a fair share.
 pub const MAX_STORED_NOTES: usize = 32;
+/// What one source may hold: half the notes and half the board's card slots, so no source can
+/// fill the store alone. A source past its share loses its own oldest note, never another's.
+pub const MAX_SOURCE_NOTES: usize = MAX_STORED_NOTES / 2;
+pub const MAX_SOURCE_CARDS: usize = MAX_FEED_CARDS / 2;
 /// How long a note stays when its source doesn't say.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// The longest a note may stay.
@@ -104,6 +109,10 @@ pub enum StoreError {
     NotFound,
     /// All card slots are taken.
     CardsFull,
+    /// The source has [`MAX_SOURCE_CARDS`] cards already.
+    SourceCardsFull,
+    /// Every note slot holds another source's note, and this source has none of its own to drop.
+    NotesFull,
     /// The id would not fit the wire's 63 characters once it follows the source's.
     BadId,
 }
@@ -191,6 +200,7 @@ impl FeedStore {
         }
         let cards = (snapshot.cards.into_iter())
             .filter(|c| qualify(source, &c.id).is_some())
+            .take(MAX_SOURCE_CARDS)
             .collect();
         inner.cards.insert(source.to_string(), cards);
         let listed: Vec<String> = (snapshot.notes.iter())
@@ -208,8 +218,9 @@ impl FeedStore {
             let Some(id) = note.id.as_deref().and_then(|l| qualify(source, l)) else {
                 continue;
             };
+            // A note that finds no slot is left out until a later poll.
             if !inner.dismissed.contains(&id) {
-                inner.put_note(source, note, true);
+                let _ = inner.put_note(source, note, true);
             }
         }
         self.publish(&inner);
@@ -232,11 +243,7 @@ impl FeedStore {
             return Err(StoreError::UnknownSource);
         }
         let applied = match update {
-            Update::PutNote(note) => Applied::Note(
-                inner
-                    .put_note(source, note, false)
-                    .ok_or(StoreError::BadId)?,
-            ),
+            Update::PutNote(note) => Applied::Note(inner.put_note(source, note, false)?),
             Update::RemoveNote(local) => {
                 let id = qualify(source, &local).ok_or(StoreError::NotFound)?;
                 let before = inner.notes.len();
@@ -252,8 +259,10 @@ impl FeedStore {
                 }
                 let taken: usize = inner.cards.values().map(Vec::len).sum();
                 let cards = inner.cards.entry(source.to_string()).or_default();
+                let own = cards.len();
                 match cards.iter_mut().find(|c| c.id == card.id) {
                     Some(old) => *old = card,
+                    None if own >= MAX_SOURCE_CARDS => return Err(StoreError::SourceCardsFull),
                     None if taken >= MAX_FEED_CARDS => return Err(StoreError::CardsFull),
                     None => cards.push(card),
                 }
@@ -326,20 +335,29 @@ impl FeedStore {
 }
 
 impl Inner {
-    /// Adds `note` as `source`'s, or replaces its namesake, newest first. Returns the wire id, or
-    /// `None` when the id doesn't fit. A note without an id gets the next number that is free.
-    fn put_note(&mut self, source: &str, note: Note, polled: bool) -> Option<String> {
+    /// Adds `note` as `source`'s, or replaces its namesake, newest first, and returns the wire
+    /// id. A note without an id gets the next number that is free. A source at
+    /// [`MAX_SOURCE_NOTES`], or a store at [`MAX_STORED_NOTES`], drops the source's own oldest
+    /// note to make room; a source with none of its own in a full store is refused.
+    fn put_note(&mut self, source: &str, note: Note, polled: bool) -> Result<String, StoreError> {
         let id = match note.id.as_deref().filter(|id| !id.is_empty()) {
-            Some(local) => qualify(source, local)?,
+            Some(local) => qualify(source, local).ok_or(StoreError::BadId)?,
             None => loop {
                 self.numbered += 1;
-                let id = qualify(source, &self.numbered.to_string())?;
+                let id = qualify(source, &self.numbered.to_string()).ok_or(StoreError::BadId)?;
                 if !self.notes.iter().any(|n| n.id == id) {
                     break id;
                 }
             },
         };
-        self.notes.retain(|n| n.id != id);
+        let now = Instant::now();
+        // A note past its time holds no slot, even before the sweep.
+        self.notes.retain(|n| n.id != id && n.expires > now);
+        let own = self.notes.iter().filter(|n| n.source == source).count();
+        if own >= MAX_SOURCE_NOTES || self.notes.len() >= MAX_STORED_NOTES {
+            let oldest = (self.notes.iter()).rposition(|n| n.source == source);
+            self.notes.remove(oldest.ok_or(StoreError::NotesFull)?);
+        }
         let ttl = note.ttl.unwrap_or(DEFAULT_TTL).clamp(MIN_TTL, MAX_TTL);
         let title = clean(&note.title, MAX_FEED_TITLE_CHARS);
         self.notes.insert(
@@ -355,12 +373,11 @@ impl Inner {
                 body: clean(&note.body, MAX_FEED_BODY_CHARS),
                 level: note.level,
                 at: unix_now(),
-                expires: Instant::now() + ttl,
+                expires: now + ttl,
                 polled,
             },
         );
-        self.notes.truncate(MAX_STORED_NOTES);
-        Some(id)
+        Ok(id)
     }
 
     /// The snapshot at `now`: cards in config order, notes newest first, all within the wire's
@@ -370,22 +387,45 @@ impl Inner {
             let found = self.sources.iter().find(|s| s.id == source);
             clean(found.map_or("", |s| &s.label), MAX_FEED_SRC_CHARS)
         };
-        let cards = (self.sources.iter())
-            .flat_map(|s| {
-                (self.cards.get(&s.id).into_iter().flatten()).filter_map(|c| {
-                    Some(FeedCard {
-                        id: qualify(&s.id, &c.id)?,
-                        label: clean(&c.label, MAX_FEED_LABEL_CHARS),
-                        value: clean(&c.value, MAX_FEED_VALUE_CHARS),
-                        state: c.state,
+        // Each source's cards, in config order, then a fair share of the slots for each.
+        let by_source: Vec<Vec<FeedCard>> = (self.sources.iter())
+            .map(|s| {
+                (self.cards.get(&s.id).into_iter().flatten())
+                    .filter_map(|c| {
+                        Some(FeedCard {
+                            id: qualify(&s.id, &c.id)?,
+                            label: clean(&c.label, MAX_FEED_LABEL_CHARS),
+                            value: clean(&c.value, MAX_FEED_VALUE_CHARS),
+                            state: c.state,
+                        })
                     })
-                })
+                    .collect()
             })
-            .take(MAX_FEED_CARDS)
             .collect();
-        let notes = (self.notes.iter())
-            .filter(|n| n.expires > now)
-            .take(MAX_FEED_NOTES)
+        let shares = fair_shares(
+            &by_source.iter().map(Vec::len).collect::<Vec<_>>(),
+            MAX_FEED_CARDS,
+        );
+        let cards = (by_source.into_iter().zip(shares))
+            .flat_map(|(cards, share)| cards.into_iter().take(share))
+            .collect();
+        // The same for notes, which then keep their newest-first order.
+        let live: Vec<&StoredNote> = self.notes.iter().filter(|n| n.expires > now).collect();
+        let counts: Vec<usize> = (self.sources.iter())
+            .map(|s| live.iter().filter(|n| n.source == s.id).count())
+            .collect();
+        let mut left: HashMap<&str, usize> = (self.sources.iter())
+            .map(|s| s.id.as_str())
+            .zip(fair_shares(&counts, MAX_FEED_NOTES))
+            .collect();
+        let notes = (live.into_iter())
+            .filter(|n| match left.get_mut(n.source.as_str()) {
+                Some(share) if *share > 0 => {
+                    *share -= 1;
+                    true
+                }
+                _ => false,
+            })
             .map(|n| FeedNote {
                 id: n.id.clone(),
                 title: n.title.clone(),
@@ -403,6 +443,27 @@ impl Inner {
             notes,
         }
     }
+}
+
+/// How many of each source's `counts` items fit in `slots`, dealt one at a time in turn, so a
+/// source early in the config can't crowd out a later one.
+fn fair_shares(counts: &[usize], slots: usize) -> Vec<usize> {
+    let mut shares = vec![0; counts.len()];
+    let mut left = slots;
+    while left > 0 {
+        let mut dealt = false;
+        for (share, &count) in shares.iter_mut().zip(counts) {
+            if left > 0 && *share < count {
+                *share += 1;
+                left -= 1;
+                dealt = true;
+            }
+        }
+        if !dealt {
+            break;
+        }
+    }
+    shares
 }
 
 /// `<source>/<local>` made printable, or just `source` when `local` is empty. `None` when it
@@ -487,19 +548,96 @@ mod tests {
     }
 
     #[test]
-    fn thirty_three_notes_keep_the_newest_32_and_the_wire_gets_the_newest_12() {
+    fn one_source_keeps_its_newest_16_and_the_wire_gets_the_newest_12() {
         let store = store(&["ha"]);
         for i in 0..33 {
             post(&store, "ha", note(&format!("n{i}"), &format!("note {i}")));
         }
-        assert_eq!(store.lock().notes.len(), MAX_STORED_NOTES);
+        assert_eq!(store.lock().notes.len(), MAX_SOURCE_NOTES);
         let wire = titles(&store);
         assert_eq!(wire.len(), MAX_FEED_NOTES);
         assert_eq!(wire[0], "note 32");
         assert_eq!(wire[11], "note 21");
-        // The oldest one, note 0, fell off the store: its id is unknown.
-        assert!(!store.dismiss("ha/n0"));
-        assert!(store.lock().notes.iter().all(|n| n.id != "ha/n0"));
+        // The oldest ones fell off the store: their ids are unknown.
+        assert!(!store.dismiss("ha/n16"));
+        assert!(store.dismiss("ha/n17"));
+    }
+
+    #[test]
+    fn a_full_store_keeps_32_and_a_source_never_evicts_anothers_notes() {
+        let store = store(&["a", "b", "c"]);
+        for source in ["a", "b"] {
+            for i in 0..MAX_SOURCE_NOTES {
+                post(&store, source, note(&format!("{i}"), source));
+            }
+        }
+        assert_eq!(store.lock().notes.len(), MAX_STORED_NOTES);
+        // c has nothing of its own to drop, so it is refused, and a and b keep all theirs.
+        assert_eq!(
+            store.apply("c", Update::PutNote(Note::new("c"))),
+            Err(StoreError::NotesFull)
+        );
+        // a drops its own oldest, never b's.
+        post(&store, "a", note("new", "a again"));
+        let held = |source: &str| {
+            store
+                .lock()
+                .notes
+                .iter()
+                .filter(|n| n.source == source)
+                .count()
+        };
+        assert_eq!(
+            (held("a"), held("b"), held("c")),
+            (MAX_SOURCE_NOTES, MAX_SOURCE_NOTES, 0)
+        );
+        assert!(store.lock().notes.iter().all(|n| n.id != "a/0"));
+        // A note of b's that leaves frees a slot c can take.
+        assert!(store.dismiss("b/0"));
+        post(&store, "c", Note::new("c"));
+    }
+
+    #[test]
+    fn the_wire_gives_each_source_a_fair_share_of_the_notes() {
+        let store = store(&["a", "b"]);
+        post(&store, "b", note("old1", "b old 1"));
+        post(&store, "b", note("old2", "b old 2"));
+        for i in 0..MAX_SOURCE_NOTES {
+            post(&store, "a", note(&format!("{i}"), &format!("a {i}")));
+        }
+        let wire = titles(&store);
+        assert_eq!(wire.len(), MAX_FEED_NOTES);
+        // a's newest ten, then b's two, still newest first.
+        assert_eq!(wire[0], "a 15");
+        assert_eq!(wire[9], "a 6");
+        assert_eq!(wire[10..], ["b old 2", "b old 1"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_note_holds_no_slot() {
+        let store = store(&["a", "b", "c"]);
+        for source in ["a", "b"] {
+            for i in 0..MAX_SOURCE_NOTES {
+                let short = Note {
+                    ttl: Some(Duration::from_secs(10)),
+                    ..note(&format!("{i}"), source)
+                };
+                post(&store, source, short);
+            }
+        }
+        advance(Duration::from_secs(11)).await;
+        // No sweep has run, and c still gets in.
+        post(&store, "c", Note::new("c"));
+        assert_eq!(titles(&store), ["c"]);
+    }
+
+    #[test]
+    fn fair_shares_deal_one_slot_at_a_time() {
+        assert_eq!(fair_shares(&[5, 3], 8), [5, 3]);
+        assert_eq!(fair_shares(&[8, 1, 1], 8), [6, 1, 1]);
+        assert_eq!(fair_shares(&[4, 4, 1], 8), [4, 3, 1]);
+        assert_eq!(fair_shares(&[0, 2], 8), [0, 2]);
+        assert_eq!(fair_shares(&[], 8), Vec::<usize>::new());
     }
 
     #[test]
@@ -620,13 +758,13 @@ mod tests {
 
     #[test]
     fn cards_follow_config_order_and_stop_at_eight() {
-        let store = store(&["b", "a"]);
-        for i in 0..5 {
+        let store = store(&["b", "a", "c"]);
+        for i in 0..MAX_SOURCE_CARDS {
             store
                 .apply("a", Update::PutCard(card(&format!("a{i}"), "1")))
                 .unwrap();
         }
-        for i in 0..3 {
+        for i in 0..MAX_SOURCE_CARDS {
             store
                 .apply("b", Update::PutCard(card(&format!("b{i}"), "2")))
                 .unwrap();
@@ -637,12 +775,16 @@ mod tests {
             .iter()
             .map(|c| c.id.clone())
             .collect();
-        assert_eq!(ids[..3], ["b/b0", "b/b1", "b/b2"]);
+        assert_eq!(ids[..4], ["b/b0", "b/b1", "b/b2", "b/b3"]);
         assert_eq!(ids.len(), 8);
         // All eight slots are taken: a new card is refused, an existing one still updates.
         assert_eq!(
-            store.apply("b", Update::PutCard(card("b9", "x"))),
+            store.apply("c", Update::PutCard(card("c0", "x"))),
             Err(StoreError::CardsFull)
+        );
+        assert_eq!(
+            store.apply("b", Update::PutCard(card("b9", "x"))),
+            Err(StoreError::SourceCardsFull)
         );
         store
             .apply("b", Update::PutCard(card("b0", "new")))
@@ -652,6 +794,34 @@ mod tests {
         assert_eq!(
             store.apply("a", Update::RemoveCard("a0".into())),
             Err(StoreError::NotFound)
+        );
+    }
+
+    #[test]
+    fn one_source_cant_block_anothers_card_or_hide_a_later_sources() {
+        let store = store(&["a", "b", "load"]);
+        let put = |source: &str, id: &str| store.apply(source, Update::PutCard(card(id, "1")));
+        for i in 0..=MAX_SOURCE_CARDS {
+            let r = put("a", &format!("a{i}"));
+            assert_eq!(r.is_err(), i == MAX_SOURCE_CARDS, "card {i}");
+        }
+        for i in 0..MAX_SOURCE_CARDS {
+            put("b", &format!("b{i}")).unwrap();
+        }
+        // A polled source's card comes on top of the eight pushed ones, and still shows.
+        store.replace(
+            "load",
+            Snapshot {
+                cards: vec![card("", "0.42")],
+                notes: vec![],
+            },
+        );
+        let ids: Vec<String> = (store.snapshot().cards.iter())
+            .map(|c| c.id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            ["a/a0", "a/a1", "a/a2", "a/a3", "b/b0", "b/b1", "b/b2", "load"]
         );
     }
 

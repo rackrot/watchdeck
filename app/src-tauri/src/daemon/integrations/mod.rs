@@ -25,7 +25,9 @@ use tokio::time::{sleep, sleep_until, Instant};
 pub use stat::FeedSlots;
 
 use super::config::{IntegrationConfig, Live};
-use super::feed::{Applied, Card, FeedStore, Snapshot, SourceInfo, StoreError, Update};
+use super::feed::{
+    Applied, Card, FeedStore, Snapshot, SourceInfo, StoreError, Update, MAX_SOURCE_CARDS,
+};
 use super::protocol::Feed;
 use super::tiles::{Sample, Task, COOLDOWN, STALE_AFTER};
 
@@ -76,6 +78,13 @@ impl From<StoreError> for PushError {
             StoreError::UnknownSource => Self::new(404, "no such integration"),
             StoreError::NotFound => Self::new(404, "not found"),
             StoreError::CardsFull => Self::new(409, "all card slots are taken"),
+            StoreError::SourceCardsFull => Self::new(
+                409,
+                format!("this integration has {MAX_SOURCE_CARDS} cards, the most one may have"),
+            ),
+            StoreError::NotesFull => {
+                Self::new(409, "all note slots hold other integrations' notes")
+            }
             StoreError::BadId => Self::new(400, "id is too long"),
         }
     }
@@ -705,13 +714,13 @@ mod tests {
                 .status,
             404
         );
-        for i in 0..9 {
+        for i in 0..=MAX_SOURCE_CARDS {
             let r = post(
                 &format!("cards/c{i}"),
                 "PUT",
                 r#"{"label":"L","value":"1"}"#,
             );
-            assert_eq!(r.is_err(), i == 8, "card {i}");
+            assert_eq!(r.is_err(), i == MAX_SOURCE_CARDS, "card {i}");
             if let Err(e) = r {
                 assert_eq!(e.status, 409);
             }
