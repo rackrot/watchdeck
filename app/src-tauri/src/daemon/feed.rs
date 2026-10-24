@@ -87,6 +87,9 @@ pub enum Update {
     PutNote(Note),
     /// By the source's own id for it.
     RemoveNote(String),
+    /// Like `RemoveNote`, but a note that is already gone is not an error: for a sender that
+    /// reports an end, such as a resolved alert, which may outlive its note.
+    ClearNote(String),
     /// Adds a card, or replaces the one with the same id.
     PutCard(Card),
     /// By the source's own id for it.
@@ -245,12 +248,13 @@ impl FeedStore {
         let applied = match update {
             Update::PutNote(note) => Applied::Note(inner.put_note(source, note, false)?),
             Update::RemoveNote(local) => {
-                let id = qualify(source, &local).ok_or(StoreError::NotFound)?;
-                let before = inner.notes.len();
-                inner.notes.retain(|n| n.id != id);
-                if inner.notes.len() == before {
+                if !inner.remove_note(source, &local) {
                     return Err(StoreError::NotFound);
                 }
+                Applied::Done
+            }
+            Update::ClearNote(local) => {
+                inner.remove_note(source, &local);
                 Applied::Done
             }
             Update::PutCard(card) => {
@@ -335,6 +339,16 @@ impl FeedStore {
 }
 
 impl Inner {
+    /// Removes `source`'s note `local`. Whether there was one.
+    fn remove_note(&mut self, source: &str, local: &str) -> bool {
+        let Some(id) = qualify(source, local) else {
+            return false;
+        };
+        let before = self.notes.len();
+        self.notes.retain(|n| n.id != id);
+        self.notes.len() != before
+    }
+
     /// Adds `note` as `source`'s, or replaces its namesake, newest first, and returns the wire
     /// id. A note without an id gets the next number that is free. A source at
     /// [`MAX_SOURCE_NOTES`], or a store at [`MAX_STORED_NOTES`], drops the source's own oldest
@@ -884,6 +898,25 @@ mod tests {
             label: "Home".into(),
         }]);
         assert_eq!(store.snapshot().notes[0].src, "Home");
+    }
+
+    #[test]
+    fn clearing_a_note_that_is_gone_is_not_an_error_but_removing_it_is() {
+        let store = store(&["ha"]);
+        post(&store, "ha", note("a", "first"));
+        assert_eq!(
+            store.apply("ha", Update::ClearNote("a".into())),
+            Ok(Applied::Done)
+        );
+        assert!(titles(&store).is_empty());
+        assert_eq!(
+            store.apply("ha", Update::ClearNote("a".into())),
+            Ok(Applied::Done)
+        );
+        assert_eq!(
+            store.apply("ha", Update::RemoveNote("a".into())),
+            Err(StoreError::NotFound)
+        );
     }
 
     #[test]

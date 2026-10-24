@@ -406,7 +406,7 @@ ha = "Bearer paste-your-token-here"
 - The file must have mode 0600, or the app won't read it and logs the fix: `chmod 600 "${XDG_CONFIG_HOME:-$HOME/.config}"/watchdeck/secrets.toml`.
 - A value goes out as an HTTP header, so it must be printable ASCII on one line, up to 4096 bytes. The app won't read a file with any other value, and the error names the secret.
 - A button or integration that names a missing secret holds back the whole config. Adding the secret applies it.
-- The Secrets page can remove a secret, after a confirmation. It refuses while the running config still names the secret in a button's action, a tile's source, a stat integration's source or a push integration's token, and the message lists those buttons and integrations by id. Change them first, then remove it.
+- The Secrets page can remove a secret, after a confirmation. It refuses while the running config still names the secret in a button's action, a tile's source, a stat or prometheus integration's source or headers, or a push or grafana integration's token, and the message lists those buttons and integrations by id. Change them first, then remove it.
 - Secret values never appear in logs or error messages. Errors name the secret, and a syntax error in `secrets.toml` gives only its line number.
 - On the device, exact copies of a value in a reply show as `<secret>`, even one cut short by the 64 KB limit. An encoded copy, such as base64 or URL-encoded, isn't caught.
 - The file is plain text. Anything running as your user can read it.
@@ -443,9 +443,9 @@ Each `[[integration]]` table is a source of notes or cards on the feed page. Its
 
 - `id`: 1 to 31 letters, digits, `_`, `-` or `.`. Two integrations can't share an id. The id starts every note and card id on the board, which holds 63 characters in all.
 - `label`: printable ASCII, at most 23 characters. It is the source shown on each of its notes and cards.
-- `kind`: `push` or `stat`.
+- `kind`: `push`, `stat`, `prometheus` or `grafana`.
 
-A `push` integration takes notes and cards from the push API. `token_secret` names a secret in `secrets.toml` of at least 32 characters, which is the token the sender must send. Two push integrations can't share a token, so each sender has its own.
+A `push` integration takes notes and cards from the push API. `token_secret` names a secret in `secrets.toml` of at least 32 characters, which is the token the sender must send. Two push integrations can't share a token, so each sender has its own. A `grafana` integration takes the same `token_secret`, and no token can serve two integrations of either kind.
 
 A `stat` integration polls `source` every `every_s` seconds, from 2 to 86400, and shows the value as a card. `json_pointer` picks the value out of the output, as a tile's does. `source` takes the same rules as a tile's source: a shell or HTTP action, with `secret_headers` for secrets.
 
@@ -465,7 +465,9 @@ json_pointer = "/load"
 source = { kind = "http", method = "GET", url = "http://nas.lan/api/load" }
 ```
 
-There are at most 16 integrations, and at most 8 of them cards (`stat` now, `prometheus` later).
+A `prometheus` integration shows the value of an instant query as a card, and a `grafana` integration shows a Grafana webhook's alerts as notes. Their keys are in [Integrations and the push API](integrations.md#prometheus), with Grafana's contact-point setup.
+
+There are at most 16 integrations, and at most 8 of them cards (`stat` and `prometheus`).
 
 ## Push API
 

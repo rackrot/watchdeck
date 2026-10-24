@@ -27,7 +27,7 @@ use watchdeck_lib::cli::{self, Env};
 use watchdeck_lib::daemon::actions::Actions;
 use watchdeck_lib::daemon::config::{self, Configs};
 use watchdeck_lib::daemon::integrations::{self, FeedHandle, FeedSlots, Integrations};
-use watchdeck_lib::daemon::protocol::Feed;
+use watchdeck_lib::daemon::protocol::{Feed, NoteLevel};
 use watchdeck_lib::daemon::push::{self, Addrs, Bound, PushApi, MAX_CONNECTIONS};
 use watchdeck_lib::daemon::secrets::Secrets;
 use watchdeck_lib::daemon::tls::Identity;
@@ -928,6 +928,154 @@ async fn the_cli_exits_2_when_nothing_listens() {
         err.contains("nothing is listening") && !err.contains(TOKEN_HA),
         "{err}"
     );
+}
+
+// ---- the grafana kind ----
+
+// Grafana's webhook contact point payload, from its documentation; see the unit tests in
+// `integrations/grafana.rs`.
+const GRAFANA_FIRING: &str = include_str!("fixtures/grafana_firing.json");
+const GRAFANA_RESOLVED: &str = include_str!("fixtures/grafana_resolved.json");
+
+/// A `grafana` integration `graf` (the token `TOKEN_HA`) beside the push integration `b`.
+async fn start_grafana() -> Rig {
+    let text = format!(
+        "{}[[integration]]\nid = \"graf\"\nkind = \"grafana\"\nlabel = \"Grafana\"\n\
+         token_secret = \"push-ha\"\nlevels = {{ page = \"error\" }}\n",
+        config_text(false, &[("b", "Bee")])
+    );
+    start_with(&text, "127.0.0.1:0".parse().unwrap()).await
+}
+
+async fn grafana(addr: SocketAddr, body: &str) -> (u16, String) {
+    call(addr, TOKEN_HA, "POST", "/v1/grafana", body).await
+}
+
+#[tokio::test]
+async fn a_grafana_webhook_adds_notes_and_a_resolved_one_removes_them() {
+    let rig = start_grafana().await;
+    let addr = rig.loopback().await;
+    let (status, body) = grafana(addr, GRAFANA_FIRING).await;
+    assert_eq!(
+        (status, body.as_str()),
+        (201, r#"{"id":"graf/c6eadffa33fcdf37"}"#)
+    );
+    let feed = rig.feed();
+    let notes: Vec<(&str, NoteLevel, &str)> = (feed.notes.iter())
+        .map(|n| (n.id.as_str(), n.level, n.src.as_str()))
+        .collect();
+    // Newest first: the second alert was applied last.
+    assert_eq!(
+        notes,
+        [
+            ("graf/bc4e0e8cc3a6f2a1", NoteLevel::Warn, "Grafana"),
+            ("graf/c6eadffa33fcdf37", NoteLevel::Error, "Grafana"),
+        ]
+    );
+    // Grafana repeats a firing notification: the same fingerprints replace, not add.
+    assert_eq!(grafana(addr, GRAFANA_FIRING).await.0, 201);
+    assert_eq!(rig.feed().notes.len(), 2);
+
+    assert_eq!(grafana(addr, GRAFANA_RESOLVED).await, (204, String::new()));
+    assert!(rig.feed().notes.is_empty());
+    // A resolve for notes that are gone (dismissed, expired, a restart) is no error.
+    assert_eq!(grafana(addr, GRAFANA_RESOLVED).await.0, 204);
+    // PUT is the contact point's other method.
+    assert_eq!(
+        call(addr, TOKEN_HA, "PUT", "/v1/grafana", GRAFANA_FIRING)
+            .await
+            .0,
+        201
+    );
+}
+
+#[tokio::test]
+async fn a_grafana_payload_with_unknown_fields_parses_and_one_without_alerts_is_400() {
+    let rig = start_grafana().await;
+    let addr = rig.loopback().await;
+    let extra = r#"{"newInGrafana13":{"x":1},"alerts":[{"status":"firing","fingerprint":"f1","labels":{"alertname":"Disk","severity":"page"},"somethingNew":true}]}"#;
+    assert_eq!(grafana(addr, extra).await.0, 201);
+    let feed = rig.feed();
+    assert_eq!(
+        (feed.notes[0].title.as_str(), feed.notes[0].level),
+        ("Disk", NoteLevel::Error),
+        "the config's levels map `page`"
+    );
+    let (status, body) = grafana(addr, r#"{"status":"firing"}"#).await;
+    assert_eq!(status, 400);
+    assert!(body.contains("alerts"), "{body}");
+    assert_eq!(grafana(addr, "nope").await.0, 400);
+    assert_eq!(
+        grafana(addr, r#"{"alerts":[{"status":"weird"}]}"#).await.0,
+        400
+    );
+}
+
+#[tokio::test]
+async fn a_token_opens_only_its_kinds_routes() {
+    let rig = start_grafana().await;
+    let addr = rig.loopback().await;
+    let unauthorized = (401, UNAUTHORIZED.to_string());
+    // The grafana token on the notes route, and the push token on the grafana route.
+    assert_eq!(
+        post_note(addr, TOKEN_HA, r#"{"title":"t"}"#).await,
+        unauthorized
+    );
+    assert_eq!(
+        call(addr, TOKEN_B, "POST", "/v1/grafana", GRAFANA_FIRING).await,
+        unauthorized
+    );
+    assert!(rig.feed().notes.is_empty());
+}
+
+#[tokio::test]
+async fn the_grafana_route_takes_64_kb_while_notes_keep_8() {
+    let rig = start_grafana().await;
+    let addr = rig.loopback().await;
+    let padded = |len: usize| {
+        let frame = r#"{"alerts":[{"status":"firing","fingerprint":"big","annotations":{"description":""}}]}"#;
+        format!(
+            r#"{{"alerts":[{{"status":"firing","fingerprint":"big","annotations":{{"description":"{}"}}}}]}}"#,
+            "x".repeat(len - frame.len())
+        )
+    };
+    // Past the 8 KB of the other routes, and exactly at the receiver's own limit.
+    let mid = padded(20 * 1024);
+    assert_eq!(grafana(addr, &mid).await.0, 201);
+    let top = padded(64 * 1024);
+    assert_eq!(top.len(), 65536);
+    assert_eq!(grafana(addr, &top).await.0, 201);
+    let (status, body) = grafana(addr, &padded(64 * 1024 + 1)).await;
+    assert_eq!(status, 413, "{body}");
+    assert!(
+        body.contains("65536"),
+        "the reply names its own limit: {body}"
+    );
+    // The same integration's token still has no more than 8 KB elsewhere.
+    let over = format!(r#"{{"title":"t","body":"{}"}}"#, "x".repeat(9000));
+    assert_eq!(post_note(addr, TOKEN_B, &over).await.0, 413);
+}
+
+#[tokio::test]
+async fn a_grafana_flood_keeps_its_own_quota_and_leaves_other_sources_notes() {
+    let rig = start_grafana().await;
+    let addr = rig.loopback().await;
+    assert_eq!(
+        post_note(addr, TOKEN_B, r#"{"title":"Mine","id":"keep"}"#)
+            .await
+            .0,
+        201
+    );
+    let alerts: Vec<String> = (0..30)
+        .map(|i| format!(r#"{{"status":"firing","fingerprint":"a{i}"}}"#))
+        .collect();
+    let (status, _) = grafana(addr, &format!(r#"{{"alerts":[{}]}}"#, alerts.join(","))).await;
+    assert_eq!(status, 201);
+    let feed = rig.feed();
+    let ids: Vec<&str> = feed.notes.iter().map(|n| n.id.as_str()).collect();
+    assert!(ids.contains(&"b/keep"), "{ids:?}");
+    assert!(ids.contains(&"graf/a29"), "the newest stays: {ids:?}");
+    assert!(!ids.contains(&"graf/a0"), "the oldest went: {ids:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

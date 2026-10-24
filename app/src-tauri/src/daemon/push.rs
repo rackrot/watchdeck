@@ -37,7 +37,7 @@ use tokio::time::{sleep, timeout, timeout_at, Instant};
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 
-use super::config::{hashed_stamp, HashedStamp, IntegrationConfig, Live, MIN_TOKEN_BYTES};
+use super::config::{hashed_stamp, HashedStamp, Live, MIN_TOKEN_BYTES};
 use super::feed::Applied;
 use super::integrations::{FeedHandle, PushRequest};
 use super::protocol::{encode_hex, TOKEN_BYTES};
@@ -46,7 +46,8 @@ use super::tiles::Task;
 
 pub const LOOPBACK_PORT: u16 = 47822;
 pub const LAN_PORT: u16 = 47823;
-/// The largest body read. One byte more is a 413.
+/// The largest body read, unless the integration's receiver sets its own cap (`Receiver::
+/// max_body_bytes`). One byte more is a 413.
 pub const MAX_BODY_BYTES: usize = 8 * 1024;
 /// From the TCP accept to the end of the headers, the TLS handshake included.
 pub const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -168,15 +169,10 @@ fn wanted(live: &Live) -> (bool, bool) {
     (any, any && lan)
 }
 
-/// Each push integration's id and the name of its token's secret.
+/// Each integration that gets requests: its id and the name of its token's secret.
 fn pushes(live: &Live) -> Vec<(String, String)> {
     (live.integrations.iter())
-        .filter_map(|i| match i {
-            IntegrationConfig::Push {
-                id, token_secret, ..
-            } => Some((id.clone(), token_secret.clone())),
-            IntegrationConfig::Stat { .. } => None,
-        })
+        .filter_map(|i| Some((i.id().to_string(), i.token_secret()?.to_string())))
         .collect()
 }
 
@@ -585,17 +581,16 @@ impl Gate {
             );
         };
         let method = req.method().as_str().to_string();
-        if req.body().size_hint().lower() > MAX_BODY_BYTES as u64 {
-            return too_large();
+        let limit = self.feed.body_limit(integration);
+        if req.body().size_hint().lower() > limit as u64 {
+            return too_large(limit);
         }
-        let body = match timeout(
-            BODY_TIMEOUT,
-            Limited::new(req.into_body(), MAX_BODY_BYTES).collect(),
-        )
-        .await
+        let body = match timeout(BODY_TIMEOUT, Limited::new(req.into_body(), limit).collect()).await
         {
             Ok(Ok(body)) => body.to_bytes(),
-            Ok(Err(e)) if e.downcast_ref::<LengthLimitError>().is_some() => return too_large(),
+            Ok(Err(e)) if e.downcast_ref::<LengthLimitError>().is_some() => {
+                return too_large(limit)
+            }
             Ok(Err(_)) => return error(StatusCode::BAD_REQUEST, "the body could not be read"),
             Err(_) => return error(StatusCode::REQUEST_TIMEOUT, "the body took too long"),
         };
@@ -715,10 +710,10 @@ fn unauthorized() -> Response<Full<Bytes>> {
     with_body(StatusCode::UNAUTHORIZED, UNAUTHORIZED.into())
 }
 
-fn too_large() -> Response<Full<Bytes>> {
+fn too_large(limit: usize) -> Response<Full<Bytes>> {
     error(
         StatusCode::PAYLOAD_TOO_LARGE,
-        &format!("the body is over {MAX_BODY_BYTES} bytes"),
+        &format!("the body is over {limit} bytes"),
     )
 }
 

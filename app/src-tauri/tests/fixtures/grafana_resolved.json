@@ -1,0 +1,69 @@
+{
+  "receiver": "watchdeck",
+  "status": "resolved",
+  "orgId": 1,
+  "alerts": [
+    {
+      "status": "resolved",
+      "labels": {
+        "alertname": "High memory usage",
+        "severity": "critical",
+        "team": "blue",
+        "zone": "us-1"
+      },
+      "annotations": {
+        "description": "The system has high memory usage",
+        "runbook_url": "https://myrunbook.com/runbook/1234",
+        "summary": "This alert was triggered for zone us-1"
+      },
+      "startsAt": "2021-10-12T09:51:03.157076+02:00",
+      "endsAt": "2021-10-12T10:21:03.157076+02:00",
+      "generatorURL": "https://play.grafana.org/alerting/grafana/qKVQR_f7z/view",
+      "fingerprint": "c6eadffa33fcdf37",
+      "silenceURL": "https://play.grafana.org/alerting/silence/new?alertmanager=grafana&matchers=alertname%3DT2%2Cteam%3Dblue%2Czone%3Dus-1",
+      "dashboardURL": "",
+      "panelURL": "",
+      "values": {
+        "B": 12.1,
+        "C": 0
+      }
+    },
+    {
+      "status": "resolved",
+      "labels": {
+        "alertname": "High CPU usage",
+        "severity": "warning",
+        "team": "blue",
+        "zone": "eu-1"
+      },
+      "annotations": {
+        "description": "The system has high CPU usage",
+        "runbook_url": "https://myrunbook.com/runbook/1234",
+        "summary": "This alert was triggered for zone eu-1"
+      },
+      "startsAt": "2021-10-12T09:56:03.157076+02:00",
+      "endsAt": "2021-10-12T10:21:03.157076+02:00",
+      "generatorURL": "https://play.grafana.org/alerting/grafana/cKVQR_f7z/view",
+      "fingerprint": "bc4e0e8cc3a6f2a1",
+      "silenceURL": "https://play.grafana.org/alerting/silence/new?alertmanager=grafana&matchers=alertname%3DT1%2Cteam%3Dblue%2Czone%3Deu-1",
+      "dashboardURL": "",
+      "panelURL": "",
+      "values": {
+        "B": 20.3,
+        "C": 0
+      }
+    }
+  ],
+  "groupLabels": {},
+  "commonLabels": {
+    "team": "blue"
+  },
+  "commonAnnotations": {},
+  "externalURL": "https://play.grafana.org/",
+  "version": "1",
+  "groupKey": "{}:{}",
+  "truncatedAlerts": 0,
+  "title": "[RESOLVED]  ",
+  "state": "ok",
+  "message": "**Resolved**\n\nLabels:\n - alertname = High memory usage\n - team = blue\n - zone = us-1\n"
+}
