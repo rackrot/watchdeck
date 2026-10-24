@@ -13,6 +13,7 @@
 #include "logcap.h"
 #include "model.h"
 #include "sdcard.h"
+#include "svc.h"
 #include "touch.h"
 #include "ui.h"
 #include "usb.h"
@@ -82,12 +83,24 @@ void app_main(void)
     }
     ui_set_touch_text(err == ESP_OK ? "Touch: ready" : "Touch: FAILED");
 
-    err = wifi_start(ui_set_wifi_text);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "wifi_start: %s", esp_err_to_name(err));
+    // svc runs the Wi-Fi scan, trial and RSSI jobs. A second start (another slice's) is harmless.
+    err = svc_start();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "svc_start: %s", esp_err_to_name(err));
     }
 
-    // The link waits for an IP itself, so it starts even if wifi_start failed. It needs the model, which the UI reads.
+    // Wi-Fi comes up with or without credentials, so Settings > Wi-Fi can scan and join from a board that has none.
+    err = wifi_init(ui_set_wifi_text);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "wifi_init: %s", esp_err_to_name(err));
+    } else {
+        err = wifi_apply_saved();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "wifi_apply_saved: %s", esp_err_to_name(err));
+        }
+    }
+
+    // The link waits for an IP itself, so it starts even if Wi-Fi failed. It needs the model, which the UI reads.
     const link_cbs_t link_cbs = {
         .on_status = ui_set_daemon_text,
         .on_welcome = ui_set_daemon_name,
@@ -111,7 +124,7 @@ void app_main(void)
         ESP_LOGE(TAG, "link_start: %s", esp_err_to_name(err));
     }
 
-    // wifi_start releases the filesystem after reading wifi.txt, even when it fails.
+    // wifi_apply_saved releases the filesystem after reading wifi.txt, even when it fails.
     err = usb_msc_start(ui_set_usb_text);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "usb_msc_start: %s", esp_err_to_name(err));

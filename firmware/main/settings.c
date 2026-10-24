@@ -9,11 +9,12 @@
 #include "display.h"
 #include "esp_log.h"
 #include "link.h"
+#include "wifi.h"
 
 #define SETTINGS_IDLE_MS 60000 // settings closes after this long without a touch
 #define SETTINGS_REFRESH_MS 1000
 #define TAB_GAP 8
-#define TAB_W 156                // five tabs, Close and the gaps fill the 1024 px row (T2 to T4 add the other four)
+#define TAB_W 156                // five tabs, Close and the gaps fill the 1024 px row (T4 adds the last)
 #define TAB_H SETTINGS_TAB_ROW_H // the buttons fill the row, about 14 mm
 #define CLOSE_W 160
 
@@ -106,8 +107,8 @@ static void page_gesture(lv_event_t *e)
     }
 }
 
-// Whether something on the page is being read or typed into without touches, so the idle close waits. The license
-// viewer today; T3's keyboard adds itself here.
+// Whether something on the page is being read or typed into without touches, so the idle close waits: the license
+// viewer, and the Wi-Fi editor, which holds a half-typed password and may wait on a trial connect.
 static bool idle_blocked(void)
 {
     return ui_licenses_open();
@@ -274,7 +275,7 @@ void settings_build(ui_mode_t from)
 
     tab_show(s_last_tab);
     s_timer = lv_timer_create(page_tick, SETTINGS_REFRESH_MS, NULL);
-    link_watch_rssi(true);
+    wifi_watch_rssi(true);
 }
 
 void settings_delete(void)
@@ -290,7 +291,7 @@ void settings_delete(void)
     lv_obj_delete(s_page);
     s_page = s_title = s_content = NULL;
     memset(s_tab_btns, 0, sizeof(s_tab_btns));
-    link_watch_rssi(false);
+    wifi_watch_rssi(false);
 }
 
 bool settings_is_open(void)

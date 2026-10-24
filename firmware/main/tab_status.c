@@ -13,7 +13,7 @@
 #include "settings.h"
 #include "wifi.h"
 
-#define RSSI_FRESH_MS 15000 // an older RSSI shows as "--": the link refreshes it every 5 s while settings is open
+#define RSSI_FRESH_MS 15000 // an older RSSI shows as "--": svc refreshes it every 5 s while settings is open
 #define LINE 31             // a row: Montserrat 24's 27 px line and 4 px
 // The columns hold 976 px between the pads. The left one's widest row is "PSRAM 32768 KiB free, min 32768" (410 px) and
 // the right one's "connected 192.168.100.200 (watchdeck.local)" (537 px), so 412 and 564 leave a pixel or two. Rows
@@ -103,7 +103,10 @@ void tab_status_tick(void)
     // wifi.c's texts carry no prefix, unlike the SD, USB and Touch ones. A "Wi-Fi: " one would not fit the column
     // beside an IP and the host name, and the texts name Wi-Fi themselves ("connected 192.168.0.5 (watchdeck.local)").
     set_row(ROW_WIFI, ui_status_text(STATUS_WIFI));
-    snprintf(text, sizeof(text), "SSID %s", wifi_ssid()[0] ? wifi_ssid() : "--");
+    char ssid[WIFI_SSID_LEN], ssid_text[WIFI_SSID_LEN];
+    wifi_current_ssid(ssid);
+    wifiscan_printable(ssid_text, sizeof(ssid_text), ssid); // a scanned name can hold bytes the font lacks
+    snprintf(text, sizeof(text), "SSID %s", ssid_text[0] ? ssid_text : "--");
     set_row(ROW_SSID, text);
     int dbm;
     uint32_t age_ms;
