@@ -4,6 +4,7 @@ include(${CMAKE_CURRENT_LIST_DIR}/font_licenses.cmake) # WD_FONT_LICENSES_TXT, f
 
 idf_component_register(SRCS "main.c" "display.c" "touch.c" "ui.c" "settings.c" "tab_status.c" "tab_logs.c" "tab_errors.c" "sleep.c" "sleepcfg.c" "uimode.c" "feedpage.c" "feedfmt.c" "grid.c" "proto.c" "pageset.c" "hoststat.c" "model.c" "icons.c" "pairing.c" "link.c" "sdcard.c" "wifi.c"
                             "usb.c" "crash.c" "logring.c" "logcap.c" "diag.c" "font_ids.c" "fonts.c" "font_licenses.c" ${WD_FONT_SRCS}
+                            "logo_img.c"
                        INCLUDE_DIRS "."
                        EMBED_TXTFILES ${WD_FONT_LICENSES_TXT}
                        PRIV_REQUIRES esp_lcd esp_hw_support esp_driver_gpio fatfs sdmmc

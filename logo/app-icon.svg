@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- watchdeck app icon: the mark (mark.svg) scaled to 90% and centered on a rounded square in the app's bg-0 color. -->
+  <rect width="1024" height="1024" rx="224" fill="#0a0d11"/>
+  <g transform="translate(51.2 51.2) scale(0.9)">
+    <defs>
+      <mask id="wd-a-keys" maskUnits="userSpaceOnUse" x="0" y="0" width="1024" height="1024">
+        <rect x="102" y="217" width="820" height="570" rx="112" fill="#fff"/>
+        <rect x="172" y="287" width="180" height="180" rx="42" fill="#000"/>
+        <rect x="422" y="287" width="180" height="180" rx="42" fill="#000"/>
+        <rect x="172" y="537" width="180" height="180" rx="42" fill="#000"/>
+        <rect x="422" y="537" width="180" height="180" rx="42" fill="#000"/>
+        <rect x="672" y="537" width="180" height="180" rx="42" fill="#000"/>
+      </mask>
+    </defs>
+    <rect x="102" y="217" width="820" height="570" rx="112" fill="#e7edf3" mask="url(#wd-a-keys)"/>
+    <rect x="672" y="287" width="180" height="180" rx="42" fill="#38bdf8"/>
+  </g>
+</svg>
