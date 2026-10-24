@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "display.h"
 #include "esp_log.h"
 #include "feedfmt.h"
 #include "grid.h"
@@ -21,8 +22,12 @@
 #define ROW_H (FEED_NOTE_H - 4) // the pitch less a 4 px gap
 #define EDGE_W 8                // a row's colored edge, by level
 #define ROW_PAD 12              // text inset in a card or row
-#define TITLE_W 640
-#define META_W 300 // source and age, right-aligned
+// A row's right side is two labels, so a long source is dotted and the age never is. Montserrat 20 digits are about
+// 11 px: "999 d" fits AGE_W, and a 23 character source is cut to the dots at SRC_W if it needs more.
+#define AGE_W 72
+#define SRC_W 270
+#define META_GAP 8
+#define TITLE_W (ROW_W - EDGE_W - 2 * ROW_PAD - SRC_W - META_GAP - AGE_W - META_GAP)
 #define MODAL_W 800
 #define MODAL_BTN_W 200
 #define MODAL_BTN_H 72
@@ -45,18 +50,23 @@ static lv_style_t st_empty;      // 32 pt, centered: "Nothing here yet"
 // since a snapshot may have come after the row was drawn.
 static struct {
     char id[PROTO_FEED_ID_MAX];
-    char src[PROTO_FEED_SRC_MAX];
     uint64_t at;
-    lv_obj_t *meta;
-    char
-        shown[PROTO_FEED_SRC_MAX + FEED_AGE_MAX + 4]; // what the meta label holds, the source of truth for ui_set_label
+    lv_obj_t *age;
+    char shown[FEED_AGE_MAX]; // what the age label holds, the source of truth for ui_set_label
 } s_rows[PROTO_FEED_NOTES_MAX];
 static size_t s_n_rows;
 
+_Static_assert(FEED_AREA_H == DISPLAY_V_RES - GRID_TOP, "the feed page fills the screen under the bar");
+
 static bool s_online;
-static lv_obj_t *s_modal;   // the note modal on the top layer, NULL while closed
-static lv_obj_t *s_dismiss; // its Dismiss button
+static lv_obj_t *s_modal;       // the note modal on the top layer, NULL while closed
+static lv_obj_t *s_dismiss;     // its Dismiss button
+static lv_obj_t *s_dismiss_lbl; // and the button's label
+static lv_obj_t *s_modal_meta;  // the source and age line
 static char s_modal_id[PROTO_FEED_ID_MAX];
+static char s_modal_src[PROTO_FEED_SRC_MAX];
+static uint64_t s_modal_at;
+static char s_modal_meta_shown[PROTO_FEED_SRC_MAX + FEED_AGE_MAX + 4];
 
 static const lv_palette_t LEVEL_PALETTE[] = {LV_PALETTE_BLUE, LV_PALETTE_GREEN, LV_PALETTE_AMBER, LV_PALETTE_RED};
 
@@ -172,7 +182,7 @@ static void close_modal(void)
 {
     if (s_modal) {
         lv_obj_delete_async(s_modal); // from an event of its own widgets, so not now
-        s_modal = s_dismiss = NULL;
+        s_modal = s_dismiss = s_dismiss_lbl = s_modal_meta = NULL;
     }
 }
 
@@ -188,10 +198,12 @@ static void modal_dismiss_clicked(lv_event_t *e)
     if (!s_online) {
         return;
     }
-    ESP_LOGI(TAG, "dismiss %s", s_modal_id);
     if (link_feed_dismiss(s_modal_id) != ESP_OK) {
         ESP_LOGW(TAG, "dismiss %s not queued", s_modal_id);
+        lv_label_set_text(s_dismiss_lbl, "Couldn't send"); // the modal stays, so the person sees it and may retry
+        return;
     }
+    ESP_LOGI(TAG, "dismiss %s", s_modal_id);
     close_modal();
 }
 
@@ -219,6 +231,7 @@ static void modal_button(lv_obj_t *row, const char *text, lv_color_t bg, lv_even
     lv_obj_center(label);
     if (cb == modal_dismiss_clicked) {
         s_dismiss = btn;
+        s_dismiss_lbl = label;
         lv_obj_set_state(btn, LV_STATE_DISABLED, !s_online);
     }
 }
@@ -228,6 +241,8 @@ static void open_note(const proto_feed_note_t *n, bool have_clock, uint64_t now)
 {
     close_modal();
     strlcpy(s_modal_id, n->id, sizeof(s_modal_id));
+    strlcpy(s_modal_src, n->src, sizeof(s_modal_src));
+    s_modal_at = n->at;
 
     s_modal = lv_obj_create(lv_layer_top());
     lv_obj_remove_style_all(s_modal);
@@ -251,10 +266,10 @@ static void open_note(const proto_feed_note_t *n, bool have_clock, uint64_t now)
 
     modal_label(card, &lv_font_montserrat_32, lv_palette_lighten(LEVEL_PALETTE[n->level], 2), n->title);
     char age[FEED_AGE_MAX];
-    char meta[PROTO_FEED_SRC_MAX + FEED_AGE_MAX + 4];
     feedfmt_age(age, n->at, now, have_clock);
-    meta_text(meta, sizeof(meta), n->src, age);
-    modal_label(card, &lv_font_montserrat_20, lv_palette_lighten(LV_PALETTE_GREY, 1), meta);
+    meta_text(s_modal_meta_shown, sizeof(s_modal_meta_shown), n->src, age);
+    s_modal_meta =
+        modal_label(card, &lv_font_montserrat_20, lv_palette_lighten(LV_PALETTE_GREY, 1), s_modal_meta_shown);
     if (n->body[0]) {
         modal_label(card, &lv_font_montserrat_24, lv_color_white(), n->body);
     }
@@ -319,13 +334,12 @@ static void add_note(lv_obj_t *page, size_t i, int y, const proto_feed_note_t *n
               (ROW_H - lv_font_get_line_height(&lv_font_montserrat_24)) / 2, TITLE_W, n->title);
 
     strlcpy(s_rows[i].id, n->id, sizeof(s_rows[i].id));
-    strlcpy(s_rows[i].src, n->src, sizeof(s_rows[i].src));
     s_rows[i].at = n->at;
-    char age[FEED_AGE_MAX];
-    feedfmt_age(age, n->at, now, have_clock);
-    meta_text(s_rows[i].shown, sizeof(s_rows[i].shown), n->src, age);
-    s_rows[i].meta = new_label(row, &st_meta, &lv_font_montserrat_20, ROW_W - EDGE_W - ROW_PAD - META_W,
-                               (ROW_H - lv_font_get_line_height(&lv_font_montserrat_20)) / 2, META_W, s_rows[i].shown);
+    feedfmt_age(s_rows[i].shown, n->at, now, have_clock);
+    const int meta_y = (ROW_H - lv_font_get_line_height(&lv_font_montserrat_20)) / 2;
+    const int age_x = ROW_W - EDGE_W - ROW_PAD - AGE_W;
+    new_label(row, &st_meta, &lv_font_montserrat_20, age_x - META_GAP - SRC_W, meta_y, SRC_W, n->src);
+    s_rows[i].age = new_label(row, &st_meta, &lv_font_montserrat_20, age_x, meta_y, AGE_W, s_rows[i].shown);
 }
 
 void feedpage_fill(lv_obj_t *page, const proto_feed_t *feed, bool have_clock, uint64_t now)
@@ -374,12 +388,16 @@ void feedpage_fill(lv_obj_t *page, const proto_feed_t *feed, bool have_clock, ui
 
 void feedpage_tick(bool have_clock, uint64_t now)
 {
+    char age[FEED_AGE_MAX];
     for (size_t i = 0; i < s_n_rows; i++) {
-        char age[FEED_AGE_MAX];
-        char text[sizeof(s_rows[i].shown)];
         feedfmt_age(age, s_rows[i].at, now, have_clock);
-        meta_text(text, sizeof(text), s_rows[i].src, age);
-        ui_set_label(s_rows[i].meta, s_rows[i].shown, sizeof(s_rows[i].shown), text);
+        ui_set_label(s_rows[i].age, s_rows[i].shown, sizeof(s_rows[i].shown), age);
+    }
+    if (s_modal_meta) {
+        char text[sizeof(s_modal_meta_shown)];
+        feedfmt_age(age, s_modal_at, now, have_clock);
+        meta_text(text, sizeof(text), s_modal_src, age);
+        ui_set_label(s_modal_meta, s_modal_meta_shown, sizeof(s_modal_meta_shown), text);
     }
 }
 

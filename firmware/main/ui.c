@@ -1360,25 +1360,59 @@ void ui_set_stats(const proto_stats_t *stats)
     lvgl_port_unlock();
 }
 
+static void feed_retry(lv_timer_t *timer);
+static lv_timer_t *s_feed_retry; // waits for the finger to lift before a snapshot rebuilds the page
+
+static bool touch_down(void)
+{
+    lv_indev_t *indev = lv_indev_get_next(NULL);
+    return indev && lv_indev_get_state(indev) == LV_INDEV_STATE_PRESSED;
+}
+
+// Under the LVGL lock. Shows the model's latest snapshot on the feed page, if it is up and the finger is off the
+// screen. A rebuild under a finger would delete the row being pressed and lose the tap or the swipe, so it waits for
+// release.
+static void feed_apply(void)
+{
+    // Only grid mode has widgets to change; any other mode builds from the model when it ends.
+    if (uimode_action(UIM_FEED, s_mode) != UI_BUILD || !s_on_feed || !s_grid) {
+        return;
+    }
+    if (touch_down()) {
+        if (!s_feed_retry) {
+            s_feed_retry = lv_timer_create(feed_retry, 50, NULL);
+        }
+        return;
+    }
+    model_lock();
+    const proto_feed_t *feed = model_feed();
+    if (feed && feed->sources > 0) {
+        uint64_t now = 0;
+        const bool have_clock = ui_clock_now(&now);
+        feedpage_fill(s_grid, feed, have_clock, now);
+    } else {
+        build_page(); // the daemon has no integration any more: back to the grid
+    }
+    model_unlock();
+}
+
+static void feed_retry(lv_timer_t *timer)
+{
+    if (touch_down()) {
+        return;
+    }
+    lv_timer_delete(timer);
+    s_feed_retry = NULL;
+    feed_apply();
+}
+
 void ui_set_feed(void)
 {
     if (!s_ready) {
         return;
     }
     lvgl_port_lock(0);
-    // Only grid mode has widgets to change; any other mode builds from the model when it ends.
-    if (uimode_action(UIM_FEED, s_mode) == UI_BUILD && s_on_feed && s_grid) {
-        model_lock();
-        const proto_feed_t *feed = model_feed();
-        if (feed && feed->sources > 0) {
-            uint64_t now = 0;
-            const bool have_clock = ui_clock_now(&now);
-            feedpage_fill(s_grid, feed, have_clock, now);
-        } else {
-            build_page(); // the daemon has no integration any more: back to the grid
-        }
-        model_unlock();
-    }
+    feed_apply();
     lvgl_port_unlock();
 }
 
@@ -1419,14 +1453,19 @@ void ui_show_set(void)
     const uint8_t pages = model_pages();
     const proto_layout_t *page = model_page(shown);
     const unsigned cols = page->cols, rows = page->rows, buttons = page->n_buttons;
+    const bool feed_built = !deferred && s_on_feed; // build_page kept the -1 page up instead of the grid
     model_unlock();
     lvgl_port_unlock();
     ESP_LOGI(TAG, "layout rev %u: %u page%s applied, showing page %u (%ux%u, %u buttons)%s", (unsigned)rev, pages,
              pages == 1 ? "" : "s", shown + 1, cols, rows, buttons,
-             in_settings ? ", built when settings closes"
-             : asleep    ? ", built when the screen wakes"
-                         : "");
-    ui_log_heap(in_settings ? "set applied under settings" : asleep ? "set applied asleep" : "page built");
+             in_settings  ? ", built when settings closes"
+             : asleep     ? ", built when the screen wakes"
+             : feed_built ? ", feed page built in its place"
+                          : "");
+    ui_log_heap(in_settings  ? "set applied under settings"
+                : asleep     ? "set applied asleep"
+                : feed_built ? "feed built"
+                             : "page built");
     if (!s_heap_logged) {
         s_heap_logged = true;
         ESP_LOGI(TAG, "first layout applied, min free internal heap %u bytes",

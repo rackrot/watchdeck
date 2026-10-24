@@ -1033,6 +1033,15 @@ void test_stats_color_for_a_gpu_with_no_gpu_field_is_accepted_and_kept(void)
     TEST_ASSERT_EQUAL_UINT8(1u << PROTO_COLOR_GPU, msg.stats.colors_mask);
 }
 
+// The caps link.c sends today. When it gains "sleep", the five-cap test below is the one to match.
+void test_hello_with_the_four_real_caps_and_a_32_character_fw_is_226_bytes(void)
+{
+    char buf[256];
+    const char *const caps[] = {"fonts", "pages", "status_bar", "feed"};
+    size_t len = proto_build_hello(buf, sizeof(buf), "wd-e8f60ae276ab", TOKEN, run_of('v', 32), 1024, 600, caps, 4);
+    TEST_ASSERT_EQUAL_size_t(226, len);
+}
+
 void test_hello_with_five_caps_and_a_32_character_fw_is_234_bytes(void)
 {
     char buf[256];
@@ -1512,6 +1521,7 @@ void app_main(void)
     RUN_TEST(test_stats_colors_as_an_object_of_whole_rgb_values);
     RUN_TEST(test_stats_colors_that_are_not_an_object_or_not_whole_rgb_are_refused);
     RUN_TEST(test_stats_color_for_a_gpu_with_no_gpu_field_is_accepted_and_kept);
+    RUN_TEST(test_hello_with_the_four_real_caps_and_a_32_character_fw_is_226_bytes);
     RUN_TEST(test_hello_with_five_caps_and_a_32_character_fw_is_234_bytes);
     RUN_TEST(test_sleep_fixture_has_every_field);
     RUN_TEST(test_sleep_minimal_fixture_has_no_image_or_text);

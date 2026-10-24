@@ -744,7 +744,7 @@ static void send_hello(void)
     // Only names this build fully supports: "fonts" means ui.c draws every font id in font_list.h, and "pages" that
     // pageset.c assembles sets of up to PROTO_MAX_PAGES and ui.c lays out the paged grid, and "status_bar" that ui.c
     // reads `stats` frames, and "feed" that ui.c shows the -1 page from `feed` frames and dismisses with feed_dismiss.
-    // The hello must stay under 256 bytes: test_proto.c pins it with the full list.
+    // The hello must stay under 256 bytes: test_proto.c pins its size for this list, and for the list with "sleep".
     static const char *const caps[] = {"fonts", "pages", "status_bar", "feed"};
     char buf[256];
     size_t len = proto_build_hello(buf, sizeof(buf), device, s.pairing->token, esp_app_get_description()->version,
@@ -1350,10 +1350,12 @@ static void handle_event(link_ev_t *ev)
         break;
     case EV_FEED_DISMISS:
         if (s.state == ST_UP && s.welcomed) {
-            char buf[PROTO_ID_MAX + 32];
+            char buf[2 * PROTO_ID_MAX + 32]; // an id of 63 characters may all be escaped
             size_t len = proto_build_feed_dismiss(buf, sizeof(buf), ev->press.btn);
             if (len > 0) {
                 send_text(buf, len, NULL);
+            } else {
+                ESP_LOGW(TAG, "feed dismiss for %s not built, dropped", ev->press.btn);
             }
         } else {
             ESP_LOGW(TAG, "link down, feed dismiss dropped");
@@ -1540,7 +1542,11 @@ esp_err_t link_feed_dismiss(const char *id)
     link_ev_t ev = {.type = EV_FEED_DISMISS};
     ESP_RETURN_ON_FALSE(strlen(id) < sizeof(ev.press.btn), ESP_ERR_INVALID_ARG, TAG, "id too long");
     strcpy(ev.press.btn, id);
-    return post(&ev) ? ESP_OK : ESP_ERR_NO_MEM;
+    if (!post(&ev)) {
+        ESP_LOGW(TAG, "feed dismiss for %s not queued", id);
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
 }
 
 esp_err_t link_pair(const link_daemon_t *daemon)
