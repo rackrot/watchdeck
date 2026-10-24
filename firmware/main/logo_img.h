@@ -3,5 +3,5 @@
 
 #include "lvgl.h"
 
-/* The mark, 240 px square, as A4: alpha only, so an image style recolor paints it. */
+/* The mark, 240 px square, as I4: a 16-entry palette of the panel and the key, clear outside. */
 extern const lv_image_dsc_t wd_logo;

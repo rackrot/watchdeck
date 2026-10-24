@@ -103,8 +103,9 @@ run = [
   "node fonts/generate.mjs --check",
 ]
 
-# Renders logo/ into the app icon images (tauri icon also writes icns and ico) and the text outputs
-# that `logo:check` compares. The icon images are not diffed, only regenerated when logo/ changes.
+# Renders logo/ into the app icon images (tauri icon also writes icns and ico, then the generator
+# prunes what the bundle doesn't list) and the text outputs that `logo:check` compares. The icon
+# images are not diffed, only regenerated when logo/ changes.
 [tasks."logo:gen"]
 description = "Regenerate the logo outputs from logo/ (app icons, device bitmap, app copies)"
 dir = "app"
