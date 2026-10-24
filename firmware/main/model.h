@@ -70,5 +70,6 @@ void model_set_feed(const proto_feed_t *feed);
 /** The latest feed snapshot, or NULL before the first one and after an unpair. Valid until the lock is released. */
 const proto_feed_t *model_feed(void);
 
-/** Forget the applied set, the page shown, the tile values, the feed and every cached icon. Needs the LVGL lock first too. */
+/** Forget the applied set, the page shown, the tile values, the feed and every cached icon. Needs the LVGL lock first
+ * too. */
 void model_clear(void);

@@ -81,7 +81,7 @@ typedef enum {
     EV_WS_BAD_CERT, // the daemon's cert is not the pinned one
     EV_PRESS,
     EV_FEED_DISMISS, // a note id in press.btn
-    EV_PAIR,        // the user picked a daemon to pair with
+    EV_PAIR,         // the user picked a daemon to pair with
     EV_PAIR_CANCEL,  // the user abandoned the attempt, or said No to its question
     EV_PAIR_CONFIRM, // the user said Yes, the desktop shows the pairing
     EV_FORGET,       // the user asked to forget the pairing

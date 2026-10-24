@@ -13,18 +13,10 @@
 #include "lvgl.h"
 
 /*
- * The screen mode. Status mode runs from boot until the first set applies, and again after every unpair. Grid mode
- * runs from the first set until an unpair. Settings replaces the grid (or status mode's lines) while open and goes
- * back to the mode it came from.
- *
- * Hooks: P1 adds MODE_SLEEP here and in ui.c's mode switch. The feed page adds no mode: it is a sub-state of MODE_GRID
- * (s_on_feed in ui.c), shown in the grid's place by build_page.
+ * The screen modes are in uimode.h, with the table of what each entry point does in each. The feed page adds no mode:
+ * it is a sub-state of MODE_GRID (s_on_feed in ui.c), shown in the grid's place by build_page.
  */
-typedef enum {
-    MODE_STATUS,
-    MODE_GRID,
-    MODE_SETTINGS,
-} ui_mode_t;
+#include "uimode.h"
 
 /** The five status lines, kept for status mode and for settings. */
 typedef enum {
@@ -49,6 +41,15 @@ const char *ui_status_text(status_t i);
 /** The daemon's host name from the last welcome, "" until then and after an unpair. */
 const char *ui_daemon_name(void);
 
+/** Whether the link is up (a session is open and a set has applied since it opened). */
+bool ui_online(void);
+
+/**
+ * The host's local time now as `clock` "14:32" and `date` "Wed 22 Oct", from the last `stats` frame. False when no
+ * frame has come since this boot or the unpair: the time is then unknown.
+ */
+bool ui_local_clock(char *clock, size_t clock_size, char *date, size_t date_size);
+
 /** Put `text` on `label` unless `cache` already holds it. A LONG_DOT label edits its own text, so the cache is the
  * source. */
 void ui_set_label(lv_obj_t *label, char *cache, size_t cache_size, const char *text);
@@ -71,7 +72,8 @@ bool ui_licenses_open(void);
 void ui_touch_track(lv_event_t *e);
 bool ui_drag_consumed(const char *what);
 
-/** The host's clock in Unix seconds, run on from the latest `stats` frame. Returns false, and leaves `now`, before the first. */
+/** The host's clock in Unix seconds, run on from the latest `stats` frame. Returns false, and leaves `now`, before the
+ * first. */
 bool ui_clock_now(uint64_t *now);
 
 /** Close settings and rebuild the mode it came from. Asks through lv_async_call, so it is safe in any widget's event.

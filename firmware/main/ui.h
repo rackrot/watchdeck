@@ -10,7 +10,10 @@
  * status lines, Licenses, Settings (except during a pairing attempt), Forget pairing while paired, and the pairing
  * views while unpaired. Grid mode, from the first set until an unpair, shows the status bar and the grid. A long swipe
  * up on the grid, or Settings in status mode, opens settings, which replaces the grid or the status lines until it
- * closes. Its tabs (settings.c) show the status texts, device info, Licenses and Forget pairing.
+ * closes. Its tabs (settings.c) show the status texts, device info, Licenses and Forget pairing. The sleep screen
+ * (sleep.c) replaces the grid or status mode too: after offline_after_s with the link down and no touch, or at once on
+ * a long swipe down. A touch wakes it and presses nothing. What each entry point below does in each mode is the table
+ * in uimode.c.
  */
 
 /** Build status mode, the toast and the result modal on `disp`. The grid comes from the daemon. */
@@ -52,9 +55,9 @@ void ui_icons_settled(void);
 void ui_set_stats(const proto_stats_t *stats);
 
 /**
- * A `feed` snapshot is in the model. With the -1 page on screen, rebuild its cards and notes from it, or go back to page
- * 1 if the daemon no longer has an integration. Otherwise nothing is on screen to change: a right swipe on page 1 reads
- * the model when it shows the page. Thread-safe, but not under the model lock.
+ * A `feed` snapshot is in the model. With the -1 page on screen, rebuild its cards and notes from it, or go back to
+ * page 1 if the daemon no longer has an integration. Otherwise nothing is on screen to change: a right swipe on page 1
+ * reads the model when it shows the page. Thread-safe, but not under the model lock.
  */
 void ui_set_feed(void);
 

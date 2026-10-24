@@ -1,6 +1,6 @@
-// The -1 page: see feedpage.h. The cards and rows share a few static styles, made when the page is filled and reset when
-// it goes, so the page holds no style memory while it is not up. Text from the feed is never markup: every label here
-// has recolor off, and a "#" shows as a "#".
+// The -1 page: see feedpage.h. The cards and rows share a few static styles, made when the page is filled and reset
+// when it goes, so the page holds no style memory while it is not up. Text from the feed is never markup: every label
+// here has recolor off, and a "#" shows as a "#".
 
 #include "feedpage.h"
 
@@ -22,7 +22,7 @@
 #define EDGE_W 8                // a row's colored edge, by level
 #define ROW_PAD 12              // text inset in a card or row
 #define TITLE_W 640
-#define META_W 300              // source and age, right-aligned
+#define META_W 300 // source and age, right-aligned
 #define MODAL_W 800
 #define MODAL_BTN_W 200
 #define MODAL_BTN_H 72
@@ -30,16 +30,16 @@
 static const char *TAG = "feed";
 
 static bool s_styles_ready;
-static lv_style_t st_card;         // every card: shape
-static lv_style_t st_state[3];     // a card's color by proto_tile_state_t: unknown, ok, bad
-static lv_style_t st_card_label;   // 24 pt, centered
-static lv_style_t st_card_value;   // 32 pt, centered
-static lv_style_t st_row;          // a note row: shape and the left edge's width
-static lv_style_t st_level[4];     // the edge's color by proto_level_t
-static lv_style_t st_title;        // 24 pt
-static lv_style_t st_meta;         // 20 pt, right-aligned: the source and the age
-static lv_style_t st_more;         // 24 pt, centered: "+N more"
-static lv_style_t st_empty;        // 32 pt, centered: "Nothing here yet"
+static lv_style_t st_card;       // every card: shape
+static lv_style_t st_state[3];   // a card's color by proto_tile_state_t: unknown, ok, bad
+static lv_style_t st_card_label; // 24 pt, centered
+static lv_style_t st_card_value; // 32 pt, centered
+static lv_style_t st_row;        // a note row: shape and the left edge's width
+static lv_style_t st_level[4];   // the edge's color by proto_level_t
+static lv_style_t st_title;      // 24 pt
+static lv_style_t st_meta;       // 20 pt, right-aligned: the source and the age
+static lv_style_t st_more;       // 24 pt, centered: "+N more"
+static lv_style_t st_empty;      // 32 pt, centered: "Nothing here yet"
 
 // The note rows on the page, for the ages and for a tap to find its note. A tap looks the note up by id in the model,
 // since a snapshot may have come after the row was drawn.
@@ -48,7 +48,8 @@ static struct {
     char src[PROTO_FEED_SRC_MAX];
     uint64_t at;
     lv_obj_t *meta;
-    char shown[PROTO_FEED_SRC_MAX + FEED_AGE_MAX + 4]; // what the meta label holds, the source of truth for ui_set_label
+    char
+        shown[PROTO_FEED_SRC_MAX + FEED_AGE_MAX + 4]; // what the meta label holds, the source of truth for ui_set_label
 } s_rows[PROTO_FEED_NOTES_MAX];
 static size_t s_n_rows;
 
@@ -158,8 +159,8 @@ static void add_card(lv_obj_t *page, size_t i, const proto_feed_card_t *c)
     lv_point_t size;
     lv_text_get_size(&size, c->value, &lv_font_montserrat_32, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
     const lv_font_t *font = size.x > w ? &lv_font_montserrat_24 : &lv_font_montserrat_32;
-    lv_obj_t *value = new_label(card, &st_card_value, font, ROW_PAD, 14 + lv_font_get_line_height(&lv_font_montserrat_24) + 8,
-                                w, c->value);
+    lv_obj_t *value = new_label(card, &st_card_value, font, ROW_PAD,
+                                14 + lv_font_get_line_height(&lv_font_montserrat_24) + 8, w, c->value);
     if (font != &lv_font_montserrat_32) {
         lv_obj_set_style_text_font(value, font, 0);
     }
@@ -314,8 +315,8 @@ static void add_note(lv_obj_t *page, size_t i, int y, const proto_feed_note_t *n
     lv_obj_add_event_cb(row, ui_touch_track, LV_EVENT_PRESSING, NULL);
     lv_obj_add_event_cb(row, note_tapped, LV_EVENT_CLICKED, (void *)(intptr_t)i);
 
-    new_label(row, &st_title, &lv_font_montserrat_24, ROW_PAD, (ROW_H - lv_font_get_line_height(&lv_font_montserrat_24)) / 2,
-              TITLE_W, n->title);
+    new_label(row, &st_title, &lv_font_montserrat_24, ROW_PAD,
+              (ROW_H - lv_font_get_line_height(&lv_font_montserrat_24)) / 2, TITLE_W, n->title);
 
     strlcpy(s_rows[i].id, n->id, sizeof(s_rows[i].id));
     strlcpy(s_rows[i].src, n->src, sizeof(s_rows[i].src));

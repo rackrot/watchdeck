@@ -8,12 +8,12 @@
 
 // The page is GRID_SCREEN_H - GRID_TOP = 556 px tall. Every size here is in px.
 #define FEED_AREA_H 556
-#define FEED_PAD 8     // above the first card or row, and between a card row and the next block
+#define FEED_PAD 8 // above the first card or row, and between a card row and the next block
 #define FEED_CARD_H 112
 #define FEED_CARD_GAP 8
 #define FEED_CARDS_PER_ROW 4
-#define FEED_NOTE_H 56 // a note row's pitch: 52 px of row and 4 px of gap
-#define FEED_MORE_H 32 // the "+N more" line
+#define FEED_NOTE_H 56  // a note row's pitch: 52 px of row and 4 px of gap
+#define FEED_MORE_H 32  // the "+N more" line
 #define FEED_AGE_MAX 12 // "now", "59 min", "23 h", "3 d" and the NUL
 
 /**

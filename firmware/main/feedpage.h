@@ -21,7 +21,8 @@
  */
 void feedpage_fill(lv_obj_t *page, const proto_feed_t *feed, bool have_clock, uint64_t now);
 
-/** Refresh the age on every note row of the page filled last. Cheap when nothing changed, so ui.c may call it each second. */
+/** Refresh the age on every note row of the page filled last. Cheap when nothing changed, so ui.c may call it each
+ * second. */
 void feedpage_tick(bool have_clock, uint64_t now);
 
 /** While the link is down the modal's Dismiss is off. The page's own dimming is ui.c's. */

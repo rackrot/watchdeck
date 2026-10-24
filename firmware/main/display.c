@@ -66,6 +66,11 @@ static esp_err_t panel_init(esp_lcd_panel_io_handle_t *io, esp_lcd_panel_handle_
     return ESP_OK;
 }
 
+void display_backlight(uint8_t percent)
+{
+    gpio_set_level(BACKLIGHT_GPIO, percent > 0);
+}
+
 esp_err_t display_init(lv_display_t **out_disp)
 {
     esp_lcd_panel_io_handle_t io = NULL;

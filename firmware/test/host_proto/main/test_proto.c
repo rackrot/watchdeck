@@ -16,6 +16,8 @@ void test_pageset_run(void);  // test_pageset.c
 void test_hoststat_run(void); // test_hoststat.c
 void test_logring_run(void);  // test_logring.c
 void test_diag_run(void);     // test_diag.c
+void test_uimode_run(void);   // test_uimode.c
+void test_sleepcfg_run(void); // test_sleepcfg.c
 void test_feedfmt_run(void);  // test_feedfmt.c
 
 static uint8_t frame[PROTO_MAX_ICON_FRAME];
@@ -1539,6 +1541,8 @@ void app_main(void)
     test_hoststat_run();
     test_logring_run();
     test_diag_run();
+    test_uimode_run();
+    test_sleepcfg_run();
     test_feedfmt_run();
 
     // Returning from app_main does not end a linux-target process, so the failure count becomes the exit status.
