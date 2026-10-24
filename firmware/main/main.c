@@ -7,12 +7,14 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 
+#include "cardtest.h"
 #include "crash.h"
 #include "display.h"
 #include "link.h"
 #include "logcap.h"
 #include "model.h"
 #include "sdcard.h"
+#include "svc.h"
 #include "touch.h"
 #include "ui.h"
 #include "usb.h"
@@ -34,6 +36,13 @@ static esp_err_t power_init(void)
         ESP_LOGI(TAG, "LDO chan %d acquired at %d mV", rails[i].chan, rails[i].mv);
     }
     return ESP_OK;
+}
+
+// A share, a remount or a failed remount: show the SD and USB lines again.
+static void on_card_owner(sdcard_owner_t owner, const char *sd_text)
+{
+    ui_set_sd_text(sd_text);
+    usb_refresh_status();
 }
 
 void app_main(void)
@@ -61,12 +70,19 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    // SD and screen failures must not stop the rest, so report and carry on.
+    // The worker for card I/O and other slow jobs, before anything can queue one.
+    esp_err_t err = svc_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "svc_start: %s, so no card share or other slow jobs", esp_err_to_name(err));
+    }
+
+    // SD and screen failures must not stop the rest, so report and carry on. The card is mounted read-write and its
+    // interrupted writes recovered before anything reads it (wifi_start reads wifi.txt).
     char sd_text[64];
     sdcard_mount(sd_text, sizeof(sd_text));
 
     lv_display_t *disp = NULL;
-    esp_err_t err = display_init(&disp);
+    err = display_init(&disp);
     if (err == ESP_OK) {
         err = ui_init(disp);
     }
@@ -74,6 +90,7 @@ void app_main(void)
         ESP_LOGE(TAG, "display/ui init: %s", esp_err_to_name(err));
     }
     ui_set_sd_text(sd_text);
+    sdcard_set_owner_cb(on_card_owner);
 
     // Touch needs the LVGL display, and its failure must not stop boot.
     err = disp ? touch_init(disp) : ESP_ERR_INVALID_STATE;
@@ -111,11 +128,12 @@ void app_main(void)
         ESP_LOGE(TAG, "link_start: %s", esp_err_to_name(err));
     }
 
-    // wifi_start releases the filesystem after reading wifi.txt, even when it fails.
-    err = usb_msc_start(ui_set_usb_text);
+    // USB comes up as an empty card reader; the card stays the device's until a share.
+    err = usb_start(ui_set_usb_text);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "usb_msc_start: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "usb_start: %s", esp_err_to_name(err));
     }
+    cardtest_start(); // CONFIG_WATCHDECK_TEST_CARD only
 
     ESP_LOGI(TAG, "boot done, min free internal heap %u bytes",
              (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));

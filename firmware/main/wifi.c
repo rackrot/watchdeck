@@ -144,9 +144,6 @@ esp_err_t wifi_start(wifi_status_cb_t status_cb)
         strcpy(ssid, CONFIG_WATCHDECK_WIFI_SSID);
         strcpy(pass, CONFIG_WATCHDECK_WIFI_PASSWORD);
     }
-    // The card goes to the USB host once wifi.txt has been read.
-    sdcard_release_fs();
-
     // An empty SSID would join any open AP, so refuse.
     if (ssid[0] == '\0') {
         report("no Wi-Fi credentials");

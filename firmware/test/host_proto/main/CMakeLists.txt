@@ -9,3 +9,5 @@ idf_component_register(SRCS "test_proto.c" "test_grid.c" "test_pageset.c" "test_
                             "../../../main/cardfs.c" "../../../main/wifitxt.c" "../../../main/svc.c"
                        INCLUDE_DIRS "../../../main"
                        PRIV_REQUIRES unity mbedtls log cjson esp_rom freertos)
+# cardfs.c's self-test row (watchdeck/selftest.cfg) exists only in CONFIG_WATCHDECK_TEST_CARD firmware; cover it here.
+target_compile_definitions(${COMPONENT_LIB} PRIVATE CONFIG_WATCHDECK_TEST_CARD=1)

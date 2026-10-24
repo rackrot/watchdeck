@@ -18,4 +18,13 @@ menu "watchdeck"
             Dereferences NULL 30 s after the first welcome from the daemon, to
             exercise the coredump and report path. Leave off in real builds.
 
+    config WATCHDECK_TEST_CARD
+        bool "Run the TF card write self-test at boot (manual checks only)"
+        default n
+        help
+            Writes watchdeck/selftest.cfg and 20 write-once watchdeck/<8hex>.bin
+            files on the TF card at every boot, reads each back, logs the
+            result, then shares the card over USB after 30 s. Back up the card
+            before flashing it. Leave off in real builds.
+
 endmenu
