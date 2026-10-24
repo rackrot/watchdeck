@@ -3293,6 +3293,34 @@ async fn a_feed_session_gets_a_snapshot_with_sources_and_the_stat_card_arrives()
 }
 
 #[tokio::test]
+async fn a_test_of_a_stat_integration_runs_its_live_source_and_touches_no_store() {
+    let daemon = start_feed().await;
+    let before = daemon.devices.feed().snapshot();
+
+    let ran = daemon.devices.test_integration("load").await.unwrap();
+    assert_eq!(
+        (ran.ok, ran.summary.as_str(), ran.text.as_str()),
+        (true, "0.42", "")
+    );
+
+    // A source that prints nothing useful is a bad card, which is a result and not an error.
+    daemon
+        .reconfigure(&feed_config().replace("\"echo\", \"0.42\"", "\"false\""))
+        .unwrap();
+    let ran = daemon.devices.test_integration("load").await.unwrap();
+    assert!(!ran.ok, "{ran:?}");
+
+    // Only a saved stat source can be tested.
+    let push = daemon.devices.test_integration("ha").await.unwrap_err();
+    assert!(push.contains("not a stat source"), "{push}");
+    let none = daemon.devices.test_integration("nope").await.unwrap_err();
+    assert!(none.contains("\"nope\""), "{none}");
+
+    // With no session open nothing polls, so a card in the store would be the test's.
+    assert_eq!(daemon.devices.feed().snapshot().cards, before.cards);
+}
+
+#[tokio::test]
 async fn a_new_note_reaches_the_session_and_its_text_is_made_printable() {
     let daemon = start_feed().await;
     let mut c = device_session(daemon.addr, DEVICE, &TOKEN, &["feed"]).await;

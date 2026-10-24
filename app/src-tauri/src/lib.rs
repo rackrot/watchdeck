@@ -287,6 +287,10 @@ pub fn run() {
                 pairing,
                 configs,
                 secrets,
+                pin: identity
+                    .spki_pin()
+                    .inspect_err(|e| log::warn!("push pin: {e}"))
+                    .map_err(|e| format!("The certificate's public key pin: {e}")),
             });
             tauri::async_runtime::spawn(server.run());
 
@@ -322,6 +326,8 @@ pub fn run() {
             commands::tile_values,
             commands::feed_snapshot,
             commands::create_push_token,
+            commands::push_pin,
+            commands::test_integration,
             commands::config_dir,
         ])
         .build(tauri::generate_context!())

@@ -23,6 +23,8 @@ pub struct Daemon {
     pub pairing: Arc<Pairing>,
     pub configs: Arc<Configs>,
     pub secrets: Arc<Secrets>,
+    /// The key pin for `curl --pinnedpubkey` (`Identity::spki_pin`), or why there is none.
+    pub pin: Result<String, String>,
 }
 
 #[tauri::command]
@@ -179,6 +181,13 @@ pub async fn create_push_token(daemon: State<'_, Daemon>, id: String) -> Result<
     .await?
 }
 
+/// The base64 SHA-256 of the daemon certificate's public key, which a LAN client of the push API
+/// pins with `curl --pinnedpubkey sha256//<pin>`. It is public, and not the `fp` in the log.
+#[tauri::command]
+pub fn push_pin(daemon: State<'_, Daemon>) -> Result<String, String> {
+    daemon.pin.clone()
+}
+
 /// Removes a secret, unless the live config still uses it. The error names the buttons.
 #[tauri::command]
 pub async fn delete_secret(daemon: State<'_, Daemon>, name: String) -> Result<(), String> {
@@ -214,6 +223,16 @@ pub async fn test_action(
     button: String,
 ) -> Result<ActionResult, String> {
     daemon.devices.test_press(&button).await
+}
+
+/// Runs stat integration `id`'s source from the live config, once, and returns the card it would
+/// show. The window names only the id, never a source, and no device or store is touched.
+#[tauri::command]
+pub async fn test_integration(
+    daemon: State<'_, Daemon>,
+    id: String,
+) -> Result<ActionResult, String> {
+    daemon.devices.test_integration(&id).await
 }
 
 /// Asks the user for a PNG, JPEG, WebP or SVG in a native file dialog, copies it into the icons

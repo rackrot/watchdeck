@@ -25,14 +25,16 @@ use tokio_tungstenite::{accept_async_with_config, WebSocketStream};
 use time::OffsetDateTime;
 
 use super::actions::{ActionResult, Actions, Run, MAX_RUNNING};
-use super::config::{Action, Layout, Live, MAX_COLS, MAX_ROWS};
+use super::config::{Action, IntegrationConfig, Layout, Live, TileConfig, MAX_COLS, MAX_ROWS};
 use super::hoststats::{self, HostSources, HostStats};
 use super::integrations::{self, FeedHandle, FeedSlots, Integrations};
+use super::protocol::TileState;
 use super::protocol::{
     decode_hex, encode_asset_frame, encode_hex, valid_device_id, Colors, ErrorCode, Feed, Message,
     Report, Token, ASSET_ID_BYTES, CAPS, CAP_FEED, CAP_FONTS, CAP_PAGES, CAP_SLEEP, CAP_STATUS_BAR,
     ICON_ID_BYTES, MAX_MESSAGE_BYTES, MAX_REPORTS_PER_SESSION, TOKEN_BYTES, VERSION,
 };
+
 use super::screens::IMAGE_BYTES;
 use super::store::Store;
 use super::tiles::{self, Sent, Tiles, Values};
@@ -303,6 +305,56 @@ impl Devices {
         // The press may have changed what the button's tile shows.
         self.0.tiles.poker().poke(btn);
         Ok(result)
+    }
+
+    /// Runs the source of stat integration `id` once, from the live config and in one of the
+    /// feed's slots, and returns the card it would show: `summary` is the value, `ok` its state.
+    /// Nothing reaches the store or a device. An unknown or non-stat id is an error, and a refused
+    /// run ("already running", "busy") is a result.
+    pub async fn test_integration(&self, id: &str) -> Result<ActionResult, String> {
+        let tile = match self
+            .0
+            .config
+            .borrow()
+            .integrations
+            .iter()
+            .find(|i| i.id() == id)
+        {
+            Some(IntegrationConfig::Stat {
+                every_s,
+                json_pointer,
+                source,
+                ..
+            }) => TileConfig {
+                every_s: *every_s,
+                json_pointer: json_pointer.clone(),
+                font: None,
+                source: source.clone(),
+            },
+            Some(_) => return Err(format!("Integration {id:?} is not a stat source.")),
+            None => return Err(format!("There is no saved integration {id:?}.")),
+        };
+        let run = match self.0.actions.start_feed(id) {
+            Ok(run) => run,
+            Err(refused) => {
+                log::info!("test: integration {id:?}: {}", refused.summary);
+                return Ok(refused);
+            }
+        };
+        let ran = run.poll(&tile.source).await;
+        let value = tiles::reading(&tile, &ran);
+        log::info!(
+            "test: integration {id:?}: {:?} ({} ms)",
+            value.state,
+            ran.result.ms
+        );
+        Ok(ActionResult {
+            ok: value.state == TileState::Ok,
+            code: ran.result.code,
+            summary: value.text,
+            text: String::new(),
+            ms: ran.result.ms,
+        })
     }
 }
 
