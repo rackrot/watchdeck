@@ -564,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn a_full_store_keeps_32_and_a_source_never_evicts_anothers_notes() {
+    fn a_full_store_keeps_32_and_a_source_never_evicts_the_others_notes() {
         let store = store(&["a", "b", "c"]);
         for source in ["a", "b"] {
             for i in 0..MAX_SOURCE_NOTES {
@@ -798,7 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn one_source_cant_block_anothers_card_or_hide_a_later_sources() {
+    fn one_source_cant_block_the_others_cards_or_hide_a_later_one() {
         let store = store(&["a", "b", "load"]);
         let put = |source: &str, id: &str| store.apply(source, Update::PutCard(card(id, "1")));
         for i in 0..=MAX_SOURCE_CARDS {
