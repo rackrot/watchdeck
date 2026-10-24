@@ -72,6 +72,15 @@ jobs:
           idf.py --preview set-target linux build
           timeout 60 build/host_proto.elf
 
+      # The card store (cardfs.c) on IDF's FatFs over a RAM disk, with the power cut at every sector write.
+      - name: Run FatFs power-cut test
+        shell: bash
+        working-directory: firmware/test/host_fatfs
+        run: |
+          . "$IDF_PATH/export.sh"
+          idf.py --preview set-target linux build
+          timeout 900 build/host_fatfs.elf
+
   app:
     runs-on: ubuntu-latest
     steps:

@@ -50,9 +50,19 @@ dir = "firmware"
 run = '. "$IDF_PATH/export.sh" >/dev/null && idf.py menuconfig'
 
 [tasks."fw:test"]
-description = "Run the host unit tests for the device message parsers"
+description = "Run the firmware host tests: the unit tests, then the FatFs power-cut test"
+run = [{ task = "fw:test:unit" }, { task = "fw:test:fatfs" }]
+
+[tasks."fw:test:unit"]
+description = "Run the host unit tests for the device message parsers and modules"
 dir = "firmware/test/host_proto"
 run = '. "$IDF_PATH/export.sh" >/dev/null && idf.py --preview set-target linux build && timeout 60 build/host_proto.elf'
+
+# Cuts the power at every sector write of each card operation; see firmware/test/host_fatfs/main/test_cuts.c.
+[tasks."fw:test:fatfs"]
+description = "Run the FatFs power-cut test of the card store on a RAM disk"
+dir = "firmware/test/host_fatfs"
+run = '. "$IDF_PATH/export.sh" >/dev/null && idf.py --preview set-target linux build && timeout 900 build/host_fatfs.elf'
 
 [tasks."app:dev"]
 description = "Run the desktop app in dev mode"
