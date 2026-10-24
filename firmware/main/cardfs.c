@@ -30,6 +30,7 @@ static const struct {
 } SMALL[] = {
     {"wifi.txt", DIR_NAME "/wifi.new"},
     {DIR_NAME "/sleep.cfg", DIR_NAME "/sleep.new"},
+    {DIR_NAME "/selftest.cfg", DIR_NAME "/selftest.new"}, // CONFIG_WATCHDECK_TEST_CARD's file (cardtest.c)
 };
 
 static char s_root[ROOT_MAX + 1];
@@ -419,6 +420,11 @@ esp_err_t cardfs_set_writable(bool writable)
 bool cardfs_writable(void)
 {
     return s_writable;
+}
+
+bool cardfs_tainted(void)
+{
+    return s_tainted;
 }
 
 bool cardfs_name_ok(const char *rel)

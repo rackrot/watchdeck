@@ -83,10 +83,15 @@ esp_err_t cardfs_init(const char *root, const cardfs_volume_t *vol);
 esp_err_t cardfs_set_writable(bool writable);
 bool cardfs_writable(void);
 
+// True from a failed card access until cardfs_set_writable(false) or cardfs_init. A writer that gets
+// ESP_ERR_INVALID_STATE while this holds has the card remounted (sdcard_note_failure) before it writes again.
+bool cardfs_tainted(void);
+
 // The allowlist. Lowercase only: FAT is case-insensitive, so other casings are refused, not folded.
 bool cardfs_name_ok(const char *rel);
 
-// Replaces a small file through its intent record. rel is "wifi.txt" or "watchdeck/sleep.cfg". First resolves a
+// Replaces a small file through its intent record. rel is "wifi.txt", "watchdeck/sleep.cfg" or
+// "watchdeck/selftest.cfg" (the card self-test's). First resolves a
 // record an earlier failed write left, and refuses if that fails, so a pending write is never lost to a new one.
 // ESP_ERR_INVALID_ARG: rel isn't a small file. ESP_ERR_INVALID_SIZE: len > CARDFS_SMALL_MAX.
 // ESP_ERR_INVALID_STATE: not writable, or tainted. CARDFS_ERR_DIR_FULL: see above; nothing written.

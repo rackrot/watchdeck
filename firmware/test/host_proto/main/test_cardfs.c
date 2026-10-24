@@ -181,6 +181,10 @@ void test_cardfs_write_small_replaces_a_file(void)
     TEST_ASSERT_EQUAL(ESP_OK, cardfs_write_small("watchdeck/sleep.cfg", "{}", 2));
     TEST_ASSERT_EQUAL_STRING("{}", slurp("watchdeck/sleep.cfg"));
     TEST_ASSERT_EQUAL_STRING("", slurp("watchdeck/sleep.new"));
+    // The card self-test's small file (CONFIG_WATCHDECK_TEST_CARD) has its own record.
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_write_small("watchdeck/selftest.cfg", "selftest 1\n", 11));
+    TEST_ASSERT_EQUAL_STRING("selftest 1\n", slurp("watchdeck/selftest.cfg"));
+    TEST_ASSERT_EQUAL_STRING("", slurp("watchdeck/selftest.new"));
 }
 
 void test_cardfs_write_small_refuses_other_names_and_sizes(void)
@@ -223,7 +227,9 @@ void test_cardfs_failed_access_stops_writes_until_writes_are_turned_off_and_on(v
     fresh_root();
     make_dir("watchdeck");
     make_dir("watchdeck/wifi.new");
+    TEST_ASSERT_FALSE(cardfs_tainted());
     TEST_ASSERT_EQUAL(ESP_FAIL, cardfs_write_small("wifi.txt", "New\n", 4));
+    TEST_ASSERT_TRUE(cardfs_tainted());
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, cardfs_write_small("watchdeck/sleep.cfg", "{}", 2));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, cardfs_write_new("watchdeck/a.bin", "x", 1));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, cardfs_recover());
@@ -235,6 +241,7 @@ void test_cardfs_failed_access_stops_writes_until_writes_are_turned_off_and_on(v
     TEST_ASSERT_EQUAL(ESP_OK, cardfs_set_writable(true));                              // not enough on its own
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, cardfs_write_small("watchdeck/sleep.cfg", "{}", 2));
     TEST_ASSERT_EQUAL(ESP_OK, cardfs_set_writable(false));
+    TEST_ASSERT_FALSE(cardfs_tainted());
     TEST_ASSERT_EQUAL(ESP_OK, cardfs_set_writable(true));
     TEST_ASSERT_EQUAL(ESP_OK, cardfs_write_small("watchdeck/sleep.cfg", "{}", 2));
     TEST_ASSERT_EQUAL(ESP_OK, cardfs_remove("watchdeck/b.bin"));

@@ -1,8 +1,10 @@
 #include "sdcard.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
+#include "cardfs.h"
 #include "diag.h"
 #include "diskio_impl.h"
 #include "driver/sdmmc_host.h"
@@ -16,22 +18,33 @@
 #define SD_CLK_GPIO 43
 #define SD_CMD_GPIO 44
 #define SD_D0_GPIO 39
+#define TEXT_MAX 64
 
 static const char *TAG = "sdcard";
 
 // ESP-IDF's FatFs is built without 64-bit LBA, so it cannot see inside a GPT disk
 // (the card ships GPT-partitioned). We read the first GPT entry ourselves and expose
-// that partition to FatFs through a read-only, offset diskio driver.
+// that partition to FatFs through an offset diskio driver that refuses any sector outside it.
 // ponytail: one card, one partition, so the driver state is static.
 static sdmmc_card_t *s_card;
 static uint32_t s_part_first_lba;
 static uint32_t s_part_sectors;
-static char s_drive[3];
+static char s_drive[3];   // the FatFs drive, "0:"; empty while unmounted. cardfs keeps a pointer to it
 static bool s_card_ready; // sdmmc_card_init succeeded
+static double s_gb;
+static volatile sdcard_owner_t s_owner = SDCARD_NO_CARD;
+static char s_text[TEXT_MAX];
+static sdcard_owner_cb_t s_owner_cb;
+
+static const cardfs_volume_t s_volume = {
+    .prepare = cardfs_fat_prepare,
+    .room = cardfs_fat_room,
+    .ctx = s_drive,
+};
 
 static DSTATUS part_disk_init(unsigned char pdrv)
 {
-    return STA_PROTECT; // read-only: FatFs rejects writes up front
+    return 0; // ready and writable; cardfs.c decides what is written
 }
 
 static DRESULT part_disk_read(unsigned char pdrv, unsigned char *buf, uint32_t sector, UINT count)
@@ -50,7 +63,17 @@ static DRESULT part_disk_read(unsigned char pdrv, unsigned char *buf, uint32_t s
 
 static DRESULT part_disk_write(unsigned char pdrv, const unsigned char *buf, uint32_t sector, UINT count)
 {
-    return RES_WRPRT; // this firmware never writes to the card
+    if (sector >= s_part_sectors || count > s_part_sectors - sector) {
+        return RES_PARERR; // never outside the partition
+    }
+    // sdmmc_write_sectors returns once the card has finished programming, so CTRL_SYNC has nothing to wait for.
+    esp_err_t err = sdmmc_write_sectors(s_card, buf, s_part_first_lba + sector, count);
+    if (err != ESP_OK) {
+        diag_count(DIAG_CARD_ERROR, esp_err_to_name(err));
+        ESP_LOGE(TAG, "write sector %lu x%u: %s", (unsigned long)sector, count, esp_err_to_name(err));
+        return RES_ERROR;
+    }
+    return RES_OK;
 }
 
 static DRESULT part_disk_ioctl(unsigned char pdrv, unsigned char cmd, void *buf)
@@ -119,7 +142,7 @@ static esp_err_t find_partition(sdmmc_card_t *card)
     return err;
 }
 
-static esp_err_t mount_card(void)
+static esp_err_t init_card(void)
 {
     // Share the host with ESP-Hosted: init is idempotent and we never deinit.
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
@@ -142,20 +165,26 @@ static esp_err_t mount_card(void)
     ESP_RETURN_ON_ERROR(sdmmc_card_init(&host, s_card), TAG, "card init");
     s_card_ready = true;
     ESP_RETURN_ON_ERROR(find_partition(s_card), TAG, "partition lookup");
+    s_gb = (double)s_card->csd.capacity * s_card->csd.sector_size / (1024.0 * 1024.0 * 1024.0);
+    return ESP_OK;
+}
 
+// Registers the diskio and the VFS path and mounts the partition. The file system is never created here: a card
+// FatFs can't mount stays unmounted, since it holds user data.
+static esp_err_t mount_fs(void)
+{
     BYTE pdrv;
     ESP_RETURN_ON_ERROR(ff_diskio_get_drive(&pdrv), TAG, "no free drive");
     ff_diskio_register(pdrv, &s_part_impl);
 
-    char *drive = s_drive;
-    drive[0] = '0' + pdrv;
-    drive[1] = ':';
-    drive[2] = '\0';
-    esp_vfs_fat_conf_t conf = {.base_path = SDCARD_MOUNT_POINT, .fat_drive = drive, .max_files = 4};
+    s_drive[0] = '0' + pdrv;
+    s_drive[1] = ':';
+    s_drive[2] = '\0';
+    esp_vfs_fat_conf_t conf = {.base_path = SDCARD_MOUNT_POINT, .fat_drive = s_drive, .max_files = 4};
     FATFS *fs;
     esp_err_t err = esp_vfs_fat_register(&conf, &fs);
     if (err == ESP_OK) {
-        FRESULT res = f_mount(fs, drive, 1); // never f_mkfs: the card holds user data
+        FRESULT res = f_mount(fs, s_drive, 1);
         if (res != FR_OK) {
             ESP_LOGE(TAG, "f_mount failed: FRESULT %d", res);
             esp_vfs_fat_unregister_path(SDCARD_MOUNT_POINT);
@@ -169,28 +198,8 @@ static esp_err_t mount_card(void)
     return err;
 }
 
-esp_err_t sdcard_mount(char *msg, size_t msg_len)
-{
-    esp_err_t err = mount_card();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "mount failed: %s", esp_err_to_name(err));
-        snprintf(msg, msg_len, "SD: not mounted (%s)", esp_err_to_name(err));
-        return err;
-    }
-
-    // Capacity only: scanning the FAT for free space on 128 GB is too slow.
-    double gb = (double)s_card->csd.capacity * s_card->csd.sector_size / (1024.0 * 1024.0 * 1024.0);
-    ESP_LOGI(TAG, "mounted %s: %s, %.1f GB", SDCARD_MOUNT_POINT, s_card->cid.name, gb);
-    snprintf(msg, msg_len, "SD: %.1f GB", gb);
-    return ESP_OK;
-}
-
-sdmmc_card_t *sdcard_card(void)
-{
-    return s_card_ready ? s_card : NULL;
-}
-
-void sdcard_release_fs(void)
+// Drops FatFs's mount, with anything it still caches, and the VFS registration. No-op if nothing is mounted.
+static void unmount_fs(void)
 {
     if (s_drive[0] == '\0') {
         return;
@@ -202,7 +211,156 @@ void sdcard_release_fs(void)
     }
     ff_diskio_unregister((BYTE)(s_drive[0] - '0'));
     s_drive[0] = '\0';
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "released %s; card handed off", SDCARD_MOUNT_POINT);
+    ESP_LOGI(TAG, "unmounted %s", SDCARD_MOUNT_POINT);
+}
+
+static void set_state(sdcard_owner_t owner, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+
+static void set_state(sdcard_owner_t owner, const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(s_text, sizeof(s_text), fmt, args);
+    va_end(args);
+    s_owner = owner;
+    ESP_LOGI(TAG, "%s", s_text);
+    if (s_owner_cb) {
+        s_owner_cb(owner, s_text);
     }
+}
+
+// The SD text for a mounted card, from what cardfs allows.
+static void set_mounted(esp_err_t why_not_writable)
+{
+    if (cardfs_writable() && !cardfs_tainted()) {
+        set_state(SDCARD_DEVICE, "SD: %.1f GB", s_gb);
+    } else {
+        const char *why = why_not_writable == ESP_ERR_NOT_SUPPORTED ? "not FAT32"
+                          : why_not_writable != ESP_OK              ? esp_err_to_name(why_not_writable)
+                                                                    : "card error";
+        set_state(SDCARD_DEVICE, "SD: %.1f GB, read-only (%s)", s_gb, why);
+    }
+}
+
+// After a mount: turns cardfs writes on and resolves its intent records. Never fails the mount: a card cardfs
+// can't write stays mounted read-only, and a recovery that fails leaves its record for the next mount. Returns why
+// writes are off, or ESP_OK.
+static esp_err_t open_store(bool first)
+{
+    esp_err_t err = first ? cardfs_init(SDCARD_MOUNT_POINT, &s_volume) : ESP_OK;
+    if (err == ESP_OK) {
+        err = cardfs_set_writable(true);
+    }
+    if (err == ESP_ERR_NOT_SUPPORTED) {
+        ESP_LOGW(TAG, "the card isn't FAT32, so it stays read-only");
+        return err;
+    }
+    if (err != ESP_OK) {
+        // Not sdcard_note_failure: that remounts on a taint, and this runs inside a remount.
+        ESP_LOGE(TAG, "card writes stay off: %s", esp_err_to_name(err));
+        diag_count(DIAG_CARD_ERROR, "card writes off");
+        return err;
+    }
+    err = cardfs_recover();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "card recovery left a write for the next mount: %s", esp_err_to_name(err));
+        diag_count(DIAG_CARD_ERROR, "recovery left for the next mount");
+    }
+    return ESP_OK;
+}
+
+esp_err_t sdcard_mount(char *msg, size_t msg_len)
+{
+    esp_err_t err = init_card();
+    if (err == ESP_OK) {
+        err = mount_fs();
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "mount failed: %s", esp_err_to_name(err));
+        diag_count(DIAG_CARD_ERROR, "mount failed");
+        set_state(SDCARD_NO_CARD, "SD: not mounted (%s)", esp_err_to_name(err));
+        snprintf(msg, msg_len, "%s", s_text);
+        return err;
+    }
+    ESP_LOGI(TAG, "mounted %s read-write: %s, %.1f GB", SDCARD_MOUNT_POINT, s_card->cid.name, s_gb);
+    s_owner = SDCARD_DEVICE;
+    const esp_err_t why = open_store(true);
+    if (why == ESP_OK && cardfs_tainted()) {
+        // Once: no card job runs yet, so the remount can't race one. It sets the state either way.
+        ESP_LOGW(TAG, "a card access failed during recovery, mounting again");
+        err = sdcard_remount();
+    } else {
+        set_mounted(why);
+    }
+    snprintf(msg, msg_len, "%s", s_text);
+    return err;
+}
+
+void sdcard_set_owner_cb(sdcard_owner_cb_t cb)
+{
+    s_owner_cb = cb;
+}
+
+sdcard_owner_t sdcard_owner(void)
+{
+    return s_owner;
+}
+
+sdmmc_card_t *sdcard_card(void)
+{
+    return s_card_ready ? s_card : NULL;
+}
+
+esp_err_t sdcard_remount(void)
+{
+    if (s_owner != SDCARD_DEVICE) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    cardfs_set_writable(false); // waits for a call in progress; clears the taint
+    unmount_fs();
+    esp_err_t err = mount_fs();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "remount failed: %s", esp_err_to_name(err));
+        diag_count(DIAG_CARD_ERROR, "remount failed");
+        set_state(SDCARD_NO_CARD, "SD: not mounted (%s)", esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGI(TAG, "mounted %s again", SDCARD_MOUNT_POINT);
+    set_mounted(open_store(false));
+    return ESP_OK;
+}
+
+void sdcard_note_failure(const char *what, esp_err_t err)
+{
+    const bool tainted = cardfs_tainted();
+    if (err == ESP_ERR_INVALID_STATE && !tainted) {
+        ESP_LOGW(TAG, "%s: the card isn't writable now (%s)", what, s_text);
+        return; // shared, read-only or absent: a state, not a card error
+    }
+    if (err == CARDFS_ERR_DIR_FULL) {
+        ESP_LOGE(TAG, "%s: the card's root or watchdeck/ is full; add or delete a file there on a PC", what);
+        diag_count(DIAG_CARD_ERROR, "card folder full, tidy it on a PC");
+    } else {
+        ESP_LOGE(TAG, "%s: %s%s", what, esp_err_to_name(err), tainted ? " (card access failed)" : "");
+        diag_count(DIAG_CARD_ERROR, tainted ? "card access failed" : esp_err_to_name(err));
+    }
+    if (tainted && s_owner == SDCARD_DEVICE) {
+        ESP_LOGW(TAG, "mounting the card again so writes can go on");
+        sdcard_remount();
+    }
+}
+
+esp_err_t sdcard_release_fs(void)
+{
+    if (s_owner != SDCARD_DEVICE) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    cardfs_set_writable(false);
+    unmount_fs();
+    return ESP_OK;
+}
+
+void sdcard_set_shared(void)
+{
+    set_state(SDCARD_SHARED, "SD: shared over USB");
 }

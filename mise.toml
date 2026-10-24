@@ -39,6 +39,21 @@ description = "Flash the firmware"
 dir = "firmware"
 run = '. "$IDF_PATH/export.sh" >/dev/null && idf.py flash'
 
+# The TF card self-test firmware (CONFIG_WATCHDECK_TEST_CARD, plans/settings-sleep-feed/01-groundwork.md G2), in its
+# own build dir with a copy of the normal build's sdkconfig that turns the self-test on, so the normal build never
+# becomes a self-test one. Run `mise run fw:build` first. Pass the action: `mise run fw:cardtest -- build`, then
+# `mise run fw:cardtest -- flash -p /dev/ttyUSB0`. It writes to the TF card at every boot: back the card up first.
+[tasks."fw:cardtest"]
+description = "Build or flash the TF card self-test firmware in firmware/build-cardtest"
+dir = "firmware"
+run = '''
+. "$IDF_PATH/export.sh" >/dev/null &&
+mkdir -p build-cardtest &&
+sed 's/^# CONFIG_WATCHDECK_TEST_CARD is not set$/CONFIG_WATCHDECK_TEST_CARD=y/' sdkconfig > build-cardtest/sdkconfig.new &&
+grep -qx CONFIG_WATCHDECK_TEST_CARD=y build-cardtest/sdkconfig.new &&
+{ cmp -s build-cardtest/sdkconfig.new build-cardtest/sdkconfig || cp build-cardtest/sdkconfig.new build-cardtest/sdkconfig; } &&
+idf.py -B build-cardtest -D SDKCONFIG=build-cardtest/sdkconfig'''
+
 [tasks."fw:monitor"]
 description = "Open the serial monitor"
 dir = "firmware"

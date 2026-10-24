@@ -13,7 +13,7 @@ typedef enum {
     DIAG_LINK_DROP,    // the link to the daemon lost or failed
     DIAG_SET_BROKEN,   // a layout set the daemon sent that could not be assembled
     DIAG_ICON_TIMEOUT, // icon_get left unanswered
-    DIAG_CARD_ERROR,   // a failed read from the TF card
+    DIAG_CARD_ERROR,   // a failed TF card read, write, mount or recovery, or a refused card write
     DIAG_KINDS,
 } diag_kind_t;
 
