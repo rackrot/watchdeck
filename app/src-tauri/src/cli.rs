@@ -3,10 +3,11 @@
 //! is involved. The request goes to the loopback listener with `std::net`.
 //!
 //! Exit codes: 0 when the daemon took the request, 2 when nothing listens (the app isn't
-//! running, or has no push integration), and 1 for anything else, with the reason on stderr.
+//! running, or has no push integration) or another user's socket does, and 1 for anything else,
+//! with the reason on stderr. The token is sent only to a listener of this user's.
 
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -89,19 +90,32 @@ pub fn run(args: &[String], env: &Env, out: &mut dyn Write, err: &mut dyn Write)
             );
             2
         }
+        Err(Failure::NotOurs) => {
+            let _ = writeln!(
+                err,
+                "watchdeck: something else is listening on {}, so the token was not sent",
+                env.addr
+            );
+            2
+        }
         Err(Failure::Other(why)) => {
             let _ = writeln!(err, "watchdeck: {why}");
             1
         }
         Ok(reply) if (200..300).contains(&reply.status) => {
             if let Some(id) = field(&reply.body, "id") {
-                let _ = writeln!(out, "{id}");
+                let _ = writeln!(out, "{}", printable(&id));
             }
             0
         }
         Ok(reply) => {
             let reason = field(&reply.body, "error").unwrap_or_else(|| reply.body.clone());
-            let _ = writeln!(err, "watchdeck: refused ({}): {reason}", reply.status);
+            let _ = writeln!(
+                err,
+                "watchdeck: refused ({}): {}",
+                reply.status,
+                printable(&reason)
+            );
             1
         }
     }
@@ -276,6 +290,8 @@ fn token_from_files(dir: &Path, integration: Option<&str>) -> Result<String, Str
 enum Failure {
     /// The connection was refused or never made.
     NotListening(io::Error),
+    /// Another user's socket listens there.
+    NotOurs,
     Other(String),
 }
 
@@ -288,6 +304,8 @@ struct Reply {
 fn send(addr: SocketAddr, token: &str, command: &Command) -> Result<Reply, Failure> {
     let mut stream =
         TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(Failure::NotListening)?;
+    // Connected first, so the listener checked is one that took this connection.
+    check_listener(addr)?;
     let failed = |e: io::Error| Failure::Other(format!("talking to {addr}: {e}"));
     stream.set_read_timeout(Some(IO_TIMEOUT)).map_err(failed)?;
     stream.set_write_timeout(Some(IO_TIMEOUT)).map_err(failed)?;
@@ -324,6 +342,102 @@ fn send(addr: SocketAddr, token: &str, command: &Command) -> Result<Reply, Failu
 fn field(body: &str, key: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     Some(value.get(key)?.as_str()?.to_string())
+}
+
+/// `text` without control characters, so what a listener says can't drive the terminal.
+fn printable(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// Refuses to send the token unless the socket listening on `addr` is this user's.
+///
+/// On Linux, `/proc/net/tcp` and `tcp6` give each listening socket's owner. Any listener that
+/// could have taken a connection to `addr` must belong to this process's effective user (the
+/// owner of `/proc/self`), or another local user could take the token with a listener of its own
+/// while the app isn't running.
+#[cfg(target_os = "linux")]
+fn check_listener(addr: SocketAddr) -> Result<(), Failure> {
+    use std::os::unix::fs::MetadataExt;
+
+    let unknown = |why: String| Failure::Other(format!("can't tell who listens on {addr}: {why}"));
+    let uid = std::fs::metadata("/proc/self")
+        .map_err(|e| unknown(e.to_string()))?
+        .uid();
+    let tcp = std::fs::read_to_string("/proc/net/tcp").map_err(|e| unknown(e.to_string()))?;
+    // Absent when IPv6 is off, and then nothing listens there.
+    let tcp6 = std::fs::read_to_string("/proc/net/tcp6").unwrap_or_default();
+    let owners: Vec<u32> = (listeners(&tcp).into_iter().chain(listeners(&tcp6)))
+        .filter(|(local, _)| reaches(*local, addr))
+        .map(|(_, uid)| uid)
+        .collect();
+    match owners.as_slice() {
+        [] => Err(unknown("no listener found".into())),
+        owners if owners.iter().all(|&owner| owner == uid) => Ok(()),
+        _ => Err(Failure::NotOurs),
+    }
+}
+
+/// Elsewhere there is no `/proc/net/tcp` to ask, so the check is skipped; the app targets Linux.
+#[cfg(not(target_os = "linux"))]
+fn check_listener(_addr: SocketAddr) -> Result<(), Failure> {
+    Ok(())
+}
+
+/// Each listening socket in a `/proc/net/tcp` or `tcp6` table: its local address and its
+/// owner's uid.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn listeners(table: &str) -> Vec<(SocketAddr, u32)> {
+    const LISTEN: &str = "0A";
+    (table.lines().skip(1))
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let (local, state, uid) = (fields.get(1)?, fields.get(3)?, fields.get(7)?);
+            if *state != LISTEN {
+                return None;
+            }
+            let (ip, port) = local.split_once(':')?;
+            let port = u16::from_str_radix(port, 16).ok()?;
+            Some(((proc_ip(ip)?, port).into(), uid.parse().ok()?))
+        })
+        .collect()
+}
+
+/// An address as `/proc/net/tcp` prints it: the bytes in network order, printed as native 32-bit
+/// words in hex.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn proc_ip(hex: &str) -> Option<IpAddr> {
+    let word = |chunk: &[u8]| -> Option<[u8; 4]> {
+        let text = std::str::from_utf8(chunk).ok()?;
+        if !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(u32::from_str_radix(text, 16).ok()?.to_ne_bytes())
+    };
+    match hex.len() {
+        8 => Some(Ipv4Addr::from(word(hex.as_bytes())?).into()),
+        32 => {
+            let mut bytes = [0u8; 16];
+            for (i, chunk) in hex.as_bytes().chunks(8).enumerate() {
+                bytes[i * 4..i * 4 + 4].copy_from_slice(&word(chunk)?);
+            }
+            Some(Ipv6Addr::from(bytes).into())
+        }
+        _ => None,
+    }
+}
+
+/// Whether a socket listening on `local` could take a connection to `addr`: the same address, or
+/// any address, on the same port, IPv4-mapped included.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn reaches(local: SocketAddr, addr: SocketAddr) -> bool {
+    if local.port() != addr.port() {
+        return false;
+    }
+    let ip = match local.ip() {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        v4 => v4,
+    };
+    ip == addr.ip() || ip.is_unspecified()
 }
 
 #[cfg(test)]
@@ -414,5 +528,78 @@ mod tests {
             err.contains("printable ASCII") && !err.contains("Injected"),
             "{err}"
         );
+    }
+
+    /// Captured from this desktop (little-endian): 127.0.0.1:47822 by uid 1000, 0.0.0.0:47822
+    /// by uid 1001, 127.0.0.53:53 by 974, and an established connection, not a listener.
+    const TCP: &str = "  \
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:BACE 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 3357267 1 0000000000000000 100 0 0 10 0
+   1: 00000000:BACE 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1001        0 3962 1 0000000000000000 100 0 0 10 0
+   2: 3500007F:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000   974        0 14335 1 0000000000000000 100 0 0 10 5
+   3: 0100007F:BACE 0100007F:9C40 01 00000000:00000000 00:00000000 00000000     0        0 77 1 0000000000000000 20 4 30 10 -1
+";
+    /// `[::]:47822` by uid 1002 and `[::1]:6001` by 1000.
+    const TCP6: &str = "  \
+  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000000000000000000000000000:BACE 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1002        0 10618190 1
+   1: 00000000000000000000000001000000:1771 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 10618186 1
+";
+
+    #[cfg(target_endian = "little")]
+    #[test]
+    fn proc_net_tcp_gives_each_listener_its_address_and_owner() {
+        let v4 = listeners(TCP);
+        assert_eq!(
+            v4,
+            [
+                ("127.0.0.1:47822".parse().unwrap(), 1000),
+                ("0.0.0.0:47822".parse().unwrap(), 1001),
+                ("127.0.0.53:53".parse().unwrap(), 974),
+            ]
+        );
+        let v6 = listeners(TCP6);
+        assert_eq!(
+            v6,
+            [
+                ("[::]:47822".parse().unwrap(), 1002),
+                ("[::1]:6001".parse().unwrap(), 1000),
+            ]
+        );
+        let target: SocketAddr = "127.0.0.1:47822".parse().unwrap();
+        let could_take: Vec<u32> = (v4.into_iter().chain(v6))
+            .filter(|(local, _)| reaches(*local, target))
+            .map(|(_, uid)| uid)
+            .collect();
+        // The exact address, the IPv4 wildcard, and the dual-stack wildcard all could.
+        assert_eq!(could_take, [1000, 1001, 1002]);
+    }
+
+    #[test]
+    fn a_listener_reaches_its_own_address_the_wildcards_and_mapped_ones_only() {
+        let target: SocketAddr = "127.0.0.1:47822".parse().unwrap();
+        for local in [
+            "127.0.0.1:47822",
+            "0.0.0.0:47822",
+            "[::]:47822",
+            "[::ffff:127.0.0.1]:47822",
+        ] {
+            assert!(reaches(local.parse().unwrap(), target), "{local}");
+        }
+        for local in [
+            "127.0.0.2:47822",
+            "127.0.0.1:47823",
+            "[::1]:47822",
+            "[::ffff:10.0.0.1]:47822",
+        ] {
+            assert!(!reaches(local.parse().unwrap(), target), "{local}");
+        }
+        assert_eq!(proc_ip("0100007"), None);
+        assert_eq!(proc_ip("0100007G"), None);
+    }
+
+    #[test]
+    fn what_a_listener_says_is_printed_without_control_characters() {
+        assert_eq!(printable("not found\x1b[2J\r\n\x07"), "not found[2J");
     }
 }
