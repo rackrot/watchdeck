@@ -986,8 +986,9 @@ static void sleep_touched(void)
 // before building, so the two are never in the LVGL pool together. Runs in the LVGL task.
 static void sleep_enter(sleep_reason_t reason)
 {
-    if (s_mode != MODE_GRID && s_mode != MODE_STATUS) {
-        return; // already asleep, or settings is open
+    // A queued privacy swipe can arrive after an unpair or a settings open, so check again here.
+    if (!uimode_can_sleep(s_mode, reason, s_paired)) {
+        return;
     }
     if (s_mode == MODE_GRID && !s_grid) {
         return;
@@ -1339,7 +1340,8 @@ void ui_set_icon(const uint8_t id[PROTO_ICON_ID_LEN], const lv_image_dsc_t *dsc)
 {
     lvgl_port_lock(0);
     // Only the grid has cells; the model holds the icon for the page built later.
-    for (size_t i = 0; uimode_action(UIM_SET_ICON, s_mode) == UI_BUILD && i < s_n_buttons; i++) {
+    const size_t n = uimode_action(UIM_SET_ICON, s_mode) == UI_BUILD ? s_n_buttons : 0;
+    for (size_t i = 0; i < n; i++) {
         if (s_has_icon[i] && memcmp(s_icon_ids[i], id, PROTO_ICON_ID_LEN) == 0) {
             show_icon(i, dsc);
         }

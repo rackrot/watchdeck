@@ -51,8 +51,27 @@ void test_uimode_only_an_offline_sleep_wakes_on_the_link(void)
     TEST_ASSERT_FALSE(uimode_link_wakes(SLEEP_PRIVACY));
 }
 
+void test_uimode_can_sleep(void)
+{
+    // Unpaired never sleeps, in any mode, for either reason.
+    for (int m = 0; m < MODE_COUNT; m++) {
+        TEST_ASSERT_FALSE(uimode_can_sleep(m, SLEEP_PRIVACY, false));
+        TEST_ASSERT_FALSE(uimode_can_sleep(m, SLEEP_OFFLINE, false));
+    }
+    TEST_ASSERT_TRUE(uimode_can_sleep(MODE_GRID, SLEEP_PRIVACY, true));
+    TEST_ASSERT_TRUE(uimode_can_sleep(MODE_GRID, SLEEP_OFFLINE, true));
+    TEST_ASSERT_TRUE(uimode_can_sleep(MODE_STATUS, SLEEP_OFFLINE, true));
+    TEST_ASSERT_FALSE(uimode_can_sleep(MODE_STATUS, SLEEP_PRIVACY, true));
+    // Never from settings, never when already asleep.
+    TEST_ASSERT_FALSE(uimode_can_sleep(MODE_SETTINGS, SLEEP_PRIVACY, true));
+    TEST_ASSERT_FALSE(uimode_can_sleep(MODE_SETTINGS, SLEEP_OFFLINE, true));
+    TEST_ASSERT_FALSE(uimode_can_sleep(MODE_SLEEP, SLEEP_PRIVACY, true));
+    TEST_ASSERT_FALSE(uimode_can_sleep(MODE_SLEEP, SLEEP_OFFLINE, true));
+}
+
 void test_uimode_run(void)
 {
+    RUN_TEST(test_uimode_can_sleep);
     RUN_TEST(test_uimode_every_cell_is_decided);
     RUN_TEST(test_uimode_asleep_builds_nothing);
     RUN_TEST(test_uimode_settings_and_grid_keep_their_behavior);
