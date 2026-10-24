@@ -157,7 +157,9 @@ fn render_rgba(svg: &[u8], px: u32) -> Result<Vec<[u8; 4]>, String> {
     resvg::render(&tree, transform, &mut pixmap.as_mut());
     Ok(pixmap
         .data()
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|p| {
             // resvg gives premultiplied color. Clear pixels carry no color, so they stay zero.
             let a = u32::from(p[3]);
