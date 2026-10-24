@@ -75,6 +75,8 @@ const char *wifi_reason_name(int code)
         return "network not found";
     case 202:
         return "authentication failed";
+    case 204:
+        return "wrong password?";
     case 205:
         return "connection failed";
     default:

@@ -99,12 +99,18 @@ void app_main(void)
     }
     ui_set_touch_text(err == ESP_OK ? "Touch: ready" : "Touch: FAILED");
 
-    err = wifi_start(ui_set_wifi_text);
+    // Wi-Fi comes up with or without credentials, so Settings > Wi-Fi can scan and join from a board that has none.
+    err = wifi_init(ui_set_wifi_text);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "wifi_start: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "wifi_init: %s", esp_err_to_name(err));
+    } else {
+        err = wifi_apply_saved();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "wifi_apply_saved: %s", esp_err_to_name(err));
+        }
     }
 
-    // The link waits for an IP itself, so it starts even if wifi_start failed. It needs the model, which the UI reads.
+    // The link waits for an IP itself, so it starts even if Wi-Fi failed. It needs the model, which the UI reads.
     const link_cbs_t link_cbs = {
         .on_status = ui_set_daemon_text,
         .on_welcome = ui_set_daemon_name,

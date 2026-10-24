@@ -21,7 +21,7 @@ typedef struct {
 /**
  * Callbacks into the UI. All run on the link task, never with the model lock held, so they may
  * block briefly (they take the LVGL lock, then maybe the model lock) but must not call back into
- * link_*, except link_watch_rssi, which only sets a flag. Any may be NULL.
+ * link_*. Any may be NULL.
  */
 typedef struct {
     void (*on_status)(const char *text);  // "searching", "connected to <name>", ...
@@ -43,7 +43,7 @@ typedef struct {
 
 /**
  * Start the link task. Paired, it finds the daemon over mDNS, connects, and keeps reconnecting
- * with backoff. Unpaired, it lists the daemons open for pairing. Call after wifi_start().
+ * with backoff. Unpaired, it lists the daemons open for pairing. Call after wifi_init().
  * `cbs` is copied.
  */
 esp_err_t link_start(const link_cbs_t *cbs);
@@ -74,9 +74,3 @@ esp_err_t link_forget(void);
  * hello, so it is set by the time a set applies. Safe from any task.
  */
 const char *link_device_id(void);
-
-/**
- * While `on`, the link task refreshes the cached RSSI (wifi_rssi) at once and then every few seconds, so a reader on
- * the LVGL task never makes the RPC itself. Safe from any task.
- */
-void link_watch_rssi(bool on);

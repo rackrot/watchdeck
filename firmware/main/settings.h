@@ -78,6 +78,14 @@ void settings_log_line_close(void);
 void tab_status_build(lv_obj_t *parent);
 void tab_status_tick(void);
 void tab_status_leave(void);
+void tab_wifi_build(lv_obj_t *parent);
+void tab_wifi_tick(void);
+void tab_wifi_leave(void);
+/** Whether the Wi-Fi editor holds something that idle must not throw away: a job running, a typed password, or the
+ * keyboard up. */
+bool tab_wifi_editing(void);
+/** Whether a trial connect or a save is running. Close and the tab buttons do nothing until it ends. */
+bool tab_wifi_busy(void);
 void tab_logs_build(lv_obj_t *parent);
 void tab_logs_tick(void);
 void tab_logs_leave(void);
