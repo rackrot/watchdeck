@@ -19,7 +19,8 @@ use tokio::sync::watch;
 
 use super::fonts_gen::FONT_IDS;
 use super::icons::{self, IconSet, Icons};
-use super::protocol::{encode_hex, Button, IconFrame, Message};
+use super::protocol::{encode_hex, Button, IconFrame, Message, Sleep};
+use super::screens::{self, ScreenImage, Screens};
 use super::secrets::Secrets;
 use super::store::write_private;
 use super::units::{fit_steps, Metric, NetUnit, TempUnit, Units};
@@ -443,7 +444,7 @@ impl SleepConfig {
         if let Some(image) = self.image.as_deref().filter(|i| !icons::plain_name(i)) {
             errors.push(format!(
                 "sleep.image {image:?} must be {}",
-                icons::name_rule("screens")
+                icons::name_rule(screens::DIR)
             ));
         }
         if let Some(fit) = self
@@ -868,6 +869,8 @@ pub struct Live {
     pub config: Config,
     /// One entry for each icon file `config` names.
     pub icons: IconSet,
+    /// The image `[sleep]` names, rendered. `None` when it names none.
+    pub screen: Option<Arc<ScreenImage>>,
 }
 
 impl Deref for Live {
@@ -884,7 +887,13 @@ impl Live {
         Self {
             config: Config::empty(),
             icons: IconSet::new(),
+            screen: None,
         }
+    }
+
+    /// The `sleep` frame for this config, with every default filled in.
+    pub fn sleep(&self) -> Sleep {
+        screens::sleep_frame(self.config.sleep.as_ref(), self.screen.as_deref())
     }
 
     pub fn layout(&self) -> Layout {
@@ -1351,9 +1360,13 @@ pub struct Configs {
     status: watch::Sender<ConfigStatus>,
     icons_dir: PathBuf,
     icons: Icons,
+    screens_dir: PathBuf,
+    screens: Screens,
     /// The icon files the file on disk names, for the poller to stamp. Kept even when the config
     /// is refused, so a file that is still being copied in is read again once it settles.
     watched: Mutex<Vec<String>>,
+    /// The same for the sleep image.
+    watched_screen: Mutex<Option<String>>,
     /// The files as the last reload read them. Holding it serializes reloads and saves, so a
     /// save's check and its write see the same file.
     read: Mutex<Stamps>,
@@ -1365,6 +1378,7 @@ impl Configs {
     pub fn open(dir: &Path, secrets: Arc<Secrets>) -> io::Result<Arc<Self>> {
         let path = dir.join(FILE);
         let icons_dir = dir.join(icons::DIR);
+        let screens_dir = dir.join(screens::DIR);
         if !path.try_exists()? {
             write_private(&path, DEFAULT.as_bytes())?;
             log::info!("wrote the default {}", path.display());
@@ -1381,7 +1395,10 @@ impl Configs {
             .0,
             icons: Icons::new(icons_dir.clone()),
             icons_dir,
+            screens: Screens::new(screens_dir.clone()),
+            screens_dir,
             watched: Mutex::default(),
+            watched_screen: Mutex::default(),
             // Nothing read yet, which differs from any file that exists.
             read: Mutex::new(Stamps::default()),
         });
@@ -1413,19 +1430,22 @@ impl Configs {
         self.prewarm();
         let mut read = self.locked();
         let before = self.stamp();
-        let mut icons_before = None;
+        let mut named_before = None;
         let mut revision = String::new();
         let loaded = read_capped(&self.path).and_then(|bytes| {
             revision = sha256_hex(&bytes);
             let text = String::from_utf8(bytes).map_err(|_| vec!["not UTF-8".to_string()])?;
             let config = parse(&text, &self.secrets.sizes())?;
             self.watch(&config);
-            icons_before = Some(self.stamp().icons);
-            let icons = self.icons.load(&config)?;
-            Ok(Live { config, icons })
+            let named = self.stamp();
+            named_before = Some((named.icons, named.screen));
+            self.render(config)
         });
         let now = self.stamp();
-        if now.files != before.files || icons_before.is_some_and(|icons| icons != now.icons) {
+        if now.files != before.files
+            || named_before
+                .is_some_and(|(icons, screen)| icons != now.icons || screen != now.screen)
+        {
             log::debug!("{} changed while being read", self.path.display());
             return Ok(false);
         }
@@ -1466,14 +1486,14 @@ impl Configs {
         }
         // Render before the lock, so a slow decode doesn't hold it, then again under the lock.
         // That pass is a cache hit unless a file changed in between, as in `reload`.
-        self.icons.load(&config)?;
+        self.render(config.clone())?;
         let _read = self.locked();
         // Again under the lock, since a secret may have been deleted since the first check.
         let errors = config.check(&self.secrets.sizes());
         if !errors.is_empty() {
             return Err(errors);
         }
-        let icons = self.icons.load(&config)?;
+        let live = self.render(config.clone())?;
         let on_disk = self.read_file()?;
         if on_disk.as_deref().map_or_else(String::new, sha256_hex) != revision {
             return Err(vec![format!(
@@ -1491,7 +1511,7 @@ impl Configs {
         write_private(&self.path, text.as_bytes())
             .map_err(|e| vec![format!("Could not save {FILE}: {e}")])?;
         let revision = sha256_hex(text.as_bytes());
-        if self.go_live(Live { config, icons }) {
+        if self.go_live(live) {
             log::info!("saved and applied {}", self.path.display());
         }
         self.set_status(revision.clone());
@@ -1570,6 +1590,25 @@ impl Configs {
         }
     }
 
+    /// `config` with the icons and the sleep image it names rendered. Every file that fails is
+    /// reported, the icons' errors first.
+    fn render(&self, config: Config) -> Result<Live, Vec<String>> {
+        let icons = self.icons.load(&config);
+        let screen = self.screens.load(config.sleep.as_ref());
+        match (icons, screen) {
+            (Ok(icons), Ok(screen)) => Ok(Live {
+                config,
+                icons,
+                screen,
+            }),
+            (icons, screen) => Err([icons.err(), screen.err()]
+                .into_iter()
+                .flatten()
+                .flatten()
+                .collect()),
+        }
+    }
+
     /// Copies the image at `src` into `icons/` and returns the file name for a button's `icon`.
     pub fn import_icon(&self, src: &Path) -> Result<String, String> {
         self.icons.import(src)
@@ -1578,6 +1617,16 @@ impl Configs {
     /// The files in `icons/` that a button's `icon` could name, sorted.
     pub fn list_icons(&self) -> Result<Vec<String>, String> {
         self.icons.list()
+    }
+
+    /// Copies the image at `src` into `screens/` and returns the file name for `[sleep]`'s `image`.
+    pub fn import_screen_image(&self, src: &Path) -> Result<String, String> {
+        self.screens.import(src)
+    }
+
+    /// The files in `screens/` that `[sleep]`'s `image` could name, sorted.
+    pub fn list_screen_images(&self) -> Result<Vec<String>, String> {
+        self.screens.list()
     }
 
     /// Removes secret `name`, unless the live config still uses it, since the next reload would
@@ -1612,7 +1661,7 @@ impl Configs {
             return;
         };
         if let Ok(config) = parse(&text, &self.secrets.sizes()) {
-            let _ = self.icons.load(&config);
+            let _ = self.render(config);
         }
     }
 
@@ -1625,6 +1674,8 @@ impl Configs {
         names.sort();
         names.dedup();
         *self.watched.lock().expect("watched icons poisoned") = names;
+        *self.watched_screen.lock().expect("watched screen poisoned") =
+            config.sleep.as_ref().and_then(|s| s.image.clone());
     }
 
     /// Reloads whenever `config.toml`, `secrets.toml` or the `icons/` directory differ from what
@@ -1650,16 +1701,21 @@ impl Configs {
 
     fn stamp(&self) -> Stamps {
         let watched = self.watched.lock().expect("watched icons poisoned");
+        let screen = self.watched_screen.lock().expect("watched screen poisoned");
         Stamps {
             files: (
                 hashed_stamp(&self.path),
                 hashed_stamp(&self.secrets.path()),
                 stamp(&self.icons_dir),
+                stamp(&self.screens_dir),
             ),
             icons: watched
                 .iter()
                 .map(|name| stamp(&self.icons_dir.join(name)))
                 .collect(),
+            screen: screen
+                .as_ref()
+                .and_then(|name| stamp(&self.screens_dir.join(name))),
         }
     }
 
@@ -1719,12 +1775,19 @@ type HashedStamp = (Stamp, Option<String>);
 /// What the poller watches.
 #[derive(Clone, Default, PartialEq)]
 struct Stamps {
-    /// `config.toml`, `secrets.toml`, then the `icons/` directory, whose stamp changes when a
-    /// file is added, renamed or removed.
-    files: (Option<HashedStamp>, Option<HashedStamp>, Option<Stamp>),
+    /// `config.toml`, `secrets.toml`, then the `icons/` and `screens/` directories, whose stamps
+    /// change when a file is added, renamed or removed.
+    files: (
+        Option<HashedStamp>,
+        Option<HashedStamp>,
+        Option<Stamp>,
+        Option<Stamp>,
+    ),
     /// The icon files `config.toml` names, which also change when one is overwritten in place or
     /// is still being written.
     icons: Vec<Option<Stamp>>,
+    /// The same for the sleep image.
+    screen: Option<Stamp>,
 }
 
 fn stamp(path: &Path) -> Option<Stamp> {
@@ -3025,6 +3088,7 @@ action = { kind = "shell", argv = ["true"] }
         Live {
             config,
             icons: IconSet::new(),
+            screen: None,
         }
     }
 
@@ -3670,6 +3734,20 @@ source = { kind = "http", method = "GET", url = "http://nas.lan/api/load" }
         let revision = configs.status().borrow().revision.clone();
         let config = parse(&with_new(FULL_NEW), &sizes()).unwrap();
 
+        // The example's `[sleep]` names a picture, which must be there.
+        fs::create_dir(tmp.path().join(crate::daemon::screens::DIR)).unwrap();
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 8))
+            .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+            .unwrap();
+        fs::write(
+            tmp.path()
+                .join(crate::daemon::screens::DIR)
+                .join("lake.jpg"),
+            jpeg.into_inner(),
+        )
+        .unwrap();
+
         configs.save(config.clone(), &revision).unwrap();
         let text = fs::read_to_string(tmp.path().join(FILE)).unwrap();
         for table in ["[sleep]", "[push]", "[[integration]]"] {
@@ -3678,6 +3756,30 @@ source = { kind = "http", method = "GET", url = "http://nas.lan/api/load" }
         assert_eq!(parse(&text, &sizes()).unwrap(), config, "{text}");
         assert_eq!(configs.current().config, config);
         assert_eq!(configs.reload(), Ok(false));
+        let live = configs.current();
+        assert!(live.screen.is_some());
+        assert_eq!(
+            live.sleep().image,
+            live.screen.as_ref().map(|s| encode_hex(&s.id))
+        );
+    }
+
+    #[test]
+    fn a_sleep_image_that_is_not_in_screens_holds_the_config_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let secrets = Arc::new(Secrets::new(tmp.path()));
+        secrets.set("ha", "Bearer x").unwrap();
+        let configs = Configs::open(tmp.path(), secrets).unwrap();
+        let revision = configs.status().borrow().revision.clone();
+        let config = parse(&sleep_with("image = \"x\""), &sizes()).unwrap();
+        assert_eq!(
+            configs.save(config, &revision),
+            Err(vec![
+                "sleep.image \"x\": no such file in screens/".to_string()
+            ])
+        );
+        let on_disk = fs::read_to_string(tmp.path().join(FILE)).unwrap();
+        assert!(!on_disk.contains("[sleep]"), "nothing was written");
     }
 
     #[test]

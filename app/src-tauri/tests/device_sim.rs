@@ -37,8 +37,10 @@ use watchdeck_lib::daemon::hoststats::HostSources;
 use watchdeck_lib::daemon::pairing::{Pairing, PairingState};
 use watchdeck_lib::daemon::protocol::{
     decode_hex, encode_hex, pairing_code, Button, Colors, ErrorCode, IconFrame, Message, NetUnit,
-    Report, TempUnit, TileState, Token,
+    Report, Sleep, SleepAnchor, SleepShow, SleepSpinner, TempUnit, TileState, Token,
+    ASSET_CHUNK_BYTES, ASSET_HEADER_BYTES,
 };
+use watchdeck_lib::daemon::screens::{self, Fit};
 use watchdeck_lib::daemon::secrets::Secrets;
 use watchdeck_lib::daemon::server::{DaemonEvent, DeviceInfo, Devices, Server};
 use watchdeck_lib::daemon::store::Store;
@@ -3177,4 +3179,350 @@ async fn picking_the_amd_by_address_reads_sysfs_and_shuts_nvml_down() {
     let bar = got.expect("no frame read the AMD");
     assert_eq!(bar.gpu_temp, Some(39));
     wait_for("NVML shutting down", || daemon.nvidia.shutdowns() == 1).await;
+}
+
+// ---- Sleep screen ----
+
+/// `CONFIG` with a `[sleep]` table that names `lake.png`, and `keys` after it.
+fn sleep_config(keys: &str) -> String {
+    format!("{CONFIG}\n[sleep]\nimage = \"lake.png\"\n{keys}")
+}
+
+/// A 4:3 picture with a gradient, so every shade of `blue` is a different image.
+fn photo_png(blue: u8) -> Vec<u8> {
+    let picture = image::RgbaImage::from_fn(400, 300, |x, y| {
+        image::Rgba([(x * 255 / 399) as u8, (y * 255 / 299) as u8, blue, 255])
+    });
+    let mut out = std::io::Cursor::new(Vec::new());
+    picture.write_to(&mut out, image::ImageFormat::Png).unwrap();
+    out.into_inner()
+}
+
+fn put_screen(daemon: &Daemon, name: &str, bytes: &[u8]) {
+    let dir = daemon.dir.path().join("screens");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(name), bytes).unwrap();
+}
+
+/// A daemon whose config names `lake.png`.
+async fn start_with_screen() -> Daemon {
+    let daemon = start().await;
+    put_screen(&daemon, "lake.png", &photo_png(0));
+    assert_eq!(daemon.reconfigure(&sleep_config("")), Ok(true));
+    daemon
+}
+
+async fn next_sleep(c: &mut Client) -> Sleep {
+    match recv(c).await {
+        Message::Sleep(sleep) => sleep,
+        other => panic!("expected sleep, got {other:?}"),
+    }
+}
+
+/// A device that names `caps`, past its welcome and first layout, and the `sleep` it got if the
+/// caps name `sleep`.
+async fn sleep_session(addr: SocketAddr, caps: &[&str]) -> (Client, Option<Sleep>) {
+    let mut c = connect(addr).await;
+    c.send(hello_with_caps(1, DEVICE, Some(&TOKEN), caps))
+        .await
+        .unwrap();
+    assert!(matches!(recv(&mut c).await, Message::Welcome { .. }));
+    assert!(matches!(recv(&mut c).await, Message::Layout { .. }));
+    let sleep = if caps.contains(&"sleep") {
+        Some(next_sleep(&mut c).await)
+    } else {
+        None
+    };
+    (c, sleep)
+}
+
+fn asset_get(id: &str, offset: u64) -> Ws {
+    Ws::text(
+        serde_json::to_string(&serde_json::json!({"t": "asset_get", "id": id, "offset": offset}))
+            .unwrap(),
+    )
+}
+
+/// The next binary frame as an asset frame: its id, offset and bytes, with the header checked.
+async fn recv_asset<S: AsyncRead + AsyncWrite + Unpin>(
+    c: &mut WebSocketStream<S>,
+) -> ([u8; 16], u32, Vec<u8>) {
+    loop {
+        match c.next().await.expect("stream ended").unwrap() {
+            Ws::Binary(frame) => {
+                assert!(frame.len() >= ASSET_HEADER_BYTES, "a header");
+                assert!(frame.len() <= ASSET_HEADER_BYTES + ASSET_CHUNK_BYTES);
+                assert_eq!(&frame[..4], b"WDA1");
+                let id = frame[4..20].try_into().unwrap();
+                let offset = u32::from_le_bytes(frame[20..24].try_into().unwrap());
+                return (id, offset, frame[ASSET_HEADER_BYTES..].to_vec());
+            }
+            Ws::Ping(_) | Ws::Pong(_) => {}
+            other => panic!("expected an asset frame, got {other:?}"),
+        }
+    }
+}
+
+/// Proves nothing else is on the way: the next message is the result of a press.
+async fn assert_only_a_result_follows(c: &mut Client, seq: u64) {
+    c.send(press("hello", seq)).await.unwrap();
+    match recv(c).await {
+        Message::Result { seq: got, .. } => assert_eq!(got, seq),
+        other => panic!("expected the press result, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_sleep_device_gets_the_frame_after_the_first_layout_and_others_get_none() {
+    let daemon = start_with_screen().await;
+    let (mut c, sleep) = sleep_session(daemon.addr, &["sleep", "bogus"]).await;
+    let sleep = sleep.unwrap();
+    assert_eq!(sleep.check(), Ok(()));
+    let image = sleep.image.clone().expect("the frame names the image");
+    assert!(decode_hex::<16>(&image).is_some(), "{image}");
+    assert_eq!(
+        Sleep {
+            image: None,
+            ..sleep
+        },
+        Sleep {
+            image: None,
+            bg: 0,
+            fg: 0xd0d0d0,
+            show: vec![SleepShow::Clock, SleepShow::Date],
+            text: None,
+            anchor: SleepAnchor::BottomLeft,
+            spinner: SleepSpinner::Arc,
+            spinner_color: 0x38bdf8,
+            offline_after_s: 10,
+            backlight: 100,
+        },
+        "an absent key takes its default"
+    );
+    assert_eq!(
+        daemon.devices.list(),
+        [DeviceInfo {
+            id: DEVICE.into(),
+            connected: true,
+            caps: vec!["sleep".into()],
+        }]
+    );
+    assert_only_a_result_follows(&mut c, 1).await;
+
+    // Without the capability the frame never comes, and `asset_get` is not a message it speaks.
+    let (mut plain, _) = sleep_session(daemon.addr, &[]).await;
+    plain.send(asset_get(&image, 0)).await.unwrap();
+    assert_only_a_result_follows(&mut plain, 2).await;
+}
+
+#[tokio::test]
+async fn a_config_with_no_sleep_table_sends_the_defaults_and_no_image() {
+    let daemon = start().await;
+    let (mut c, sleep) = sleep_session(daemon.addr, &["sleep"]).await;
+    let sleep = sleep.unwrap();
+    assert_eq!(sleep.image, None);
+    assert_eq!((sleep.offline_after_s, sleep.backlight), (10, 100));
+    assert_eq!(sleep.check(), Ok(()));
+    // There is no image to ask for.
+    c.send(asset_get(&"ab".repeat(16), 0)).await.unwrap();
+    assert_only_a_result_follows(&mut c, 1).await;
+}
+
+#[tokio::test]
+async fn asset_get_serves_the_image_in_four_chunks_that_hash_to_its_id() {
+    let daemon = start_with_screen().await;
+    let (mut c, sleep) = sleep_session(daemon.addr, &["sleep"]).await;
+    let image = sleep.unwrap().image.unwrap();
+    let id = decode_hex::<16>(&image).unwrap();
+    let expected = screens::render(&photo_png(0), Fit::Cover, 0).unwrap();
+    assert_eq!(expected.id, id);
+
+    let mut pixels = Vec::new();
+    for i in 0..4u64 {
+        let offset = i * ASSET_CHUNK_BYTES as u64;
+        c.send(asset_get(&image, offset)).await.unwrap();
+        let (got_id, got_offset, chunk) = recv_asset(&mut c).await;
+        assert_eq!((got_id, u64::from(got_offset)), (id, offset));
+        assert_eq!(chunk.len(), ASSET_CHUNK_BYTES);
+        pixels.extend_from_slice(&chunk);
+    }
+    assert_eq!(pixels.len(), 1_048_576);
+    assert_eq!(pixels, expected.pixels());
+    assert_eq!(Sha256::digest(&pixels)[..16], id);
+
+    // A request the device repeats, after a timeout, gets the same chunk again.
+    c.send(asset_get(&image, ASSET_CHUNK_BYTES as u64))
+        .await
+        .unwrap();
+    let (_, _, again) = recv_asset(&mut c).await;
+    assert_eq!(again, pixels[ASSET_CHUNK_BYTES..2 * ASSET_CHUNK_BYTES]);
+    assert_only_a_result_follows(&mut c, 1).await;
+}
+
+#[tokio::test]
+async fn a_bad_asset_get_gets_bad_request_then_close() {
+    let daemon = start_with_screen().await;
+    let (c, sleep) = sleep_session(daemon.addr, &["sleep"]).await;
+    let image = sleep.unwrap().image.unwrap();
+    drop(c);
+    let stale = "0".repeat(32);
+    let chunk = ASSET_CHUNK_BYTES as u64;
+    let requests = [
+        // A malformed id.
+        asset_get("xyz", 0),
+        asset_get(&image.to_uppercase(), 0),
+        asset_get(&image[..31], 0),
+        asset_get("", 0),
+        // An offset that is not a whole chunk.
+        asset_get(&image, 1),
+        asset_get(&image, chunk + 1),
+        asset_get(&image, 4 * chunk - 1),
+        // An offset at or past the end of the image, for the current id or another.
+        asset_get(&image, 4 * chunk),
+        asset_get(&image, 5 * chunk),
+        asset_get(&image, u64::from(u32::MAX) + 1),
+        asset_get(&stale, 4 * chunk),
+        // Not an offset at all.
+        Ws::text(format!(r#"{{"t":"asset_get","id":"{image}","offset":-1}}"#)),
+        Ws::text(format!(
+            r#"{{"t":"asset_get","id":"{image}","offset":1.5}}"#
+        )),
+        Ws::text(format!(r#"{{"t":"asset_get","id":"{image}"}}"#)),
+    ];
+    for request in requests {
+        let (mut c, _) = sleep_session(daemon.addr, &["sleep"]).await;
+        c.send(request.clone()).await.unwrap();
+        let Message::Error { code, .. } = recv(&mut c).await else {
+            panic!("expected an error for {request:?}")
+        };
+        assert_eq!(code, ErrorCode::BadRequest, "{request:?}");
+        expect_closed(&mut c).await;
+    }
+    // The last chunk is fine.
+    let (mut c, _) = sleep_session(daemon.addr, &["sleep"]).await;
+    c.send(asset_get(&image, 3 * chunk)).await.unwrap();
+    assert_eq!(recv_asset(&mut c).await.1, 3 * ASSET_CHUNK_BYTES as u32);
+}
+
+#[tokio::test]
+async fn an_asset_get_for_another_id_gets_no_reply_and_the_session_stays_open() {
+    let daemon = start_with_screen().await;
+    let (mut c, sleep) = sleep_session(daemon.addr, &["sleep"]).await;
+    let image = sleep.unwrap().image.unwrap();
+    let other = "ab".repeat(16);
+    for offset in [0, ASSET_CHUNK_BYTES as u64] {
+        c.send(asset_get(&other, offset)).await.unwrap();
+    }
+    assert_only_a_result_follows(&mut c, 1).await;
+    // And the real one still answers.
+    c.send(asset_get(&image, 0)).await.unwrap();
+    assert_eq!(
+        recv_asset(&mut c).await.0,
+        decode_hex::<16>(&image).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn a_sleep_only_edit_pushes_sleep_and_no_layout_and_a_layout_edit_pushes_no_sleep() {
+    let mut daemon = start_with_screen().await;
+    let (mut c, sleep) = sleep_session(daemon.addr, &["sleep"]).await;
+    let sleep = sleep.unwrap();
+    assert_eq!(
+        daemon.events.recv().await.unwrap(),
+        DaemonEvent::DeviceConnected(DEVICE.into())
+    );
+
+    let edited = sleep_config(
+        "spinner = \"bar\"\nbacklight = 0\nshow = [\"clock\", \"text\"]\ntext = \"Back\"",
+    );
+    assert_eq!(daemon.reconfigure(&edited), Ok(true));
+    let next = next_sleep(&mut c).await;
+    assert_eq!(next.image, sleep.image, "the same picture keeps its id");
+    assert_eq!(next.spinner, SleepSpinner::Bar);
+    assert_eq!(next.backlight, 0);
+    assert_eq!(next.show, [SleepShow::Clock, SleepShow::Text]);
+    assert_eq!(next.text.as_deref(), Some("Back"));
+    assert_only_a_result_follows(&mut c, 1).await;
+    assert!(daemon.events.try_recv().is_err(), "no layout was pushed");
+
+    // The same config again changes nothing.
+    assert_eq!(daemon.reconfigure(&edited), Ok(false));
+    // A button edit pushes a layout and no sleep.
+    let relabeled = edited.replace("Hello", "Hi");
+    assert_eq!(daemon.reconfigure(&relabeled), Ok(true));
+    assert!(matches!(recv(&mut c).await, Message::Layout { rev: 2, .. }));
+    assert_only_a_result_follows(&mut c, 2).await;
+}
+
+#[tokio::test]
+async fn a_new_image_changes_the_id_and_the_old_id_then_gets_nothing() {
+    let daemon = start_with_screen().await;
+    let (mut c, sleep) = sleep_session(daemon.addr, &["sleep"]).await;
+    let old = sleep.unwrap().image.unwrap();
+
+    put_screen(&daemon, "lake.png", &photo_png(200));
+    assert_eq!(daemon.reconfigure(&sleep_config("")), Ok(true));
+    let new = next_sleep(&mut c).await.image.unwrap();
+    assert_ne!(new, old);
+
+    c.send(asset_get(&old, 0)).await.unwrap();
+    assert_only_a_result_follows(&mut c, 1).await;
+    c.send(asset_get(&new, 0)).await.unwrap();
+    assert_eq!(recv_asset(&mut c).await.0, decode_hex::<16>(&new).unwrap());
+
+    // Naming no image at all drops it from the frame and from what the session serves.
+    assert_eq!(daemon.reconfigure(CONFIG), Ok(true));
+    assert_eq!(next_sleep(&mut c).await.image, None);
+    c.send(asset_get(&new, 0)).await.unwrap();
+    assert_only_a_result_follows(&mut c, 2).await;
+}
+
+#[tokio::test]
+async fn a_missing_or_bad_sleep_image_is_refused_and_pushes_nothing() {
+    let daemon = start_with_screen().await;
+    let (mut c, _) = sleep_session(daemon.addr, &["sleep"]).await;
+
+    let missing = sleep_config("").replace("lake.png", "gone.png");
+    assert_eq!(
+        daemon.reconfigure(&missing),
+        Err(vec![
+            "sleep.image \"gone.png\": no such file in screens/".to_string()
+        ])
+    );
+    put_screen(&daemon, "lake.png", b"not a picture");
+    let errors = daemon.reconfigure(&sleep_config("")).unwrap_err();
+    assert!(
+        errors[0].starts_with("sleep.image \"lake.png\": "),
+        "{errors:?}"
+    );
+    assert_only_a_result_follows(&mut c, 1).await;
+}
+
+#[tokio::test]
+async fn a_paged_set_comes_first_then_the_known_tile_then_sleep() {
+    let daemon = start().await;
+    let paged = tile_config(2, "echo up")
+        .replacen(
+            "[[button]]",
+            "[[page]]\nid = \"main\"\n\n[[page]]\nid = \"more\"\n\n[[button]]",
+            1,
+        )
+        .replace("label = \"Plain\"", "label = \"Plain\"\npage = \"more\"");
+    assert_eq!(daemon.reconfigure(&paged), Ok(true));
+
+    // One device polls the tile, so its value is known when the next one connects.
+    let mut first = session_with_caps(daemon.addr, DEVICE, &TOKEN, &["pages"]).await;
+    let _ = recv_set(&mut first).await;
+    assert_eq!(recv_tile(&mut first, 5).await.0, "up");
+
+    daemon
+        .devices
+        .pair(OTHER, Sha256::digest(OTHER_TOKEN).into())
+        .unwrap();
+    let mut c = session_with_caps(daemon.addr, OTHER, &OTHER_TOKEN, &["pages", "sleep"]).await;
+    let set = recv_set(&mut c).await;
+    assert_eq!(set.len(), 2, "both pages come first");
+    assert_eq!(recv_tile(&mut c, 5).await.0, "up");
+    let sleep = next_sleep(&mut c).await;
+    assert_eq!(sleep.check(), Ok(()));
 }
