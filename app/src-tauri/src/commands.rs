@@ -173,7 +173,8 @@ pub async fn set_secret(
 pub async fn create_push_token(daemon: State<'_, Daemon>, id: String) -> Result<String, String> {
     let (configs, secrets) = (daemon.configs.clone(), daemon.secrets.clone());
     blocking(move || {
-        let token = push::create_token(&secrets, &id)?;
+        let name = push::token_secret_name(&id);
+        let token = configs.replace_secret_of(&name, &id, || push::create_token(&secrets, &id))?;
         // A config held back for want of this secret can go live now. reload logs its own outcome.
         let _ = configs.reload();
         Ok(token)
