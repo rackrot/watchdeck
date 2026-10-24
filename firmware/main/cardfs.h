@@ -67,6 +67,9 @@ typedef struct {
     // sector. ESP_OK: it can. CARDFS_ERR_DIR_FULL: it can't (see above). ESP_FAIL: a read error or a damaged
     // directory.
     esp_err_t (*room)(const char *dir, const uint8_t *runs, size_t n, void *ctx);
+    // Counts the volume's bytes and the free ones among them. May read the whole allocation table, so it can take 10 s
+    // on a large card. ESP_FAIL: a read error. NULL: not supported.
+    esp_err_t (*space)(uint64_t *total, uint64_t *free_bytes, void *ctx);
     void *ctx;
 } cardfs_volume_t;
 
@@ -78,6 +81,9 @@ typedef struct {
 // them, so it's exact while FatFs has nothing unsynced: true between cardfs calls on an untainted mount.
 esp_err_t cardfs_fat_prepare(void *ctx);
 esp_err_t cardfs_fat_room(const char *dir, const uint8_t *runs, size_t n, void *ctx);
+// f_getfree on the drive, for any FAT type. It counts the free clusters afresh, since cardfs_fat_prepare invalidated
+// FatFs's hint.
+esp_err_t cardfs_fat_space(uint64_t *total, uint64_t *free_bytes, void *ctx);
 
 // Sets the root (e.g. "/sdcard", at most 15 characters) and the volume (copied; vol->ctx is kept), creates the
 // mutex, attaches, clears the taint and runs vol->prepare, returning its error. Writes are refused until
@@ -140,6 +146,11 @@ esp_err_t cardfs_remove(const char *rel);
 // never called. ESP_ERR_INVALID_STATE: detached.
 typedef void (*cardfs_list_cb_t)(const char *name, size_t size, bool is_dir, void *ctx);
 esp_err_t cardfs_list(cardfs_list_cb_t cb, void *ctx);
+
+// The volume's total and free bytes. Holds the mutex for the whole count (up to 10 s on a large card), so a detach and
+// every other cardfs call wait for it, and an unmount can't start under it. ESP_ERR_INVALID_STATE: detached.
+// ESP_ERR_NOT_SUPPORTED: the volume has no space function. ESP_FAIL: a read error, which taints cardfs.
+esp_err_t cardfs_free_space(uint64_t *total, uint64_t *free_bytes);
 
 // Resolves every intent record: a valid one is applied (rel rewritten if it differs) and emptied, a torn one is
 // emptied, an empty or absent one means no write was in progress. Idempotent, so a cut during recovery is recovered

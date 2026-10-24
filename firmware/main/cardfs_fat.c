@@ -51,6 +51,15 @@ static esp_err_t open_volume(void *ctx, const char *dir, FATFS **fs, DWORD *star
     return ESP_OK;
 }
 
+static UINT sector_size(const FATFS *fs)
+{
+#if FF_MAX_SS != FF_MIN_SS
+    return fs->ssize;
+#else
+    return FF_MAX_SS;
+#endif
+}
+
 esp_err_t cardfs_fat_prepare(void *ctx)
 {
     FATFS *fs;
@@ -184,11 +193,7 @@ esp_err_t cardfs_fat_room(const char *dir, const uint8_t *runs, size_t n, void *
         ESP_LOGE(TAG, "room: /%s starts at the root's cluster; check the card on a PC", dir);
         return ESP_FAIL;
     }
-#if FF_MAX_SS != FF_MIN_SS
-    s.ss = s.fs->ssize;
-#else
-    s.ss = FF_MAX_SS;
-#endif
+    s.ss = sector_size(s.fs);
     s.sec = malloc(s.ss);
     err = s.sec ? scan_dir(&s, start ? start : root) : ESP_ERR_NO_MEM;
     if (err == ESP_OK) {
@@ -199,4 +204,19 @@ esp_err_t cardfs_fat_room(const char *dir, const uint8_t *runs, size_t n, void *
     free(s.slot);
     free(s.sec);
     return err;
+}
+
+esp_err_t cardfs_fat_space(uint64_t *total, uint64_t *free_bytes, void *ctx)
+{
+    FATFS *fs;
+    DWORD free_clusters;
+    const FRESULT res = f_getfree(ctx, &free_clusters, &fs);
+    if (res != FR_OK) {
+        ESP_LOGE(TAG, "f_getfree: FRESULT %d", res);
+        return ESP_FAIL;
+    }
+    const uint64_t cluster = (uint64_t)fs->csize * sector_size(fs);
+    *total = (uint64_t)(fs->n_fatent - 2) * cluster;
+    *free_bytes = (uint64_t)free_clusters * cluster;
+    return ESP_OK;
 }

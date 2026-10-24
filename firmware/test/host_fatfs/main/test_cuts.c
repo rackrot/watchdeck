@@ -47,7 +47,8 @@
 
 static FATFS *s_fs;
 static char s_drive[3];
-static const cardfs_volume_t s_vol = {.prepare = cardfs_fat_prepare, .room = cardfs_fat_room, .ctx = s_drive};
+static const cardfs_volume_t s_vol = {
+    .prepare = cardfs_fat_prepare, .room = cardfs_fat_room, .space = cardfs_fat_space, .ctx = s_drive};
 
 // As in host_proto: on the linux target the static link leaves mbedtls's heap hooks unresolved once PSA is used
 // (esp_mem.c sits in an archive that the linker has already passed). Supply them with libc here.
@@ -1032,6 +1033,41 @@ void test_cuts_one_failed_write_is_retried_from_the_record(void)
     TEST_ASSERT_TRUE(hash_failed > 0);
 }
 
+// The free-space count scans the allocation table afresh (cardfs_fat_prepare invalidated FatFs's hint) and writes
+// nothing, and a FAT16 volume is counted too.
+void test_free_space_counts_the_clusters_and_writes_nothing(void)
+{
+    unmount();
+    ramdisk_create(FAT32_CLUSTERS + 4096, 0x5eed);
+    MKFS_PARM opt = {.fmt = FM_FAT32 | FM_SFD, .n_fat = 2, .au_size = RAMDISK_SECTOR};
+    static uint8_t work[4096];
+    TEST_ASSERT_EQUAL(FR_OK, f_mkfs(s_drive, &opt, work, sizeof(work)));
+    mount();
+    plant("data.bin", 5000, 1); // 10 clusters of 512 bytes
+    unmount();
+    mount(); // FatFs's cached free count is gone
+
+    ramdisk_reset_count();
+    uint64_t total = 0, free_bytes = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_free_space(&total, &free_bytes));
+    TEST_ASSERT_EQUAL(0, ramdisk_writes());
+    const uint64_t cluster = (uint64_t)s_fs->csize * RAMDISK_SECTOR;
+    TEST_ASSERT_EQUAL_UINT64((uint64_t)(s_fs->n_fatent - 2) * cluster, total);
+    TEST_ASSERT_EQUAL_UINT64(total - 11 * cluster, free_bytes); // the file's 10 clusters and the root directory's
+    unmount();
+
+    ramdisk_create(40000, 0x5eed);
+    opt.fmt = FM_FAT | FM_SFD;
+    TEST_ASSERT_EQUAL(FR_OK, f_mkfs(s_drive, &opt, work, sizeof(work)));
+    TEST_ASSERT_EQUAL(FR_OK, f_mount(s_fs, s_drive, 1));
+    TEST_ASSERT_EQUAL(FS_FAT16, s_fs->fs_type);
+    TEST_ASSERT_EQUAL_HEX(ESP_ERR_NOT_SUPPORTED, cardfs_init(ROOT, &s_vol));
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_free_space(&total, &free_bytes)); // reading works on a read-only card
+    TEST_ASSERT_TRUE(total > 0);
+    TEST_ASSERT_EQUAL_UINT64(total, free_bytes); // a FAT16 root directory is outside the data area
+    unmount();
+}
+
 // The card is FAT32. A FAT16 volume is refused at init, when writes are turned on, and by the room function.
 void test_a_fat16_volume_is_refused(void)
 {
@@ -1265,6 +1301,7 @@ void app_main(void)
     RUN_TEST(test_cuts_retry_after_a_write_error_never_leaves_a_torn_wifi_txt);
     RUN_TEST(test_cuts_one_failed_write_is_retried_from_the_record);
     RUN_TEST(test_room_refuses_a_watchdeck_that_starts_at_the_root);
+    RUN_TEST(test_free_space_counts_the_clusters_and_writes_nothing);
     RUN_TEST(test_a_fat16_volume_is_refused);
     // Returning from app_main does not end a linux-target process, so the failure count becomes the exit status.
     exit(UNITY_END());
