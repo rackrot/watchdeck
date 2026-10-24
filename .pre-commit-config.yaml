@@ -61,6 +61,17 @@ repos:
         files: ^firmware/.*\.(c|h)$
         exclude: ^firmware/main/(fonts/|logo_img\.[ch]$)
 
+      # The TF card holds user data in a GPT partition esp_tinyusb and FatFs would see as unformatted, so the
+      # firmware never formats it, never lets esp_tinyusb mount it to the app, and never takes it back from USB at
+      # run time (plans/settings-sleep-feed/01-groundwork.md, G2). The host tests format their RAM disk, so only
+      # firmware/main is checked.
+      - id: no-card-format
+        name: no card format or esp_tinyusb app mount
+        language: pygrep
+        # yamllint disable-line rule:line-length
+        entry: '\b(tinyusb_msc_set_storage_mount_point|tinyusb_msc_format_storage|tinyusb_msc_delete_storage|f_mkfs|esp_vfs_fat_sdcard_format|esp_vfs_fat_sdmmc_mount)\s*\(|auto_mount_off\s*=\s*(0|false)\b'
+        files: ^firmware/main/.*\.(c|h)$
+
       - id: fonts-generated
         name: fonts generated
         language: system
