@@ -1,0 +1,17 @@
+{
+  "t": "feed",
+  "sources": 2,
+  "cards": [
+    { "id": "nas-load", "label": "NAS load", "value": "0.42", "state": "ok" }
+  ],
+  "notes": [
+    {
+      "id": "ha/backup",
+      "title": "Backup done",
+      "body": "Nightly backup finished in 4 min",
+      "level": "ok",
+      "src": "Home Assistant",
+      "at": 1792692433
+    }
+  ]
+}
