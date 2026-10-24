@@ -14,7 +14,7 @@
 #define SETTINGS_IDLE_MS 60000 // settings closes after this long without a touch
 #define SETTINGS_REFRESH_MS 1000
 #define TAB_GAP 8
-#define TAB_W 156                // five tabs, Close and the gaps fill the 1024 px row (T4 adds the last)
+#define TAB_W 156                // five tabs, Close and the gaps fill the 1024 px row
 #define TAB_H SETTINGS_TAB_ROW_H // the buttons fill the row, about 14 mm
 #define CLOSE_W 160
 
@@ -23,6 +23,7 @@
 static const settings_tab_t TABS[] = {
     {"Status", tab_status_build, tab_status_tick, tab_status_leave},
     {"Wi-Fi", tab_wifi_build, tab_wifi_tick, tab_wifi_leave},
+    {"Storage", tab_storage_build, tab_storage_tick, tab_storage_leave},
     {"Logs", tab_logs_build, tab_logs_tick, tab_logs_leave},
     {"Errors", tab_errors_build, tab_errors_tick, tab_errors_leave},
 };

@@ -291,6 +291,46 @@ void test_cardfs_detached_refuses_reads_and_writes_until_attached(void)
     TEST_ASSERT_EQUAL_STRING("New\n", slurp("wifi.txt"));
 }
 
+static esp_err_t s_space_result;
+
+static esp_err_t stub_space(uint64_t *total, uint64_t *free_bytes, void *ctx)
+{
+    *total = 1000;
+    *free_bytes = 400;
+    return s_space_result;
+}
+
+void test_cardfs_free_space_asks_the_volume_and_refuses_when_detached_or_unsupported(void)
+{
+    fresh_root();
+    uint64_t total = 0, free_bytes = 0;
+    // fresh_root's volume has no space function.
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_SUPPORTED, cardfs_free_space(&total, &free_bytes));
+    TEST_ASSERT_FALSE(cardfs_tainted());
+
+    const cardfs_volume_t vol = {.room = stub_room, .space = stub_space};
+    s_space_result = ESP_OK;
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_init(root, &vol));
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_free_space(&total, &free_bytes));
+    TEST_ASSERT_EQUAL_UINT64(1000, total);
+    TEST_ASSERT_EQUAL_UINT64(400, free_bytes);
+
+    // A read error from the count is a failed card access.
+    s_space_result = ESP_FAIL;
+    TEST_ASSERT_EQUAL(ESP_FAIL, cardfs_free_space(&total, &free_bytes));
+    TEST_ASSERT_TRUE(cardfs_tainted());
+
+    // Detached, the volume isn't asked at all.
+    cardfs_detach();
+    total = free_bytes = 0;
+    s_space_result = ESP_OK;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, cardfs_free_space(&total, &free_bytes));
+    TEST_ASSERT_EQUAL_UINT64(0, total);
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_attach());
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_free_space(&total, &free_bytes));
+    TEST_ASSERT_EQUAL_UINT64(1000, total);
+}
+
 // A detach also clears a taint: the remount it brackets is what the taint asks for.
 void test_cardfs_detach_and_attach_clear_a_taint(void)
 {
@@ -679,6 +719,7 @@ void test_cardfs_run(void)
     RUN_TEST(test_cardfs_write_whose_record_cannot_be_created_keeps_the_old_file);
     RUN_TEST(test_cardfs_failed_access_stops_writes_until_writes_are_turned_off_and_on);
     RUN_TEST(test_cardfs_detached_refuses_reads_and_writes_until_attached);
+    RUN_TEST(test_cardfs_free_space_asks_the_volume_and_refuses_when_detached_or_unsupported);
     RUN_TEST(test_cardfs_detach_and_attach_clear_a_taint);
     RUN_TEST(test_cardfs_init_needs_a_volume_and_runs_its_prepare);
     RUN_TEST(test_cardfs_record_that_cannot_be_hashed_is_kept);

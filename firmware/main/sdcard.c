@@ -38,6 +38,8 @@ static char s_drive[3];   // the FatFs drive, "0:"; empty while unmounted. cardf
 static bool s_card_ready; // sdmmc_card_init succeeded
 static double s_gb;
 static volatile sdcard_owner_t s_owner = SDCARD_NO_CARD;
+static const char *volatile s_fs_name; // of the first partition once it mounted; a literal, so a read can't tear
+static volatile esp_err_t s_error;     // why the owner is NO_CARD
 static char s_text[TEXT_MAX];
 static sdcard_owner_cb_t s_owner_cb;
 static uint8_t *s_verify_buf; // VERIFY_SECTORS sectors of internal DMA RAM, from the first mount on
@@ -47,6 +49,7 @@ static volatile uint64_t s_verify_sectors, s_verify_us;
 static const cardfs_volume_t s_volume = {
     .prepare = cardfs_fat_prepare,
     .room = cardfs_fat_room,
+    .space = cardfs_fat_space,
     .ctx = s_drive,
 };
 
@@ -239,11 +242,15 @@ static esp_err_t mount_fs(void)
             f_mount(NULL, s_drive, 0); // FatFs keeps the FATFS registered even when the mount fails
             esp_vfs_fat_unregister_path(SDCARD_MOUNT_POINT);
             err = ESP_FAIL;
+        } else {
+            static const char *const FS_NAMES[] = {NULL, "FAT12", "FAT16", "FAT32", "exFAT"};
+            s_fs_name = fs->fs_type < sizeof(FS_NAMES) / sizeof(FS_NAMES[0]) ? FS_NAMES[fs->fs_type] : NULL;
         }
     }
     if (err != ESP_OK) {
         ff_diskio_unregister(pdrv);
         s_drive[0] = '\0';
+        s_fs_name = NULL;
     }
     return err;
 }
@@ -274,6 +281,9 @@ static void set_state(sdcard_owner_t owner, const char *fmt, ...)
     vsnprintf(s_text, sizeof(s_text), fmt, args);
     va_end(args);
     s_owner = owner;
+    if (owner != SDCARD_NO_CARD) {
+        s_error = ESP_OK;
+    }
     ESP_LOGI(TAG, "%s", s_text);
     if (s_owner_cb) {
         s_owner_cb(owner, s_text);
@@ -329,6 +339,7 @@ esp_err_t sdcard_mount(char *msg, size_t msg_len)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "mount failed: %s", esp_err_to_name(err));
         diag_count(DIAG_CARD_ERROR, "mount failed");
+        s_error = err;
         set_state(SDCARD_NO_CARD, "SD: not mounted (%s)", esp_err_to_name(err));
         snprintf(msg, msg_len, "%s", s_text);
         return err;
@@ -362,6 +373,16 @@ sdmmc_card_t *sdcard_card(void)
     return s_card_ready ? s_card : NULL;
 }
 
+void sdcard_info(sdcard_info_t *out)
+{
+    *out = (sdcard_info_t){.present = s_card_ready, .fs = s_fs_name, .error = s_error};
+    if (s_card_ready) {
+        _Static_assert(sizeof(((sdcard_info_t *)0)->name) > sizeof(((sdmmc_cid_t *)0)->name), "room for the NUL");
+        memcpy(out->name, s_card->cid.name, sizeof(s_card->cid.name)); // out is zeroed, so the NUL is there
+        out->bytes = (uint64_t)s_card->csd.capacity * s_card->csd.sector_size;
+    }
+}
+
 void sdcard_write_check_stats(uint64_t *sectors, uint64_t *us)
 {
     *sectors = s_verify_sectors;
@@ -381,6 +402,7 @@ static esp_err_t remount(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "remount failed: %s", esp_err_to_name(err));
         diag_count(DIAG_CARD_ERROR, "remount failed");
+        s_error = err;
         set_state(SDCARD_NO_CARD, "SD: not mounted (%s)", esp_err_to_name(err));
         return err;
     }

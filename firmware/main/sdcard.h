@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -35,6 +36,16 @@ sdcard_owner_t sdcard_owner(void);
 
 /** The initialised card, valid after sdcard_mount() found one (also while shared). */
 sdmmc_card_t *sdcard_card(void);
+
+/** What the card is, for the Storage tab. Kept while the card is shared. Safe from any task. */
+typedef struct {
+    bool present;    // a card answered the init, so the fields below are set
+    char name[9];    // the card's product name from its CID, NUL terminated
+    uint64_t bytes;  // the whole card
+    const char *fs;  // "FAT16", "FAT32", ... of the first partition once it has mounted, else NULL
+    esp_err_t error; // why the owner is NO_CARD: the init or mount error, else ESP_OK
+} sdcard_info_t;
+void sdcard_info(sdcard_info_t *out);
 
 // The calls below run on the svc task only (they assert it), like every card access after boot (svc.h), so none of
 // them races another. Each detaches cardfs before it unmounts (cardfs_detach), so a cardfs call from any task either

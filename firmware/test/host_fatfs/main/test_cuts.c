@@ -47,7 +47,8 @@
 
 static FATFS *s_fs;
 static char s_drive[3];
-static const cardfs_volume_t s_vol = {.prepare = cardfs_fat_prepare, .room = cardfs_fat_room, .ctx = s_drive};
+static const cardfs_volume_t s_vol = {
+    .prepare = cardfs_fat_prepare, .room = cardfs_fat_room, .space = cardfs_fat_space, .ctx = s_drive};
 
 // As in host_proto: on the linux target the static link leaves mbedtls's heap hooks unresolved once PSA is used
 // (esp_mem.c sits in an archive that the linker has already passed). Supply them with libc here.
@@ -87,9 +88,10 @@ typedef struct {
     const char *target; // relative to ROOT
     const uint8_t *data;
     size_t len;
-    bool refused;  // the card has no room: CARDFS_ERR_DIR_FULL, nothing written
-    bool straddle; // refused because a name's entries would cross a sector boundary
-    bool exact;    // the operation fills the last free entry of fill's last cluster
+    bool refused;     // the card has no room: CARDFS_ERR_DIR_FULL, nothing written
+    bool straddle;    // refused because a name's entries would cross a sector boundary
+    bool exact;       // the operation fills the last free entry of fill's last cluster
+    bool count_first; // a free-space count (f_getfree) runs first, as the Storage tab's does
     uint8_t sha[32];
 } op_t;
 
@@ -333,6 +335,13 @@ static void compare(const tree_t *before, const tree_t *after, const char *targe
 
 static esp_err_t run_op(const op_t *op)
 {
+    if (op->count_first) {
+        uint64_t total, free_bytes;
+        const esp_err_t err = cardfs_free_space(&total, &free_bytes);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
     switch (op->kind) {
     case OP_IMAGE:
         return cardfs_write_new(op->target, op->data, op->len);
@@ -727,6 +736,14 @@ void test_cuts_wifi_txt_replace(void)
     run_cuts(&op, true);
 }
 
+// The Storage tab's count (which makes FatFs trust its fresh free count and flag FSINFO) before the same replace.
+void test_cuts_wifi_txt_replace_after_a_free_space_count(void)
+{
+    op_t op =
+        SMALL_OP(.name = "wifi.txt replace after a count", .card = CARD_OLD_FILES, .count_first = true, WIFI(NEW_WIFI));
+    run_cuts(&op, true);
+}
+
 // Every entry exists from an earlier write, so a full watchdeck/ needs no room.
 void test_cuts_wifi_txt_replace_with_a_full_watchdeck(void)
 {
@@ -1032,6 +1049,47 @@ void test_cuts_one_failed_write_is_retried_from_the_record(void)
     TEST_ASSERT_TRUE(hash_failed > 0);
 }
 
+// The free-space count scans the allocation table afresh (cardfs_fat_prepare invalidated FatFs's hint) and writes
+// nothing, and a FAT16 volume is counted too.
+void test_free_space_counts_the_clusters_and_writes_nothing(void)
+{
+    unmount();
+    ramdisk_create(FAT32_CLUSTERS + 4096, 0x5eed);
+    MKFS_PARM opt = {.fmt = FM_FAT32 | FM_SFD, .n_fat = 2, .au_size = RAMDISK_SECTOR};
+    static uint8_t work[4096];
+    TEST_ASSERT_EQUAL(FR_OK, f_mkfs(s_drive, &opt, work, sizeof(work)));
+    mount();
+    plant("data.bin", 5000, 1); // 10 clusters of 512 bytes
+    unmount();
+    mount(); // FatFs's cached free count is gone
+
+    ramdisk_reset_count();
+    uint64_t total = 0, free_bytes = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_free_space(&total, &free_bytes));
+    TEST_ASSERT_EQUAL(0, ramdisk_writes());
+    const uint64_t cluster = (uint64_t)s_fs->csize * RAMDISK_SECTOR;
+    TEST_ASSERT_EQUAL_UINT64((uint64_t)(s_fs->n_fatent - 2) * cluster, total);
+    TEST_ASSERT_EQUAL_UINT64(total - 11 * cluster, free_bytes); // the file's 10 clusters and the root directory's
+
+    // A write after the count syncs FSINFO, which then holds the exact free count (not the hint prepare cleared).
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_write_small("wifi.txt", HOME_WIFI, sizeof(HOME_WIFI) - 1));
+    unmount();
+    fatwalk_t w;
+    TEST_ASSERT_TRUE(fatwalk(&w));
+    TEST_ASSERT_EQUAL_UINT32(w.free, w.fsinfo_free);
+
+    ramdisk_create(40000, 0x5eed);
+    opt.fmt = FM_FAT | FM_SFD;
+    TEST_ASSERT_EQUAL(FR_OK, f_mkfs(s_drive, &opt, work, sizeof(work)));
+    TEST_ASSERT_EQUAL(FR_OK, f_mount(s_fs, s_drive, 1));
+    TEST_ASSERT_EQUAL(FS_FAT16, s_fs->fs_type);
+    TEST_ASSERT_EQUAL_HEX(ESP_ERR_NOT_SUPPORTED, cardfs_init(ROOT, &s_vol));
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_free_space(&total, &free_bytes)); // reading works on a read-only card
+    TEST_ASSERT_TRUE(total > 0);
+    TEST_ASSERT_EQUAL_UINT64(total, free_bytes); // a FAT16 root directory is outside the data area
+    unmount();
+}
+
 // The card is FAT32. A FAT16 volume is refused at init, when writes are turned on, and by the room function.
 void test_a_fat16_volume_is_refused(void)
 {
@@ -1246,6 +1304,7 @@ void app_main(void)
     RUN_TEST(test_cuts_first_wifi_txt_into_a_root_with_exactly_enough_room);
     RUN_TEST(test_cuts_first_wifi_txt_into_a_nearly_full_root_is_refused);
     RUN_TEST(test_cuts_wifi_txt_replace);
+    RUN_TEST(test_cuts_wifi_txt_replace_after_a_free_space_count);
     RUN_TEST(test_cuts_wifi_txt_replace_with_a_full_watchdeck);
     RUN_TEST(test_cuts_sleep_cfg_replace);
     RUN_TEST(test_cuts_first_sleep_cfg_into_a_watchdeck_with_exactly_enough_room);
@@ -1265,6 +1324,7 @@ void app_main(void)
     RUN_TEST(test_cuts_retry_after_a_write_error_never_leaves_a_torn_wifi_txt);
     RUN_TEST(test_cuts_one_failed_write_is_retried_from_the_record);
     RUN_TEST(test_room_refuses_a_watchdeck_that_starts_at_the_root);
+    RUN_TEST(test_free_space_counts_the_clusters_and_writes_nothing);
     RUN_TEST(test_a_fat16_volume_is_refused);
     // Returning from app_main does not end a linux-target process, so the failure count becomes the exit status.
     exit(UNITY_END());

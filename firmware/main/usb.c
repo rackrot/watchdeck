@@ -1,5 +1,6 @@
 #include "usb.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 
 #include "esp_check.h"
@@ -14,10 +15,10 @@
 static const char *TAG = "usb";
 
 static usb_status_cb_t s_status_cb;
-static bool s_ready;             // TinyUSB and its MSC driver are installed, with esp_tinyusb's mounting off
-static volatile bool s_attached; // a host has the device configured
-static volatile bool s_share_queued;
-static esp_err_t s_error; // the last start or share failure, shown until a share succeeds
+static bool s_ready;                // TinyUSB and its MSC driver are installed, with esp_tinyusb's mounting off
+static volatile bool s_attached;    // a host has the device configured
+static _Atomic bool s_share_queued; // cleared with a release store once the owner and s_error are final
+static esp_err_t s_error;           // the last start or share failure, shown until a share succeeds
 // Kept while shared: Stop sharing restarts the board, so they're never released.
 static esp_blockdev_handle_t s_bdev;
 static tinyusb_msc_storage_handle_t s_storage;
@@ -109,9 +110,9 @@ static esp_err_t map_card(void)
 
 static void share_job(void *arg)
 {
-    s_share_queued = false;
     if (sdcard_owner() != SDCARD_DEVICE) {
         ESP_LOGW(TAG, "share: the card isn't the device's, nothing to do");
+        atomic_store_explicit(&s_share_queued, false, memory_order_release);
         return;
     }
     esp_err_t err = sdcard_release_fs(); // waits for a cardfs call in progress, then unmounts
@@ -129,19 +130,41 @@ static void share_job(void *arg)
     } else {
         usb_refresh_status();
     }
+    // After the owner and the error are set, so usb_share_busy() false means they are final.
+    atomic_store_explicit(&s_share_queued, false, memory_order_release);
+}
+
+bool usb_connected(void)
+{
+    return s_attached;
+}
+
+bool usb_share_busy(void)
+{
+    return atomic_load_explicit(&s_share_queued, memory_order_acquire);
+}
+
+esp_err_t usb_error(void)
+{
+    return s_error;
+}
+
+bool usb_ready(void)
+{
+    return s_ready;
 }
 
 esp_err_t usb_share(void)
 {
     // Without the driver usb_start installed, the storage call would install esp_tinyusb's default one, with its
     // mounting on.
-    if (!s_ready || sdcard_owner() != SDCARD_DEVICE || s_share_queued) {
+    if (!s_ready || sdcard_owner() != SDCARD_DEVICE || usb_share_busy()) {
         return ESP_ERR_INVALID_STATE;
     }
-    s_share_queued = true;
+    atomic_store_explicit(&s_share_queued, true, memory_order_relaxed);
     const esp_err_t err = svc_post(share_job, NULL);
     if (err != ESP_OK) {
-        s_share_queued = false;
+        atomic_store_explicit(&s_share_queued, false, memory_order_release);
     }
     return err;
 }

@@ -27,9 +27,9 @@ my-password
 You can edit the file without removing the card:
 
 1. Plug a USB-C cable into the board's **USB 2.0** port, which is not the serial port. Until you share the card, the computer sees an empty card reader, because the board keeps the card for itself.
-2. On the board, open Settings > Storage and tap Share. The card shows up as a USB drive with a `tf-data` partition. While it's shared, the board can't save anything to the card.
+2. On the board, open Settings > Storage and tap Share over USB, then tap it again to confirm. The card shows up as a USB drive with a `tf-data` partition. While it's shared, the board can't save anything to the card.
 3. Edit `wifi.txt`, then eject the drive on the computer.
-4. Tap Stop sharing, or press reset. The board restarts (about 8 seconds, and it stays paired), takes the card back and reads the new file.
+4. Tap Stop sharing, then I ejected it, restart, or press reset. The board restarts (about 8 seconds, and it stays paired), takes the card back and reads the new file.
 
 Always eject before unplugging or stopping. The board acknowledges a USB write before it reaches the card, so unplugging early can lose data.
 

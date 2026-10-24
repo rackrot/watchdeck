@@ -962,6 +962,19 @@ esp_err_t cardfs_list(cardfs_list_cb_t cb, void *ctx)
     return ret;
 }
 
+esp_err_t cardfs_free_space(uint64_t *total, uint64_t *free_bytes)
+{
+    if (!enter()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t ret = s_vol.space ? s_vol.space(total, free_bytes, s_vol.ctx) : ESP_ERR_NOT_SUPPORTED;
+    if (ret == ESP_FAIL) {
+        taint("the free space count failed");
+    }
+    unlock();
+    return ret;
+}
+
 esp_err_t cardfs_recover(void)
 {
     if (!enter()) {
