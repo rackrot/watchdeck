@@ -85,7 +85,7 @@ test("the same [sleep] keys in another order are not a change", () => {
   assert.equal(sleepChanged(a, b), false);
 });
 
-test("sleep and integration messages land in their buckets, and an unknown id's stays whole", () => {
+test("sleep and integration messages land in their buckets, and a message with no id stays whole", () => {
   const map = mapErrors([
     'sleep.fit "x" is not cover or contain',
     'integration "ha": token_secret "y" is not in secrets.toml',

@@ -204,12 +204,15 @@ pub fn box_px(cols: u32, rows: u32, paged: bool) -> u32 {
 /// Why `name` can't name a file in `icons/`, or `None` if it can. It is a plain file name, so
 /// it can't reach outside the directory.
 pub fn name_error(name: &str) -> Option<String> {
-    (!plain_name(name)).then(|| {
-        format!(
-            "icon must be a file name in {DIR}/: 1 to {MAX_NAME_BYTES} letters, digits, '_', '-' \
-             or '.', not starting with '.'"
-        )
-    })
+    (!plain_name(name)).then(|| format!("icon must be {}", name_rule(DIR)))
+}
+
+/// The rule `plain_name` checks, worded for a file in `dir`/.
+pub fn name_rule(dir: &str) -> String {
+    format!(
+        "a file name in {dir}/: 1 to {MAX_NAME_BYTES} letters, digits, '_', '-' or '.', not \
+         starting with '.'"
+    )
 }
 
 /// Whether `name` is a plain file name, the rule `screens/` shares with `icons/`.

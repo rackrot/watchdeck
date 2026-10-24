@@ -405,7 +405,7 @@ ha = "Bearer paste-your-token-here"
 
 - The file must have mode 0600, or the app won't read it and logs the fix: `chmod 600 "${XDG_CONFIG_HOME:-$HOME/.config}"/watchdeck/secrets.toml`.
 - A value goes out as an HTTP header, so it must be printable ASCII on one line, up to 4096 bytes. The app won't read a file with any other value, and the error names the secret.
-- A button that names a missing secret holds back the whole config. Adding the secret applies it.
+- A button or integration that names a missing secret holds back the whole config. Adding the secret applies it.
 - The Secrets page can remove a secret, after a confirmation. It refuses while the running config still names the secret in a button's action, a tile's source, a stat integration's source or a push integration's token, and the message lists those buttons and integrations by id. Change them first, then remove it.
 - Secret values never appear in logs or error messages. Errors name the secret, and a syntax error in `secrets.toml` gives only its line number.
 - On the device, exact copies of a value in a reply show as `<secret>`, even one cut short by the 64 KB limit. An encoded copy, such as base64 or URL-encoded, isn't caught.
@@ -430,7 +430,7 @@ offline_after_s = 10               # 0 to 3600. 0 never sleeps for a lost link
 backlight = 100                    # 0 to 100, the backlight while asleep
 ```
 
-- Every key is optional. An absent key takes the default.
+- Every key is optional. An absent key takes the default: black `bg`, light grey `fg`, `show` of `clock` and `date`, anchor `bottom_left`, the `arc` spinner in `#38bdf8`, `offline_after_s` 10, `backlight` 100, and the logo when `image` is absent.
 - `image` is a plain file name: letters, digits, `_`, `-` or `.`, at most 63 bytes, not starting with a dot. It names a file in `screens/`.
 - `text` is printable ASCII, at most 47 characters.
 - Colors are `#rrggbb`.
@@ -443,7 +443,7 @@ Each `[[integration]]` table is a source of notes or cards on the feed page. Its
 - `label`: printable ASCII, at most 23 characters. It is the source shown on each of its notes and cards.
 - `kind`: `push` or `stat`.
 
-A `push` integration takes notes and cards from the push API. `token_secret` names a secret in `secrets.toml` of at least 32 characters, which is the token the sender must send.
+A `push` integration takes notes and cards from the push API. `token_secret` names a secret in `secrets.toml` of at least 32 characters, which is the token the sender must send. Two push integrations can't share a token, so each sender has its own.
 
 A `stat` integration polls `source` every `every_s` seconds, from 2 to 86400, and shows the value as a card. `json_pointer` picks the value out of the output, as a tile's does. `source` takes the same rules as a tile's source: a shell or HTTP action, with `secret_headers` for secrets.
 

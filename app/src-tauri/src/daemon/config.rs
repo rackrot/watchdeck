@@ -442,7 +442,8 @@ impl SleepConfig {
         let mut errors = Vec::new();
         if let Some(image) = self.image.as_deref().filter(|i| !icons::plain_name(i)) {
             errors.push(format!(
-                "sleep.image {image:?} must be a plain file name in screens/"
+                "sleep.image {image:?} must be {}",
+                icons::name_rule("screens")
             ));
         }
         if let Some(fit) = self
@@ -544,6 +545,15 @@ impl IntegrationConfig {
     fn id(&self) -> &str {
         match self {
             Self::Push { id, .. } | Self::Stat { id, .. } => id,
+        }
+    }
+
+    /// Whether this one counts against the card limit. Matched without a wildcard, so a new
+    /// kind must decide here.
+    pub fn is_card(&self) -> bool {
+        match self {
+            Self::Push { .. } => false,
+            Self::Stat { .. } => true,
         }
     }
 
@@ -966,8 +976,8 @@ impl Config {
         self.buttons.iter().find(|b| b.id == id)
     }
 
-    /// The ids of the buttons and integrations that send secret `name`: a button's action or tile
-    /// source with a secret header, or a push integration's token.
+    /// The buttons and integrations that send secret `name`, each named with its kind and id: a
+    /// button's action or tile source with a secret header, or a push integration's token.
     pub fn secret_users(&self, name: &str) -> Vec<String> {
         let buttons = (self.buttons.iter())
             .filter(|b| {
@@ -976,10 +986,10 @@ impl Config {
                         .as_ref()
                         .is_some_and(|t| action_uses_secret(&t.source, name))
             })
-            .map(|b| b.id.clone());
+            .map(|b| format!("button {}", b.id));
         let integrations = (self.integrations.iter())
             .filter(|i| i.uses_secret(name))
-            .map(|i| i.id().to_string());
+            .map(|i| format!("integration {}", i.id()));
         buttons.chain(integrations).collect()
     }
 
@@ -1114,6 +1124,8 @@ impl Config {
             ));
         }
         let mut integration_ids = HashSet::new();
+        // Each push token's first integration, so a second one using it can name that one.
+        let mut tokens = HashMap::new();
         for integration in &self.integrations {
             if !integration_ids.insert(integration.id()) {
                 errors.push(format!(
@@ -1121,11 +1133,19 @@ impl Config {
                     integration.id()
                 ));
             }
+            if let IntegrationConfig::Push {
+                id, token_secret, ..
+            } = integration
+            {
+                if let Some(first) = tokens.insert(token_secret.as_str(), id.as_str()) {
+                    errors.push(format!(
+                        "integration {id:?}: token_secret {token_secret:?} is already used by {first:?}"
+                    ));
+                }
+            }
             errors.extend(integration.check(secrets));
         }
-        let cards = (self.integrations.iter())
-            .filter(|i| matches!(i, IntegrationConfig::Stat { .. }))
-            .count();
+        let cards = self.integrations.iter().filter(|i| i.is_card()).count();
         if cards > MAX_CARD_SOURCES {
             errors.push(format!(
                 "{cards} card sources (stat and prometheus), at most {MAX_CARD_SOURCES}"
@@ -3436,7 +3456,7 @@ source = { kind = "http", method = "GET", url = "http://nas.lan/api/load" }
         let refused = |keys: &str, expected: &str| assert_refused(&sleep_with(keys), expected);
         refused(
             "image = \"../x.png\"",
-            "sleep.image \"../x.png\" must be a plain file name in screens/",
+            "sleep.image \"../x.png\" must be a file name in screens/: 1 to 63 letters, digits, '_', '-' or '.', not starting with '.'",
         );
         refused(
             "fit = \"stretch\"",
@@ -3596,13 +3616,39 @@ source = { kind = "http", method = "GET", url = "http://nas.lan/api/load" }
         assert_refused(&many(17), "17 integrations, at most 16");
         assert_refused(&many(9), "9 card sources (stat and prometheus), at most 8");
         parse(&many(8), &sizes()).unwrap();
-        // Push integrations don't count as cards.
+        // Push integrations don't count as cards. Each needs a token of its own.
+        let mut secrets = sizes().unwrap();
+        for i in 0..9 {
+            secrets.insert(format!("tok{i}"), 40);
+        }
         let pushes = with_new(
             &(0..9)
-                .map(|i| push_table(&format!("p{i}"), "P", "push-ha"))
+                .map(|i| push_table(&format!("p{i}"), "P", &format!("tok{i}")))
                 .collect::<String>(),
         );
-        parse(&pushes, &sizes()).unwrap();
+        parse(&pushes, &Ok(secrets)).unwrap();
+    }
+
+    #[test]
+    fn two_push_integrations_cant_share_a_token() {
+        let text = format!(
+            "{}{}",
+            push_table("a", "A", "push-ha"),
+            push_table("b", "B", "push-ha")
+        );
+        assert_refused(
+            &with_new(&text),
+            "integration \"b\": token_secret \"push-ha\" is already used by \"a\"",
+        );
+        // Two distinct tokens are fine.
+        let mut secrets = sizes().unwrap();
+        secrets.insert("push-two".to_string(), 40);
+        let distinct = with_new(&format!(
+            "{}{}",
+            push_table("a", "A", "push-ha"),
+            push_table("b", "B", "push-two")
+        ));
+        parse(&distinct, &Ok(secrets)).unwrap();
     }
 
     #[test]
@@ -3671,9 +3717,9 @@ source = { kind = "http", method = "GET", url = "http://nas.lan/api/load" }
             .unwrap();
 
         let err = configs.delete_secret("push-ha").unwrap_err();
-        assert!(err.contains("used by ha."), "{err}");
+        assert!(err.contains("used by integration ha."), "{err}");
         let err = configs.delete_secret("nas-token").unwrap_err();
-        assert!(err.contains("used by load."), "{err}");
+        assert!(err.contains("used by integration load."), "{err}");
         assert_eq!(secrets.names().unwrap(), ["nas-token", "push-ha"]);
     }
 
@@ -4283,9 +4329,9 @@ source = { kind = "http", method = "GET", url = "http://nas.lan/api/load" }
         configs.save(config, &revision).unwrap();
 
         let err = configs.delete_secret("ha").unwrap_err();
-        assert!(err.contains("used by a, c."), "{err}");
+        assert!(err.contains("used by button a, button c."), "{err}");
         let err = configs.delete_secret("tile-only").unwrap_err();
-        assert!(err.contains("used by b."), "{err}");
+        assert!(err.contains("used by button b."), "{err}");
         assert_eq!(secrets.names().unwrap(), ["ha", "spare", "tile-only"]);
 
         configs.delete_secret("spare").unwrap();
