@@ -80,7 +80,7 @@ static void tab_show(size_t i)
 static void tab_switch(void *user_data)
 {
     const size_t i = (size_t)(intptr_t)user_data;
-    if (s_page && i != s_tab) {
+    if (s_page && i != s_tab && !tab_wifi_busy()) {
         tab_show(i);
     }
 }
@@ -93,6 +93,9 @@ static void tab_tapped(lv_event_t *e)
 static void close_tapped(lv_event_t *e)
 {
     (void)e;
+    if (tab_wifi_busy()) {
+        return; // a trial connect or a save ends first; leaving would drop its result
+    }
     ui_settings_close();
 }
 

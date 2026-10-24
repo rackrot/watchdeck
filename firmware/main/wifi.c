@@ -65,6 +65,7 @@ static int64_t s_rssi_at_us;
 
 static volatile wifi_conn_state_t s_state_mirror; // s_m.state, for readers that can't take s_lock
 static volatile bool s_scanning;
+static volatile bool s_ready;       // wifi_init finished: the lock, timers and handlers exist and the driver is started
 static volatile bool s_rssi_queued; // one RSSI job at a time in svc's queue
 static bool s_rssi_timed;           // the first refresh's duration has been logged
 
@@ -212,20 +213,26 @@ size_t wifi_scan_results(wifiscan_entry_t *out, size_t max)
 
 /* ---- The connect machine's glue ---- */
 
-static void set_config(const char *ssid, const char *pass)
+// The driver config and the two display copies of the SSIDs live here, not on the stack: the machine runs on the event
+// loop's 2304 B stack and the esp_timer task's. Only step_locked touches them, with s_lock held.
+static wifi_config_t s_cfg;
+static char s_show_cur[WIFI_SSID_LEN], s_show_try[WIFI_SSID_LEN];
+
+static esp_err_t set_config(const char *ssid, const char *pass)
 {
-    wifi_config_t cfg = {0};
+    memset(&s_cfg, 0, sizeof(s_cfg));
     // Lengths are validated by the callers; a full-length field needs no NUL.
-    memcpy(cfg.sta.ssid, ssid, strlen(ssid));
-    memcpy(cfg.sta.password, pass, strlen(pass));
+    memcpy(s_cfg.sta.ssid, ssid, strlen(ssid));
+    memcpy(s_cfg.sta.password, pass, strlen(pass));
     if (pass[0] != '\0') {
-        cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK; // don't join an open AP with the same SSID
+        s_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK; // don't join an open AP with the same SSID
     }
-    const esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    const esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &s_cfg);
+    memset(&s_cfg, 0, sizeof(s_cfg)); // the password
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_set_config: %s", esp_err_to_name(err));
     }
-    memset(&cfg, 0, sizeof(cfg));
+    return err;
 }
 
 static void trial_forget(void)
@@ -239,9 +246,17 @@ static void trial_forget(void)
 static void save_current_job(void *arg);
 static void rssi_timer_cb(void *arg);
 
-// Runs one event through the machine and does what it asks. Called with s_lock held; `note` gets the status text to
-// show once the lock is released.
-static void step_locked(wifi_conn_ev_t ev, int arg, char *note, size_t note_size)
+static void stacks_job(void *arg)
+{
+    logcap_log_stacks();
+}
+
+// Bumped whenever the trial timer is stopped or started, so a timeout job queued by an earlier arming can tell.
+static volatile uint32_t s_trial_gen;
+
+// Does one event's actions. Returns true when the driver refused a call, which the caller feeds back as
+// WE_DRIVER_ERROR: after a refused call no connect is issued and no timer starts, and no disconnect event will come.
+static bool run_step(wifi_conn_ev_t ev, int arg, char *note, size_t note_size)
 {
     const wifi_conn_state_t before = s_m.state;
     const wifi_step_t out = wifistate_step(&s_m, ev, arg);
@@ -250,61 +265,69 @@ static void step_locked(wifi_conn_ev_t ev, int arg, char *note, size_t note_size
         ESP_LOGI(TAG, "state %s -> %s", wifistate_name(before), wifistate_name(s_m.state));
     }
 
-    char cur[WIFI_SSID_LEN], tried[WIFI_SSID_LEN];
-    wifiscan_printable(cur, sizeof(cur), s_cur_ssid);
-    wifiscan_printable(tried, sizeof(tried), s_try_ssid);
+    wifiscan_printable(s_show_cur, sizeof(s_show_cur), s_cur_ssid);
+    wifiscan_printable(s_show_try, sizeof(s_show_try), s_try_ssid);
+    bool failed = false;
 
     if (a & WA_STOP_RETRY) {
         esp_timer_stop(s_retry_timer); // INVALID_STATE when it isn't armed
     }
     if (a & WA_STOP_TRIAL_TIMER) {
+        s_trial_gen++;
         esp_timer_stop(s_trial_timer);
     }
     if (a & WA_DISCONNECT) {
         esp_wifi_disconnect(); // an error only says there was nothing to leave
     }
     if (a & WA_SET_CURRENT_CONFIG) {
-        set_config(s_cur_ssid, s_cur_pass);
+        failed = set_config(s_cur_ssid, s_cur_pass) != ESP_OK;
     }
     if (a & WA_SET_TRIAL_CONFIG) {
-        set_config(s_try_ssid, s_try_pass);
+        failed = set_config(s_try_ssid, s_try_pass) != ESP_OK;
     }
-    if (a & WA_CONNECT) {
+    if ((a & WA_CONNECT) && !failed) {
         const esp_err_t err = esp_wifi_connect();
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "esp_wifi_connect: %s", esp_err_to_name(err));
+            failed = true;
         }
     }
-    if (a & WA_ARM_RETRY) {
+    if ((a & WA_ARM_RETRY) && !failed) {
         const esp_err_t err = esp_timer_start_once(s_retry_timer, RECONNECT_DELAY_US);
         if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) { // INVALID_STATE: retry already armed
             ESP_LOGE(TAG, "retry timer: %s", esp_err_to_name(err));
         }
     }
-    if (a & WA_START_TRIAL_TIMER) {
+    if ((a & WA_START_TRIAL_TIMER) && !failed) {
+        s_trial_gen++;
         const esp_err_t err = esp_timer_start_once(s_trial_timer, TRIAL_TIMEOUT_US);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "trial timer: %s", esp_err_to_name(err));
         }
-        snprintf(note, note_size, "trying %s", tried);
+        if (s_m.state == WS_TRIAL) {
+            snprintf(note, note_size, "trying %s", s_show_try);
+        } else if (s_m.state == WS_RESTORING) {
+            snprintf(note, note_size, "going back to %s", s_show_cur);
+        }
     }
 
     if (ev == WE_DISCONNECTED && s_m.state == WS_BACKOFF) {
-        snprintf(note, note_size, "connecting to %s (retry, reason %d)", cur, arg);
+        snprintf(note, note_size, "connecting to %s (retry, reason %d)", s_show_cur, arg);
     } else if (ev == WE_DISCONNECTED && s_m.state == WS_TRIAL) {
         ESP_LOGI(TAG, "trial: disconnected, reason %d", arg);
     }
 
     if ((a & WA_REFUSED) && ev == WE_TRIAL_BEGIN) {
-        ESP_LOGW(TAG, "trial refused: a trial or restore is running");
+        ESP_LOGW(TAG, "trial refused: a trial is running");
         trial_forget();
         job_done(false, out.fail, WIFI_SAVE_NONE, ESP_OK);
     }
     if (a & WA_TRIAL_FAILED) {
-        ESP_LOGW(TAG, "trial of %s failed: %s", tried, wifistate_fail_text(out.fail));
-        snprintf(note, note_size, "could not join %s (%s)", tried, wifistate_fail_text(out.fail));
+        ESP_LOGW(TAG, "trial of %s failed: %s", s_show_try, wifistate_fail_text(out.fail));
+        snprintf(note, note_size, "could not join %s (%s)", s_show_try, wifistate_fail_text(out.fail));
         trial_forget();
         job_done(false, out.fail, WIFI_SAVE_NONE, ESP_OK);
+        svc_post(stacks_job, NULL); // best effort: the high-water marks after a trial
     }
     if (a & WA_TRIAL_OK) {
         // The trial's network is the current one now; its password goes from the candidate slot to the saved one.
@@ -313,10 +336,23 @@ static void step_locked(wifi_conn_ev_t ev, int arg, char *note, size_t note_size
         logcap_set_password(s_cur_pass);
         trial_forget();
         job_joined(s_cur_ssid);
-        ESP_LOGI(TAG, "trial of %s joined, saving wifi.txt", tried);
+        ESP_LOGI(TAG, "trial of %s joined, saving wifi.txt", s_show_try);
         if (svc_post(save_current_job, NULL) != ESP_OK) {
             job_done(true, WF_NONE, WIFI_SAVE_BUSY, ESP_OK);
         }
+        svc_post(stacks_job, NULL);
+    }
+    return failed;
+}
+
+// Runs one event through the machine and does what it asks, then any driver error that came of it (a few times at
+// most: a refused trial config ends the trial, the restore it starts can be refused too, and then the retry timer takes
+// over). Called with s_lock held; `note` gets the status text to show once the lock is released.
+static void step_locked(wifi_conn_ev_t ev, int arg, char *note, size_t note_size)
+{
+    for (int pass = 0; pass < 4 && run_step(ev, arg, note, note_size); pass++) {
+        ev = WE_DRIVER_ERROR;
+        arg = 0;
     }
     s_state_mirror = s_m.state;
 }
@@ -332,18 +368,47 @@ static void dispatch(wifi_conn_ev_t ev, int arg)
     }
 }
 
-static void retry_cb(void *arg)
+// The two timers fire on the esp_timer task, whose stack is small and shared with everyone else's timers, so they only
+// post the event to svc. A full queue means trying again in a moment.
+static void retry_job(void *arg)
 {
     dispatch(WE_RETRY_TIMER, s_scanning);
 }
 
+static void retry_cb(void *arg)
+{
+    if (svc_post(retry_job, NULL) != ESP_OK) {
+        esp_timer_start_once(s_retry_timer, 1000 * 1000);
+    }
+}
+
+static void trial_timeout_job(void *arg)
+{
+    if ((uint32_t)(uintptr_t)arg == s_trial_gen) { // not a timeout of a trial or restore that has ended since
+        dispatch(WE_TRIAL_TIMEOUT, 0);
+    }
+}
+
 static void trial_timeout_cb(void *arg)
 {
-    dispatch(WE_TRIAL_TIMEOUT, 0);
+    if (svc_post(trial_timeout_job, (void *)(uintptr_t)s_trial_gen) != ESP_OK) {
+        esp_timer_start_once(s_trial_timer, 1000 * 1000); // the generation is the same; it only runs later
+    }
 }
 
 static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
+    if (id == WIFI_EVENT_STA_CONNECTED) {
+        // The SSID comes in the event: no driver call from here, and no guess from the AP info of the moment.
+        const wifi_event_sta_connected_t *ev = data;
+        char note[NOTE_MAX] = "";
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        const char *want = s_m.state == WS_TRIAL ? s_try_ssid : s_m.state == WS_RESTORING ? s_cur_ssid : NULL;
+        const int match = want && strlen(want) == ev->ssid_len && memcmp(want, ev->ssid, ev->ssid_len) == 0;
+        step_locked(WE_CONNECTED, match, note, sizeof(note));
+        xSemaphoreGive(s_lock);
+        return;
+    }
     if (id != WIFI_EVENT_STA_DISCONNECTED) {
         return;
     }
@@ -362,15 +427,7 @@ static void on_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data
 
     char note[NOTE_MAX] = "";
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    // A trial counts only for its own SSID, a restore for the old one; any other IP (a straggler of the network we
-    // just left) leaves the machine alone.
-    int matches = 1;
-    if (s_m.state == WS_TRIAL || s_m.state == WS_RESTORING) {
-        wifi_ap_record_t ap;
-        const char *want = s_m.state == WS_TRIAL ? s_try_ssid : s_cur_ssid;
-        matches = esp_wifi_sta_get_ap_info(&ap) == ESP_OK && strcmp((const char *)ap.ssid, want) == 0;
-    }
-    step_locked(WE_GOT_IP, matches, note, sizeof(note));
+    step_locked(WE_GOT_IP, 0, note, sizeof(note)); // the machine knows from its joined flag whether this IP counts
     if (s_m.state == WS_CONNECTED) {
         snprintf(note, sizeof(note), "connected " IPSTR " (" HOSTNAME ".local)", IP2STR(&ev->ip_info.ip));
     }
@@ -407,12 +464,16 @@ esp_err_t wifi_init(wifi_status_cb_t status_cb)
     // Station mode with no config: nothing connects until wifi_apply_saved or a trial sets one, but a scan works.
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "set_mode");
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "esp_wifi_start");
+    s_ready = true; // the jobs and the connect path may run now
     return ESP_OK;
 }
 
 // Join the network. Called once at boot with the saved credentials.
 static esp_err_t wifi_apply(const char *ssid, const char *pass, const char *source)
 {
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
     char shown[WIFI_SSID_LEN];
     wifiscan_printable(shown, sizeof(shown), ssid);
 
@@ -545,7 +606,11 @@ static void scan_job(void *arg)
 
     s_scanning = true;
     err = esp_wifi_scan_start(NULL, true);
-    if (err == ESP_OK) {
+    if (err != ESP_OK) {
+        // A connect in flight can make the driver refuse or abort the scan; the board check settles how often.
+        ESP_LOGW(TAG, "esp_wifi_scan_start: %s (0x%x) in state %s", esp_err_to_name(err), (unsigned)err,
+                 wifistate_name(s_state_mirror));
+    } else {
         uint16_t n = 0;
         err = esp_wifi_scan_get_ap_num(&n);
         if (err == ESP_OK && n > SCAN_RECORDS) {
@@ -581,7 +646,7 @@ static void scan_job(void *arg)
 
 esp_err_t wifi_scan(void)
 {
-    if (!s_lock || s_state_mirror == WS_TRIAL || s_state_mirror == WS_RESTORING || !job_claim(WIFI_JOB_SCAN)) {
+    if (!s_ready || s_state_mirror == WS_TRIAL || s_state_mirror == WS_RESTORING || !job_claim(WIFI_JOB_SCAN)) {
         return ESP_ERR_INVALID_STATE;
     }
     const esp_err_t err = svc_post(scan_job, NULL);
@@ -600,7 +665,7 @@ static esp_err_t start_credential_job(wifi_job_kind_t kind, const char *ssid, co
     if (!valid) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (!s_lock || !job_claim(kind)) {
+    if (!s_ready || !job_claim(kind)) {
         return ESP_ERR_INVALID_STATE;
     }
     strlcpy(s_req.ssid, ssid, sizeof(s_req.ssid));
@@ -672,7 +737,7 @@ static void rssi_timer_cb(void *arg)
 
 void wifi_watch_rssi(bool on)
 {
-    if (!s_rssi_timer) {
+    if (!s_ready) {
         return;
     }
     if (on) {

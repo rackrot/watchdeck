@@ -60,6 +60,7 @@ void test_diag_wifi_reason_names(void)
     TEST_ASSERT_EQUAL_STRING("wrong password?", wifi_reason_name(15));
     TEST_ASSERT_EQUAL_STRING("authentication failed", wifi_reason_name(202));
     TEST_ASSERT_EQUAL_STRING("authentication expired", wifi_reason_name(2));
+    TEST_ASSERT_EQUAL_STRING("wrong password?", wifi_reason_name(204));
     TEST_ASSERT_EQUAL_STRING("connection failed", wifi_reason_name(205));
     TEST_ASSERT_EQUAL_STRING("other", wifi_reason_name(0));
     TEST_ASSERT_EQUAL_STRING("other", wifi_reason_name(9999));

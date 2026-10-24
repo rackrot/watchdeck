@@ -27,6 +27,10 @@
 // Nothing else may call esp_log_set_vprintf.
 esp_err_t logcap_init(void);
 
+// Logs the free stack bytes of the main tasks ("stack bytes free: ..."). One line runs about 60 s after boot; the Wi-Fi
+// code asks for another after each trial. Call it from a task with room for a 160 B line, not the event loop's.
+void logcap_log_stacks(void);
+
 // Secrets the hook redacts. NULL or "" clears. A password under 8 characters is not kept (WPA's minimum; an open
 // network has none), so a short one is not redacted. All are copied. The candidate password is for a trial connect:
 // set it before the trial starts, and clear it when the trial ends (the saved one then goes through

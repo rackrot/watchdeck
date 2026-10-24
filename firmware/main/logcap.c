@@ -66,7 +66,12 @@ static int capture_hook(const char *fmt, va_list args)
 static const char *const s_stack_tasks[] = {"link",      "LVGL task", "svc", "sys_evt",   "ipc0",       "ipc1",
                                             "esp_timer", "wifi",      "tiT", "sdio_read", "sdio_write", "process_rx"};
 
-static void log_stacks(void *arg)
+static void log_stacks_timer(void *arg)
+{
+    logcap_log_stacks();
+}
+
+void logcap_log_stacks(void)
 {
     char line[160];
     size_t at = snprintf(line, sizeof(line), "stack bytes free:");
@@ -101,7 +106,7 @@ esp_err_t logcap_init(void)
 
     // One line about 60 s after boot, for the stack check. A failure only loses that line.
     static esp_timer_handle_t stack_timer;
-    const esp_timer_create_args_t args = {.callback = log_stacks, .name = "stack_log"};
+    const esp_timer_create_args_t args = {.callback = log_stacks_timer, .name = "stack_log"};
     if (esp_timer_create(&args, &stack_timer) == ESP_OK) {
         esp_timer_start_once(stack_timer, STACK_LOG_DELAY_US);
     }

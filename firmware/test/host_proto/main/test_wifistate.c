@@ -34,9 +34,10 @@ static void reach(wifi_conn_state_t state)
     case WS_TRIAL:
         wifistate_step(&m, WE_TRIAL_BEGIN, 1);
         break;
-    case WS_RESTORING:
+    case WS_RESTORING: // by two missing-network disconnects, so no grace for a stray one is set
         wifistate_step(&m, WE_TRIAL_BEGIN, 1);
-        wifistate_step(&m, WE_TRIAL_TIMEOUT, 0);
+        wifistate_step(&m, WE_DISCONNECTED, R_NO_AP);
+        wifistate_step(&m, WE_DISCONNECTED, R_NO_AP);
         break;
     }
     TEST_ASSERT_EQUAL(state, m.state);
@@ -67,7 +68,8 @@ void test_wifistate_boot_connects_and_a_drop_arms_the_retry(void)
     TEST_ASSERT_EQUAL(WS_BACKOFF, m.state);
 
     out = wifistate_step(&m, WE_RETRY_TIMER, 0);
-    TEST_ASSERT_EQUAL_HEX32(WA_CONNECT, out.actions);
+    // The driver may still hold a failed trial's config, so every retry sets the current one again.
+    TEST_ASSERT_EQUAL_HEX32(WA_SET_CURRENT_CONFIG | WA_CONNECT, out.actions);
     TEST_ASSERT_EQUAL(WS_CONNECTING, m.state);
 }
 
@@ -125,16 +127,40 @@ void test_wifistate_our_own_disconnect_is_not_a_trial_failure(void)
     TEST_ASSERT_EQUAL(0, m.not_found);
 }
 
-void test_wifistate_a_got_ip_for_another_ssid_does_not_end_the_trial(void)
+void test_wifistate_a_got_ip_before_the_trials_own_connected_is_ignored(void)
 {
+    // The trial's SSID is the old network's too: its IP arrives late, before the new link is up.
     reach(WS_TRIAL);
     wifi_step_t out = wifistate_step(&m, WE_GOT_IP, 0);
     TEST_ASSERT_EQUAL_HEX32(0, out.actions);
     TEST_ASSERT_EQUAL(WS_TRIAL, m.state);
 
-    out = wifistate_step(&m, WE_GOT_IP, 1);
+    wifistate_step(&m, WE_CONNECTED, 0); // another SSID
+    out = wifistate_step(&m, WE_GOT_IP, 0);
+    TEST_ASSERT_EQUAL_HEX32(0, out.actions);
+    TEST_ASSERT_EQUAL(WS_TRIAL, m.state);
+
+    wifistate_step(&m, WE_CONNECTED, 1);
+    out = wifistate_step(&m, WE_GOT_IP, 0);
     TEST_ASSERT_EQUAL_HEX32(WA_STOP_TRIAL_TIMER | WA_TRIAL_OK, out.actions);
     TEST_ASSERT_EQUAL(WS_CONNECTED, m.state);
+}
+
+void test_wifistate_a_disconnect_after_connected_clears_the_joined_flag(void)
+{
+    reach(WS_TRIAL);
+    wifistate_step(&m, WE_CONNECTED, 1);
+    TEST_ASSERT_TRUE(m.joined);
+    wifistate_step(&m, WE_DISCONNECTED, R_CONN_FAIL);
+    TEST_ASSERT_FALSE(m.joined);
+    const wifi_step_t out = wifistate_step(&m, WE_GOT_IP, 0); // the dropped link's IP
+    TEST_ASSERT_EQUAL_HEX32(0, out.actions);
+    TEST_ASSERT_EQUAL(WS_TRIAL, m.state);
+
+    // A new trial starts clean too.
+    wifistate_step(&m, WE_CONNECTED, 1);
+    wifistate_step(&m, WE_TRIAL_TIMEOUT, 0); // ends the trial: restoring
+    TEST_ASSERT_FALSE(m.joined);
 }
 
 void test_wifistate_two_wrong_password_disconnects_end_the_trial_and_restore(void)
@@ -174,9 +200,107 @@ void test_wifistate_the_20_s_timeout_restores(void)
 {
     reach(WS_TRIAL);
     const wifi_step_t out = wifistate_step(&m, WE_TRIAL_TIMEOUT, 0);
-    assert_has(out, WA_STOP_TRIAL_TIMER | WA_DISCONNECT | WA_SET_CURRENT_CONFIG | WA_CONNECT | WA_TRIAL_FAILED);
+    // The restore gets the same clock as a deadline.
+    assert_has(out, WA_STOP_TRIAL_TIMER | WA_DISCONNECT | WA_SET_CURRENT_CONFIG | WA_CONNECT | WA_START_TRIAL_TIMER |
+                        WA_TRIAL_FAILED);
     TEST_ASSERT_EQUAL(WF_TIMEOUT, out.fail);
     TEST_ASSERT_EQUAL(WS_RESTORING, m.state);
+}
+
+void test_wifistate_a_timeout_with_no_old_network_ends_in_idle(void)
+{
+    wifistate_init(&m);
+    wifistate_step(&m, WE_TRIAL_BEGIN, 0);
+    const wifi_step_t out = wifistate_step(&m, WE_TRIAL_TIMEOUT, 0);
+    assert_has(out, WA_STOP_TRIAL_TIMER | WA_DISCONNECT | WA_TRIAL_FAILED);
+    assert_lacks(out, WA_SET_CURRENT_CONFIG | WA_CONNECT | WA_START_TRIAL_TIMER | WA_ARM_RETRY);
+    TEST_ASSERT_EQUAL(WF_TIMEOUT, out.fail);
+    TEST_ASSERT_EQUAL(WS_IDLE, m.state);
+}
+
+void test_wifistate_the_restore_deadline_falls_to_backoff(void)
+{
+    reach(WS_RESTORING);
+    const wifi_step_t out = wifistate_step(&m, WE_TRIAL_TIMEOUT, 0);
+    TEST_ASSERT_EQUAL_HEX32(WA_DISCONNECT | WA_ARM_RETRY, out.actions);
+    TEST_ASSERT_EQUAL(WS_BACKOFF, m.state);
+    // The retry then connects with the old network's config.
+    TEST_ASSERT_EQUAL_HEX32(WA_SET_CURRENT_CONFIG | WA_CONNECT, wifistate_step(&m, WE_RETRY_TIMER, 0).actions);
+}
+
+void test_wifistate_a_stray_disconnect_after_a_timeout_does_not_arm_the_retry_over_the_restore(void)
+{
+    reach(WS_TRIAL);
+    wifistate_step(&m, WE_TRIAL_TIMEOUT, 0);
+    TEST_ASSERT_EQUAL(WS_RESTORING, m.state);
+    wifi_step_t out = wifistate_step(&m, WE_DISCONNECTED, R_CONN_FAIL); // the trial's last attempt reporting in
+    TEST_ASSERT_EQUAL_HEX32(0, out.actions);
+    TEST_ASSERT_EQUAL(WS_RESTORING, m.state);
+    out = wifistate_step(&m, WE_DISCONNECTED, R_CONN_FAIL); // the restore's own failure
+    TEST_ASSERT_EQUAL_HEX32(WA_STOP_TRIAL_TIMER | WA_ARM_RETRY, out.actions);
+    TEST_ASSERT_EQUAL(WS_BACKOFF, m.state);
+}
+
+void test_wifistate_reasons_210_211_212_count_as_network_not_found(void)
+{
+    const int reasons[] = {210, 211, 212};
+    for (size_t i = 0; i < 3; i++) {
+        reach(WS_TRIAL);
+        wifistate_step(&m, WE_DISCONNECTED, reasons[i]);
+        const wifi_step_t out = wifistate_step(&m, WE_DISCONNECTED, R_NO_AP);
+        TEST_ASSERT_EQUAL(WF_NOT_FOUND, out.fail);
+    }
+}
+
+void test_wifistate_a_driver_error_in_a_trial_ends_it_without_a_connect(void)
+{
+    reach(WS_TRIAL);
+    wifi_step_t out = wifistate_step(&m, WE_DRIVER_ERROR, 0);
+    assert_has(out, WA_STOP_TRIAL_TIMER | WA_TRIAL_FAILED);
+    TEST_ASSERT_EQUAL(WF_ERROR, out.fail);
+    TEST_ASSERT_EQUAL(WS_RESTORING, m.state);
+    assert_lacks(out, WA_TRIAL_OK);
+
+    // The restore's own refusal goes to the retry.
+    out = wifistate_step(&m, WE_DRIVER_ERROR, 0);
+    TEST_ASSERT_EQUAL_HEX32(WA_STOP_TRIAL_TIMER | WA_ARM_RETRY, out.actions);
+    TEST_ASSERT_EQUAL(WS_BACKOFF, m.state);
+}
+
+void test_wifistate_a_driver_error_in_a_trial_with_no_old_network_ends_in_idle(void)
+{
+    wifistate_init(&m);
+    wifistate_step(&m, WE_TRIAL_BEGIN, 0);
+    const wifi_step_t out = wifistate_step(&m, WE_DRIVER_ERROR, 0);
+    assert_has(out, WA_TRIAL_FAILED);
+    TEST_ASSERT_EQUAL(WF_ERROR, out.fail);
+    TEST_ASSERT_EQUAL(WS_IDLE, m.state);
+}
+
+void test_wifistate_a_driver_error_on_a_normal_connect_arms_the_retry(void)
+{
+    reach(WS_CONNECTING);
+    wifi_step_t out = wifistate_step(&m, WE_DRIVER_ERROR, 0);
+    assert_has(out, WA_ARM_RETRY);
+    TEST_ASSERT_EQUAL(WS_BACKOFF, m.state);
+    // A retry that fails again keeps retrying.
+    wifistate_step(&m, WE_RETRY_TIMER, 0);
+    out = wifistate_step(&m, WE_DRIVER_ERROR, 0);
+    assert_has(out, WA_ARM_RETRY);
+    TEST_ASSERT_EQUAL(WS_BACKOFF, m.state);
+    // In IDLE there is nothing to retry.
+    reach(WS_IDLE);
+    TEST_ASSERT_EQUAL_HEX32(0, wifistate_step(&m, WE_DRIVER_ERROR, 0).actions);
+}
+
+void test_wifistate_a_trial_supersedes_a_restore(void)
+{
+    reach(WS_RESTORING);
+    const wifi_step_t out = wifistate_step(&m, WE_TRIAL_BEGIN, 1);
+    TEST_ASSERT_EQUAL(WS_TRIAL, m.state);
+    assert_has(out, WA_STOP_TRIAL_TIMER | WA_DISCONNECT | WA_SET_TRIAL_CONFIG | WA_CONNECT | WA_START_TRIAL_TIMER);
+    assert_lacks(out, WA_REFUSED);
+    TEST_ASSERT_FALSE(m.joined);
 }
 
 void test_wifistate_a_timeout_after_one_wrong_password_names_the_password(void)
@@ -207,20 +331,54 @@ void test_wifistate_a_restore_failure_falls_to_backoff_with_the_old_credentials(
     TEST_ASSERT_EQUAL(WS_RESTORING, m.state);
 
     out = wifistate_step(&m, WE_DISCONNECTED, R_NO_AP);
-    TEST_ASSERT_EQUAL_HEX32(WA_ARM_RETRY, out.actions);
+    TEST_ASSERT_EQUAL_HEX32(WA_STOP_TRIAL_TIMER | WA_ARM_RETRY, out.actions);
     TEST_ASSERT_EQUAL(WS_BACKOFF, m.state);
 
-    // The retry then connects with whatever config is set, which the restore made the old one.
+    // The retry then sets the old config again and connects.
     out = wifistate_step(&m, WE_RETRY_TIMER, 0);
-    TEST_ASSERT_EQUAL_HEX32(WA_CONNECT, out.actions);
+    TEST_ASSERT_EQUAL_HEX32(WA_SET_CURRENT_CONFIG | WA_CONNECT, out.actions);
 }
 
 void test_wifistate_the_old_network_coming_back_ends_the_restore(void)
 {
     reach(WS_RESTORING);
-    const wifi_step_t out = wifistate_step(&m, WE_GOT_IP, 1);
-    TEST_ASSERT_EQUAL_HEX32(0, out.actions);
+    wifistate_step(&m, WE_CONNECTED, 0); // another SSID: no
+    TEST_ASSERT_EQUAL_HEX32(0, wifistate_step(&m, WE_GOT_IP, 0).actions);
+    TEST_ASSERT_EQUAL(WS_RESTORING, m.state);
+    wifistate_step(&m, WE_CONNECTED, 1);
+    const wifi_step_t out = wifistate_step(&m, WE_GOT_IP, 0);
+    TEST_ASSERT_EQUAL_HEX32(WA_STOP_TRIAL_TIMER, out.actions); // the deadline
     TEST_ASSERT_EQUAL(WS_CONNECTED, m.state);
+}
+
+void test_wifistate_got_ip_outside_a_trial_stops_the_retry_timer(void)
+{
+    const wifi_conn_state_t states[] = {WS_BACKOFF, WS_CONNECTING};
+    for (size_t i = 0; i < 2; i++) {
+        reach(states[i]);
+        const wifi_step_t out = wifistate_step(&m, WE_GOT_IP, 0);
+        TEST_ASSERT_EQUAL_HEX32(WA_STOP_RETRY, out.actions);
+        TEST_ASSERT_EQUAL(WS_CONNECTED, m.state);
+    }
+}
+
+void test_wifistate_a_trial_from_connecting_leaves_and_stops_the_retry(void)
+{
+    reach(WS_CONNECTING);
+    const wifi_step_t out = wifistate_step(&m, WE_TRIAL_BEGIN, 1);
+    assert_has(out, WA_STOP_RETRY | WA_DISCONNECT | WA_SET_TRIAL_CONFIG | WA_CONNECT | WA_START_TRIAL_TIMER);
+    TEST_ASSERT_EQUAL(WS_TRIAL, m.state);
+    // The abandoned connect's own disconnect is not a failure of the trial.
+    TEST_ASSERT_EQUAL_HEX32(0, wifistate_step(&m, WE_DISCONNECTED, R_ASSOC_LEAVE).actions);
+}
+
+void test_wifistate_apply_from_backoff_stops_the_retry_without_a_disconnect(void)
+{
+    reach(WS_BACKOFF);
+    const wifi_step_t out = wifistate_step(&m, WE_APPLY, 0);
+    assert_has(out, WA_STOP_RETRY | WA_SET_CURRENT_CONFIG | WA_CONNECT);
+    assert_lacks(out, WA_DISCONNECT);
+    TEST_ASSERT_EQUAL(WS_CONNECTING, m.state);
 }
 
 void test_wifistate_a_trial_with_no_old_network_ends_in_idle(void)
@@ -230,7 +388,7 @@ void test_wifistate_a_trial_with_no_old_network_ends_in_idle(void)
     wifistate_step(&m, WE_DISCONNECTED, R_AUTH_FAIL);
     const wifi_step_t out = wifistate_step(&m, WE_DISCONNECTED, R_AUTH_FAIL);
     assert_has(out, WA_DISCONNECT | WA_TRIAL_FAILED);
-    assert_lacks(out, WA_SET_CURRENT_CONFIG | WA_CONNECT | WA_ARM_RETRY);
+    assert_lacks(out, WA_SET_CURRENT_CONFIG | WA_CONNECT | WA_ARM_RETRY | WA_START_TRIAL_TIMER);
     TEST_ASSERT_EQUAL(WS_IDLE, m.state);
 
     // Stragglers in IDLE change nothing.
@@ -243,7 +401,8 @@ void test_wifistate_a_trial_from_idle_that_joins_makes_the_network_current(void)
     wifistate_init(&m);
     wifi_step_t out = wifistate_step(&m, WE_TRIAL_BEGIN, 0);
     assert_lacks(out, WA_DISCONNECT);
-    wifistate_step(&m, WE_GOT_IP, 1);
+    wifistate_step(&m, WE_CONNECTED, 1);
+    wifistate_step(&m, WE_GOT_IP, 0);
     TEST_ASSERT_EQUAL(WS_CONNECTED, m.state);
     // A later trial that fails goes back to the network that joined.
     wifistate_step(&m, WE_TRIAL_BEGIN, 1);
@@ -251,14 +410,17 @@ void test_wifistate_a_trial_from_idle_that_joins_makes_the_network_current(void)
     TEST_ASSERT_EQUAL(WS_RESTORING, m.state);
 }
 
-void test_wifistate_a_trial_or_apply_during_a_trial_or_restore_is_refused(void)
+void test_wifistate_a_trial_during_a_trial_and_an_apply_during_either_are_refused(void)
 {
+    reach(WS_TRIAL);
+    wifi_step_t out = wifistate_step(&m, WE_TRIAL_BEGIN, 1);
+    TEST_ASSERT_EQUAL_HEX32(WA_REFUSED, out.actions);
+    TEST_ASSERT_EQUAL(WF_BUSY, out.fail);
+    TEST_ASSERT_EQUAL(WS_TRIAL, m.state);
+
     const wifi_conn_state_t busy[] = {WS_TRIAL, WS_RESTORING};
     for (size_t i = 0; i < 2; i++) {
         reach(busy[i]);
-        wifi_step_t out = wifistate_step(&m, WE_TRIAL_BEGIN, 1);
-        TEST_ASSERT_EQUAL_HEX32(WA_REFUSED, out.actions);
-        TEST_ASSERT_EQUAL(WF_BUSY, out.fail);
         out = wifistate_step(&m, WE_APPLY, 0);
         TEST_ASSERT_EQUAL_HEX32(WA_REFUSED, out.actions);
         TEST_ASSERT_EQUAL(busy[i], m.state);
@@ -291,6 +453,7 @@ void test_wifistate_names_and_fail_text(void)
     TEST_ASSERT_EQUAL_STRING("wrong password?", wifistate_fail_text(WF_WRONG_PASSWORD));
     TEST_ASSERT_EQUAL_STRING("network not found", wifistate_fail_text(WF_NOT_FOUND));
     TEST_ASSERT_EQUAL_STRING("timed out", wifistate_fail_text(WF_TIMEOUT));
+    TEST_ASSERT_EQUAL_STRING("error", wifistate_fail_text(WF_ERROR));
     TEST_ASSERT_EQUAL_STRING("", wifistate_fail_text(WF_NONE));
 }
 
@@ -365,7 +528,8 @@ void test_wifistate_run(void)
     RUN_TEST(test_wifistate_a_trial_from_backoff_cancels_the_retry_and_never_arms_it);
     RUN_TEST(test_wifistate_a_trial_from_connected_leaves_the_old_network_first);
     RUN_TEST(test_wifistate_our_own_disconnect_is_not_a_trial_failure);
-    RUN_TEST(test_wifistate_a_got_ip_for_another_ssid_does_not_end_the_trial);
+    RUN_TEST(test_wifistate_a_got_ip_before_the_trials_own_connected_is_ignored);
+    RUN_TEST(test_wifistate_a_disconnect_after_connected_clears_the_joined_flag);
     RUN_TEST(test_wifistate_two_wrong_password_disconnects_end_the_trial_and_restore);
     RUN_TEST(test_wifistate_one_wrong_password_and_another_failure_keep_trying);
     RUN_TEST(test_wifistate_two_network_not_found_end_the_trial);
@@ -376,7 +540,18 @@ void test_wifistate_run(void)
     RUN_TEST(test_wifistate_the_old_network_coming_back_ends_the_restore);
     RUN_TEST(test_wifistate_a_trial_with_no_old_network_ends_in_idle);
     RUN_TEST(test_wifistate_a_trial_from_idle_that_joins_makes_the_network_current);
-    RUN_TEST(test_wifistate_a_trial_or_apply_during_a_trial_or_restore_is_refused);
+    RUN_TEST(test_wifistate_a_trial_during_a_trial_and_an_apply_during_either_are_refused);
+    RUN_TEST(test_wifistate_a_timeout_with_no_old_network_ends_in_idle);
+    RUN_TEST(test_wifistate_the_restore_deadline_falls_to_backoff);
+    RUN_TEST(test_wifistate_a_stray_disconnect_after_a_timeout_does_not_arm_the_retry_over_the_restore);
+    RUN_TEST(test_wifistate_reasons_210_211_212_count_as_network_not_found);
+    RUN_TEST(test_wifistate_a_driver_error_in_a_trial_ends_it_without_a_connect);
+    RUN_TEST(test_wifistate_a_driver_error_in_a_trial_with_no_old_network_ends_in_idle);
+    RUN_TEST(test_wifistate_a_driver_error_on_a_normal_connect_arms_the_retry);
+    RUN_TEST(test_wifistate_a_trial_supersedes_a_restore);
+    RUN_TEST(test_wifistate_got_ip_outside_a_trial_stops_the_retry_timer);
+    RUN_TEST(test_wifistate_a_trial_from_connecting_leaves_and_stops_the_retry);
+    RUN_TEST(test_wifistate_apply_from_backoff_stops_the_retry_without_a_disconnect);
     RUN_TEST(test_wifistate_a_disconnect_reason_8_from_a_connected_board_is_a_drop);
     RUN_TEST(test_wifistate_apply_from_connected_leaves_and_rejoins);
     RUN_TEST(test_wifistate_names_and_fail_text);

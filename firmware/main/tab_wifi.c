@@ -2,8 +2,9 @@
 // keyboard, tries the network and saves it to wifi.txt. The work is wifi.c's, on the svc task; this file only starts a
 // job and polls its result, so nothing here waits. Everything runs in the LVGL task or under the LVGL lock.
 //
-// The password is never shown in clear but behind the Show button, never logged, and never kept outside the text area
-// and wifi.c's own copies.
+// The password is shown in clear only behind the Show button, is never logged, and is kept nowhere but the text area
+// and wifi.c's own copies. When the text area is cleared or deleted its buffer is first overwritten with filler of the
+// same length (scrub_password). That is best effort: LVGL may have moved the buffer, and freed heap is not wiped.
 
 #include <stdio.h>
 #include <string.h>
@@ -129,6 +130,7 @@ static bool s_ssid_exact;              // the SSID field still shows s_ssid_raw 
 static bool s_programmatic;            // the SSID field is being set by code, not typed in
 static bool s_save_armed;              // "Save without connecting" was tapped once and asks to be tapped again
 static bool s_kb_logged;
+static bool s_kb_up;                             // the keyboard is shown
 static wifiscan_entry_t s_entries[WIFISCAN_MAX]; // what the list shows
 static size_t s_entry_n;
 
@@ -174,9 +176,28 @@ static void disarm_save(void)
     }
 }
 
+// Overwrite the password text area's text with same-length filler, then empty it.
+static void scrub_password(void)
+{
+    if (!s_pass_ta) {
+        return;
+    }
+    char filler[WIFITXT_PASS_MAX + 1];
+    size_t n = strlen(lv_textarea_get_text(s_pass_ta));
+    if (n > WIFITXT_PASS_MAX) {
+        n = WIFITXT_PASS_MAX;
+    }
+    memset(filler, 'x', n);
+    filler[n] = '\0';
+    lv_textarea_set_text(s_pass_ta, filler);
+    lv_textarea_set_text(s_pass_ta, "");
+}
+
+// Disabled while a job runs. Cancel goes too: a trial can't be called off from here, and the screen it would return
+// to has to stay until the job says how it ended.
 static void set_busy(bool busy)
 {
-    lv_obj_t *const inputs[] = {s_ssid_ta, s_pass_ta, s_scan_btn, s_connect_btn, s_save_btn};
+    lv_obj_t *const inputs[] = {s_ssid_ta, s_pass_ta, s_scan_btn, s_connect_btn, s_save_btn, s_cancel_btn};
     for (size_t i = 0; i < sizeof(inputs) / sizeof(inputs[0]); i++) {
         if (busy) {
             lv_obj_add_state(inputs[i], LV_STATE_DISABLED);
@@ -188,6 +209,7 @@ static void set_busy(bool busy)
 
 static void show_keyboard(lv_obj_t *ta)
 {
+    s_kb_up = true;
     lv_keyboard_set_textarea(s_kb, ta);
     lv_obj_set_hidden(s_list, true);
     lv_obj_set_hidden(s_kb, false);
@@ -199,6 +221,7 @@ static void show_keyboard(lv_obj_t *ta)
 
 static void hide_keyboard(void)
 {
+    s_kb_up = false;
     lv_keyboard_set_textarea(s_kb, NULL);
     lv_obj_set_hidden(s_kb, true);
     lv_obj_set_hidden(s_list, false);
@@ -249,7 +272,7 @@ static void list_item_clicked(lv_event_t *e)
         return;
     }
     set_ssid_field(s_entries[i].ssid);
-    lv_textarea_set_text(s_pass_ta, ""); // a password typed for another network stays with that network
+    scrub_password(); // a password typed for another network stays with that network
     if (s_entries[i].secure) {
         show_keyboard(s_pass_ta);
         set_msg(MSG_INFO, "Type the password.");
@@ -414,7 +437,7 @@ static void finished(const wifi_job_t *j)
         break;
     case WIFI_JOB_TRIAL:
         if (j->ok) {
-            lv_textarea_set_text(s_pass_ta, ""); // joined: the password has done its work
+            scrub_password(); // joined: the password has done its work
             if (j->save == WIFI_SAVE_OK) {
                 set_msg(MSG_GOOD, "Connected and saved to wifi.txt.");
             } else {
@@ -475,11 +498,13 @@ static void build_rows(void);
 
 static void editor_close(void)
 {
+    scrub_password(); // before the text area goes, whichever way it goes
     if (s_poll) {
         lv_timer_delete(s_poll);
         s_poll = NULL;
     }
     s_editing = false;
+    s_kb_up = false;
     s_pending = WIFI_JOB_NONE;
     memset(s_ssid_raw, 0, sizeof(s_ssid_raw));
     s_ssid_exact = false;
@@ -495,8 +520,8 @@ static void cancel_async(void *unused)
     if (!s_content || !s_editing) {
         return;
     }
-    lv_obj_clean(s_content); // the password goes with its text area
-    editor_close();
+    editor_close(); // scrubs the password, then the clean deletes its text area
+    lv_obj_clean(s_content);
     settings_set_swipe_close(true);
     build_rows();
 }
@@ -686,5 +711,11 @@ void tab_wifi_leave(void)
 
 bool tab_wifi_editing(void)
 {
-    return s_editing;
+    // An editor with nothing typed, no job and no keyboard is just a view, and idles out like the others.
+    return s_editing && (s_pending != WIFI_JOB_NONE || s_kb_up || (s_pass_ta && lv_textarea_get_text(s_pass_ta)[0]));
+}
+
+bool tab_wifi_busy(void)
+{
+    return s_editing && (s_pending == WIFI_JOB_TRIAL || s_pending == WIFI_JOB_SAVE);
 }

@@ -11,7 +11,11 @@
  *   CONNECTED   has an IP
  *   BACKOFF     disconnected, the retry timer is armed
  *   TRIAL       a connect with the typed credentials; the retry timer is stopped and never armed
- *   RESTORING   the trial failed, reconnecting to the old network; a failure here falls to BACKOFF
+ *   RESTORING   the trial failed, reconnecting to the old network; a failure, or the same 20 s clock running out,
+ *               falls to BACKOFF. A new trial may begin from here.
+ *
+ * A trial or a restore counts a GOT_IP only after a CONNECTED for the SSID it expects (m->joined), so the previous
+ * network's IP, arriving late, can't pass for the new one.
  */
 
 #include <stdbool.h>
@@ -30,10 +34,12 @@ typedef enum {
 typedef enum {
     WE_APPLY,         // connect with the current credentials (boot)
     WE_DISCONNECTED,  // arg: the reason number
-    WE_GOT_IP,        // arg: 1 when the SSID joined is the one this state expects (the trial's, or the old one)
+    WE_CONNECTED,     // STA_CONNECTED. arg: 1 when its SSID is the one this state expects (the trial's, or the old one)
+    WE_GOT_IP,        // arg unused
     WE_RETRY_TIMER,   // arg: 1 while a scan runs, which a connect would abort
     WE_TRIAL_BEGIN,   // arg: 1 when there is an old network to go back to
-    WE_TRIAL_TIMEOUT, // the 20 s timer
+    WE_TRIAL_TIMEOUT, // the 20 s timer: a trial's, or a restore's deadline
+    WE_DRIVER_ERROR,  // esp_wifi_set_config or esp_wifi_connect failed, so no disconnect event will come
 } wifi_conn_ev_t;
 
 // What the glue does, in this order: stop the retry timer, stop the trial timer, disconnect, set the config (the old
@@ -48,7 +54,7 @@ typedef enum {
 #define WA_START_TRIAL_TIMER (1u << 7)
 #define WA_TRIAL_OK (1u << 8)     // joined the trial's network: make its credentials the current ones and save them
 #define WA_TRIAL_FAILED (1u << 9) // out.fail says why
-#define WA_REFUSED (1u << 10)     // WE_TRIAL_BEGIN or WE_APPLY while a trial or a restore runs; out.fail is WF_BUSY
+#define WA_REFUSED (1u << 10)     // WE_TRIAL_BEGIN while a trial runs, WE_APPLY while one or a restore runs: WF_BUSY
 
 typedef enum {
     WF_NONE,
@@ -56,11 +62,14 @@ typedef enum {
     WF_NOT_FOUND,
     WF_TIMEOUT,
     WF_BUSY,
+    WF_ERROR, // the driver refused the config or the connect
 } wifi_fail_t;
 
 typedef struct {
     wifi_conn_state_t state;
     bool has_old;       // a trial can go back to a network
+    bool joined;        // a trial or restore has seen CONNECTED for its SSID and no disconnect since
+    bool restore_grace; // a restore after a timeout: the first stray disconnect is the trial's, not the restore's
     uint8_t wrong_pass; // this trial's disconnects that point at the password
     uint8_t not_found;  // and at a missing network
 } wifi_machine_t;
@@ -74,7 +83,7 @@ void wifistate_init(wifi_machine_t *m);
 wifi_step_t wifistate_step(wifi_machine_t *m, wifi_conn_ev_t ev, int arg);
 
 const char *wifistate_name(wifi_conn_state_t s);
-// "wrong password?", "network not found", "timed out", "busy". "" for WF_NONE.
+// "wrong password?", "network not found", "timed out", "busy", "error". "" for WF_NONE.
 const char *wifistate_fail_text(wifi_fail_t f);
 
 /* ---- The scan list ---- */
