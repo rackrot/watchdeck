@@ -3312,12 +3312,66 @@ async fn a_test_of_a_stat_integration_runs_its_live_source_and_touches_no_store(
 
     // Only a saved stat source can be tested.
     let push = daemon.devices.test_integration("ha").await.unwrap_err();
-    assert!(push.contains("not a stat source"), "{push}");
+    assert!(push.contains("not a stat or prometheus source"), "{push}");
     let none = daemon.devices.test_integration("nope").await.unwrap_err();
     assert!(none.contains("\"nope\""), "{none}");
 
     // With no session open nothing polls, so a card in the store would be the test's.
     assert_eq!(daemon.devices.feed().snapshot().cards, before.cards);
+}
+
+#[tokio::test]
+async fn a_test_of_a_prometheus_integration_runs_the_query_once_and_shows_the_card() {
+    // One reply for any request: a vector with the value 91.234.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if socket.read(&mut byte).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    head.push(byte[0]);
+                }
+                let body = r#"{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1,"91.234"]}]}}"#;
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+            });
+        }
+    });
+    let config = |extra: &str| {
+        format!(
+            "{}\n[[integration]]\nid = \"cpu\"\nkind = \"prometheus\"\nlabel = \"CPU\"\n\
+             url = \"http://{addr}\"\nquery = \"up\"\nevery_s = 30\n{extra}",
+            feed_config()
+        )
+    };
+    let daemon = start_feed().await;
+    daemon
+        .reconfigure(&config("decimals = 1\nsuffix = \"%\"\nbad_above = 90\n"))
+        .unwrap();
+
+    // Over the threshold: the card text as the board shows it, and not ok.
+    let ran = daemon.devices.test_integration("cpu").await.unwrap();
+    assert_eq!((ran.ok, ran.summary.as_str()), (false, "91.2%"), "{ran:?}");
+
+    daemon
+        .reconfigure(&config("decimals = 0\nbad_above = 95\n"))
+        .unwrap();
+    let ran = daemon.devices.test_integration("cpu").await.unwrap();
+    assert_eq!((ran.ok, ran.summary.as_str()), (true, "91"), "{ran:?}");
+
+    // With no session open nothing polls, so a value in the store would be the test's.
+    let snapshot = daemon.devices.feed().snapshot();
+    let cards = &snapshot.cards;
+    assert!(cards.iter().all(|c| c.value == "--"), "{cards:?}");
 }
 
 #[tokio::test]
