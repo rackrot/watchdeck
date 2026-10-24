@@ -183,7 +183,7 @@ The user took every recommended answer below on 2026-10-23. Q5 stays a gate at L
 | Q2 | How does the screen wake from a manual (privacy) sleep? | **Any touch**, swallowed so it presses nothing. A deliberate gesture (a long swipe up) is safer against bumps but harder to find. It can be a later `[sleep] wake = "swipe"` |
 | Q3 | Should the push API be reachable from the LAN (Home Assistant on another host)? | **Off by default.** With `[push] lan = true` it also serves HTTPS on 47823 with the daemon's self-signed certificate, which Home Assistant's `rest_command` takes with `verify_ssl: false` or the shown fingerprint. Never plain HTTP on the LAN, since the bearer token would cross it in clear |
 | Q4 | Does a board that boots paired and can't reach its daemon show the sleep screen after 10 s? Device-ui decided it stays in status mode | **Yes, the sleep screen** with the spinner and the link status. A touch shows status mode, with Forget pairing and Settings, for as long as the user keeps touching. `offline_after_s = 0` restores the old behavior |
-| Q5 | Logo direction | Pick one of the L1 candidates (a gate, not a question to answer now) |
+| Q5 | Logo direction | **Decided 2026-10-23: candidate A, Deck** (see 05-logo.md, L1 results) |
 
 ## Risks (top 8; each file has the rest)
 
