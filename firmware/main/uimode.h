@@ -52,5 +52,11 @@ typedef enum {
 /** What `entry` does while the UI is in `mode`. */
 ui_action_t uimode_action(ui_entry_t entry, ui_mode_t mode);
 
+/**
+ * Whether the sleep screen may start now. Never unpaired and never from settings or while already asleep. A privacy
+ * sleep (a swipe on the grid) starts from the grid only; an offline sleep from the grid or status mode.
+ */
+bool uimode_can_sleep(ui_mode_t mode, sleep_reason_t reason, bool paired);
+
 /** Whether a set applying (the link coming back) ends a sleep of this reason. Privacy stays until a touch. */
 bool uimode_link_wakes(sleep_reason_t reason);

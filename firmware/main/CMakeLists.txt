@@ -2,7 +2,7 @@ include(${CMAKE_CURRENT_LIST_DIR}/fonts/fonts.cmake) # WD_FONT_SRCS, generated b
 
 include(${CMAKE_CURRENT_LIST_DIR}/font_licenses.cmake) # WD_FONT_LICENSES_TXT, from fonts/
 
-idf_component_register(SRCS "main.c" "display.c" "touch.c" "ui.c" "settings.c" "tab_status.c" "sleep.c" "sleepcfg.c" "uimode.c" "feedpage.c" "feedfmt.c" "grid.c" "proto.c" "pageset.c" "hoststat.c" "model.c" "icons.c" "pairing.c" "link.c" "sdcard.c" "wifi.c"
+idf_component_register(SRCS "main.c" "display.c" "touch.c" "ui.c" "settings.c" "tab_status.c" "tab_logs.c" "tab_errors.c" "sleep.c" "sleepcfg.c" "uimode.c" "feedpage.c" "feedfmt.c" "grid.c" "proto.c" "pageset.c" "hoststat.c" "model.c" "icons.c" "pairing.c" "link.c" "sdcard.c" "wifi.c"
                             "usb.c" "crash.c" "logring.c" "logcap.c" "diag.c" "font_ids.c" "fonts.c" "font_licenses.c" ${WD_FONT_SRCS}
                        INCLUDE_DIRS "."
                        EMBED_TXTFILES ${WD_FONT_LICENSES_TXT}

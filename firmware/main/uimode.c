@@ -45,6 +45,14 @@ ui_action_t uimode_action(ui_entry_t entry, ui_mode_t mode)
     return TABLE[entry][mode];
 }
 
+bool uimode_can_sleep(ui_mode_t mode, sleep_reason_t reason, bool paired)
+{
+    if (!paired) {
+        return false;
+    }
+    return mode == MODE_GRID || (mode == MODE_STATUS && reason == SLEEP_OFFLINE);
+}
+
 bool uimode_link_wakes(sleep_reason_t reason)
 {
     return reason == SLEEP_OFFLINE;

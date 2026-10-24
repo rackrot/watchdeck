@@ -42,6 +42,9 @@ uint32_t logcap_dropped(void);
 // page.
 uint32_t logcap_next_seq(void);
 
+// The seq of the newest E or W line stored, 0 if none. It changes only when such a line arrives.
+uint32_t logcap_error_seq(void);
+
 // The oldest sequence number still held (equal to logcap_next_seq() when the ring is empty).
 uint32_t logcap_oldest_seq(void);
 

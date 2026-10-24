@@ -24,6 +24,14 @@ const sleep_cfg_t *sleep_config(void);
  */
 void sleep_show(void (*on_touch)(void));
 
+/**
+ * Use `cfg` from now on (copied). If the screen is up it is rebuilt in place from it; the backlight and the touch
+ * callback are not touched, so the screen does not flash or lose its wake handler. Takes no lock itself: the caller
+ * must hold the LVGL lock (lvgl_port_lock) or be in the LVGL task, like every function here. P3 calls it from the link
+ * and boot jobs, which take the lock first.
+ */
+void sleep_set_config(const sleep_cfg_t *cfg);
+
 /** Delete the screen and restore the backlight to full. Does nothing when it is not up. */
 void sleep_hide(void);
 

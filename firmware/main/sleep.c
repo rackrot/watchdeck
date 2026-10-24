@@ -20,6 +20,9 @@ static lv_obj_t *s_strip;
 static lv_obj_t *s_status;
 static lv_timer_t *s_timer;
 static void (*s_on_touch)(void);
+static lv_obj_t *s_image_area; // the placeholder logo today; P3 puts the picture here
+static lv_obj_t *s_spinner;
+static bool s_spinning;
 static bool s_pressed; // a touch began on the screen, so its release wakes it; one that began before it was up does not
 
 void sleep_init(void)
@@ -101,6 +104,7 @@ static lv_obj_t *spinner_create(lv_obj_t *parent, sleep_spinner_t kind, lv_color
         lv_obj_set_style_arc_color(sp, color, LV_PART_INDICATOR);
         lv_obj_set_style_arc_opa(sp, LV_OPA_20, LV_PART_MAIN);
         lv_obj_set_style_arc_color(sp, color, LV_PART_MAIN);
+        lv_anim_delete(sp, NULL); // spinner_run starts it
         return sp;
     }
     case SLEEP_SPIN_DOTS: {
@@ -111,7 +115,6 @@ static lv_obj_t *spinner_create(lv_obj_t *parent, sleep_spinner_t kind, lv_color
             lv_obj_t *dot = circle(box, 12, color);
             lv_obj_align(dot, LV_ALIGN_LEFT_MID, i * 18, 0);
             lv_obj_set_style_opa(dot, LV_OPA_20, 0);
-            loop_anim(dot, opa_exec, LV_OPA_20, LV_OPA_COVER, 450, (uint32_t)i * 150);
         }
         return box;
     }
@@ -123,18 +126,60 @@ static lv_obj_t *spinner_create(lv_obj_t *parent, sleep_spinner_t kind, lv_color
         lv_obj_set_style_bg_color(bar, color, LV_PART_MAIN);
         lv_obj_set_style_bg_opa(bar, LV_OPA_20, LV_PART_MAIN);
         lv_obj_set_style_bg_color(bar, color, LV_PART_INDICATOR);
-        loop_anim(bar, bar_exec, 0, 100, 900, 0);
         return bar;
     }
     case SLEEP_SPIN_PULSE: {
         lv_obj_t *c = circle(parent, SPINNER_PX, color);
         lv_obj_set_style_transform_pivot_x(c, SPINNER_PX / 2, 0);
         lv_obj_set_style_transform_pivot_y(c, SPINNER_PX / 2, 0);
-        loop_anim(c, pulse_exec, 0, 100, 800, 0);
         return c;
     }
     default:
         return NULL; // SLEEP_SPIN_NONE
+    }
+}
+
+// Start or stop the spinner's animations. They run only while the strip shows, so a link that is up costs no frames.
+static void spinner_run(bool on)
+{
+    if (!s_spinner || s_spinning == on) {
+        return;
+    }
+    s_spinning = on;
+    switch (s_cfg.spinner) {
+    case SLEEP_SPIN_ARC:
+        if (on) {
+            lv_spinner_set_anim_params(s_spinner, 1000, 240);
+        } else {
+            lv_anim_delete(s_spinner, NULL);
+        }
+        break;
+    case SLEEP_SPIN_DOTS:
+        for (uint32_t i = 0; i < lv_obj_get_child_count(s_spinner); i++) {
+            lv_obj_t *dot = lv_obj_get_child(s_spinner, i);
+            if (on) {
+                loop_anim(dot, opa_exec, LV_OPA_20, LV_OPA_COVER, 450, i * 150);
+            } else {
+                lv_anim_delete(dot, NULL);
+            }
+        }
+        break;
+    case SLEEP_SPIN_BAR:
+        if (on) {
+            loop_anim(s_spinner, bar_exec, 0, 100, 900, 0);
+        } else {
+            lv_anim_delete(s_spinner, NULL);
+        }
+        break;
+    case SLEEP_SPIN_PULSE:
+        if (on) {
+            loop_anim(s_spinner, pulse_exec, 0, 100, 800, 0);
+        } else {
+            lv_anim_delete(s_spinner, NULL);
+        }
+        break;
+    default:
+        break;
     }
 }
 
@@ -162,13 +207,11 @@ static const lv_font_t *el_font(sleep_el_t el)
     return el == SLEEP_EL_CLOCK ? &lv_font_montserrat_48 : &lv_font_montserrat_32;
 }
 
-void sleep_show(void (*on_touch)(void))
+// The widgets from the configuration. Leaves the backlight and the touch callback alone.
+static void build(void)
 {
-    if (s_root) {
-        return;
-    }
-    s_on_touch = on_touch;
     s_pressed = false;
+    s_spinning = false;
     const lv_color_t fg = lv_color_hex(s_cfg.fg);
 
     s_root = lv_obj_create(lv_screen_active());
@@ -182,7 +225,7 @@ void sleep_show(void (*on_touch)(void))
     lv_obj_add_event_cb(s_root, root_event, LV_EVENT_RELEASED, NULL);
 
     // The placeholder for the logo (L4) and the picture (P3): a rounded square in the text color, centered in the area.
-    lv_obj_t *logo = passive(lv_obj_create(s_root));
+    lv_obj_t *logo = s_image_area = passive(lv_obj_create(s_root));
     lv_obj_remove_style_all(logo);
     lv_obj_set_size(logo, LOGO_PX, LOGO_PX);
     lv_obj_set_pos(logo, (SLEEP_AREA_W - LOGO_PX) / 2, (SLEEP_AREA_H - LOGO_PX) / 2);
@@ -209,11 +252,11 @@ void sleep_show(void (*on_touch)(void))
     lv_obj_remove_style_all(s_strip);
     lv_obj_set_size(s_strip, DISPLAY_H_RES, SLEEP_STRIP_H);
     lv_obj_set_pos(s_strip, 0, SLEEP_AREA_H);
-    lv_obj_t *spinner = spinner_create(s_strip, s_cfg.spinner, lv_color_hex(s_cfg.spinner_color));
+    s_spinner = spinner_create(s_strip, s_cfg.spinner, lv_color_hex(s_cfg.spinner_color));
     int text_x = STRIP_PAD;
-    if (spinner) {
-        lv_obj_set_pos(spinner, STRIP_PAD, (SLEEP_STRIP_H - lv_obj_get_height(spinner)) / 2);
-        text_x += lv_obj_get_width(spinner) + STRIP_GAP;
+    if (s_spinner) {
+        lv_obj_set_pos(s_spinner, STRIP_PAD, (SLEEP_STRIP_H - lv_obj_get_height(s_spinner)) / 2);
+        text_x += lv_obj_get_width(s_spinner) + STRIP_GAP;
     }
     s_status = lv_label_create(s_strip);
     lv_obj_set_style_text_font(s_status, &lv_font_montserrat_32, 0);
@@ -224,6 +267,25 @@ void sleep_show(void (*on_touch)(void))
 
     s_timer = lv_timer_create(timer_cb, REFRESH_MS, NULL);
     sleep_refresh();
+}
+
+static void destroy(void)
+{
+    lv_timer_delete(s_timer);
+    s_timer = NULL;
+    lv_obj_delete(s_root); // its animations go with their objects
+    s_root = s_strip = s_status = s_image_area = s_spinner = NULL;
+    s_spinning = false;
+    memset(s_els, 0, sizeof(s_els));
+}
+
+void sleep_show(void (*on_touch)(void))
+{
+    if (s_root) {
+        return;
+    }
+    s_on_touch = on_touch;
+    build();
     display_backlight(s_cfg.backlight);
 }
 
@@ -232,12 +294,17 @@ void sleep_hide(void)
     if (!s_root) {
         return;
     }
-    lv_timer_delete(s_timer);
-    s_timer = NULL;
-    lv_obj_delete(s_root); // its animations go with their objects
-    s_root = s_strip = s_status = NULL;
-    memset(s_els, 0, sizeof(s_els));
+    destroy();
     display_backlight(100);
+}
+
+void sleep_set_config(const sleep_cfg_t *cfg)
+{
+    s_cfg = *cfg;
+    if (s_root) {
+        destroy();
+        build();
+    }
 }
 
 static void set_text(lv_obj_t *label, const char *text)
@@ -274,6 +341,8 @@ void sleep_refresh(void)
     }
 
     // The spinner and the link status show while the link is down, for either reason the screen is up.
-    lv_obj_set_hidden(s_strip, ui_online());
+    const bool online = ui_online();
+    lv_obj_set_hidden(s_strip, online);
+    spinner_run(!online);
     set_text(s_status, ui_status_text(STATUS_DAEMON));
 }

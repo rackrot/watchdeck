@@ -51,6 +51,7 @@ typedef struct {
     size_t used;                // bytes in records
     uint32_t next_seq;          // the sequence number the next line gets (the first is 1, so 0 is never a line)
     uint32_t count;             // lines held
+    uint32_t error_seq;         // the seq of the newest E or W line stored, 0 until one
     uint32_t cp[LOGRING_IDX_N]; // offset of the record whose seq is a multiple of LOGRING_STEP, at [seq / STEP % N]
     char token[LOGRING_SECRET_MAX + 1];
     char pass[LOGRING_PASS_SLOTS][LOGRING_SECRET_MAX + 1];
@@ -92,6 +93,10 @@ bool logring_capture(logring_t *r, char *text, size_t cap, int ret, uint32_t ms)
 uint32_t logring_next_seq(const logring_t *r);
 uint32_t logring_oldest_seq(const logring_t *r);
 uint32_t logring_count(const logring_t *r);
+
+// The seq of the newest E or W line ever stored (0 if none), even once the ring has dropped it. A reader of the errors
+// compares it with the value it last saw to know whether to read again.
+uint32_t logring_error_seq(const logring_t *r);
 
 /*
  * Copy up to `max` lines, oldest first, into `out`. `from`: the lines with seq >= from_seq (the next page forward).
