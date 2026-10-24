@@ -12,7 +12,7 @@ pub use super::units::{NetUnit, TempUnit};
 pub const VERSION: u32 = 1;
 
 /// The capabilities a session keeps from `hello.caps`; any other name is dropped.
-pub const CAPS: [&str; 3] = [CAP_FONTS, CAP_PAGES, CAP_STATUS_BAR];
+pub const CAPS: [&str; 4] = [CAP_FONTS, CAP_PAGES, CAP_STATUS_BAR, CAP_FEED];
 /// The device draws every font in `fonts_gen::FONT_IDS` and reads the layout's font fields.
 pub const CAP_FONTS: &str = "fonts";
 /// The device assembles a set of up to 4 `layout` pages and lays out the shorter grid for 2 or
@@ -68,17 +68,17 @@ const MAX_RGB: u32 = 0xFF_FFFF;
 const MAX_SLEEP_TEXT_CHARS: usize = 47;
 const MAX_OFFLINE_AFTER_S: u32 = 3600;
 const MAX_BACKLIGHT: u32 = 100;
-const MAX_FEED_SOURCES: u32 = 16;
-const MAX_FEED_CARDS: usize = 8;
-const MAX_FEED_NOTES: usize = 12;
-const MAX_FEED_ID_CHARS: usize = 63;
-const MAX_FEED_LABEL_CHARS: usize = 23;
-const MAX_FEED_VALUE_CHARS: usize = 15;
-const MAX_FEED_TITLE_CHARS: usize = 47;
-const MAX_FEED_BODY_CHARS: usize = 159;
-const MAX_FEED_SRC_CHARS: usize = 23;
+pub(crate) const MAX_FEED_SOURCES: u32 = 16;
+pub(crate) const MAX_FEED_CARDS: usize = 8;
+pub(crate) const MAX_FEED_NOTES: usize = 12;
+pub(crate) const MAX_FEED_ID_CHARS: usize = 63;
+pub(crate) const MAX_FEED_LABEL_CHARS: usize = 23;
+pub(crate) const MAX_FEED_VALUE_CHARS: usize = 15;
+pub(crate) const MAX_FEED_TITLE_CHARS: usize = 47;
+pub(crate) const MAX_FEED_BODY_CHARS: usize = 159;
+pub(crate) const MAX_FEED_SRC_CHARS: usize = 23;
 /// The largest whole number a JSON number carries exactly in the device's double.
-const MAX_JSON_INT: u64 = (1 << 53) - 1;
+pub(crate) const MAX_JSON_INT: u64 = (1 << 53) - 1;
 
 /// First field of the pairing code's input, which binds the code to this protocol version.
 const PAIR_LABEL: &str = "watchdeck-pair-v1";

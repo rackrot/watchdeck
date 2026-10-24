@@ -11,6 +11,7 @@ use crate::daemon::actions::ActionResult;
 use crate::daemon::config::{Config, Configs, StatusBarConfig, StatusBarDefaults};
 use crate::daemon::gpu::GpuList;
 use crate::daemon::pairing::{Pairing, PairingState};
+use crate::daemon::protocol::Feed;
 use crate::daemon::secrets::Secrets;
 use crate::daemon::server::{DeviceInfo, Devices};
 use crate::daemon::tiles::TileView;
@@ -124,6 +125,13 @@ pub async fn save_config(
 #[tauri::command]
 pub fn tile_values(daemon: State<'_, Daemon>) -> Vec<TileView> {
     TileView::all(&daemon.devices.tile_values().borrow())
+}
+
+/// The -1 page's current snapshot, which is also what the boards get. It is the starting point
+/// for the `feed-changed` event.
+#[tauri::command]
+pub fn feed_snapshot(daemon: State<'_, Daemon>) -> Feed {
+    (*daemon.devices.feed().snapshot()).clone()
 }
 
 /// Secret names. Values never leave the daemon.

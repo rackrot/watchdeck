@@ -229,6 +229,18 @@ pub fn run() {
                 }
             });
 
+            // The window follows `feed-changed` for the -1 page's snapshot.
+            let handle = app.handle().clone();
+            let mut feed_rx = devices.feed().subscribe();
+            tauri::async_runtime::spawn(async move {
+                while feed_rx.changed().await.is_ok() {
+                    let feed = feed_rx.borrow_and_update().clone();
+                    if let Err(e) = handle.emit("feed-changed", &*feed) {
+                        log::error!("emitting feed-changed: {e}");
+                    }
+                }
+            });
+
             // The window follows `config-status` to show why config.toml isn't live.
             let handle = app.handle().clone();
             let mut config_status = configs.status();
@@ -273,6 +285,7 @@ pub fn run() {
             commands::list_gpus,
             commands::test_action,
             commands::tile_values,
+            commands::feed_snapshot,
             commands::config_dir,
         ])
         .build(tauri::generate_context!())

@@ -14,7 +14,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Semaphore};
 use tokio::task::JoinSet;
-use tokio::time::{sleep, timeout, timeout_at, Instant};
+use tokio::time::{sleep, sleep_until, timeout, timeout_at, Instant};
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -27,9 +27,10 @@ use time::OffsetDateTime;
 use super::actions::{ActionResult, Actions, Run, MAX_RUNNING};
 use super::config::{Action, Layout, Live, MAX_COLS, MAX_ROWS};
 use super::hoststats::{self, HostSources, HostStats};
+use super::integrations::{self, FeedHandle, FeedSlots, Integrations};
 use super::protocol::{
-    decode_hex, encode_hex, valid_device_id, Colors, ErrorCode, Message, Report, Token, CAPS,
-    CAP_FONTS, CAP_PAGES, CAP_STATUS_BAR, ICON_ID_BYTES, MAX_MESSAGE_BYTES,
+    decode_hex, encode_hex, valid_device_id, Colors, ErrorCode, Feed, Message, Report, Token, CAPS,
+    CAP_FEED, CAP_FONTS, CAP_PAGES, CAP_STATUS_BAR, ICON_ID_BYTES, MAX_MESSAGE_BYTES,
     MAX_REPORTS_PER_SESSION, TOKEN_BYTES, VERSION,
 };
 use super::store::Store;
@@ -43,6 +44,9 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a closing session waits for the device to close too.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_BUTTON_ID_BYTES: usize = 64;
+/// A session sends the feed at most this often, so a busy source costs the board two frames a
+/// second at most.
+const FEED_GAP: Duration = Duration::from_millis(500);
 /// Ids in one `icon_get`: one page never names more icons than it has cells, and a device asks
 /// for the icons of a set of pages in several requests.
 const MAX_ICON_IDS: usize = (MAX_COLS * MAX_ROWS) as usize;
@@ -104,6 +108,8 @@ struct Shared {
     next_id: AtomicU64,
     /// Polls the tiles while a session is open, and holds their latest values.
     tiles: Tiles,
+    /// The feed's sources, polled while a session is open, and the cards and notes they fill.
+    integrations: Integrations,
     /// The host's stats, sampled while a session is open. `None` between periods.
     stats: watch::Receiver<Option<HostStats>>,
     /// One lock, so a session is only ever registered under a pairing that still exists.
@@ -143,7 +149,8 @@ impl Server {
         let listener = TcpListener::bind(addr).await?;
         let (connected, polling) = watch::channel(0);
         let stats = hoststats::spawn(polling.clone(), config.clone(), sources);
-        let tiles = tiles::spawn(actions.clone(), config.clone(), polling);
+        let tiles = tiles::spawn(actions.clone(), config.clone(), polling.clone());
+        let integrations = integrations::spawn(FeedSlots(actions.clone()), config.clone(), polling);
         Ok(Self {
             listener,
             shared: Arc::new(Shared {
@@ -154,6 +161,7 @@ impl Server {
                 events,
                 next_id: AtomicU64::new(0),
                 tiles,
+                integrations,
                 stats,
                 registry: Mutex::new(Registry {
                     store,
@@ -216,6 +224,11 @@ impl Devices {
     /// The latest tile readings, which change as devices connect, poll and leave.
     pub fn tile_values(&self) -> watch::Receiver<Values> {
         self.0.tiles.values()
+    }
+
+    /// The feed: its snapshot, and the in-process API that posts and dismisses notes.
+    pub fn feed(&self) -> FeedHandle {
+        self.0.integrations.handle()
     }
 
     pub fn list(&self) -> Vec<DeviceInfo> {
@@ -774,6 +787,17 @@ where
         return end_kicked(tx, kicked, device).await;
     }
 
+    let feed = shared.integrations.handle();
+    let feed_on = caps.iter().any(|cap| cap == CAP_FEED);
+    let mut feed_rx = feed.subscribe();
+    // The first snapshot goes out with the session, even an empty one, which tells the board
+    // there is no -1 page. Later ones wait for the gap.
+    let mut feed_ready = Instant::now();
+    if feed_on {
+        send_feed(tx, &mut feed_rx).await?;
+        feed_ready = Instant::now() + FEED_GAP;
+    }
+
     let mut reports = 0;
     let mut acked = 0;
     let (done_tx, mut done_rx) = mpsc::channel::<Done>(MAX_RUNNING);
@@ -817,6 +841,15 @@ where
                 if let Some(kicked) = tiles.push(tx, &mut kick, &layout, &live).await? {
                     return end_kicked(tx, kicked, device).await;
                 }
+                continue;
+            }
+            // The gap is waited here, not in the arm, so presses and pings go on meanwhile.
+            Ok(()) = async {
+                sleep_until(feed_ready).await;
+                feed_rx.changed().await
+            }, if feed_on => {
+                send_feed(tx, &mut feed_rx).await?;
+                feed_ready = Instant::now() + FEED_GAP;
                 continue;
             }
             Ok(()) = stats.changed(), if status_bar => {
@@ -917,6 +950,16 @@ where
                     }
                 }
             }
+            Incoming::Msg(Message::FeedDismiss(dismiss)) if feed_on => {
+                if let Err(why) = dismiss.check() {
+                    send_error(tx, ErrorCode::BadRequest, why).await?;
+                    return Ok(());
+                }
+                // An unknown id is ignored: another board may have dismissed it first.
+                if feed.dismiss(&dismiss.id) {
+                    log::info!("{device}: dismissed note {:?}", dismiss.id);
+                }
+            }
             Incoming::Msg(Message::Report(report)) => {
                 reports += 1;
                 // The device resends an unacked report on every session, so a bad or surplus one
@@ -958,6 +1001,24 @@ where
             Incoming::Failed(e) => return Err(e),
         }
     }
+}
+
+/// Sends the feed's latest snapshot, which `rx` then counts as seen. One that breaks the wire's
+/// rules is logged and skipped, since the board would refuse it.
+async fn send_feed<S>(
+    tx: &mut WsSink<S>,
+    rx: &mut watch::Receiver<Arc<Feed>>,
+) -> Result<(), WsError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // Cloned out, so no watch guard is held across the send.
+    let feed = rx.borrow_and_update().clone();
+    if let Err(why) = feed.check() {
+        log::error!("not sending the feed: {why}");
+        return Ok(());
+    }
+    send(tx, &Message::Feed((*feed).clone())).await
 }
 
 /// The ids of an `icon_get`, or `None` if it has too many or one is malformed.

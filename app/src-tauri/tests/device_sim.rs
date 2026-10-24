@@ -31,13 +31,14 @@ use tokio_tungstenite::tungstenite::Message as Ws;
 use tokio_tungstenite::{client_async, connect_async, WebSocketStream};
 use watchdeck_lib::daemon::actions::{ActionResult, Actions};
 use watchdeck_lib::daemon::config::{self, Configs};
+use watchdeck_lib::daemon::feed::{Applied, Note, Update};
 use watchdeck_lib::daemon::gpu::nvidia::fake::FakeNvidia;
 use watchdeck_lib::daemon::gpu::GpuReading;
 use watchdeck_lib::daemon::hoststats::HostSources;
 use watchdeck_lib::daemon::pairing::{Pairing, PairingState};
 use watchdeck_lib::daemon::protocol::{
-    decode_hex, encode_hex, pairing_code, Button, Colors, ErrorCode, IconFrame, Message, NetUnit,
-    Report, TempUnit, TileState, Token,
+    decode_hex, encode_hex, pairing_code, Button, CardState, Colors, ErrorCode, Feed, FeedCard,
+    FeedDismiss, IconFrame, Message, NetUnit, NoteLevel, Report, TempUnit, TileState, Token,
 };
 use watchdeck_lib::daemon::secrets::Secrets;
 use watchdeck_lib::daemon::server::{DaemonEvent, DeviceInfo, Devices, Server};
@@ -182,9 +183,22 @@ impl Daemon {
 /// A daemon on an ephemeral port with `DEVICE` paired and `config` as its `config.toml`, whose
 /// pairing listener binds `pair_addr` for at most `window` once started.
 async fn start_with(pair_addr: SocketAddr, window: Duration, config: &str) -> Daemon {
+    start_with_secrets(pair_addr, window, config, &[]).await
+}
+
+/// [`start_with`], with `secrets` (name, value) in `secrets.toml` before the config is read.
+async fn start_with_secrets(
+    pair_addr: SocketAddr,
+    window: Duration,
+    config: &str,
+    secret_values: &[(&str, &str)],
+) -> Daemon {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join(config::FILE), config).unwrap();
     let secrets = Arc::new(Secrets::new(dir.path()));
+    for (name, value) in secret_values {
+        secrets.set(name, value).unwrap();
+    }
     let configs = Configs::open(dir.path(), secrets.clone()).unwrap();
     assert!(
         configs.status().borrow().errors.is_empty(),
@@ -3177,4 +3191,234 @@ async fn picking_the_amd_by_address_reads_sysfs_and_shuts_nvml_down() {
     let bar = got.expect("no frame read the AMD");
     assert_eq!(bar.gpu_temp, Some(39));
     wait_for("NVML shutting down", || daemon.nvidia.shutdowns() == 1).await;
+}
+
+// ---- The feed ----
+
+const PUSH_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// `CONFIG` with a push integration, `ha`, and a stat integration, `load`, that prints 0.42.
+fn feed_config() -> String {
+    format!(
+        "{CONFIG}\n\
+         [[integration]]\nid = \"ha\"\nkind = \"push\"\nlabel = \"Home Assistant\"\n\
+         token_secret = \"push-ha\"\n\n\
+         [[integration]]\nid = \"load\"\nkind = \"stat\"\nlabel = \"NAS load\"\nevery_s = 2\n\
+         source = {{ kind = \"shell\", argv = [\"echo\", \"0.42\"] }}\n"
+    )
+}
+
+async fn start_feed() -> Daemon {
+    start_with_secrets(
+        "127.0.0.1:0".parse().unwrap(),
+        Duration::from_secs(30),
+        &feed_config(),
+        &[("push-ha", PUSH_TOKEN)],
+    )
+    .await
+}
+
+/// A session of `device` whose hello names `caps`, past its welcome.
+async fn device_session(addr: SocketAddr, device: &str, token: &[u8; 32], caps: &[&str]) -> Client {
+    let mut c = connect(addr).await;
+    c.send(hello_with_caps(1, device, Some(token), caps))
+        .await
+        .unwrap();
+    assert!(matches!(recv(&mut c).await, Message::Welcome { .. }));
+    c
+}
+
+/// Every message that arrives within `ms`.
+async fn frames_within(c: &mut Client, ms: u64) -> Vec<Message> {
+    let end = tokio::time::Instant::now() + Duration::from_millis(ms);
+    let mut got = Vec::new();
+    while let Ok(msg) = tokio::time::timeout_at(end, recv(c)).await {
+        got.push(msg);
+    }
+    got
+}
+
+/// The first `feed` within `secs` that `want` accepts, skipping every other message.
+async fn feed_where(c: &mut Client, secs: u64, want: impl Fn(&Feed) -> bool) -> Feed {
+    let end = tokio::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        match tokio::time::timeout_at(end, recv(c)).await {
+            Ok(Message::Feed(feed)) if want(&feed) => return feed,
+            Ok(_) => {}
+            Err(_) => panic!("no wanted feed within {secs} s"),
+        }
+    }
+}
+
+fn post_note(daemon: &Daemon, title: &str) -> String {
+    match daemon
+        .devices
+        .feed()
+        .post("ha", Update::PutNote(Note::new(title)))
+        .unwrap()
+    {
+        Applied::Note(id) => id,
+        Applied::Done => panic!("a note has an id"),
+    }
+}
+
+fn dismiss(id: &str) -> Ws {
+    Ws::text(serde_json::to_string(&Message::FeedDismiss(FeedDismiss { id: id.into() })).unwrap())
+}
+
+#[tokio::test]
+async fn a_feed_session_gets_a_snapshot_with_sources_and_the_stat_card_arrives() {
+    let daemon = start_feed().await;
+    let mut c = device_session(daemon.addr, DEVICE, &TOKEN, &["fonts", "pages", "feed"]).await;
+    // The layout and the tiles come first, then the snapshot, which already counts both sources.
+    assert!(matches!(recv(&mut c).await, Message::Layout { .. }));
+    let first = feed_where(&mut c, 2, |_| true).await;
+    assert_eq!((first.sources, first.notes.len()), (2, 0));
+    // The stat's slot is there before its value is.
+    let loaded = feed_where(&mut c, 5, |f| {
+        f.cards.first().is_some_and(|c| c.state == CardState::Ok)
+    })
+    .await;
+    assert_eq!(
+        loaded.cards,
+        [FeedCard {
+            id: "load".into(),
+            label: "NAS load".into(),
+            value: "0.42".into(),
+            state: CardState::Ok,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn a_new_note_reaches_the_session_and_its_text_is_made_printable() {
+    let daemon = start_feed().await;
+    let mut c = device_session(daemon.addr, DEVICE, &TOKEN, &["feed"]).await;
+    feed_where(&mut c, 2, |_| true).await;
+
+    let id = post_note(&daemon, "Fianc\u{e9} \u{1f600} done");
+    let feed = feed_where(&mut c, 3, |f| !f.notes.is_empty()).await;
+    let note = &feed.notes[0];
+    assert_eq!(note.id, id);
+    assert_eq!(note.id, "ha/1");
+    assert_eq!(
+        (note.title.as_str(), note.src.as_str()),
+        ("Fianc? ? done", "Home Assistant")
+    );
+    assert_eq!(note.level, NoteLevel::Info);
+    assert!(note.at.abs_diff(unix_now()) <= 5);
+}
+
+#[tokio::test]
+async fn a_dismiss_on_one_board_clears_the_note_on_both() {
+    let daemon = start_feed().await;
+    daemon
+        .devices
+        .pair(OTHER, Sha256::digest(OTHER_TOKEN).into())
+        .unwrap();
+    let mut a = device_session(daemon.addr, DEVICE, &TOKEN, &["feed"]).await;
+    let mut b = device_session(daemon.addr, OTHER, &OTHER_TOKEN, &["feed"]).await;
+    let id = post_note(&daemon, "Backup done");
+    feed_where(&mut a, 3, |f| f.notes.len() == 1).await;
+    feed_where(&mut b, 3, |f| f.notes.len() == 1).await;
+
+    a.send(dismiss(&id)).await.unwrap();
+    feed_where(&mut a, 3, |f| f.notes.is_empty()).await;
+    feed_where(&mut b, 3, |f| f.notes.is_empty()).await;
+
+    // Dismissing it again, or something that never was, changes nothing and ends nothing.
+    a.send(dismiss(&id)).await.unwrap();
+    a.send(dismiss("ha/never")).await.unwrap();
+    a.send(press("hello", 1)).await.unwrap();
+    loop {
+        match recv_within(&mut a, 3).await {
+            Message::Result { ok, .. } => {
+                assert!(ok);
+                break;
+            }
+            Message::Feed(feed) => assert!(feed.notes.is_empty()),
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_dismiss_with_a_bad_id_gets_bad_request_then_close() {
+    let daemon = start_feed().await;
+    let mut c = device_session(daemon.addr, DEVICE, &TOKEN, &["feed"]).await;
+    c.send(dismiss("")).await.unwrap();
+    loop {
+        match recv_within(&mut c, 3).await {
+            Message::Error { code, .. } => {
+                assert_eq!(code, ErrorCode::BadRequest);
+                break;
+            }
+            Message::Feed(_) | Message::Layout { .. } => {}
+            other => panic!("expected bad_request, got {other:?}"),
+        }
+    }
+    expect_closed(&mut c).await;
+}
+
+#[tokio::test]
+async fn a_session_without_feed_gets_no_feed_and_its_dismiss_is_ignored() {
+    let daemon = start_feed().await;
+    let mut c = device_session(daemon.addr, DEVICE, &TOKEN, &["fonts", "pages"]).await;
+    let id = post_note(&daemon, "Nobody asked");
+    c.send(dismiss(&id)).await.unwrap();
+    // Longer than the 500 ms gap, and the stat card has been polled by then.
+    let frames = frames_within(&mut c, 1500).await;
+    assert!(
+        frames.iter().all(|m| !matches!(m, Message::Feed(_))),
+        "{frames:?}"
+    );
+    // Not its dismiss to make: the note is still there, and the session still works.
+    assert_eq!(daemon.devices.feed().snapshot().notes.len(), 1);
+    c.send(press("hello", 1)).await.unwrap();
+    assert!(matches!(
+        recv_within(&mut c, 3).await,
+        Message::Result { ok: true, .. }
+    ));
+}
+
+#[tokio::test]
+async fn a_burst_of_notes_is_coalesced_and_the_board_gets_the_newest_twelve() {
+    let daemon = start_feed().await;
+    let mut c = device_session(daemon.addr, DEVICE, &TOKEN, &["feed"]).await;
+    feed_where(&mut c, 2, |f| {
+        f.cards.first().is_some_and(|c| c.state == CardState::Ok)
+    })
+    .await;
+    for i in 0..40 {
+        post_note(&daemon, &format!("note {i}"));
+    }
+    let frames = frames_within(&mut c, 1500).await;
+    let feeds: Vec<&Feed> = frames
+        .iter()
+        .filter_map(|m| match m {
+            Message::Feed(f) => Some(f),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        (1..=3).contains(&feeds.len()),
+        "{} feed frames for 40 notes",
+        feeds.len()
+    );
+    let last = feeds.last().unwrap();
+    assert_eq!(last.notes.len(), 12);
+    assert_eq!(last.notes[0].title, "note 39");
+    assert_eq!(last.notes[11].title, "note 28");
+}
+
+#[tokio::test]
+async fn removing_every_integration_tells_the_board_there_are_none() {
+    let daemon = start_feed().await;
+    let mut c = device_session(daemon.addr, DEVICE, &TOKEN, &["feed"]).await;
+    post_note(&daemon, "Backup done");
+    feed_where(&mut c, 3, |f| f.sources == 2 && f.notes.len() == 1).await;
+
+    assert!(daemon.reconfigure(CONFIG).is_ok());
+    let feed = feed_where(&mut c, 3, |f| f.sources == 0).await;
+    assert!(feed.cards.is_empty() && feed.notes.is_empty(), "{feed:?}");
 }
