@@ -32,6 +32,20 @@
 #define PROTO_ICON_HEADER_LEN 24 // "WDI1", the id, then width and height as u16 LE
 #define PROTO_ICON_MAX_SIDE 256
 #define PROTO_MAX_ICON_FRAME (PROTO_ICON_HEADER_LEN + PROTO_ICON_MAX_SIDE * PROTO_ICON_MAX_SIDE * 4) // one binary frame
+#define PROTO_ASSET_ID_LEN 16     // bytes in an asset id, shown as 32 hex digits in sleep and asset_get
+#define PROTO_ASSET_CHUNK 262144  // bytes in one asset chunk; every asset_get offset is a multiple of it
+#define PROTO_ASSET_HEADER_LEN 24 // "WDA1", the id, then the offset as u32 LE
+#define PROTO_ASSET_FRAME_MAX (PROTO_ASSET_HEADER_LEN + PROTO_ASSET_CHUNK) // one binary frame
+#define PROTO_SLEEP_TEXT_MAX 48                                            // 47 characters plus NUL
+#define PROTO_FEED_SOURCES_MAX 16
+#define PROTO_FEED_CARDS_MAX 8
+#define PROTO_FEED_NOTES_MAX 12
+#define PROTO_FEED_ID_MAX 64    // 63 characters plus NUL
+#define PROTO_FEED_LABEL_MAX 24 // 23 characters plus NUL
+#define PROTO_FEED_VALUE_MAX 16 // 15 characters plus NUL
+#define PROTO_FEED_TITLE_MAX 48 // 47 characters plus NUL
+#define PROTO_FEED_BODY_MAX 160 // 159 characters plus NUL
+#define PROTO_FEED_SRC_MAX 24   // 23 characters plus NUL
 
 typedef enum {
     PROTO_MSG_UNKNOWN, // well-formed JSON with a "t" this firmware does not know
@@ -45,6 +59,8 @@ typedef enum {
     PROTO_MSG_PAIR_RESULT,
     PROTO_MSG_REPORT_ACK,
     PROTO_MSG_STATS,
+    PROTO_MSG_SLEEP,
+    PROTO_MSG_FEED,
 } proto_type_t;
 
 typedef struct {
@@ -160,6 +176,83 @@ typedef struct {
 } proto_icon_t;
 
 typedef enum {
+    PROTO_ANCHOR_CENTER,
+    PROTO_ANCHOR_TOP_LEFT,
+    PROTO_ANCHOR_TOP_RIGHT,
+    PROTO_ANCHOR_BOTTOM_LEFT,
+    PROTO_ANCHOR_BOTTOM_RIGHT,
+} proto_anchor_t;
+
+typedef enum {
+    PROTO_SPINNER_ARC,
+    PROTO_SPINNER_DOTS,
+    PROTO_SPINNER_BAR,
+    PROTO_SPINNER_PULSE,
+    PROTO_SPINNER_NONE,
+} proto_spinner_t;
+
+// The bits of proto_sleep_t.show_mask: the elements the sleep screen shows.
+#define PROTO_SHOW_CLOCK (1u << 0)
+#define PROTO_SHOW_DATE (1u << 1)
+#define PROTO_SHOW_HOST (1u << 2)
+#define PROTO_SHOW_TEXT (1u << 3)
+
+// A `sleep` frame: how the sleep screen looks. Strings are NUL-terminated.
+typedef struct {
+    bool has_image;
+    uint8_t image[PROTO_ASSET_ID_LEN]; // valid when has_image
+    uint32_t bg;                       // 0xRRGGBB
+    uint32_t fg;
+    uint8_t show_mask;
+    char text[PROTO_SLEEP_TEXT_MAX]; // empty when the frame has no text
+    proto_anchor_t anchor;
+    proto_spinner_t spinner;
+    uint32_t spinner_color;
+    uint32_t offline_after_s;
+    uint32_t backlight;
+} proto_sleep_t;
+
+typedef enum {
+    PROTO_LEVEL_INFO,
+    PROTO_LEVEL_OK,
+    PROTO_LEVEL_WARN,
+    PROTO_LEVEL_ERROR,
+} proto_level_t;
+
+typedef struct {
+    char id[PROTO_FEED_ID_MAX];
+    char label[PROTO_FEED_LABEL_MAX];
+    char value[PROTO_FEED_VALUE_MAX];
+    proto_tile_state_t state; // unknown for any state other than "ok" or "bad"
+} proto_feed_card_t;
+
+typedef struct {
+    char id[PROTO_FEED_ID_MAX];
+    char title[PROTO_FEED_TITLE_MAX];
+    char body[PROTO_FEED_BODY_MAX];
+    proto_level_t level;
+    char src[PROTO_FEED_SRC_MAX];
+    uint64_t at; // Unix seconds
+} proto_feed_note_t;
+
+// A `feed` snapshot. It replaces the last one.
+typedef struct {
+    uint8_t sources;
+    size_t n_cards;
+    proto_feed_card_t cards[PROTO_FEED_CARDS_MAX];
+    size_t n_notes;
+    proto_feed_note_t notes[PROTO_FEED_NOTES_MAX];
+} proto_feed_t;
+
+// One validated asset chunk. `data` points into the frame, which the caller still owns.
+typedef struct {
+    uint8_t id[PROTO_ASSET_ID_LEN];
+    uint32_t offset;
+    size_t len;
+    const uint8_t *data;
+} proto_asset_t;
+
+typedef enum {
     PROTO_REPORT_CRASH, // from a coredump of an earlier boot; every field is set
     PROTO_REPORT_RESET, // from esp_reset_reason() with no dump; only id and reason are sent
 } proto_report_kind_t;
@@ -195,6 +288,8 @@ typedef struct {
         bool pair_ok;                            // PROTO_MSG_PAIR_RESULT
         char report_ack_id[PROTO_REPORT_ID_LEN]; // PROTO_MSG_REPORT_ACK, 8 lowercase hex digits
         proto_stats_t stats;                     // PROTO_MSG_STATS
+        proto_sleep_t sleep;                     // PROTO_MSG_SLEEP
+        proto_feed_t feed;                       // PROTO_MSG_FEED
     };
 } proto_msg_t;
 
@@ -226,6 +321,18 @@ size_t proto_build_icon_get(char *buf, size_t buf_len, const uint8_t ids[][PROTO
 /** Build layout_ack for the layout with revision `rev`. Returns the JSON length, or 0 if it does not fit in `buf`. */
 size_t proto_build_layout_ack(char *buf, size_t buf_len, uint32_t rev);
 
+/**
+ * Build asset_get for the chunk at `offset`. Returns 0 if `offset` is not a multiple of PROTO_ASSET_CHUNK,
+ * or if the JSON does not fit in `buf`.
+ */
+size_t proto_build_asset_get(char *buf, size_t buf_len, const uint8_t id[PROTO_ASSET_ID_LEN], uint32_t offset);
+
+/**
+ * Build feed_dismiss for note `id`. Returns 0 if `id` is not 1 to 63 printable ASCII characters, or if the
+ * JSON does not fit in `buf`.
+ */
+size_t proto_build_feed_dismiss(char *buf, size_t buf_len, const char *id);
+
 /** Build a press message. Returns the JSON length, or 0 if it does not fit in `buf`. */
 size_t proto_build_press(char *buf, size_t buf_len, const char *btn, uint32_t seq);
 
@@ -252,3 +359,12 @@ esp_err_t proto_parse(const char *json, size_t len, proto_msg_t *out);
  * a non-ESP_OK code, logs why, and leaves `out` unspecified.
  */
 esp_err_t proto_parse_icon(const uint8_t *frame, size_t len, proto_icon_t *out);
+
+/**
+ * Check one asset frame against the chunk the device asked for, in this order: at least a header, the "WDA1"
+ * magic, the id and offset it asked for, and a length of exactly the chunk that is left at `offset` in an asset
+ * of `asset_size` bytes (PROTO_ASSET_CHUNK, or less for the last one). Nothing is read past `len`. Any failure
+ * returns a non-ESP_OK code, logs why, and leaves `out` unspecified. The caller checks the whole image's SHA-256.
+ */
+esp_err_t proto_parse_asset(const uint8_t *frame, size_t len, const uint8_t id[PROTO_ASSET_ID_LEN], uint32_t offset,
+                            uint32_t asset_size, proto_asset_t *out);

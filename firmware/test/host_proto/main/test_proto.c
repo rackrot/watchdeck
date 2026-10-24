@@ -1028,6 +1028,365 @@ void test_stats_color_for_a_gpu_with_no_gpu_field_is_accepted_and_kept(void)
     TEST_ASSERT_EQUAL_UINT8(1u << PROTO_COLOR_GPU, msg.stats.colors_mask);
 }
 
+void test_hello_with_five_caps_and_a_32_character_fw_is_234_bytes(void)
+{
+    char buf[256];
+    const char *const caps[] = {"fonts", "pages", "status_bar", "sleep", "feed"};
+    size_t len = proto_build_hello(buf, sizeof(buf), "wd-e8f60ae276ab", TOKEN, run_of('v', 32), 1024, 600, caps, 5);
+    TEST_ASSERT_EQUAL_size_t(234, len);
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"caps\":[\"fonts\",\"pages\",\"status_bar\",\"sleep\",\"feed\"]"));
+}
+
+// ---- Sleep, feed and asset frames ----
+
+// Parse `base` with the first `from` replaced by `to`. The test fails if `from` is not in `base`.
+static esp_err_t parse_edited(const char *base, const char *from, const char *to)
+{
+    static char edited[PROTO_MAX_MSG];
+    const char *at = strstr(base, from);
+    TEST_ASSERT_NOT_NULL(at);
+    int n = snprintf(edited, sizeof(edited), "%.*s%s%s", (int)(at - base), base, to, at + strlen(from));
+    TEST_ASSERT_TRUE(n > 0 && (size_t)n < sizeof(edited));
+    return proto_parse(edited, (size_t)n, &msg);
+}
+
+// The fixtures in app/src-tauri/tests/fixtures/, which the daemon round-trips.
+static const char SLEEP_FIXTURE[] =
+    "{\"t\":\"sleep\",\"image\":\"5b1f0c7e9d3a2b4c6d8e0f1a2b3c4d5e\",\"bg\":0,\"fg\":16777215,"
+    "\"show\":[\"clock\",\"date\",\"host\"],\"text\":\"Back soon\",\"anchor\":\"bottom_left\",\"spinner\":\"arc\","
+    "\"spinner_color\":3718648,\"offline_after_s\":10,\"backlight\":100}";
+static const char SLEEP_MIN_FIXTURE[] =
+    "{\"t\":\"sleep\",\"bg\":0,\"fg\":0,\"show\":[],\"anchor\":\"center\",\"spinner\":\"none\",\"spinner_color\":0,"
+    "\"offline_after_s\":0,\"backlight\":0}";
+static const char FEED_FIXTURE[] =
+    "{\"t\":\"feed\",\"sources\":2,\"cards\":[{\"id\":\"nas-load\",\"label\":\"NAS load\",\"value\":\"0.42\","
+    "\"state\":\"ok\"}],\"notes\":[{\"id\":\"ha/backup\",\"title\":\"Backup done\","
+    "\"body\":\"Nightly backup finished in 4 min\",\"level\":\"ok\",\"src\":\"Home Assistant\","
+    "\"at\":1792692433}]}";
+
+void test_sleep_fixture_has_every_field(void)
+{
+    TEST_ASSERT_EQUAL(ESP_OK, proto_parse(SLEEP_FIXTURE, strlen(SLEEP_FIXTURE), &msg));
+    TEST_ASSERT_EQUAL(PROTO_MSG_SLEEP, msg.type);
+    const proto_sleep_t *s = &msg.sleep;
+    TEST_ASSERT_TRUE(s->has_image);
+    const uint8_t image[PROTO_ASSET_ID_LEN] = {0x5b, 0x1f, 0x0c, 0x7e, 0x9d, 0x3a, 0x2b, 0x4c,
+                                               0x6d, 0x8e, 0x0f, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e};
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(image, s->image, PROTO_ASSET_ID_LEN);
+    TEST_ASSERT_EQUAL_UINT32(0, s->bg);
+    TEST_ASSERT_EQUAL_UINT32(16777215u, s->fg);
+    TEST_ASSERT_EQUAL_UINT8(PROTO_SHOW_CLOCK | PROTO_SHOW_DATE | PROTO_SHOW_HOST, s->show_mask);
+    TEST_ASSERT_EQUAL_STRING("Back soon", s->text);
+    TEST_ASSERT_EQUAL(PROTO_ANCHOR_BOTTOM_LEFT, s->anchor);
+    TEST_ASSERT_EQUAL(PROTO_SPINNER_ARC, s->spinner);
+    TEST_ASSERT_EQUAL_UINT32(3718648u, s->spinner_color);
+    TEST_ASSERT_EQUAL_UINT32(10, s->offline_after_s);
+    TEST_ASSERT_EQUAL_UINT32(100, s->backlight);
+}
+
+void test_sleep_minimal_fixture_has_no_image_or_text(void)
+{
+    TEST_ASSERT_EQUAL(ESP_OK, proto_parse(SLEEP_MIN_FIXTURE, strlen(SLEEP_MIN_FIXTURE), &msg));
+    TEST_ASSERT_FALSE(msg.sleep.has_image);
+    TEST_ASSERT_EQUAL_STRING("", msg.sleep.text);
+    TEST_ASSERT_EQUAL_UINT8(0, msg.sleep.show_mask);
+    TEST_ASSERT_EQUAL(PROTO_ANCHOR_CENTER, msg.sleep.anchor);
+    TEST_ASSERT_EQUAL(PROTO_SPINNER_NONE, msg.sleep.spinner);
+}
+
+void test_sleep_image_must_be_32_lowercase_hex(void)
+{
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_edited(SLEEP_FIXTURE, "\"image\":\"5b1f0c7e9d3a2b4c6d8e0f1a2b3c4d5e\"",
+                                                        "\"image\":\"5b1f0c7e9d3a2b4c6d8e0f1a2b3c4d5\""));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_edited(SLEEP_FIXTURE, "\"image\":\"5b1f0c7e9d3a2b4c6d8e0f1a2b3c4d5e\"",
+                                                        "\"image\":\"5b1f0c7e9d3a2b4c6d8e0f1a2b3c4d5e0\""));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_edited(SLEEP_FIXTURE, "\"image\":\"5b1f0c7e9d3a2b4c6d8e0f1a2b3c4d5e\"",
+                                                        "\"image\":\"5B1F0C7E9D3A2B4C6D8E0F1A2B3C4D5E\""));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      parse_edited(SLEEP_FIXTURE, "\"image\":\"5b1f0c7e9d3a2b4c6d8e0f1a2b3c4d5e\"", "\"image\":null"));
+}
+
+void test_sleep_show_names_once_and_unknown_names_are_ignored(void)
+{
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      parse_edited(SLEEP_FIXTURE, "[\"clock\",\"date\",\"host\"]", "[\"clock\",\"clock\"]"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_edited(SLEEP_FIXTURE, "[\"clock\",\"date\",\"host\"]", "[1]"));
+    TEST_ASSERT_EQUAL(ESP_OK, parse_edited(SLEEP_FIXTURE, "[\"clock\",\"date\",\"host\"]", "[\"clock\",\"weather\"]"));
+    TEST_ASSERT_EQUAL_UINT8(PROTO_SHOW_CLOCK, msg.sleep.show_mask);
+    TEST_ASSERT_EQUAL(ESP_OK, parse_edited(SLEEP_FIXTURE, "[\"clock\",\"date\",\"host\"]", "[\"text\",\"host\"]"));
+    TEST_ASSERT_EQUAL_UINT8(PROTO_SHOW_TEXT | PROTO_SHOW_HOST, msg.sleep.show_mask);
+}
+
+void test_sleep_text_of_47_is_accepted_and_48_refused(void)
+{
+    char field[64];
+    snprintf(field, sizeof(field), "\"text\":\"%s\"", run_of('a', 47));
+    TEST_ASSERT_EQUAL(ESP_OK, parse_edited(SLEEP_FIXTURE, "\"text\":\"Back soon\"", field));
+    TEST_ASSERT_EQUAL_size_t(47, strlen(msg.sleep.text));
+    snprintf(field, sizeof(field), "\"text\":\"%s\"", run_of('a', 48));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_edited(SLEEP_FIXTURE, "\"text\":\"Back soon\"", field));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_edited(SLEEP_FIXTURE, "\"text\":\"Back soon\"", "\"text\":\"a\\nb\""));
+}
+
+void test_sleep_colors_and_ranges_are_inclusive(void)
+{
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_edited(SLEEP_FIXTURE, "\"fg\":16777215", "\"fg\":16777216"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      parse_edited(SLEEP_FIXTURE, "\"spinner_color\":3718648", "\"spinner_color\":-1"));
+    TEST_ASSERT_EQUAL(ESP_OK, parse_edited(SLEEP_FIXTURE, "\"offline_after_s\":10", "\"offline_after_s\":3600"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      parse_edited(SLEEP_FIXTURE, "\"offline_after_s\":10", "\"offline_after_s\":3601"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      parse_edited(SLEEP_FIXTURE, "\"offline_after_s\":10", "\"offline_after_s\":-1"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      parse_edited(SLEEP_FIXTURE, "\"offline_after_s\":10", "\"offline_after_s\":10.5"));
+    TEST_ASSERT_EQUAL(ESP_OK, parse_edited(SLEEP_FIXTURE, "\"backlight\":100", "\"backlight\":0"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_edited(SLEEP_FIXTURE, "\"backlight\":100", "\"backlight\":101"));
+}
+
+void test_sleep_unknown_spinner_or_anchor_is_refused(void)
+{
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_edited(SLEEP_FIXTURE, "\"spinner\":\"arc\"", "\"spinner\":\"wave\""));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      parse_edited(SLEEP_FIXTURE, "\"anchor\":\"bottom_left\"", "\"anchor\":\"middle\""));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_edited(SLEEP_FIXTURE, "\"anchor\":\"bottom_left\",", ""));
+}
+
+// A feed frame with `cards` copies of one valid card and `notes` copies of one valid note whose title is `title`.
+static esp_err_t parse_feed_of(size_t cards, size_t notes, const char *title)
+{
+    static const char CARD[] = "{\"id\":\"nas-load\",\"label\":\"NAS load\",\"value\":\"0.42\",\"state\":\"ok\"}";
+    size_t n = (size_t)snprintf(json, sizeof(json), "{\"t\":\"feed\",\"sources\":2,\"cards\":[");
+    for (size_t i = 0; i < cards; i++) {
+        n += (size_t)snprintf(json + n, sizeof(json) - n, "%s%s", i ? "," : "", CARD);
+    }
+    n += (size_t)snprintf(json + n, sizeof(json) - n, "],\"notes\":[");
+    for (size_t i = 0; i < notes; i++) {
+        n += (size_t)snprintf(json + n, sizeof(json) - n,
+                              "%s{\"id\":\"ha/backup\",\"title\":\"%s\",\"body\":\"Nightly\",\"level\":\"ok\","
+                              "\"src\":\"Home Assistant\",\"at\":1792692433}",
+                              i ? "," : "", title);
+    }
+    snprintf(json + n, sizeof(json) - n, "]}");
+    return proto_parse(json, strlen(json), &msg);
+}
+
+void test_feed_fixture_has_its_card_and_note(void)
+{
+    TEST_ASSERT_EQUAL(ESP_OK, proto_parse(FEED_FIXTURE, strlen(FEED_FIXTURE), &msg));
+    TEST_ASSERT_EQUAL(PROTO_MSG_FEED, msg.type);
+    const proto_feed_t *f = &msg.feed;
+    TEST_ASSERT_EQUAL_UINT8(2, f->sources);
+    TEST_ASSERT_EQUAL_size_t(1, f->n_cards);
+    TEST_ASSERT_EQUAL_STRING("nas-load", f->cards[0].id);
+    TEST_ASSERT_EQUAL_STRING("NAS load", f->cards[0].label);
+    TEST_ASSERT_EQUAL_STRING("0.42", f->cards[0].value);
+    TEST_ASSERT_EQUAL(PROTO_TILE_OK, f->cards[0].state);
+    TEST_ASSERT_EQUAL_size_t(1, f->n_notes);
+    TEST_ASSERT_EQUAL_STRING("ha/backup", f->notes[0].id);
+    TEST_ASSERT_EQUAL_STRING("Backup done", f->notes[0].title);
+    TEST_ASSERT_EQUAL_STRING("Nightly backup finished in 4 min", f->notes[0].body);
+    TEST_ASSERT_EQUAL(PROTO_LEVEL_OK, f->notes[0].level);
+    TEST_ASSERT_EQUAL_STRING("Home Assistant", f->notes[0].src);
+    TEST_ASSERT_EQUAL_UINT64(1792692433u, f->notes[0].at);
+}
+
+void test_feed_empty_frame_has_no_cards_or_notes(void)
+{
+    const char *empty = "{\"t\":\"feed\",\"sources\":0,\"cards\":[],\"notes\":[]}";
+    TEST_ASSERT_EQUAL(ESP_OK, proto_parse(empty, strlen(empty), &msg));
+    TEST_ASSERT_EQUAL_UINT8(0, msg.feed.sources);
+    TEST_ASSERT_EQUAL_size_t(0, msg.feed.n_cards);
+    TEST_ASSERT_EQUAL_size_t(0, msg.feed.n_notes);
+}
+
+void test_feed_9_cards_or_13_notes_is_refused(void)
+{
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_feed_of(9, 0, "t"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_feed_of(0, 13, "t"));
+    TEST_ASSERT_EQUAL(ESP_OK, parse_feed_of(8, 12, "t"));
+    TEST_ASSERT_EQUAL_size_t(8, msg.feed.n_cards);
+    TEST_ASSERT_EQUAL_size_t(12, msg.feed.n_notes);
+}
+
+void test_feed_title_of_47_is_accepted_and_48_refused(void)
+{
+    TEST_ASSERT_EQUAL(ESP_OK, parse_feed_of(0, 1, run_of('t', 47)));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_feed_of(0, 1, run_of('t', 48)));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_feed_of(0, 1, ""));
+}
+
+void test_feed_string_limits_are_exact(void)
+{
+    char field[256];
+    snprintf(field, sizeof(field), "\"label\":\"%s\"", run_of('l', 23));
+    TEST_ASSERT_EQUAL(ESP_OK, parse_edited(FEED_FIXTURE, "\"label\":\"NAS load\"", field));
+    snprintf(field, sizeof(field), "\"label\":\"%s\"", run_of('l', 24));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_edited(FEED_FIXTURE, "\"label\":\"NAS load\"", field));
+    snprintf(field, sizeof(field), "\"value\":\"%s\"", run_of('v', 15));
+    TEST_ASSERT_EQUAL(ESP_OK, parse_edited(FEED_FIXTURE, "\"value\":\"0.42\"", field));
+    snprintf(field, sizeof(field), "\"value\":\"%s\"", run_of('v', 16));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_edited(FEED_FIXTURE, "\"value\":\"0.42\"", field));
+    snprintf(field, sizeof(field), "\"id\":\"%s\"", run_of('i', 63));
+    TEST_ASSERT_EQUAL(ESP_OK, parse_edited(FEED_FIXTURE, "\"id\":\"nas-load\"", field));
+    snprintf(field, sizeof(field), "\"id\":\"%s\"", run_of('i', 64));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_edited(FEED_FIXTURE, "\"id\":\"nas-load\"", field));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_edited(FEED_FIXTURE, "\"id\":\"nas-load\"", "\"id\":\"\""));
+    snprintf(field, sizeof(field), "\"body\":\"%s\"", run_of('b', 160));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      parse_edited(FEED_FIXTURE, "\"body\":\"Nightly backup finished in 4 min\"", field));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      parse_edited(FEED_FIXTURE, "\"src\":\"Home Assistant\"", "\"src\":\"Home\\u0001\""));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_edited(FEED_FIXTURE, "\"sources\":2", "\"sources\":17"));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_edited(FEED_FIXTURE, "\"sources\":2", "\"sources\":2.5"));
+}
+
+void test_feed_unknown_level_is_refused_and_unknown_state_is_unknown(void)
+{
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_edited(FEED_FIXTURE, "\"level\":\"ok\"", "\"level\":\"debug\""));
+    TEST_ASSERT_EQUAL(ESP_OK, parse_edited(FEED_FIXTURE, "\"state\":\"ok\"", "\"state\":\"warn\""));
+    TEST_ASSERT_EQUAL(PROTO_TILE_UNKNOWN, msg.feed.cards[0].state);
+    TEST_ASSERT_EQUAL(ESP_OK, parse_edited(FEED_FIXTURE, "\"state\":\"ok\"", "\"state\":\"bad\""));
+    TEST_ASSERT_EQUAL(PROTO_TILE_BAD, msg.feed.cards[0].state);
+}
+
+// Every string at its limit: 8 cards and 12 notes, 63-character ids, 159-character bodies.
+static esp_err_t parse_fullest_feed(void)
+{
+    static char x[PROTO_FEED_BODY_MAX];
+    memset(x, 'x', sizeof(x) - 1);
+    x[sizeof(x) - 1] = '\0';
+    size_t n = (size_t)snprintf(json, sizeof(json), "{\"t\":\"feed\",\"sources\":16,\"cards\":[");
+    for (int i = 0; i < 8; i++) {
+        n += (size_t)snprintf(json + n, sizeof(json) - n,
+                              "%s{\"id\":\"%.*s\",\"label\":\"%.*s\",\"value\":\"%.*s\",\"state\":\"bad\"}",
+                              i ? "," : "", 63, x, 23, x, 15, x);
+    }
+    n += (size_t)snprintf(json + n, sizeof(json) - n, "],\"notes\":[");
+    for (int i = 0; i < 12; i++) {
+        n += (size_t)snprintf(json + n, sizeof(json) - n,
+                              "%s{\"id\":\"%.*s\",\"title\":\"%.*s\",\"body\":\"%.*s\",\"level\":\"error\","
+                              "\"src\":\"%.*s\",\"at\":9007199254740991}",
+                              i ? "," : "", 63, x, 47, x, 159, x, 23, x);
+    }
+    snprintf(json + n, sizeof(json) - n, "]}");
+    return proto_parse(json, strlen(json), &msg);
+}
+
+void test_feed_fullest_snapshot_parses_and_at_past_2_to_53_is_refused(void)
+{
+    TEST_ASSERT_EQUAL(ESP_OK, parse_fullest_feed());
+    TEST_ASSERT_EQUAL_size_t(8, msg.feed.n_cards);
+    TEST_ASSERT_EQUAL_size_t(12, msg.feed.n_notes);
+    TEST_ASSERT_EQUAL_size_t(15, strlen(msg.feed.cards[7].value));
+    TEST_ASSERT_EQUAL_size_t(159, strlen(msg.feed.notes[11].body));
+    TEST_ASSERT_EQUAL_UINT64(9007199254740991ull, msg.feed.notes[11].at);
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_edited(FEED_FIXTURE, "\"at\":1792692433", "\"at\":9007199254740992"));
+}
+
+// An asset frame for the chunk at `offset` of ASSET_ID, `data_len` bytes long, in `frame`.
+static const uint8_t ASSET_ID[PROTO_ASSET_ID_LEN] = {0x5b, 0x1f, 0x0c, 0x7e, 0x9d, 0x3a, 0x2b, 0x4c,
+                                                     0x6d, 0x8e, 0x0f, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e};
+
+static size_t make_asset(uint32_t offset, size_t data_len)
+{
+    memcpy(frame, "WDA1", 4);
+    memcpy(frame + 4, ASSET_ID, PROTO_ASSET_ID_LEN);
+    frame[20] = offset & 0xff;
+    frame[21] = (offset >> 8) & 0xff;
+    frame[22] = (offset >> 16) & 0xff;
+    frame[23] = (offset >> 24) & 0xff;
+    for (size_t i = 0; i < data_len; i++) {
+        frame[PROTO_ASSET_HEADER_LEN + i] = (uint8_t)(i * 7);
+    }
+    return PROTO_ASSET_HEADER_LEN + data_len;
+}
+
+void test_asset_wrong_magic_or_unasked_id_or_offset_is_refused(void)
+{
+    proto_asset_t asset;
+    size_t len = make_asset(0, PROTO_ASSET_CHUNK);
+    TEST_ASSERT_EQUAL(ESP_OK, proto_parse_asset(frame, len, ASSET_ID, 0, 2 * PROTO_ASSET_CHUNK, &asset));
+
+    frame[3] = '2';
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, proto_parse_asset(frame, len, ASSET_ID, 0, 2 * PROTO_ASSET_CHUNK, &asset));
+    frame[3] = '1';
+
+    frame[4] ^= 0x01;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, proto_parse_asset(frame, len, ASSET_ID, 0, 2 * PROTO_ASSET_CHUNK, &asset));
+    frame[4] ^= 0x01;
+
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      proto_parse_asset(frame, len, ASSET_ID, PROTO_ASSET_CHUNK, 2 * PROTO_ASSET_CHUNK, &asset));
+}
+
+void test_asset_length_must_be_the_chunk_or_what_is_left(void)
+{
+    proto_asset_t asset;
+    // A short middle chunk and a long one are both refused.
+    size_t len = make_asset(PROTO_ASSET_CHUNK, PROTO_ASSET_CHUNK - 1);
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_SIZE,
+                      proto_parse_asset(frame, len, ASSET_ID, PROTO_ASSET_CHUNK, 3 * PROTO_ASSET_CHUNK, &asset));
+    len = make_asset(PROTO_ASSET_CHUNK, PROTO_ASSET_CHUNK + 1);
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_SIZE,
+                      proto_parse_asset(frame, len, ASSET_ID, PROTO_ASSET_CHUNK, 3 * PROTO_ASSET_CHUNK, &asset));
+
+    // The last chunk is what is left: 10 bytes of an asset that is one chunk and 10 bytes.
+    len = make_asset(PROTO_ASSET_CHUNK, 10);
+    TEST_ASSERT_EQUAL(ESP_OK,
+                      proto_parse_asset(frame, len, ASSET_ID, PROTO_ASSET_CHUNK, PROTO_ASSET_CHUNK + 10, &asset));
+    TEST_ASSERT_EQUAL_size_t(10, asset.len);
+    TEST_ASSERT_EQUAL_PTR(frame + PROTO_ASSET_HEADER_LEN, asset.data);
+    TEST_ASSERT_EQUAL_UINT32(PROTO_ASSET_CHUNK, asset.offset);
+    len = make_asset(PROTO_ASSET_CHUNK, 11);
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_SIZE,
+                      proto_parse_asset(frame, len, ASSET_ID, PROTO_ASSET_CHUNK, PROTO_ASSET_CHUNK + 10, &asset));
+
+    // A frame shorter than its header.
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_SIZE, proto_parse_asset(frame, 23, ASSET_ID, 0, PROTO_ASSET_CHUNK, &asset));
+}
+
+void test_asset_full_frame_is_accepted_at_the_cap(void)
+{
+    proto_asset_t asset;
+    size_t len = make_asset(0, PROTO_ASSET_CHUNK);
+    TEST_ASSERT_EQUAL_size_t(PROTO_ASSET_FRAME_MAX, len);
+    TEST_ASSERT_EQUAL(ESP_OK, proto_parse_asset(frame, len, ASSET_ID, 0, 2 * PROTO_ASSET_CHUNK, &asset));
+    TEST_ASSERT_EQUAL_size_t(PROTO_ASSET_CHUNK, asset.len);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(ASSET_ID, asset.id, PROTO_ASSET_ID_LEN);
+}
+
+void test_asset_offset_past_the_end_of_the_asset_is_refused(void)
+{
+    proto_asset_t asset;
+    size_t len = make_asset(PROTO_ASSET_CHUNK, 0);
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      proto_parse_asset(frame, len, ASSET_ID, PROTO_ASSET_CHUNK, PROTO_ASSET_CHUNK, &asset));
+}
+
+void test_asset_get_builds_a_whole_chunk_offset_only(void)
+{
+    char buf[256];
+    size_t len = proto_build_asset_get(buf, sizeof(buf), ASSET_ID, PROTO_ASSET_CHUNK);
+    TEST_ASSERT_GREATER_THAN(0, len);
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"t\":\"asset_get\""));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"id\":\"5b1f0c7e9d3a2b4c6d8e0f1a2b3c4d5e\""));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"offset\":262144"));
+    TEST_ASSERT_EQUAL_size_t(0, proto_build_asset_get(buf, sizeof(buf), ASSET_ID, PROTO_ASSET_CHUNK + 1));
+}
+
+void test_feed_dismiss_id_is_1_to_63_printable(void)
+{
+    char buf[256];
+    size_t len = proto_build_feed_dismiss(buf, sizeof(buf), "ha/backup");
+    TEST_ASSERT_GREATER_THAN(0, len);
+    TEST_ASSERT_NOT_NULL(strstr(buf, "{\"t\":\"feed_dismiss\",\"id\":\"ha/backup\"}"));
+    TEST_ASSERT_EQUAL_size_t(0, proto_build_feed_dismiss(buf, sizeof(buf), ""));
+    TEST_ASSERT_EQUAL_size_t(0, proto_build_feed_dismiss(buf, sizeof(buf), run_of('d', 64)));
+    TEST_ASSERT_GREATER_THAN(0, proto_build_feed_dismiss(buf, sizeof(buf), run_of('d', 63)));
+    TEST_ASSERT_EQUAL_size_t(0, proto_build_feed_dismiss(buf, sizeof(buf), "a\tb"));
+}
+
 void app_main(void)
 {
     psa_status_t status = psa_crypto_init();
@@ -1120,6 +1479,27 @@ void app_main(void)
     RUN_TEST(test_stats_colors_as_an_object_of_whole_rgb_values);
     RUN_TEST(test_stats_colors_that_are_not_an_object_or_not_whole_rgb_are_refused);
     RUN_TEST(test_stats_color_for_a_gpu_with_no_gpu_field_is_accepted_and_kept);
+    RUN_TEST(test_hello_with_five_caps_and_a_32_character_fw_is_234_bytes);
+    RUN_TEST(test_sleep_fixture_has_every_field);
+    RUN_TEST(test_sleep_minimal_fixture_has_no_image_or_text);
+    RUN_TEST(test_sleep_image_must_be_32_lowercase_hex);
+    RUN_TEST(test_sleep_show_names_once_and_unknown_names_are_ignored);
+    RUN_TEST(test_sleep_text_of_47_is_accepted_and_48_refused);
+    RUN_TEST(test_sleep_colors_and_ranges_are_inclusive);
+    RUN_TEST(test_sleep_unknown_spinner_or_anchor_is_refused);
+    RUN_TEST(test_feed_fixture_has_its_card_and_note);
+    RUN_TEST(test_feed_empty_frame_has_no_cards_or_notes);
+    RUN_TEST(test_feed_9_cards_or_13_notes_is_refused);
+    RUN_TEST(test_feed_title_of_47_is_accepted_and_48_refused);
+    RUN_TEST(test_feed_string_limits_are_exact);
+    RUN_TEST(test_feed_unknown_level_is_refused_and_unknown_state_is_unknown);
+    RUN_TEST(test_feed_fullest_snapshot_parses_and_at_past_2_to_53_is_refused);
+    RUN_TEST(test_asset_wrong_magic_or_unasked_id_or_offset_is_refused);
+    RUN_TEST(test_asset_length_must_be_the_chunk_or_what_is_left);
+    RUN_TEST(test_asset_full_frame_is_accepted_at_the_cap);
+    RUN_TEST(test_asset_offset_past_the_end_of_the_asset_is_refused);
+    RUN_TEST(test_asset_get_builds_a_whole_chunk_offset_only);
+    RUN_TEST(test_feed_dismiss_id_is_1_to_63_printable);
     test_grid_run();
     test_pageset_run();
     test_hoststat_run();

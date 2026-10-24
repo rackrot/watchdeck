@@ -230,6 +230,37 @@ size_t proto_build_layout_ack(char *buf, size_t buf_len, uint32_t rev)
     return print_into(root, buf, buf_len);
 }
 
+size_t proto_build_asset_get(char *buf, size_t buf_len, const uint8_t id[PROTO_ASSET_ID_LEN], uint32_t offset)
+{
+    if (offset % PROTO_ASSET_CHUNK != 0) {
+        return 0;
+    }
+    char id_hex[2 * PROTO_ASSET_ID_LEN + 1];
+    to_hex(id, PROTO_ASSET_ID_LEN, id_hex);
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return 0;
+    }
+    cJSON_AddStringToObject(root, "t", "asset_get");
+    cJSON_AddStringToObject(root, "id", id_hex);
+    cJSON_AddNumberToObject(root, "offset", offset);
+    return print_into(root, buf, buf_len);
+}
+
+size_t proto_build_feed_dismiss(char *buf, size_t buf_len, const char *id)
+{
+    if (!is_printable(id, 1, PROTO_FEED_ID_MAX - 1)) {
+        return 0;
+    }
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return 0;
+    }
+    cJSON_AddStringToObject(root, "t", "feed_dismiss");
+    cJSON_AddStringToObject(root, "id", id);
+    return print_into(root, buf, buf_len);
+}
+
 // Copy a string field into dst. Missing or non-string fields return false. A value that does
 // not fit is truncated, or rejected when `exact` is set (ids must survive the round trip).
 static bool get_str(const cJSON *obj, const char *key, char *dst, size_t dst_len, bool exact)
@@ -598,6 +629,196 @@ esp_err_t proto_parse_icon(const uint8_t *frame, size_t len, proto_icon_t *out)
     return ESP_OK;
 }
 
+// The index of `s` in `names`, or -1.
+static int name_index(const char *s, const char *const names[], size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(s, names[i]) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+// Read a required string field that must be one of `names`. Returns its index, or -1.
+static int get_name(const cJSON *obj, const char *key, const char *const names[], size_t n)
+{
+    char s[16] = "";
+    if (!get_str(obj, key, s, sizeof(s), true)) {
+        return -1;
+    }
+    return name_index(s, names, n);
+}
+
+// Copy a required printable string of at least `min` characters into dst. The limit is dst_len - 1 characters,
+// exactly: a longer value is refused, not cut.
+static bool get_text(const cJSON *obj, const char *key, char *dst, size_t dst_len, size_t min)
+{
+    return get_str(obj, key, dst, dst_len, true) && is_printable(dst, min, dst_len - 1);
+}
+
+static esp_err_t parse_sleep(const cJSON *root, proto_sleep_t *out)
+{
+    static const char *const anchors[] = {"center", "top_left", "top_right", "bottom_left", "bottom_right"};
+    static const char *const spinners[] = {"arc", "dots", "bar", "pulse", "none"};
+    static const char *const shows[] = {"clock", "date", "host", "text"};
+    double bg, fg, spinner_color, offline_after_s, backlight;
+    int anchor = get_name(root, "anchor", anchors, 5);
+    int spinner = get_name(root, "spinner", spinners, 5);
+    if (!get_whole(root, "bg", 0, 0xFFFFFF, &bg) || !get_whole(root, "fg", 0, 0xFFFFFF, &fg) ||
+        !get_whole(root, "spinner_color", 0, 0xFFFFFF, &spinner_color) ||
+        !get_whole(root, "offline_after_s", 0, 3600, &offline_after_s) ||
+        !get_whole(root, "backlight", 0, 100, &backlight) || anchor < 0 || spinner < 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    out->has_image = cJSON_GetObjectItemCaseSensitive(root, "image") != NULL;
+    if (out->has_image && !get_hex(root, "image", out->image, sizeof(out->image))) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // Each known name at most once. An unknown name is ignored, so a newer daemon's element doesn't refuse the frame.
+    const cJSON *show = cJSON_GetObjectItemCaseSensitive(root, "show");
+    if (!cJSON_IsArray(show)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    out->show_mask = 0;
+    const cJSON *name;
+    cJSON_ArrayForEach(name, show)
+    {
+        if (!cJSON_IsString(name)) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        int bit = name_index(name->valuestring, shows, sizeof(shows) / sizeof(shows[0]));
+        if (bit < 0) {
+            continue;
+        }
+        if (out->show_mask & (1u << bit)) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        out->show_mask |= (uint8_t)(1u << bit);
+    }
+
+    out->text[0] = '\0';
+    if (cJSON_GetObjectItemCaseSensitive(root, "text") && !get_text(root, "text", out->text, sizeof(out->text), 0)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    out->bg = (uint32_t)bg;
+    out->fg = (uint32_t)fg;
+    out->anchor = (proto_anchor_t)anchor;
+    out->spinner = (proto_spinner_t)spinner;
+    out->spinner_color = (uint32_t)spinner_color;
+    out->offline_after_s = (uint32_t)offline_after_s;
+    out->backlight = (uint32_t)backlight;
+    return ESP_OK;
+}
+
+static esp_err_t parse_feed_card(const cJSON *item, proto_feed_card_t *out)
+{
+    char state[8] = "";
+    if (!cJSON_IsObject(item) || !get_text(item, "id", out->id, sizeof(out->id), 1) ||
+        !get_text(item, "label", out->label, sizeof(out->label), 0) ||
+        !get_text(item, "value", out->value, sizeof(out->value), 0) ||
+        !get_str(item, "state", state, sizeof(state), false)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    out->state = strcmp(state, "ok") == 0    ? PROTO_TILE_OK
+                 : strcmp(state, "bad") == 0 ? PROTO_TILE_BAD
+                                             : PROTO_TILE_UNKNOWN;
+    return ESP_OK;
+}
+
+static esp_err_t parse_feed_note(const cJSON *item, proto_feed_note_t *out)
+{
+    static const char *const levels[] = {"info", "ok", "warn", "error"};
+    double at;
+    if (!cJSON_IsObject(item)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    int level = get_name(item, "level", levels, sizeof(levels) / sizeof(levels[0]));
+    if (level < 0 || !get_text(item, "id", out->id, sizeof(out->id), 1) ||
+        !get_text(item, "title", out->title, sizeof(out->title), 1) ||
+        !get_text(item, "body", out->body, sizeof(out->body), 0) ||
+        !get_text(item, "src", out->src, sizeof(out->src), 0) || !get_whole(item, "at", 0, STATS_INT_MAX, &at)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    out->level = (proto_level_t)level;
+    out->at = (uint64_t)at;
+    return ESP_OK;
+}
+
+static esp_err_t parse_feed(const cJSON *root, proto_feed_t *out)
+{
+    double sources;
+    const cJSON *cards = cJSON_GetObjectItemCaseSensitive(root, "cards");
+    const cJSON *notes = cJSON_GetObjectItemCaseSensitive(root, "notes");
+    if (!get_whole(root, "sources", 0, PROTO_FEED_SOURCES_MAX, &sources) || !cJSON_IsArray(cards) ||
+        cJSON_GetArraySize(cards) > PROTO_FEED_CARDS_MAX || !cJSON_IsArray(notes) ||
+        cJSON_GetArraySize(notes) > PROTO_FEED_NOTES_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    out->sources = (uint8_t)sources;
+
+    const cJSON *item;
+    out->n_cards = 0;
+    cJSON_ArrayForEach(item, cards)
+    {
+        if (parse_feed_card(item, &out->cards[out->n_cards]) != ESP_OK) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        out->n_cards++;
+    }
+    out->n_notes = 0;
+    cJSON_ArrayForEach(item, notes)
+    {
+        if (parse_feed_note(item, &out->notes[out->n_notes]) != ESP_OK) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        out->n_notes++;
+    }
+    return ESP_OK;
+}
+
+esp_err_t proto_parse_asset(const uint8_t *frame, size_t len, const uint8_t id[PROTO_ASSET_ID_LEN], uint32_t offset,
+                            uint32_t asset_size, proto_asset_t *out)
+{
+    if (len < PROTO_ASSET_HEADER_LEN) {
+        ESP_LOGW(TAG, "asset frame of %u bytes is shorter than its header", (unsigned)len);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (memcmp(frame, "WDA1", 4) != 0) {
+        ESP_LOGW(TAG, "binary frame is not an asset");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (memcmp(frame + 4, id, PROTO_ASSET_ID_LEN) != 0) {
+        ESP_LOGW(TAG, "asset frame is for an id that was not asked for");
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint32_t got =
+        (uint32_t)frame[20] | (uint32_t)frame[21] << 8 | (uint32_t)frame[22] << 16 | (uint32_t)frame[23] << 24;
+    if (got != offset) {
+        ESP_LOGW(TAG, "asset frame is at offset %u, not the %u asked for", (unsigned)got, (unsigned)offset);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (offset >= asset_size) {
+        ESP_LOGW(TAG, "asked for offset %u of an asset of %u bytes", (unsigned)offset, (unsigned)asset_size);
+        return ESP_ERR_INVALID_ARG;
+    }
+    // Every chunk is PROTO_ASSET_CHUNK bytes but the last, which is what is left.
+    size_t want = asset_size - offset < PROTO_ASSET_CHUNK ? asset_size - offset : PROTO_ASSET_CHUNK;
+    if (len != PROTO_ASSET_HEADER_LEN + want) {
+        ESP_LOGW(TAG, "asset chunk at %u should be %u bytes, got %u", (unsigned)offset,
+                 (unsigned)(PROTO_ASSET_HEADER_LEN + want), (unsigned)len);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    memcpy(out->id, id, PROTO_ASSET_ID_LEN);
+    out->offset = offset;
+    out->len = want;
+    out->data = frame + PROTO_ASSET_HEADER_LEN;
+    return ESP_OK;
+}
+
 esp_err_t proto_parse(const char *json, size_t len, proto_msg_t *out)
 {
     memset(out, 0, sizeof(*out));
@@ -648,6 +869,12 @@ esp_err_t proto_parse(const char *json, size_t len, proto_msg_t *out)
     } else if (strcmp(t, "stats") == 0) {
         out->type = PROTO_MSG_STATS;
         err = parse_stats(root, &out->stats);
+    } else if (strcmp(t, "sleep") == 0) {
+        out->type = PROTO_MSG_SLEEP;
+        err = parse_sleep(root, &out->sleep);
+    } else if (strcmp(t, "feed") == 0) {
+        out->type = PROTO_MSG_FEED;
+        err = parse_feed(root, &out->feed);
     } else {
         out->type = PROTO_MSG_UNKNOWN;
         strlcpy(out->unknown_t, t, sizeof(out->unknown_t));
