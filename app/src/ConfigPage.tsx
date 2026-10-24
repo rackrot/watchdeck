@@ -63,7 +63,13 @@ type Saved = {
 /** A `[status_bar]` edit reaches a connected device within this long: the config poll and the next tick. */
 const BAR_WITHIN_S = 2;
 
-export default function ConfigPage({ secrets }: { secrets: string[] }) {
+export default function ConfigPage({
+  secrets,
+  onConfigLoaded,
+}: {
+  secrets: string[];
+  onConfigLoaded: () => void;
+}) {
   const [view, setView] = useState<ConfigView | null>(null);
   const [draft, setDraft] = useState<Config | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
@@ -121,8 +127,11 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
       setLoadError("");
     } catch (e) {
       setLoadError(String(e));
+    } finally {
+      // The first answer, good or not, takes the splash away; an error shows on the page.
+      onConfigLoaded();
     }
-  }, [refreshIcons]);
+  }, [refreshIcons, onConfigLoaded]);
   // Listen first, then read, so no change falls between the two.
   useEffect(() => {
     const listeners = Promise.all([
@@ -146,7 +155,10 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
     ]);
     listeners.then(
       () => load(),
-      (e) => setLoadError(String(e)),
+      (e) => {
+        setLoadError(String(e));
+        onConfigLoaded();
+      },
     );
     return () => {
       listeners.then((stops) => {
@@ -155,7 +167,7 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
         }
       });
     };
-  }, [load]);
+  }, [load, onConfigLoaded]);
 
   const dirty = view !== null && draft !== null && isDirty(draft, view);
   const diskChanged = view !== null && diskMoved(view, onDisk);

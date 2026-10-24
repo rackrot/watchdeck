@@ -1,4 +1,5 @@
 import { type KeyboardEvent, useState } from "react";
+import logo from "./assets/logo.svg";
 import ConfigPage from "./ConfigPage";
 import Devices from "./Devices";
 import { useDevices, useSecrets } from "./hooks";
@@ -14,7 +15,7 @@ const TABS = [
 
 type Tab = (typeof TABS)[number][0];
 
-function App() {
+function App({ onConfigLoaded }: { onConfigLoaded: () => void }) {
   const [tab, setTab] = useState<Tab>("layout");
   const [devices] = useDevices();
   const [secrets, refreshSecrets] = useSecrets();
@@ -40,7 +41,10 @@ function App() {
   return (
     <div className="app">
       <header className="topbar">
-        <h1 className="wordmark">watchdeck</h1>
+        <h1 className="wordmark">
+          <img src={logo} alt="" className="brand-mark" />
+          watchdeck
+        </h1>
         <div
           className="tabs"
           role="tablist"
@@ -79,7 +83,7 @@ function App() {
           aria-labelledby="tab-layout"
           hidden={tab !== "layout"}
         >
-          <ConfigPage secrets={secrets} />
+          <ConfigPage secrets={secrets} onConfigLoaded={onConfigLoaded} />
         </div>
         <div
           role="tabpanel"
