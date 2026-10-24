@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "display.h"
+#include "logo_img.h"
 #include "ui_priv.h"
 
 #define REFRESH_MS 1000
@@ -10,7 +11,6 @@
 #define BAR_SPIN_W 96
 #define STRIP_PAD 32 // from the screen's left edge to the spinner
 #define STRIP_GAP 16 // spinner to status text
-#define LOGO_PX 160  // the placeholder square, until L4's art
 
 static sleep_cfg_t s_cfg;
 
@@ -20,7 +20,7 @@ static lv_obj_t *s_strip;
 static lv_obj_t *s_status;
 static lv_timer_t *s_timer;
 static void (*s_on_touch)(void);
-static lv_obj_t *s_image_area; // the placeholder logo today; P3 puts the picture here
+static lv_obj_t *s_image_area; // the mark today; P3 puts the picture here
 static lv_obj_t *s_spinner;
 static bool s_spinning;
 static bool s_pressed; // a touch began on the screen, so its release wakes it; one that began before it was up does not
@@ -185,6 +185,16 @@ static void spinner_run(bool on)
 
 /* ---- The screen ---- */
 
+// The image area's content, centered in the 1024 x 512 area. Today the mark, whose two-color palette is fixed (not
+// recolored to fg); P3 replaces this body with the configured picture, and falls back to the mark when none is set.
+static lv_obj_t *image_create(lv_obj_t *parent)
+{
+    lv_obj_t *img = passive(lv_image_create(parent));
+    lv_image_set_src(img, &wd_logo);
+    lv_obj_set_pos(img, (SLEEP_AREA_W - wd_logo.header.w) / 2, (SLEEP_AREA_H - wd_logo.header.h) / 2);
+    return img;
+}
+
 static void root_event(lv_event_t *e)
 {
     const lv_event_code_t code = lv_event_get_code(e);
@@ -224,14 +234,7 @@ static void build(void)
     lv_obj_add_event_cb(s_root, root_event, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(s_root, root_event, LV_EVENT_RELEASED, NULL);
 
-    // The placeholder for the logo (L4) and the picture (P3): a rounded square in the text color, centered in the area.
-    lv_obj_t *logo = s_image_area = passive(lv_obj_create(s_root));
-    lv_obj_remove_style_all(logo);
-    lv_obj_set_size(logo, LOGO_PX, LOGO_PX);
-    lv_obj_set_pos(logo, (SLEEP_AREA_W - LOGO_PX) / 2, (SLEEP_AREA_H - LOGO_PX) / 2);
-    lv_obj_set_style_radius(logo, 36, 0);
-    lv_obj_set_style_bg_color(logo, fg, 0);
-    lv_obj_set_style_bg_opa(logo, LV_OPA_COVER, 0);
+    s_image_area = image_create(s_root);
 
     const int align = sleepcfg_text_align(s_cfg.anchor);
     for (int i = 0; i < SLEEP_EL_COUNT; i++) {
