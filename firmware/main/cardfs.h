@@ -26,7 +26,11 @@
 //
 // Boot order, after the card is mounted read-write and before anything else touches it: cardfs_init, then
 // cardfs_set_writable(true), then cardfs_recover. Before USB takes the card: cardfs_set_writable(false), which waits
-// for a call in progress. Every call takes one mutex.
+// for a call in progress. Every call takes one mutex. Right after f_mount the caller sets fs->free_clst and
+// fs->last_clst to 0xFFFFFFFF: IDF 6.1 always trusts FSINFO (ffconf.h FF_FS_NOFSINFO 0, whatever the
+// CONFIG_FATFS_DONT_TRUST_* options say), and a cut can leave its free count stale, which makes FatFs report a
+// full card falsely. The room function reads the disk raw, so after a cardfs call fails with an I/O error the
+// caller remounts before the next write, in case FatFs still holds an unsynced sector.
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -68,8 +72,9 @@ bool cardfs_name_ok(const char *rel);
 // Replaces a small file through its intent record. rel is "wifi.txt" or "watchdeck/sleep.cfg". First resolves a
 // record an earlier failed write left, and refuses if that fails, so a pending write is never lost to a new one.
 // ESP_ERR_INVALID_ARG: rel isn't a small file. ESP_ERR_INVALID_SIZE: len > CARDFS_SMALL_MAX.
-// ESP_ERR_INVALID_STATE: not writable. CARDFS_ERR_DIR_FULL: see above; nothing written.
-// ESP_FAIL: an I/O error; rel is as an earlier write left it, or new once recovery has run.
+// ESP_ERR_INVALID_STATE: not writable. CARDFS_ERR_DIR_FULL: see above; nothing written. ESP_ERR_NO_MEM: nothing
+// written. ESP_FAIL: an I/O error; rel is as an earlier write left it, or new once recovery has run. ESP_OK also
+// when the in-place write failed but its record, tried once more at once, wrote and verified it.
 esp_err_t cardfs_write_small(const char *rel, const void *data, size_t len);
 
 // Creates rel and writes it once, fsynced at the end. ESP_ERR_NOT_ALLOWED: rel exists (delete an invalid file
