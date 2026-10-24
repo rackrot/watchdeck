@@ -31,8 +31,18 @@ void wifi_current_ssid(char out[WIFI_SSID_LEN]);
  * saved) or "none". */
 const char *wifi_source(void);
 
-/** Whether wifi.txt held credentials at boot or has been written since. */
-bool wifi_file_present(void);
+/** What the last look at wifi.txt on the card found. WIFI_FILE_UNKNOWN: not looked yet. */
+typedef enum {
+    WIFI_FILE_UNKNOWN,
+    WIFI_FILE_FOUND,
+    WIFI_FILE_ABSENT,
+    WIFI_FILE_SHARED, // the card is shared over USB, so nothing is known
+    WIFI_FILE_NO_CARD,
+} wifi_file_t;
+wifi_file_t wifi_file_state(void);
+
+/** Looks for wifi.txt on the svc task, which sets wifi_file_state() when it runs. Never blocks. */
+void wifi_probe_file(void);
 
 /** The station's IPv4 address as text, false when it has none. */
 bool wifi_ip(char *out, size_t out_size);
@@ -76,12 +86,13 @@ typedef enum {
 typedef enum {
     WIFI_SAVE_NONE,
     WIFI_SAVE_OK,
-    WIFI_SAVE_NO_CARD,  // no card was mounted
-    WIFI_SAVE_SHARED,   // the card is shared over USB, or read-only
-    WIFI_SAVE_TAINTED,  // an earlier card access failed; a restart clears it
-    WIFI_SAVE_DIR_FULL, // the card's root folder has no room for the entry
-    WIFI_SAVE_BUSY,     // svc's queue was full
-    WIFI_SAVE_ERROR,    // another card error
+    WIFI_SAVE_NO_CARD,   // no card was mounted
+    WIFI_SAVE_SHARED,    // the card is shared over USB
+    WIFI_SAVE_READ_ONLY, // mounted, but cardfs can't write it (not FAT32)
+    WIFI_SAVE_TAINTED,   // an earlier card access failed; the card has been remounted
+    WIFI_SAVE_DIR_FULL,  // the card's root folder has no room for the entry
+    WIFI_SAVE_BUSY,      // svc's queue was full
+    WIFI_SAVE_ERROR,     // another card error
 } wifi_save_t;
 
 typedef struct {

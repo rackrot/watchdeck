@@ -14,6 +14,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "psa/crypto.h"
+#include "sdkconfig.h"
 
 #define DIR_NAME "watchdeck"
 #define ROOT_MAX 15
@@ -30,12 +31,16 @@ static const struct {
 } SMALL[] = {
     {"wifi.txt", DIR_NAME "/wifi.new"},
     {DIR_NAME "/sleep.cfg", DIR_NAME "/sleep.new"},
+#if CONFIG_WATCHDECK_TEST_CARD
+    {DIR_NAME "/selftest.cfg", DIR_NAME "/selftest.new"}, // the card self-test's file (cardtest.c)
+#endif
 };
 
 static char s_root[ROOT_MAX + 1];
 static cardfs_volume_t s_vol;
 static SemaphoreHandle_t s_lock;
 static StaticSemaphore_t s_lock_buf;
+static bool s_attached; // the volume is mounted: from cardfs_init or cardfs_attach until cardfs_detach
 static bool s_writable;
 static bool s_tainted;         // a card access failed on this mount; see cardfs.h
 static uint32_t s_generation;  // counts small writes since boot; recovery logs the one it redid
@@ -359,6 +364,19 @@ static void unlock(void)
     xSemaphoreGive(s_lock);
 }
 
+// lock(), for a call that touches the card: false, with the mutex released, while the volume is detached.
+static bool enter(void)
+{
+    if (!lock()) {
+        return false;
+    }
+    if (!s_attached) {
+        unlock();
+        return false;
+    }
+    return true;
+}
+
 // ESP_OK when a write may start: writable and not tainted.
 static esp_err_t may_write(void)
 {
@@ -392,6 +410,7 @@ esp_err_t cardfs_init(const char *root, const cardfs_volume_t *vol)
     lock();
     strcpy(s_root, root);
     s_vol = *vol;
+    s_attached = true;
     s_writable = false;
     s_tainted = false;
     const esp_err_t err = prepare();
@@ -408,6 +427,8 @@ esp_err_t cardfs_set_writable(bool writable)
     if (!writable) {
         s_tainted = false; // the caller remounts before it turns writes back on
         s_writable = false;
+    } else if (!s_attached) {
+        err = ESP_ERR_INVALID_STATE;
     } else {
         err = prepare();
         s_writable = err == ESP_OK;
@@ -416,9 +437,35 @@ esp_err_t cardfs_set_writable(bool writable)
     return err;
 }
 
+void cardfs_detach(void)
+{
+    if (!lock()) {
+        return;
+    }
+    s_attached = false;
+    s_writable = false;
+    s_tainted = false;
+    unlock();
+}
+
+esp_err_t cardfs_attach(void)
+{
+    if (!lock()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_attached = true;
+    unlock();
+    return ESP_OK;
+}
+
 bool cardfs_writable(void)
 {
     return s_writable;
+}
+
+bool cardfs_tainted(void)
+{
+    return s_tainted;
 }
 
 bool cardfs_name_ok(const char *rel)
@@ -618,7 +665,7 @@ esp_err_t cardfs_write_small(const char *rel, const void *data, size_t len)
     if (len > CARDFS_SMALL_MAX) {
         return ESP_ERR_INVALID_SIZE;
     }
-    if (!lock()) {
+    if (!enter()) {
         return ESP_ERR_INVALID_STATE;
     }
     esp_err_t err = write_small_locked(rel, record, data, len);
@@ -691,7 +738,7 @@ esp_err_t cardfs_write_new(const char *rel, const void *data, size_t len)
     if (!cardfs_name_ok(rel) || small_record(rel)) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (!lock()) {
+    if (!enter()) {
         return ESP_ERR_INVALID_STATE;
     }
     esp_err_t err = write_new_locked(rel, data, len);
@@ -704,7 +751,7 @@ esp_err_t cardfs_read(const char *rel, void *buf, size_t cap, size_t *len)
     if (!cardfs_name_ok(rel)) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (!lock()) {
+    if (!enter()) {
         return ESP_ERR_INVALID_STATE;
     }
     char path[PATH_LEN];
@@ -774,7 +821,7 @@ esp_err_t cardfs_verify(const char *rel, size_t len, const uint8_t *digest, size
     if (!cardfs_name_ok(rel) || digest_len == 0 || digest_len > SHA_LEN) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (!lock()) {
+    if (!enter()) {
         return ESP_ERR_INVALID_STATE;
     }
     char path[PATH_LEN];
@@ -806,7 +853,7 @@ esp_err_t cardfs_remove(const char *rel)
     if (!cardfs_name_ok(rel)) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (!lock()) {
+    if (!enter()) {
         return ESP_ERR_INVALID_STATE;
     }
     char path[PATH_LEN];
@@ -902,7 +949,7 @@ static esp_err_t list_locked(list_t *l)
 
 esp_err_t cardfs_list(cardfs_list_cb_t cb, void *ctx)
 {
-    if (!lock()) {
+    if (!enter()) {
         return ESP_ERR_INVALID_STATE;
     }
     list_t l = {0};
@@ -917,7 +964,7 @@ esp_err_t cardfs_list(cardfs_list_cb_t cb, void *ctx)
 
 esp_err_t cardfs_recover(void)
 {
-    if (!lock()) {
+    if (!enter()) {
         return ESP_ERR_INVALID_STATE;
     }
     esp_err_t ret = may_write();

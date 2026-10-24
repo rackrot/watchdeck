@@ -8,6 +8,8 @@
 // (and the model lock after it) only to hand the result to the UI, and never holds the cardfs mutex while it
 // waits for the LVGL lock.
 
+#include <stdbool.h>
+
 #include "esp_err.h"
 
 #define SVC_QUEUE_LEN 8
@@ -22,3 +24,6 @@ esp_err_t svc_start(void);
 // Queues fn(arg) and never blocks. ESP_ERR_NO_MEM: the queue is full, show the caller's "busy" message.
 // ESP_ERR_INVALID_STATE: svc_start hasn't run.
 esp_err_t svc_post(svc_job_t fn, void *arg);
+
+// True when called from a svc job, for asserting that a job-only function isn't called elsewhere.
+bool svc_on_task(void);

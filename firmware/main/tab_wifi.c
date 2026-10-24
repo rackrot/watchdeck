@@ -73,6 +73,9 @@ static bool s_editing;      // the editor is up (and its keyboard may be)
 static lv_obj_t *s_rows[ROW_COUNT];
 static char s_row_text[ROW_COUNT][ROW_TEXT_MAX];
 
+#define PROBE_TICKS 5 // the rows refresh every second; wifi.txt is looked at on every 5th
+static unsigned s_probe_ticks;
+
 static void set_row(row_t r, const char *text)
 {
     ui_set_label(s_rows[r], s_row_text[r], ROW_TEXT_MAX, text);
@@ -116,7 +119,16 @@ void tab_wifi_tick(void)
         strlcpy(text, "No credentials", sizeof(text));
     }
     set_row(ROW_SOURCE, text);
-    set_row(ROW_FILE, wifi_file_present() ? "wifi.txt: found on the card" : "wifi.txt: not found");
+    static const char *const FILE_TEXT[] = {
+        [WIFI_FILE_UNKNOWN] = "wifi.txt: unknown",  [WIFI_FILE_FOUND] = "wifi.txt: found on the card",
+        [WIFI_FILE_ABSENT] = "wifi.txt: not found", [WIFI_FILE_SHARED] = "wifi.txt: unknown (card shared)",
+        [WIFI_FILE_NO_CARD] = "wifi.txt: no card",
+    };
+    set_row(ROW_FILE, FILE_TEXT[wifi_file_state()]);
+    if (++s_probe_ticks >= PROBE_TICKS) { // the card may have been shared, or a save may have changed it
+        s_probe_ticks = 0;
+        wifi_probe_file();
+    }
 }
 
 /* ---- The editor ---- */
@@ -406,13 +418,15 @@ static const char *save_text(wifi_save_t save)
     case WIFI_SAVE_OK:
         return "saved to wifi.txt";
     case WIFI_SAVE_NO_CARD:
-        return "no card in the slot";
+        return "no card";
     case WIFI_SAVE_SHARED:
-        return "the card is shared over USB, or read-only";
+        return "the card is shared over USB";
+    case WIFI_SAVE_READ_ONLY:
+        return "the card is read-only";
     case WIFI_SAVE_TAINTED:
-        return "a card error earlier; restart the board";
+        return "a card error; the card was remounted, try again";
     case WIFI_SAVE_DIR_FULL:
-        return "the card's root folder is full";
+        return "card folder full, tidy it on a PC";
     case WIFI_SAVE_BUSY:
         return "the board was busy";
     default:
@@ -696,6 +710,8 @@ void tab_wifi_build(lv_obj_t *parent)
 {
     s_content = parent;
     s_editing = false;
+    s_probe_ticks = 0;
+    wifi_probe_file();
     build_rows();
 }
 

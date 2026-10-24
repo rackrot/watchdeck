@@ -4,7 +4,7 @@ The board joins a 2.4 GHz network through its ESP32-C6 co-processor. It reads cr
 
 | Source | Where | Change it by |
 |---|---|---|
-| SD card | `wifi.txt` at the root of the TF card | Editing the file, then pressing reset |
+| SD card | `wifi.txt` at the root of the TF card | Editing the file while the card is shared over USB, then stopping the share |
 | Compiled in | `firmware/sdkconfig.defaults.local` | Rebuilding and reflashing |
 
 A valid `wifi.txt` takes priority. If the card has no `wifi.txt`, or the file is invalid, the board uses the compiled-in credentials. If neither source has an SSID, the board doesn't connect.
@@ -24,9 +24,23 @@ my-password
 - For an open network, leave out the password line.
 - A blank first line means "don't connect". The board won't fall back to the compiled-in credentials.
 
-You can edit the file without removing the card. Plug a USB-C cable into the board's **USB 2.0** port, which is not the serial port. The card then shows up as a USB drive with a `tf-data` partition. Edit `wifi.txt`, eject the drive, and press reset.
+You can edit the file without removing the card:
 
-Always eject before unplugging. The board acknowledges a USB write before it reaches the card, so unplugging early can lose data.
+1. Plug a USB-C cable into the board's **USB 2.0** port, which is not the serial port. Until you share the card, the computer sees an empty card reader, because the board keeps the card for itself.
+2. On the board, open Settings > Storage and tap Share. The card shows up as a USB drive with a `tf-data` partition. While it's shared, the board can't save anything to the card.
+3. Edit `wifi.txt`, then eject the drive on the computer.
+4. Tap Stop sharing, or press reset. The board restarts (about 8 seconds, and it stays paired), takes the card back and reads the new file.
+
+Always eject before unplugging or stopping. The board acknowledges a USB write before it reaches the card, so unplugging early can lose data.
+
+## The card
+
+The board writes to the card only to save `wifi.txt` and the files in its own `watchdeck` folder. It never formats the card. Each save is recoverable: if the power goes off in the middle, the board finishes or undoes the save the next time it starts, so `wifi.txt` holds either the old or the new settings.
+
+- If the power went off while the board was saving `wifi.txt`, let it start once with the card in before you edit the file on a computer. Otherwise the save it finishes at that start replaces your edit.
+- The board never makes a folder bigger. On about 1 card in 16, creating the `watchdeck` folder needs room the card's top level doesn't have yet, and the board reports the card folder as full. Create a `watchdeck` folder at the top of the card on a computer, or add or delete one file there.
+- FAT32 has no journal, so a power cut at the wrong moment can, rarely, damage the file system. If the board reports a card error, check the card on a computer (`fsck.vfat` on Linux, `chkdsk` on Windows). Keep nothing on the card you can't replace.
+- A card that isn't FAT32 works read-only: the board reads `wifi.txt` but can't save to it.
 
 ## Option 2: compiled-in credentials
 

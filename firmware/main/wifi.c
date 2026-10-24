@@ -56,7 +56,8 @@ static portMUX_TYPE s_snap_mux = portMUX_INITIALIZER_UNLOCKED;
 static wifi_job_t s_job;
 static char s_snap_ssid[WIFI_SSID_LEN];
 static const char *s_source = "none";
-static bool s_file_present;
+static volatile wifi_file_t s_file_state;
+static volatile bool s_probe_queued;
 static wifiscan_entry_t s_scan[WIFISCAN_MAX];
 static size_t s_scan_n;
 static bool s_rssi_valid;
@@ -197,9 +198,9 @@ const char *wifi_source(void)
     return s_source; // a pointer to a literal, written whole
 }
 
-bool wifi_file_present(void)
+wifi_file_t wifi_file_state(void)
 {
-    return s_file_present;
+    return s_file_state;
 }
 
 size_t wifi_scan_results(wifiscan_entry_t *out, size_t max)
@@ -495,21 +496,17 @@ esp_err_t wifi_apply_saved(void)
     char pass[PASS_MAX + 1] = "";
     const char *source = "sd";
     if (read_card_credentials(ssid, pass)) {
-        s_file_present = true;
+        s_file_state = WIFI_FILE_FOUND;
     } else {
         source = "config";
         if (strlen(CONFIG_WATCHDECK_WIFI_SSID) > SSID_MAX || strlen(CONFIG_WATCHDECK_WIFI_PASSWORD) > PASS_MAX) {
             ESP_LOGE(TAG, "Kconfig SSID or password is too long");
-            sdcard_release_fs();
             report("invalid Wi-Fi credentials");
             return ESP_ERR_INVALID_ARG;
         }
         strcpy(ssid, CONFIG_WATCHDECK_WIFI_SSID);
         strcpy(pass, CONFIG_WATCHDECK_WIFI_PASSWORD);
     }
-    // The card goes to the USB host once wifi.txt has been read.
-    sdcard_release_fs();
-
     // An empty SSID would join any open AP, so refuse.
     if (ssid[0] == '\0') {
         report("no Wi-Fi credentials: set them in Settings > Wi-Fi");
@@ -520,6 +517,7 @@ esp_err_t wifi_apply_saved(void)
 
 /* ---- Jobs on svc ---- */
 
+// Why cardfs refused. Called before sdcard_note_failure, whose remount would erase the taint this looks at.
 static wifi_save_t save_result(esp_err_t err)
 {
     switch (err) {
@@ -527,17 +525,23 @@ static wifi_save_t save_result(esp_err_t err)
         return WIFI_SAVE_OK;
     case CARDFS_ERR_DIR_FULL:
         return WIFI_SAVE_DIR_FULL;
-    case ESP_ERR_INVALID_STATE: // not writable, or tainted: the mount's owner says which
-        if (!sdcard_card()) {
+    case ESP_ERR_INVALID_STATE: // detached, tainted, or not writable
+        if (sdcard_owner() == SDCARD_SHARED) {
+            return WIFI_SAVE_SHARED;
+        }
+        if (sdcard_owner() == SDCARD_NO_CARD) {
             return WIFI_SAVE_NO_CARD;
         }
-        return cardfs_writable() ? WIFI_SAVE_TAINTED : WIFI_SAVE_SHARED;
+        if (cardfs_tainted()) {
+            return WIFI_SAVE_TAINTED;
+        }
+        return cardfs_writable() ? WIFI_SAVE_ERROR : WIFI_SAVE_READ_ONLY;
     default:
         return WIFI_SAVE_ERROR;
     }
 }
 
-// Write wifi.txt. The password reaches no log.
+// Write wifi.txt, on the svc task. The password reaches no log.
 static wifi_save_t write_wifi_txt(const char *ssid, const char *pass)
 {
     char buf[WIFITXT_FILE_MAX];
@@ -547,10 +551,40 @@ static wifi_save_t write_wifi_txt(const char *ssid, const char *pass)
     }
     const esp_err_t err = cardfs_write_small("wifi.txt", buf, len);
     memset(buf, 0, sizeof(buf));
+    const wifi_save_t save = save_result(err);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "wifi.txt not written: %s (0x%x)", esp_err_to_name(err), (unsigned)err);
+        sdcard_note_failure("wifi.txt write", err); // logs, counts, and remounts a tainted card
     }
-    return save_result(err);
+    return save;
+}
+
+static void probe_job(void *arg)
+{
+    s_probe_queued = false;
+    char buf[WIFITXT_FILE_MAX + 1];
+    size_t len = 0;
+    const esp_err_t err = cardfs_read("wifi.txt", buf, sizeof(buf), &len);
+    memset(buf, 0, sizeof(buf));
+    if (err == ESP_OK || err == ESP_ERR_INVALID_SIZE) { // too long to be a valid file, but it is there
+        s_file_state = WIFI_FILE_FOUND;
+    } else if (err == ESP_ERR_NOT_FOUND) {
+        s_file_state = WIFI_FILE_ABSENT;
+    } else if (err == ESP_ERR_INVALID_STATE) {
+        s_file_state = sdcard_owner() == SDCARD_SHARED ? WIFI_FILE_SHARED : WIFI_FILE_NO_CARD;
+    } else {
+        s_file_state = WIFI_FILE_UNKNOWN;
+    }
+}
+
+void wifi_probe_file(void)
+{
+    if (s_probe_queued) {
+        return;
+    }
+    s_probe_queued = true;
+    if (svc_post(probe_job, NULL) != ESP_OK) {
+        s_probe_queued = false;
+    }
 }
 
 // After a trial joined: write the credentials it made current.
@@ -565,7 +599,7 @@ static void save_current_job(void *arg)
     memset(pass, 0, sizeof(pass));
     if (save == WIFI_SAVE_OK) {
         snapshot_network(ssid, "sd");
-        s_file_present = true;
+        s_file_state = WIFI_FILE_FOUND;
     }
     job_done(true, WF_NONE, save, ESP_OK);
 }
@@ -579,7 +613,7 @@ static void save_only_job(void *arg)
     const wifi_save_t save = write_wifi_txt(ssid, pass);
     memset(pass, 0, sizeof(pass));
     if (save == WIFI_SAVE_OK) {
-        s_file_present = true;
+        s_file_state = WIFI_FILE_FOUND;
     }
     job_done(save == WIFI_SAVE_OK, WF_NONE, save, ESP_OK);
 }
