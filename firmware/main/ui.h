@@ -6,10 +6,11 @@
 #include "proto.h"
 
 /*
- * Screen modes. Status mode, from boot until the first set applies and again after every unpair, shows the status
- * lines, Licenses, Forget pairing while paired, and the pairing views while unpaired. Grid mode, from the first set
- * until an unpair, shows only the grid. A long swipe up on the grid opens settings, which replaces the grid until it
- * closes and shows the status texts, device info, Licenses and Forget pairing.
+ * Screen modes (ui_priv.h). Status mode, from boot until the first set applies and again after every unpair, shows the
+ * status lines, Licenses, Settings (except during a pairing attempt), Forget pairing while paired, and the pairing
+ * views while unpaired. Grid mode, from the first set until an unpair, shows the status bar and the grid. A long swipe
+ * up on the grid, or Settings in status mode, opens settings, which replaces the grid or the status lines until it
+ * closes. Its tabs (settings.c) show the status texts, device info, Licenses and Forget pairing.
  */
 
 /** Build status mode, the toast and the result modal on `disp`. The grid comes from the daemon. */
