@@ -34,6 +34,19 @@ export type Field =
 
 export type FieldErrors = Partial<Record<Field, string[]>>;
 
+/** A field of an integration's form. A stat source's action fields are `source.<field>`. */
+export type IntegrationField =
+  | "id"
+  | "label"
+  | "token"
+  | "every_s"
+  | "json_pointer"
+  | `source.${ActionField}`
+  /** A problem with the integration that no field owns. */
+  | "integration";
+
+export type IntegrationErrors = Partial<Record<IntegrationField, string[]>>;
+
 /** A field of the status bar form: a setting, or one metric's steps. */
 export type StatusBarField =
   | "gpu"
@@ -169,6 +182,43 @@ function actionField(problem: string): ActionField | null {
   return rules.find(([pattern]) => pattern.test(problem))?.[1] ?? null;
 }
 
+/**
+ * An integration's messages, as the bucket holds them (the id's prefix already cut), sorted by the
+ * field of its form. A stat source's messages start `source: `, then an action's wording. The
+ * bare "is not a valid header name" shows under both header tables, as a button's does.
+ */
+export function integrationFields(messages: string[]): IntegrationErrors {
+  const errors: IntegrationErrors = {};
+  const add = (field: IntegrationField, message: string) => {
+    errors[field] = [...(errors[field] ?? []), message];
+  };
+  for (const message of messages) {
+    const source = message.match(/^source: (.*)$/s)?.[1];
+    if (source !== undefined) {
+      if (/^"[^"]*" is not a valid header name/.test(source)) {
+        add("source.headers", message);
+        add("source.secret_headers", message);
+        continue;
+      }
+      const field = actionField(source);
+      add(field ? `source.${field}` : "integration", message);
+      continue;
+    }
+    const rules: [RegExp, IntegrationField][] = [
+      [/^id /, "id"],
+      [/^label/, "label"],
+      [/^token/, "token"],
+      [/^every_s /, "every_s"],
+      [/^json_pointer /, "json_pointer"],
+    ];
+    add(
+      rules.find(([pattern]) => pattern.test(message))?.[1] ?? "integration",
+      message,
+    );
+  }
+  return errors;
+}
+
 /** Which fields of a button `problem` is about, or "button". */
 function fieldsOf(problem: string): Field[] {
   // The message doesn't say which table the name was in, so it shows under both.
@@ -268,12 +318,13 @@ export function addButtonError(
 /**
  * Sorts messages by what they are about. With `ids`, the ids of the draft's buttons, a message
  * about a button the draft doesn't have goes to `general`, whole, so it still shows. `pageIds`
- * does the same for pages.
+ * and `integrationIds` do the same for pages and integrations.
  */
 export function mapErrors(
   messages: string[],
   ids?: string[],
   pageIds?: string[],
+  integrationIds?: string[],
 ): ErrorMap {
   const map = emptyErrors();
   for (const message of messages) {
@@ -305,6 +356,10 @@ export function mapErrors(
       addSleepError(map, sleepField(message), message);
     } else if (integration) {
       const id = unquote(integration[1]);
+      if (integrationIds && !integrationIds.includes(id)) {
+        map.general.push(message);
+        continue;
+      }
       map.integrations.set(id, [
         ...(map.integrations.get(id) ?? []),
         integration[2],
@@ -349,6 +404,21 @@ export function numberErrors(config: Config): ErrorMap {
     }
     if (b.tile && !isCount(b.tile.source.timeout_s)) {
       addButtonError(map, b.id, "tile.source.timeout_s", `timeout_s ${whole}`);
+    }
+  }
+  for (const i of config.integration ?? []) {
+    if (i.kind !== "stat") {
+      continue;
+    }
+    const bad = [
+      ...(isCount(i.every_s) ? [] : [`every_s ${whole}`]),
+      ...(isCount(i.source.timeout_s) ? [] : [`source: timeout_s ${whole}`]),
+    ];
+    if (bad.length > 0) {
+      map.integrations.set(i.id, [
+        ...(map.integrations.get(i.id) ?? []),
+        ...bad,
+      ]);
     }
   }
   // Only the type is checked: a negative or huge `at` is a rule, which Rust words.

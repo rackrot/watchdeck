@@ -1,4 +1,5 @@
 import { type ReactNode, useEffect, useState } from "react";
+import type { ActionResult } from "./api";
 import { parseWhole } from "./edit";
 import { DEFAULT_FONT, FONTS, fontInfo } from "./fonts";
 
@@ -40,6 +41,33 @@ export function Field({
       {children}
       <Problems list={problems} />
     </label>
+  );
+}
+
+/** What a Test button last got: the daemon's result, or why the call failed. Null before any. */
+export type TestState = { result: ActionResult } | { error: string } | null;
+
+/** The outcome of a Test under its button: a chip with the summary, and the output if there is any. */
+export function TestOutcome({ test }: { test: TestState }) {
+  if (!test) {
+    return null;
+  }
+  if ("error" in test) {
+    return (
+      <p className="problems" role="alert">
+        {test.error}
+      </p>
+    );
+  }
+  const { result } = test;
+  return (
+    <div role="status">
+      <span className={`chip ${result.ok ? "ok" : "bad"}`}>
+        {result.ok ? "ok" : "failed"}: {result.summary}
+        {result.ms > 0 && ` (${result.ms} ms)`}
+      </span>
+      {result.text && <pre className="mono">{result.text}</pre>}
+    </div>
   );
 }
 

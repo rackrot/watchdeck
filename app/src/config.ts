@@ -151,6 +151,18 @@ export type IntegrationConfig =
       source: Action;
     };
 
+/** Rust's limits on `[[integration]]`: `MAX_INTEGRATIONS`, `MAX_INTEGRATION_ID` and `MAX_INTEGRATION_LABEL`. */
+export const MAX_INTEGRATIONS = 16;
+export const MAX_INTEGRATION_ID = 31;
+export const MAX_INTEGRATION_LABEL = 23;
+
+/** The push API's ports (`daemon/push.rs`): loopback over http, and the LAN's over https. */
+export const PUSH_PORT = 47822;
+export const PUSH_LAN_PORT = 47823;
+
+/** The secret that holds push integration `id`'s token (`token_secret_name` in push.rs). */
+export const tokenSecretFor = (id: string): string => `push-${id}`;
+
 export type Config = {
   version: number;
   /** `font` is the grid's default font id. Absent: Montserrat. */

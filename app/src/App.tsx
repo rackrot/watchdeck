@@ -83,7 +83,11 @@ function App({ onConfigLoaded }: { onConfigLoaded: () => void }) {
           aria-labelledby="tab-layout"
           hidden={tab !== "layout"}
         >
-          <ConfigPage secrets={secrets} onConfigLoaded={onConfigLoaded} />
+          <ConfigPage
+            secrets={secrets}
+            onSecretsChanged={refreshSecrets}
+            onConfigLoaded={onConfigLoaded}
+          />
         </div>
         <div
           role="tabpanel"

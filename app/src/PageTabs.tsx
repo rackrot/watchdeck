@@ -23,11 +23,20 @@ type Props = {
   /** The new config, and the page to show after it. */
   onChange: (config: Config, page: number) => void;
   onSelect: (page: number) => void;
+  /** The Feed tab shows once the config has an integration or the user adds one. */
+  feedShown: boolean;
+  /** The Feed tab is the one open, so no page is. */
+  feedOpen: boolean;
+  /** An integration has a complaint from the last save. */
+  feedBad: boolean;
+  /** Opens the Feed tab, and makes it appear if it wasn't there. */
+  onFeed: () => void;
 };
 
 /**
- * The tabs above the grid editor: pick a page, add one (up to 4), name it, move it left or right,
- * delete it. With one page there are no tabs, only the button that makes the second.
+ * The tabs above the grid editor: the Feed tab first when there is one, then the pages. Pick a
+ * page, add one (up to 4), name it, move it left or right, delete it. With one page and no feed
+ * there are no tabs, only the buttons that add a page and a feed.
  */
 export default function PageTabs({
   config,
@@ -35,22 +44,34 @@ export default function PageTabs({
   errors,
   onChange,
   onSelect,
+  feedShown,
+  feedOpen,
+  feedBad,
+  onFeed,
 }: Props) {
   const [confirming, setConfirming] = useState(false);
   const count = pageCount(config);
   const pages = config.page ?? [];
   const full = count >= MAX_PAGES;
   const add = () => onChange(addPage(config), count);
+  const addFeed = !feedShown && (
+    <button type="button" onClick={onFeed}>
+      Add feed
+    </button>
+  );
 
-  if (count < 2) {
+  if (count < 2 && !feedShown) {
     return (
       <div className="page-tabs">
         <div className="tab-row">
           <button type="button" onClick={add}>
             Add page
           </button>
+          {addFeed}
           <span className="muted hint">
-            Pages give the device more buttons. Swipe on it to change page.
+            Pages give the device more buttons. Swipe on it to change page. A
+            feed shows notifications and values one swipe to the right of page
+            1.
           </span>
         </div>
         <Problems list={[...errors.values()].flat()} />
@@ -58,7 +79,7 @@ export default function PageTabs({
     );
   }
 
-  const current = pages[page];
+  const current = feedOpen || count < 2 ? undefined : pages[page];
   const doomed = buttonsOnPage(config, page);
   const problems = [...errors].flatMap(([id, list]) => {
     const owner = pages.find((p) => p.id === id);
@@ -73,29 +94,60 @@ export default function PageTabs({
   return (
     <div className="page-tabs">
       <div className="tab-row" role="tablist" aria-label="Pages">
-        {pages.map((p, i) => (
+        {feedShown && (
           <button
             type="button"
             role="tab"
-            aria-selected={i === page}
-            className={[
-              "tab",
-              i === page && "selected",
-              errors.has(p.id) && "bad",
-            ]
+            aria-selected={feedOpen}
+            className={["tab", feedOpen && "selected", feedBad && "bad"]
               .filter(Boolean)
               .join(" ")}
-            key={p.id}
-            onClick={() => go(i)}
+            onClick={() => {
+              setConfirming(false);
+              onFeed();
+            }}
           >
-            {pageName(p)}
+            Feed
           </button>
-        ))}
+        )}
+        {count < 2 ? (
+          <button
+            type="button"
+            role="tab"
+            aria-selected={!feedOpen}
+            className={["tab", !feedOpen && "selected"]
+              .filter(Boolean)
+              .join(" ")}
+            onClick={() => go(0)}
+          >
+            Buttons
+          </button>
+        ) : (
+          pages.map((p, i) => (
+            <button
+              type="button"
+              role="tab"
+              aria-selected={!feedOpen && i === page}
+              className={[
+                "tab",
+                !feedOpen && i === page && "selected",
+                errors.has(p.id) && "bad",
+              ]
+                .filter(Boolean)
+                .join(" ")}
+              key={p.id}
+              onClick={() => go(i)}
+            >
+              {pageName(p)}
+            </button>
+          ))
+        )}
       </div>
       <div className="tab-row">
         <button type="button" disabled={full} onClick={add}>
           {full ? `Add page (at most ${MAX_PAGES})` : "Add page"}
         </button>
+        {addFeed}
       </div>
 
       {current && (

@@ -3,6 +3,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   configDir,
   type DeviceInfo,
+  EMPTY_FEED,
+  type Feed,
+  feedSnapshot,
   iconUrl,
   listDevices,
   listSecrets,
@@ -39,6 +42,10 @@ export const useDevices = (): [DeviceInfo[], string] =>
 
 export const useTileReadings = (): TileReading[] =>
   useDaemonState("tile-values", tileValues, [])[0];
+
+/** The -1 page's snapshot, kept current by `feed-changed`. */
+export const useFeed = (): Feed =>
+  useDaemonState("feed-changed", feedSnapshot, EMPTY_FEED)[0];
 
 /** A function from a file name to its URL, or null until the config dir is known. */
 function useFileUrls(

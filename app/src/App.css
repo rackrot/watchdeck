@@ -781,3 +781,151 @@ button.chip.selected {
     animation: none;
   }
 }
+
+/* The Feed tab. */
+
+.copy-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.copy-block .outside {
+  justify-content: space-between;
+}
+
+.copy-block pre {
+  max-height: 22em;
+  padding: 8px;
+  background: var(--bg-2);
+  border-radius: var(--radius);
+  white-space: pre;
+  overflow-wrap: normal;
+}
+
+.token-once {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--stale);
+  border-radius: var(--radius);
+}
+
+.token-once .outside {
+  justify-content: space-between;
+}
+
+code.token {
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+/* The -1 page preview, in the panel's pixels like .screen (firmware/main/feedpage.c). */
+
+.feed-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.feed-screen {
+  overflow: hidden;
+  color: var(--dev-text);
+}
+
+.feed-card {
+  position: absolute;
+  border-radius: 12px;
+  background: var(--dev-tile-unknown);
+  overflow: hidden;
+}
+
+.feed-card.ok {
+  background: var(--dev-card-ok);
+}
+
+.feed-card.bad {
+  background: var(--dev-tile-bad);
+}
+
+.feed-card-label,
+.feed-card-value {
+  position: absolute;
+  text-align: center;
+  white-space: pre;
+  overflow: hidden;
+}
+
+.feed-card-label {
+  font-size: 24px;
+  line-height: 27px;
+  color: var(--dev-card-label);
+}
+
+.feed-card-value {
+  line-height: 35px;
+}
+
+.feed-row {
+  position: absolute;
+  border-left: 8px solid var(--dev-level-info);
+  border-radius: 8px;
+  background: var(--dev-row);
+}
+
+.feed-row.ok {
+  border-left-color: var(--dev-level-ok);
+}
+
+.feed-row.warn {
+  border-left-color: var(--dev-level-warn);
+}
+
+.feed-row.error {
+  border-left-color: var(--dev-level-error);
+}
+
+.feed-title,
+.feed-meta {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  white-space: pre;
+  overflow: hidden;
+}
+
+.feed-title {
+  font-size: 24px;
+}
+
+.feed-meta {
+  justify-content: flex-end;
+  font-size: 20px;
+  color: var(--dev-text-dim);
+  text-overflow: ellipsis;
+}
+
+.feed-more,
+.feed-empty {
+  position: absolute;
+  left: 0;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.feed-more {
+  font-size: 24px;
+  color: var(--dev-text-dim);
+}
+
+.feed-empty {
+  top: 0;
+  height: 100%;
+  font-size: 32px;
+  color: var(--dev-empty);
+}

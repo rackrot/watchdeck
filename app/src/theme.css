@@ -35,6 +35,18 @@
   --dev-tile-unknown: #616161;
   --dev-tile-bad: #d32f2f;
   --dev-shadow: rgb(158 158 158 / 50%);
+  /* The -1 page as firmware/main/feedpage.c draws it (lv_palette: BLUE_GREY darken 3 for an ok
+     card, GREY darken 4 for a row, the main colors for a level, GREY lighten 1 and 3 for text). */
+  --dev-card-ok: #37474f;
+  --dev-row: #212121;
+  --dev-level-info: #2196f3;
+  --dev-level-ok: #4caf50;
+  --dev-level-warn: #ffc107;
+  --dev-level-error: #f44336;
+  --dev-text: #fff;
+  --dev-text-dim: #bdbdbd;
+  --dev-card-label: #e0e0e0;
+  --dev-empty: #757575;
 
   --font-ui: system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --font-mono:
