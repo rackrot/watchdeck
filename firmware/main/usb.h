@@ -33,6 +33,9 @@ void usb_stop_sharing(void);
 /** Whether a computer has the device configured. There is no VBUS sensing, so an unplug may go unnoticed. */
 bool usb_connected(void);
 
+/** Whether USB started, so a share can work. False when usb_start failed (usb_error() says why). */
+bool usb_ready(void);
+
 /** Whether a share is queued or running. Once it ends, sdcard_owner() and usb_error() are final. */
 bool usb_share_busy(void);
 

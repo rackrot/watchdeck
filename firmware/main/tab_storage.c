@@ -25,8 +25,11 @@
 #define BTN_H 56
 #define SHARE_W 360
 #define FREE_W 300
-#define PROBE_TICKS 5  // wifi.txt and the sleep files are read every 5th tick, and when the owner changes
-#define ARMED_TICKS 10 // a first tap on Share or Stop sharing is forgotten after this many seconds
+#define PROBE_TICKS 5    // wifi.txt and the sleep files are read every 5th tick, and when the owner changes
+#define BACKOFF_TICKS 30 // after a probe that failed, the next waits this many ticks
+#define WIFI_READ_MAX 256
+#define ARMED_TICKS 10   // a first tap on Share or Stop sharing is forgotten after this many seconds
+#define ARM_GUARD_MS 600 // a second tap sooner than this after the first is a double tap, not a confirmation
 #define MSG_TEXT_MAX 192
 
 #define SHARE_WARNING                                                                                                  \
@@ -61,6 +64,7 @@ enum { JOB_IDLE, JOB_RUNNING, JOB_DONE };
 typedef struct {
     storagefmt_access_t wifi_access, sleep_access;
     storagefmt_wifi_t wifi;
+    bool failed; // a read failed (not "absent" or "detached")
     char ssid[WIFITXT_SSID_MAX + 1];
     bool cfg;
     size_t images;
@@ -92,7 +96,8 @@ static storagefmt_access_t unavailable(void)
     }
 }
 
-static storagefmt_access_t access_of(esp_err_t err)
+// What a cardfs result says about reading. A real failure is remembered in *failure for the caller to report once.
+static storagefmt_access_t access_of(esp_err_t err, esp_err_t *failure)
 {
     if (err == ESP_OK || err == ESP_ERR_NOT_FOUND) {
         return STORAGEFMT_READ;
@@ -100,7 +105,9 @@ static storagefmt_access_t access_of(esp_err_t err)
     if (err == ESP_ERR_INVALID_STATE) {
         return unavailable();
     }
-    sdcard_note_failure("storage tab read", err); // logs, counts, remounts a tainted card
+    if (*failure == ESP_OK) {
+        *failure = err;
+    }
     return STORAGEFMT_ERROR;
 }
 
@@ -123,21 +130,26 @@ static void list_cb(const char *name, size_t size, bool is_dir, void *ctx)
 static void probe_job(void *arg)
 {
     probe_t p = {0};
-    char buf[WIFITXT_FILE_MAX + 1]; // one byte more than a valid file, to tell a longer one
+    esp_err_t failure = ESP_OK;
+    // The boot parse reads two lines and ignores the rest of the file, so read well past a longest valid file (100
+    // bytes with CRLF) and parse what fits: a file with more lines after the password is still valid.
+    char buf[WIFI_READ_MAX];
     size_t len = 0;
     esp_err_t err = cardfs_read("wifi.txt", buf, sizeof(buf), &len);
-    p.wifi_access = access_of(err == ESP_ERR_INVALID_SIZE ? ESP_OK : err);
-    if (err == ESP_OK) {
+    p.wifi_access = access_of(err == ESP_ERR_INVALID_SIZE ? ESP_OK : err, &failure); // INVALID_SIZE: it's there
+    if (err == ESP_OK || err == ESP_ERR_INVALID_SIZE) {
         p.wifi = storagefmt_wifi_parse(buf, len, p.ssid);
-    } else if (err == ESP_ERR_INVALID_SIZE) {
-        p.wifi = STORAGEFMT_WIFI_INVALID; // too long to be valid, but it is there
     } else {
         p.wifi = STORAGEFMT_WIFI_ABSENT;
     }
     memset(buf, 0, sizeof(buf)); // the password was in it
 
     err = cardfs_list(list_cb, &p);
-    p.sleep_access = access_of(err);
+    p.sleep_access = access_of(err, &failure);
+    if (failure != ESP_OK) {
+        p.failed = true;
+        sdcard_note_failure("storage tab read", failure); // logs, counts, remounts a tainted card; once per probe
+    }
 
     s_probe = p;
     atomic_store(&s_probe_state, JOB_DONE);
@@ -192,10 +204,11 @@ static probe_t s_seen;       // the last probe taken; wifi_access and sleep_acce
 static space_t s_space_seen; // the last free-space count, with s_space_known
 static bool s_space_known;
 static sdcard_owner_t s_owner; // the owner at the last tick, to catch a change
-static unsigned s_probe_ticks;
-static bool s_armed; // Share or Stop sharing was tapped once and asks to be tapped again
+static unsigned s_probe_wait;  // ticks until the next probe; 0 starts one as soon as none is out
+static bool s_armed;           // Share or Stop sharing was tapped once and asks to be tapped again
 static unsigned s_armed_ticks;
-static bool s_sharing; // a share was queued from here and has not ended
+static uint32_t s_armed_at; // lv_tick_get() of that first tap
+static bool s_sharing;      // a share was queued from here and has not ended
 
 static void set_row(row_t r, const char *text)
 {
@@ -252,7 +265,7 @@ static void refresh_buttons(void)
 {
     const sdcard_owner_t owner = sdcard_owner();
     const char *text = "Share over USB";
-    bool enabled = owner == SDCARD_DEVICE;
+    bool enabled = owner == SDCARD_DEVICE && usb_ready();
     if (s_sharing || usb_share_busy()) {
         text = "Sharing...";
         enabled = false;
@@ -304,6 +317,8 @@ static void share_ended(void)
     s_sharing = false;
     if (sdcard_owner() == SDCARD_SHARED) {
         set_msg(MSG_GOOD, "The card is shared. Eject the drive on your computer before you stop sharing.");
+    } else if (usb_error() == ESP_OK) {
+        set_msg(MSG_BAD, "The card changed hands; try again.");
     } else {
         set_msgf(MSG_BAD, "Sharing failed: %s.", esp_err_to_name(usb_error()));
     }
@@ -311,6 +326,7 @@ static void share_ended(void)
 
 static void space_taken(void)
 {
+    disarm(); // the result replaces the message, so a share warning must not stay armed behind it
     if (s_space_seen.err == ESP_OK) {
         s_space_known = true;
         set_msg(MSG_INFO, "");
@@ -332,15 +348,22 @@ void tab_storage_tick(void)
     const sdcard_owner_t owner = sdcard_owner();
     if (owner != s_owner) { // the card changed hands: look again at once, and drop what was known
         s_owner = owner;
-        s_probe_ticks = PROBE_TICKS;
+        s_probe_wait = 0;
         memset(&s_seen, 0, sizeof(s_seen));
         s_space_known = false;
         disarm();
     }
-    if (owner == SDCARD_DEVICE && ++s_probe_ticks >= PROBE_TICKS && start_job(&s_probe_state, probe_job)) {
-        s_probe_ticks = 0;
+    if (owner == SDCARD_DEVICE) {
+        if (s_probe_wait > 0) {
+            s_probe_wait--;
+        }
+        if (s_probe_wait == 0 && start_job(&s_probe_state, probe_job)) {
+            s_probe_wait = PROBE_TICKS;
+        }
     }
-    take_job(&s_probe_state, &s_seen, &s_probe, sizeof(s_seen));
+    if (take_job(&s_probe_state, &s_seen, &s_probe, sizeof(s_seen)) && s_seen.failed) {
+        s_probe_wait = BACKOFF_TICKS; // don't hammer a card that just failed
+    }
     if (take_job(&s_space_state, &s_space_seen, &s_space, sizeof(s_space_seen))) {
         space_taken();
     }
@@ -356,9 +379,13 @@ void tab_storage_tick(void)
 static void main_clicked(lv_event_t *e)
 {
     (void)e;
+    if (s_armed && lv_tick_elaps(s_armed_at) < ARM_GUARD_MS) {
+        return; // a double tap isn't a confirmation: the person hasn't had time to read
+    }
     if (!s_armed) { // the first tap says what will happen, the second does it
         s_armed = true;
         s_armed_ticks = 0;
+        s_armed_at = lv_tick_get();
         switch (sdcard_owner()) {
         case SDCARD_DEVICE:
             set_msg(MSG_INFO, SHARE_WARNING);
@@ -393,6 +420,7 @@ static void main_clicked(lv_event_t *e)
 static void free_clicked(lv_event_t *e)
 {
     (void)e;
+    disarm();
     if (start_job(&s_space_state, space_job)) {
         set_msg(MSG_INFO, FREE_RUNNING);
     } else {
@@ -426,7 +454,7 @@ void tab_storage_build(lv_obj_t *parent)
     s_armed = s_sharing = false;
     s_main_text = NULL;
     s_owner = (sdcard_owner_t)-1; // the first tick sees a change and reads the card
-    s_probe_ticks = PROBE_TICKS;
+    s_probe_wait = 0;
     s_sharing = usb_share_busy(); // a share started before the tab was left and is still under way
 
     int y = SETTINGS_PAD;
@@ -451,6 +479,9 @@ void tab_storage_build(lv_obj_t *parent)
     lv_obj_set_width(s_msg, SETTINGS_CONTENT_W - 2 * SETTINGS_PAD);
     lv_obj_set_pos(s_msg, SETTINGS_PAD, y);
     set_msg(MSG_INFO, atomic_load(&s_space_state) == JOB_RUNNING ? FREE_RUNNING : "");
+    if (!usb_ready()) {
+        set_msgf(MSG_BAD, "USB didn't start (%s), so the card can't be shared.", esp_err_to_name(usb_error()));
+    }
 
     // A probe that finished while the tab was away is older than this build; throw it away and read again.
     int done = JOB_DONE;

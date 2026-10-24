@@ -88,9 +88,10 @@ typedef struct {
     const char *target; // relative to ROOT
     const uint8_t *data;
     size_t len;
-    bool refused;  // the card has no room: CARDFS_ERR_DIR_FULL, nothing written
-    bool straddle; // refused because a name's entries would cross a sector boundary
-    bool exact;    // the operation fills the last free entry of fill's last cluster
+    bool refused;     // the card has no room: CARDFS_ERR_DIR_FULL, nothing written
+    bool straddle;    // refused because a name's entries would cross a sector boundary
+    bool exact;       // the operation fills the last free entry of fill's last cluster
+    bool count_first; // a free-space count (f_getfree) runs first, as the Storage tab's does
     uint8_t sha[32];
 } op_t;
 
@@ -334,6 +335,13 @@ static void compare(const tree_t *before, const tree_t *after, const char *targe
 
 static esp_err_t run_op(const op_t *op)
 {
+    if (op->count_first) {
+        uint64_t total, free_bytes;
+        const esp_err_t err = cardfs_free_space(&total, &free_bytes);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
     switch (op->kind) {
     case OP_IMAGE:
         return cardfs_write_new(op->target, op->data, op->len);
@@ -728,6 +736,14 @@ void test_cuts_wifi_txt_replace(void)
     run_cuts(&op, true);
 }
 
+// The Storage tab's count (which makes FatFs trust its fresh free count and flag FSINFO) before the same replace.
+void test_cuts_wifi_txt_replace_after_a_free_space_count(void)
+{
+    op_t op =
+        SMALL_OP(.name = "wifi.txt replace after a count", .card = CARD_OLD_FILES, .count_first = true, WIFI(NEW_WIFI));
+    run_cuts(&op, true);
+}
+
 // Every entry exists from an earlier write, so a full watchdeck/ needs no room.
 void test_cuts_wifi_txt_replace_with_a_full_watchdeck(void)
 {
@@ -1054,7 +1070,13 @@ void test_free_space_counts_the_clusters_and_writes_nothing(void)
     const uint64_t cluster = (uint64_t)s_fs->csize * RAMDISK_SECTOR;
     TEST_ASSERT_EQUAL_UINT64((uint64_t)(s_fs->n_fatent - 2) * cluster, total);
     TEST_ASSERT_EQUAL_UINT64(total - 11 * cluster, free_bytes); // the file's 10 clusters and the root directory's
+
+    // A write after the count syncs FSINFO, which then holds the exact free count (not the hint prepare cleared).
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_write_small("wifi.txt", HOME_WIFI, sizeof(HOME_WIFI) - 1));
     unmount();
+    fatwalk_t w;
+    TEST_ASSERT_TRUE(fatwalk(&w));
+    TEST_ASSERT_EQUAL_UINT32(w.free, w.fsinfo_free);
 
     ramdisk_create(40000, 0x5eed);
     opt.fmt = FM_FAT | FM_SFD;
@@ -1282,6 +1304,7 @@ void app_main(void)
     RUN_TEST(test_cuts_first_wifi_txt_into_a_root_with_exactly_enough_room);
     RUN_TEST(test_cuts_first_wifi_txt_into_a_nearly_full_root_is_refused);
     RUN_TEST(test_cuts_wifi_txt_replace);
+    RUN_TEST(test_cuts_wifi_txt_replace_after_a_free_space_count);
     RUN_TEST(test_cuts_wifi_txt_replace_with_a_full_watchdeck);
     RUN_TEST(test_cuts_sleep_cfg_replace);
     RUN_TEST(test_cuts_first_sleep_cfg_into_a_watchdeck_with_exactly_enough_room);

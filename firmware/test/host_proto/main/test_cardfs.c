@@ -291,7 +291,6 @@ void test_cardfs_detached_refuses_reads_and_writes_until_attached(void)
     TEST_ASSERT_EQUAL_STRING("New\n", slurp("wifi.txt"));
 }
 
-// A detach also clears a taint: the remount it brackets is what the taint asks for.
 static esp_err_t s_space_result;
 
 static esp_err_t stub_space(uint64_t *total, uint64_t *free_bytes, void *ctx)
@@ -332,6 +331,7 @@ void test_cardfs_free_space_asks_the_volume_and_refuses_when_detached_or_unsuppo
     TEST_ASSERT_EQUAL_UINT64(1000, total);
 }
 
+// A detach also clears a taint: the remount it brackets is what the taint asks for.
 void test_cardfs_detach_and_attach_clear_a_taint(void)
 {
     fresh_root();
