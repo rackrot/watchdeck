@@ -12,7 +12,7 @@ pub use super::units::{NetUnit, TempUnit};
 pub const VERSION: u32 = 1;
 
 /// The capabilities a session keeps from `hello.caps`; any other name is dropped.
-pub const CAPS: [&str; 5] = [CAP_FONTS, CAP_PAGES, CAP_STATUS_BAR, CAP_SLEEP, CAP_FEED];
+pub const CAPS: [&str; 3] = [CAP_FONTS, CAP_PAGES, CAP_STATUS_BAR];
 /// The device draws every font in `fonts_gen::FONT_IDS` and reads the layout's font fields.
 pub const CAP_FONTS: &str = "fonts";
 /// The device assembles a set of up to 4 `layout` pages and lays out the shorter grid for 2 or
@@ -533,13 +533,15 @@ impl Sleep {
 pub struct AssetGet {
     /// The asset's id, 32 lowercase hex digits.
     pub id: String,
-    /// A multiple of [`ASSET_CHUNK_BYTES`], below the asset's size. The daemon checks the size
-    /// when it answers, since only then does it know the asset.
+    /// A multiple of [`ASSET_CHUNK_BYTES`]. Below the image's size, and the id naming the session's
+    /// current image, are checked when the daemon answers, since only then does it know the image.
     pub offset: u64,
 }
 
 impl AssetGet {
-    /// Why this request is unacceptable.
+    /// Why this request is malformed: the id, or an offset that is not a whole chunk. The daemon
+    /// answers a failure with `bad_request` and a close. An offset at or past the image's size
+    /// gets the same, and an id that is not the current image gets no reply.
     pub fn check(&self) -> Result<(), String> {
         if decode_hex::<ASSET_ID_BYTES>(&self.id).is_none() {
             return Err("id is not 32 lowercase hex digits".into());
@@ -566,7 +568,17 @@ pub struct FeedCard {
     pub id: String,
     pub label: String,
     pub value: String,
-    pub state: TileState,
+    pub state: CardState,
+}
+
+/// A card's state on the wire. A device shows `unknown`, like any other value it doesn't know,
+/// as unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CardState {
+    Ok,
+    Bad,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -762,18 +774,19 @@ impl IconFrame {
 }
 
 /// One chunk of an asset as an asset frame: `WDA1`, the 16-byte id, the offset as u32 LE, then the
-/// bytes. Callers pass at most [`ASSET_CHUNK_BYTES`], which the device checks against the asset's size.
-pub fn encode_asset_frame(id: &[u8; ASSET_ID_BYTES], offset: u32, data: &[u8]) -> Vec<u8> {
-    assert!(
-        data.len() <= ASSET_CHUNK_BYTES,
-        "an asset chunk is at most {ASSET_CHUNK_BYTES} bytes"
-    );
+/// bytes. Returns `None` when the chunk is longer than [`ASSET_CHUNK_BYTES`] or the offset does not
+/// fit the u32 on the wire, so a caller's bug can't panic a session task.
+pub fn encode_asset_frame(id: &[u8; ASSET_ID_BYTES], offset: u64, data: &[u8]) -> Option<Vec<u8>> {
+    let offset = u32::try_from(offset).ok()?;
+    if data.len() > ASSET_CHUNK_BYTES {
+        return None;
+    }
     let mut frame = Vec::with_capacity(ASSET_HEADER_BYTES + data.len());
     frame.extend_from_slice(ASSET_MAGIC);
     frame.extend_from_slice(id);
     frame.extend_from_slice(&offset.to_le_bytes());
     frame.extend_from_slice(data);
-    frame
+    Some(frame)
 }
 
 /// `wd-` plus the device's Wi-Fi MAC as 12 lowercase hex digits, exactly as the firmware writes it.
@@ -1403,6 +1416,8 @@ mod tests {
         assert!(edit(&|f| f.notes[0].title = String::new()).starts_with("a note field"));
         assert!(edit(&|f| f.notes[0].body = "b".repeat(160)).starts_with("a note field"));
         assert!(edit(&|f| f.notes[0].id = "i".repeat(64)).starts_with("a note field"));
+        assert!(edit(&|f| f.cards[0].id = String::new()).starts_with("a card field"));
+        assert!(edit(&|f| f.cards[0].id = "i".repeat(64)).starts_with("a card field"));
         assert!(edit(&|f| f.cards[0].label = "l".repeat(24)).starts_with("a card field"));
         assert!(edit(&|f| f.cards[0].value = "v".repeat(16)).starts_with("a card field"));
         assert!(edit(&|f| f.notes[0].src = "s".repeat(24)).starts_with("a note field"));
@@ -1429,7 +1444,7 @@ mod tests {
             id: "\"".repeat(MAX_FEED_ID_CHARS),
             label: "\"".repeat(MAX_FEED_LABEL_CHARS),
             value: "\"".repeat(MAX_FEED_VALUE_CHARS),
-            state: TileState::Bad,
+            state: CardState::Bad,
         };
         let note = FeedNote {
             id: "\"".repeat(MAX_FEED_ID_CHARS),
@@ -1448,6 +1463,31 @@ mod tests {
         let text = serde_json::to_string(&Message::Feed(feed)).unwrap();
         eprintln!("fullest feed frame: {} bytes", text.len());
         assert!(text.len() < MAX_MESSAGE_BYTES, "{} bytes", text.len());
+    }
+
+    #[test]
+    fn a_card_state_of_unknown_round_trips_and_other_states_do_not_parse() {
+        let card = FeedCard {
+            id: "nas-load".into(),
+            label: "NAS load".into(),
+            value: "0.42".into(),
+            state: CardState::Unknown,
+        };
+        let text = serde_json::to_string(&card).unwrap();
+        assert!(text.contains(r#""state":"unknown""#), "{text}");
+        assert_eq!(serde_json::from_str::<FeedCard>(&text).unwrap(), card);
+        let text = r#"{"id":"a","label":"","value":"","state":"stale"}"#;
+        assert!(serde_json::from_str::<FeedCard>(text).is_err());
+    }
+
+    #[test]
+    fn offline_after_s_must_be_a_whole_number_of_seconds() {
+        for bad in ["-1", "1.5"] {
+            let text = format!(
+                r#"{{"t":"sleep","bg":0,"fg":0,"show":[],"anchor":"center","spinner":"none","spinner_color":0,"offline_after_s":{bad},"backlight":0}}"#
+            );
+            assert!(serde_json::from_str::<Message>(&text).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -1494,7 +1534,7 @@ mod tests {
     fn an_asset_frame_is_the_header_then_the_chunk() {
         let id: [u8; ASSET_ID_BYTES] = std::array::from_fn(|i| 0xa0 + i as u8);
         let chunk = vec![7u8; ASSET_CHUNK_BYTES];
-        let frame = encode_asset_frame(&id, 262_144, &chunk);
+        let frame = encode_asset_frame(&id, 262_144, &chunk).unwrap();
         assert_eq!(frame.len(), MAX_ASSET_FRAME_BYTES);
         assert_eq!(MAX_ASSET_FRAME_BYTES, MAX_ICON_FRAME_BYTES);
         assert_eq!(&frame[..4], b"WDA1");
@@ -1503,14 +1543,19 @@ mod tests {
         assert_eq!(&frame[24..], chunk.as_slice());
 
         // A short last chunk is just shorter.
-        let last = encode_asset_frame(&id, 0, &[1, 2, 3]);
+        let last = encode_asset_frame(&id, 0, &[1, 2, 3]).unwrap();
         assert_eq!(last.len(), ASSET_HEADER_BYTES + 3);
         assert_eq!(&last[20..24], [0, 0, 0, 0]);
     }
 
     #[test]
-    #[should_panic(expected = "an asset chunk is at most")]
-    fn an_asset_frame_refuses_a_chunk_over_the_cap() {
-        encode_asset_frame(&[0; ASSET_ID_BYTES], 0, &vec![0; ASSET_CHUNK_BYTES + 1]);
+    fn an_asset_frame_refuses_misuse_without_panicking() {
+        let id = [0u8; ASSET_ID_BYTES];
+        assert_eq!(
+            encode_asset_frame(&id, 0, &vec![0; ASSET_CHUNK_BYTES + 1]),
+            None
+        );
+        assert_eq!(encode_asset_frame(&id, u64::from(u32::MAX) + 1, &[1]), None);
+        assert!(encode_asset_frame(&id, u64::from(u32::MAX), &[1]).is_some());
     }
 }

@@ -819,6 +819,24 @@ esp_err_t proto_parse_asset(const uint8_t *frame, size_t len, const uint8_t id[P
     return ESP_OK;
 }
 
+// True if the text has a \u0000 escape, which is only ever inside a string. cJSON would store it as a NUL that
+// ends the string early, so a sleep or feed frame with one is refused up front. An escaped backslash (\\) is
+// skipped, so \\u0000 is text and not an escape. Older frames keep their cut-at-the-NUL behavior.
+static bool has_nul_escape(const char *json, size_t len)
+{
+    for (size_t i = 0; i + 1 < len; i++) {
+        if (json[i] != '\\') {
+            continue;
+        }
+        if (json[i + 1] == '\\') {
+            i++;
+        } else if (json[i + 1] == 'u' && i + 6 <= len && memcmp(json + i + 2, "0000", 4) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 esp_err_t proto_parse(const char *json, size_t len, proto_msg_t *out)
 {
     memset(out, 0, sizeof(*out));
@@ -871,10 +889,10 @@ esp_err_t proto_parse(const char *json, size_t len, proto_msg_t *out)
         err = parse_stats(root, &out->stats);
     } else if (strcmp(t, "sleep") == 0) {
         out->type = PROTO_MSG_SLEEP;
-        err = parse_sleep(root, &out->sleep);
+        err = has_nul_escape(json, len) ? ESP_ERR_INVALID_ARG : parse_sleep(root, &out->sleep);
     } else if (strcmp(t, "feed") == 0) {
         out->type = PROTO_MSG_FEED;
-        err = parse_feed(root, &out->feed);
+        err = has_nul_escape(json, len) ? ESP_ERR_INVALID_ARG : parse_feed(root, &out->feed);
     } else {
         out->type = PROTO_MSG_UNKNOWN;
         strlcpy(out->unknown_t, t, sizeof(out->unknown_t));

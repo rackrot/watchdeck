@@ -1250,6 +1250,34 @@ void test_feed_unknown_level_is_refused_and_unknown_state_is_unknown(void)
     TEST_ASSERT_EQUAL(PROTO_TILE_BAD, msg.feed.cards[0].state);
 }
 
+void test_feed_state_unknown_is_unknown(void)
+{
+    TEST_ASSERT_EQUAL(ESP_OK, parse_edited(FEED_FIXTURE, "\"state\":\"ok\"", "\"state\":\"unknown\""));
+    TEST_ASSERT_EQUAL(PROTO_TILE_UNKNOWN, msg.feed.cards[0].state);
+}
+
+void test_nul_escape_is_refused_in_any_string_but_an_escaped_backslash_is_text(void)
+{
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      parse_edited(SLEEP_FIXTURE, "\"text\":\"Back soon\"", "\"text\":\"Back\\u0000soon\""));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, parse_edited(FEED_FIXTURE, "\"body\":\"Nightly backup finished in 4 min\"",
+                                                        "\"body\":\"Nightly\\u0000\""));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      parse_edited(FEED_FIXTURE, "\"id\":\"nas-load\"", "\"id\":\"nas\\u0000load\""));
+    // \\u0000 is a backslash and the text u0000, which is printable, so it is accepted.
+    TEST_ASSERT_EQUAL(ESP_OK, parse_edited(SLEEP_FIXTURE, "\"text\":\"Back soon\"", "\"text\":\"a\\\\u0000b\""));
+    TEST_ASSERT_EQUAL_STRING("a\\u0000b", msg.sleep.text);
+}
+
+void test_raw_and_escaped_non_ascii_is_refused(void)
+{
+    // A raw UTF-8 e-acute (C3 A9) and its é escape both decode to bytes above 0x7e.
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      parse_edited(SLEEP_FIXTURE, "\"text\":\"Back soon\"", "\"text\":\"ol\xc3\xa9\""));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG,
+                      parse_edited(SLEEP_FIXTURE, "\"text\":\"Back soon\"", "\"text\":\"ol\\u00e9\""));
+}
+
 // Every string at its limit: 8 cards and 12 notes, 63-character ids, 159-character bodies.
 static esp_err_t parse_fullest_feed(void)
 {
@@ -1493,6 +1521,9 @@ void app_main(void)
     RUN_TEST(test_feed_title_of_47_is_accepted_and_48_refused);
     RUN_TEST(test_feed_string_limits_are_exact);
     RUN_TEST(test_feed_unknown_level_is_refused_and_unknown_state_is_unknown);
+    RUN_TEST(test_feed_state_unknown_is_unknown);
+    RUN_TEST(test_nul_escape_is_refused_in_any_string_but_an_escaped_backslash_is_text);
+    RUN_TEST(test_raw_and_escaped_non_ascii_is_refused);
     RUN_TEST(test_feed_fullest_snapshot_parses_and_at_past_2_to_53_is_refused);
     RUN_TEST(test_asset_wrong_magic_or_unasked_id_or_offset_is_refused);
     RUN_TEST(test_asset_length_must_be_the_chunk_or_what_is_left);

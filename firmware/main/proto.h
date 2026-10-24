@@ -36,7 +36,9 @@
 #define PROTO_ASSET_CHUNK 262144  // bytes in one asset chunk; every asset_get offset is a multiple of it
 #define PROTO_ASSET_HEADER_LEN 24 // "WDA1", the id, then the offset as u32 LE
 #define PROTO_ASSET_FRAME_MAX (PROTO_ASSET_HEADER_LEN + PROTO_ASSET_CHUNK) // one binary frame
-#define PROTO_SLEEP_TEXT_MAX 48                                            // 47 characters plus NUL
+// The receive buffer is sized for an icon frame, so an asset frame must fit it too.
+_Static_assert(PROTO_ASSET_FRAME_MAX == PROTO_MAX_ICON_FRAME, "asset frames must fit the icon receive buffer");
+#define PROTO_SLEEP_TEXT_MAX 48 // 47 characters plus NUL
 #define PROTO_FEED_SOURCES_MAX 16
 #define PROTO_FEED_CARDS_MAX 8
 #define PROTO_FEED_NOTES_MAX 12

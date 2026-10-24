@@ -496,10 +496,10 @@ A minimal frame has `show` empty, `anchor` `center`, `spinner` `none` and no `im
 | Field | Type | Meaning |
 |---|---|---|
 | `id` | string | The asset's id, 32 lowercase hex digits |
-| `offset` | int | A multiple of 262,144, below the asset's size. The first chunk is at 0 |
+| `offset` | int | A multiple of 262,144. The first chunk is at 0. Below the asset's size is checked when the daemon answers |
 
 - The device keeps one request outstanding, so it sends the next one after the frame for the last.
-- The daemon answers with one [asset frame](#asset-frames) for the chunk, or with nothing if `id` isn't the session's current sleep image or `offset` is not below its size.
+- The daemon checks the request in this order. A malformed `id`, or an `offset` that is not a multiple of 262,144, gets `error` `bad_request` and a close. An `offset` at or past the image's size gets the same. An `id` that is not the session's current sleep image gets no reply and the session stays open. Otherwise the daemon answers with one [asset frame](#asset-frames) for the chunk.
 
 ### Asset frames
 
@@ -532,7 +532,7 @@ A `feed` is a snapshot that replaces the device's last one.
 | `cards[].id` | string | 1 to 63 characters |
 | `cards[].label` | string | At most 23 characters |
 | `cards[].value` | string | At most 15 characters |
-| `cards[].state` | string | `ok` or `bad`. A device shows any other value as unknown |
+| `cards[].state` | string | `ok`, `bad` or `unknown`. A device shows `unknown`, like any other value, as unknown |
 | `notes` | [object] | Required. At most 12 notes, newest first, each with the fields below |
 | `notes[].id` | string | 1 to 63 characters. Names the note in `feed_dismiss` |
 | `notes[].title` | string | 1 to 47 characters |
@@ -541,7 +541,7 @@ A `feed` is a snapshot that replaces the device's last one.
 | `notes[].src` | string | The integration's name, at most 23 characters |
 | `notes[].at` | int | Unix seconds, 0 to 2^53 - 1 |
 
-Every string is printable ASCII. The fullest snapshot, with every string at its limit and every character escaped, stays under 16 KB, the cap of a text frame.
+Every string is printable ASCII. A device refuses a `sleep` or `feed` frame with a `\u0000` escape in any string, since it would end the string early, and either frame with a raw or escaped character above 0x7E in a string. An escaped backslash (`\\`) is only a backslash, so `\\u0000` is text. The fullest snapshot, with every string at its limit and every character escaped, stays under 16 KB, the cap of a text frame.
 
 - **Refused**: a field of the wrong type, a count or length over its limit, a string under its minimum or outside printable ASCII, a `level` that isn't in its list, or an `at` past 2^53 - 1. The device logs the frame and drops it, and keeps its last good snapshot.
 - The daemon sends `feed` after the `sleep` message and at the same point in the session, then on each change, at most twice a second. It never sends one between the pages of a [set](#pages).
