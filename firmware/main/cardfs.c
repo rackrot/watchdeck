@@ -19,6 +19,7 @@
 #define ROOT_MAX 15
 #define PATH_LEN (ROOT_MAX + sizeof("/" DIR_NAME "/") + CARDFS_NAME_MAX)
 #define SHA_LEN 32
+#define RUNS_MAX 3 // most new entries one call adds to one directory
 
 static const char *TAG = "cardfs";
 
@@ -28,10 +29,12 @@ static const struct {
     const char *record;
 } SMALL[] = {
     {"wifi.txt", DIR_NAME "/wifi.new"},
-    {DIR_NAME "/sleep.json", DIR_NAME "/sleep.new"},
+    {DIR_NAME "/sleep.cfg", DIR_NAME "/sleep.new"},
 };
 
 static char s_root[ROOT_MAX + 1];
+static cardfs_room_fn_t s_room;
+static void *s_room_ctx;
 static SemaphoreHandle_t s_lock;
 static StaticSemaphore_t s_lock_buf;
 static bool s_writable;
@@ -155,12 +158,16 @@ static int same_contents(const char *path, const void *data, size_t len)
     return err;
 }
 
-// Empties a record. It stays as a 0-byte file, so its directory entry is reused by the next write: FatFs links a
-// directory's new cluster before zeroing it (ff.c dir_next, then dir_clear), so a cut while it grows a directory
-// can leave stale bytes in it. O_TRUNC through FatFs clears the entry before it frees the chain; truncate() and
-// ftruncate() free the chain first, so they're never used here.
+// Empties a record that exists; an absent one is left absent, since creating it here would skip the room check.
+// IDF's VFS honours O_TRUNC only together with O_CREAT (FA_CREATE_ALWAYS, vfs_fat.c fat_mode_conv), hence the stat
+// first. FA_CREATE_ALWAYS clears the entry before it frees the chain; truncate() and ftruncate() free the chain
+// first, so they're never used here.
 static int clear_record(const char *path)
 {
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        return errno == ENOENT ? 0 : errno;
+    }
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
         return errno;
@@ -168,9 +175,8 @@ static int clear_record(const char *path)
     return close(fd) == 0 ? 0 : errno;
 }
 
-// Returns 0 when path can be found by name with len bytes. FatFs can place a new entry past the end marker of a
-// directory with stale bytes in it, where no lookup finds it; this turns that into an error before anything relies
-// on the file.
+// Returns 0 when path can be found by name with len bytes. The room check keeps FatFs from placing an entry where
+// no lookup finds it; this is the second line, turning such a file into an error before anything relies on it.
 static int findable(const char *path, size_t len)
 {
     struct stat st;
@@ -178,6 +184,92 @@ static int findable(const char *path, size_t len)
         return errno;
     }
     return (size_t)st.st_size == len ? 0 : EILSEQ;
+}
+
+// 1 when rel exists, 0 when it doesn't, or a negative errno.
+static int exists(const char *rel)
+{
+    char path[PATH_LEN];
+    path_of(path, rel);
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        return 1;
+    }
+    return errno == ENOENT ? 0 : -errno;
+}
+
+// Directory entries FatFs gives a name: one for a name it can store as 8.3 without a long name (one dot at most,
+// a body of 1 to 8 and an extension of up to 3 characters, all one case; ours are lowercase), else one per 13
+// characters of long name plus the 8.3 entry (ff.c create_name, dir_register).
+static unsigned entries_for(const char *name)
+{
+    const size_t n = strlen(name);
+    const char *dot = strchr(name, '.');
+    const size_t body = dot ? (size_t)(dot - name) : n;
+    const size_t ext = dot ? n - body - 1 : 0;
+    if (body >= 1 && body <= 8 && ext <= 3 && (!dot || (ext >= 1 && !strchr(dot + 1, '.')))) {
+        return 1;
+    }
+    return (unsigned)(n + 12) / 13 + 1;
+}
+
+// The new entries one call adds, in the order it adds them, per directory.
+typedef struct {
+    uint8_t root[RUNS_MAX];
+    size_t n_root;
+    uint8_t dir[RUNS_MAX];
+    size_t n_dir;
+    bool dir_new; // watchdeck/ is created, in a cluster f_mkdir zeroes first, so it has room
+} plan_t;
+
+// Adds rel to the plan when it doesn't exist yet. Returns 0 or a negative errno.
+static int plan_file(plan_t *p, const char *rel)
+{
+    const int e = exists(rel);
+    if (e <= 0) {
+        const char *slash = strchr(rel, '/');
+        if (e == 0 && !slash && p->n_root < RUNS_MAX) {
+            p->root[p->n_root++] = (uint8_t)entries_for(rel);
+        } else if (e == 0 && slash && !p->dir_new && p->n_dir < RUNS_MAX) {
+            p->dir[p->n_dir++] = (uint8_t)entries_for(slash + 1);
+        }
+    }
+    return e < 0 ? e : 0;
+}
+
+// Adds watchdeck/ to the plan when it doesn't exist yet; called before plan_file for anything in it.
+static int plan_dir(plan_t *p)
+{
+    const int e = exists(DIR_NAME);
+    if (e == 0) {
+        p->root[p->n_root++] = (uint8_t)entries_for(DIR_NAME);
+        p->dir_new = true;
+    }
+    return e < 0 ? e : 0;
+}
+
+// ESP_OK when every planned entry fits without FatFs growing its directory, CARDFS_ERR_DIR_FULL when one doesn't,
+// ESP_FAIL on a read error.
+static esp_err_t check_room(const plan_t *p, int plan_err, const char *what)
+{
+    if (plan_err != 0) {
+        ESP_LOGE(TAG, "%s: stat: %s", what, strerror(-plan_err));
+        return ESP_FAIL;
+    }
+    esp_err_t err = ESP_OK;
+    if (p->n_root > 0) {
+        err = s_room("", p->root, p->n_root, s_room_ctx);
+    }
+    if (err == ESP_OK && p->n_dir > 0) {
+        err = s_room(DIR_NAME, p->dir, p->n_dir, s_room_ctx);
+    }
+    if (err == CARDFS_ERR_DIR_FULL) {
+        ESP_LOGE(TAG, "%s: refused, a directory on the card is full; delete a few files from it on a PC", what);
+    } else if (err != ESP_OK) {
+        ESP_LOGE(TAG, "%s: room check: %s", what, esp_err_to_name(err));
+        err = ESP_FAIL;
+    }
+    return err;
 }
 
 static int ensure_dir(void)
@@ -205,9 +297,9 @@ static void unlock(void)
     xSemaphoreGive(s_lock);
 }
 
-esp_err_t cardfs_init(const char *root)
+esp_err_t cardfs_init(const char *root, cardfs_room_fn_t room, void *room_ctx)
 {
-    if (strlen(root) > ROOT_MAX) {
+    if (strlen(root) > ROOT_MAX || !room) {
         return ESP_ERR_INVALID_ARG;
     }
     if (!s_lock) {
@@ -215,6 +307,8 @@ esp_err_t cardfs_init(const char *root)
     }
     lock();
     strcpy(s_root, root);
+    s_room = room;
+    s_room_ctx = room_ctx;
     s_writable = false;
     unlock();
     return ESP_OK;
@@ -260,11 +354,119 @@ bool cardfs_name_ok(const char *rel)
     return true;
 }
 
+// Why the record in buf (n bytes) can't be trusted, or NULL when it can.
+static const char *record_problem(const uint8_t *buf, size_t n)
+{
+    if (n < CARDFS_RECORD_HDR) {
+        return "short header";
+    }
+    if (memcmp(buf, "WDI1", 4) != 0) {
+        return "bad magic";
+    }
+    if (get_le32(buf + 44) != esp_rom_crc32_le(0, buf, 44)) {
+        return "bad header CRC";
+    }
+    const uint32_t len = get_le32(buf + 4);
+    if (len > CARDFS_SMALL_MAX || n != CARDFS_RECORD_HDR + len) {
+        return "payload length differs";
+    }
+    uint8_t hash[SHA_LEN];
+    if (!sha256(buf + CARDFS_RECORD_HDR, len, hash)) {
+        return "SHA-256 failed";
+    }
+    if (memcmp(hash, buf + 12, SHA_LEN) != 0) {
+        return "bad SHA-256";
+    }
+    return NULL;
+}
+
+// Resolves rel's record: ESP_OK when none is pending any more, ESP_FAIL or CARDFS_ERR_DIR_FULL when it's left in
+// place for the next try.
+static esp_err_t recover_one(const char *rel, const char *record)
+{
+    char rec_path[PATH_LEN];
+    char rel_path[PATH_LEN];
+    path_of(rec_path, record);
+    path_of(rel_path, rel);
+
+    uint8_t *buf = malloc(CARDFS_RECORD_HDR + CARDFS_SMALL_MAX);
+    if (!buf) {
+        return ESP_ERR_NO_MEM;
+    }
+    esp_err_t ret = ESP_OK;
+    size_t n;
+    int err = get_file(rec_path, buf, CARDFS_RECORD_HDR + CARDFS_SMALL_MAX, &n);
+    if (err == ENOENT || (err == 0 && n == 0)) {
+        goto out; // no record, or an empty one: no write in progress
+    }
+    if (err != 0 && err != EFBIG) {
+        ESP_LOGE(TAG, "read %s: %s; left for the next try", record, strerror(err));
+        ret = ESP_FAIL;
+        goto out;
+    }
+    const char *problem = err == EFBIG ? "too long" : record_problem(buf, n);
+    if (problem) {
+        // Cut while the record was written, so rel was never touched.
+        ESP_LOGW(TAG, "%s: %s, cleared; %s untouched", record, problem, rel);
+    } else {
+        const uint32_t len = get_le32(buf + 4);
+        const uint8_t *payload = buf + CARDFS_RECORD_HDR;
+        if (same_contents(rel_path, payload, len) == 0) {
+            ESP_LOGI(TAG, "%s: write %lu was complete", rel, (unsigned long)get_le32(buf + 8));
+        } else {
+            plan_t plan = {0};
+            ret = check_room(&plan, plan_file(&plan, rel), rel);
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "%s left for the next try", record);
+                goto out;
+            }
+            err = put_file(rel_path, NULL, 0, payload, len);
+            if (err == 0) {
+                err = same_contents(rel_path, payload, len);
+            }
+            if (err != 0) {
+                ESP_LOGE(TAG, "redo %s: %s; %s left for the next try", rel, strerror(err), record);
+                ret = ESP_FAIL;
+                goto out;
+            }
+            ESP_LOGW(TAG, "%s: redid write %lu (%lu bytes)", rel, (unsigned long)get_le32(buf + 8), (unsigned long)len);
+        }
+    }
+    err = clear_record(rec_path);
+    if (err != 0) {
+        ESP_LOGE(TAG, "clear %s: %s", record, strerror(err));
+        ret = ESP_FAIL;
+    }
+out:
+    free(buf);
+    return ret;
+}
+
 static esp_err_t write_small_locked(const char *rel, const char *record, const uint8_t *data, size_t len)
 {
     if (!s_writable) {
         return ESP_ERR_INVALID_STATE;
     }
+    // A record an earlier write left (an I/O error after it was written) must be applied before this write
+    // empties it, or a cut in this write's step 1 would leave rel as that write tore it.
+    esp_err_t ret = recover_one(rel, record);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "%s: an earlier write is still pending, so this one is refused", rel);
+        return ret;
+    }
+    plan_t plan = {0};
+    int plan_err = plan_dir(&plan);
+    if (plan_err == 0) {
+        plan_err = plan_file(&plan, record);
+    }
+    if (plan_err == 0) {
+        plan_err = plan_file(&plan, rel);
+    }
+    ret = check_room(&plan, plan_err, rel);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
     uint8_t hdr[CARDFS_RECORD_HDR];
     memcpy(hdr, "WDI1", 4);
     put_le32(hdr + 4, (uint32_t)len);
@@ -298,7 +500,11 @@ static esp_err_t write_small_locked(const char *rel, const char *record, const u
         err = same_contents(rel_path, data, len);
     }
     if (err != 0) {
-        ESP_LOGE(TAG, "write %s: %s; %s stays for recovery", rel, strerror(err), record);
+        ESP_LOGE(TAG, "write %s: %s; trying %s once more", rel, strerror(err), record);
+        if (recover_one(rel, record) == ESP_OK) {
+            ESP_LOGW(TAG, "wrote %s (%u bytes) at the second try", rel, (unsigned)len);
+            return ESP_OK;
+        }
         return ESP_FAIL;
     }
     err = clear_record(rec_path);
@@ -330,6 +536,19 @@ static esp_err_t write_new_locked(const char *rel, const uint8_t *data, size_t l
 {
     if (!s_writable) {
         return ESP_ERR_INVALID_STATE;
+    }
+    plan_t plan = {0};
+    int plan_err = plan_dir(&plan);
+    if (plan_err == 0) {
+        const int e = exists(rel);
+        if (e == 1) {
+            return ESP_ERR_NOT_ALLOWED;
+        }
+        plan_err = e < 0 ? e : plan_file(&plan, rel);
+    }
+    esp_err_t ret = check_room(&plan, plan_err, rel);
+    if (ret != ESP_OK) {
+        return ret;
     }
     char path[PATH_LEN];
     path_of(path, rel);
@@ -511,106 +730,95 @@ esp_err_t cardfs_remove(const char *rel)
     return ret;
 }
 
+typedef struct {
+    char *name;
+    size_t size;
+    bool is_dir;
+} list_entry_t;
+
+typedef struct {
+    list_entry_t *e;
+    size_t n, cap;
+} list_t;
+
+static void list_free(list_t *l)
+{
+    for (size_t i = 0; i < l->n; i++) {
+        free(l->e[i].name);
+    }
+    free(l->e);
+}
+
+static esp_err_t list_add(list_t *l, const char *name, const struct stat *st)
+{
+    if (l->n == l->cap) {
+        const size_t cap = l->cap ? 2 * l->cap : 16;
+        list_entry_t *e = realloc(l->e, cap * sizeof(*e));
+        if (!e) {
+            return ESP_ERR_NO_MEM;
+        }
+        l->e = e;
+        l->cap = cap;
+    }
+    char *copy = strdup(name);
+    if (!copy) {
+        return ESP_ERR_NO_MEM;
+    }
+    l->e[l->n++] = (list_entry_t){.name = copy, .size = (size_t)st->st_size, .is_dir = S_ISDIR(st->st_mode)};
+    return ESP_OK;
+}
+
+static esp_err_t list_locked(list_t *l)
+{
+    char path[PATH_LEN + 256];
+    snprintf(path, sizeof(path), "%s/%s", s_root, DIR_NAME);
+    DIR *dir = opendir(path);
+    if (!dir) {
+        return errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+    }
+    esp_err_t ret = ESP_OK;
+    for (;;) {
+        errno = 0;
+        const struct dirent *ent = readdir(dir);
+        if (!ent) {
+            if (errno != 0) {
+                ESP_LOGE(TAG, "list %s: %s", DIR_NAME, strerror(errno));
+                ret = ESP_FAIL;
+            }
+            break;
+        }
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+            continue;
+        }
+        snprintf(path, sizeof(path), "%s/%s/%s", s_root, DIR_NAME, ent->d_name);
+        struct stat st;
+        if (stat(path, &st) != 0) {
+            ESP_LOGE(TAG, "stat %s/%s: %s", DIR_NAME, ent->d_name, strerror(errno));
+            ret = ESP_FAIL;
+            break;
+        }
+        ret = list_add(l, ent->d_name, &st);
+        if (ret != ESP_OK) {
+            break;
+        }
+    }
+    closedir(dir);
+    return ret;
+}
+
 esp_err_t cardfs_list(cardfs_list_cb_t cb, void *ctx)
 {
     if (!lock()) {
         return ESP_ERR_INVALID_STATE;
     }
-    char path[PATH_LEN + 256];
-    snprintf(path, sizeof(path), "%s/%s", s_root, DIR_NAME);
-    DIR *dir = opendir(path);
-    esp_err_t ret = ESP_OK;
-    if (!dir) {
-        ret = errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
-    } else {
-        struct dirent *ent;
-        while ((ent = readdir(dir)) != NULL) {
-            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
-                continue;
-            }
-            snprintf(path, sizeof(path), "%s/%s/%s", s_root, DIR_NAME, ent->d_name);
-            struct stat st;
-            if (stat(path, &st) != 0) {
-                ESP_LOGW(TAG, "stat %s/%s: %s", DIR_NAME, ent->d_name, strerror(errno));
-                continue;
-            }
-            cb(ent->d_name, (size_t)st.st_size, S_ISDIR(st.st_mode), ctx);
-        }
-        closedir(dir);
-    }
+    list_t l = {0};
+    const esp_err_t ret = list_locked(&l);
     unlock();
+    for (size_t i = 0; ret == ESP_OK && i < l.n; i++) {
+        cb(l.e[i].name, l.e[i].size, l.e[i].is_dir, ctx);
+    }
+    list_free(&l);
     return ret;
-}
-
-// Why the record in buf (n bytes) can't be trusted, or NULL when it can.
-static const char *record_problem(const uint8_t *buf, size_t n)
-{
-    if (n < CARDFS_RECORD_HDR) {
-        return "short header";
-    }
-    if (memcmp(buf, "WDI1", 4) != 0) {
-        return "bad magic";
-    }
-    if (get_le32(buf + 44) != esp_rom_crc32_le(0, buf, 44)) {
-        return "bad header CRC";
-    }
-    const uint32_t len = get_le32(buf + 4);
-    if (len > CARDFS_SMALL_MAX || n != CARDFS_RECORD_HDR + len) {
-        return "payload length differs";
-    }
-    uint8_t hash[SHA_LEN];
-    if (!sha256(buf + CARDFS_RECORD_HDR, len, hash)) {
-        return "SHA-256 failed";
-    }
-    if (memcmp(hash, buf + 12, SHA_LEN) != 0) {
-        return "bad SHA-256";
-    }
-    return NULL;
-}
-
-static esp_err_t recover_one(const char *rel, const char *record, uint8_t *buf)
-{
-    char rec_path[PATH_LEN];
-    char rel_path[PATH_LEN];
-    path_of(rec_path, record);
-    path_of(rel_path, rel);
-
-    size_t n;
-    int err = get_file(rec_path, buf, CARDFS_RECORD_HDR + CARDFS_SMALL_MAX, &n);
-    if (err == ENOENT || (err == 0 && n == 0)) {
-        return ESP_OK; // no record, or an empty one: no write in progress
-    }
-    if (err != 0 && err != EFBIG) {
-        ESP_LOGE(TAG, "read %s: %s; left for the next mount", record, strerror(err));
-        return ESP_FAIL;
-    }
-    const char *problem = err == EFBIG ? "too long" : record_problem(buf, n);
-    if (problem) {
-        // Cut while the record was written, so rel was never touched.
-        ESP_LOGW(TAG, "%s: %s, cleared; %s untouched", record, problem, rel);
-    } else {
-        const uint32_t len = get_le32(buf + 4);
-        const uint8_t *payload = buf + CARDFS_RECORD_HDR;
-        if (same_contents(rel_path, payload, len) == 0) {
-            ESP_LOGI(TAG, "%s: write %lu was complete", rel, (unsigned long)get_le32(buf + 8));
-        } else {
-            err = put_file(rel_path, NULL, 0, payload, len);
-            if (err == 0) {
-                err = same_contents(rel_path, payload, len);
-            }
-            if (err != 0) {
-                ESP_LOGE(TAG, "redo %s: %s; %s left for the next mount", rel, strerror(err), record);
-                return ESP_FAIL;
-            }
-            ESP_LOGW(TAG, "%s: redid write %lu (%lu bytes)", rel, (unsigned long)get_le32(buf + 8), (unsigned long)len);
-        }
-    }
-    err = clear_record(rec_path);
-    if (err != 0) {
-        ESP_LOGE(TAG, "clear %s: %s", record, strerror(err));
-        return ESP_FAIL;
-    }
-    return ESP_OK;
 }
 
 esp_err_t cardfs_recover(void)
@@ -619,19 +827,15 @@ esp_err_t cardfs_recover(void)
         return ESP_ERR_INVALID_STATE;
     }
     esp_err_t ret = ESP_OK;
-    uint8_t *buf = NULL;
     if (!s_writable) {
         ret = ESP_ERR_INVALID_STATE;
-    } else if (!(buf = malloc(CARDFS_RECORD_HDR + CARDFS_SMALL_MAX))) {
-        ret = ESP_ERR_NO_MEM;
     } else {
         for (size_t i = 0; i < sizeof(SMALL) / sizeof(SMALL[0]); i++) {
-            if (recover_one(SMALL[i].rel, SMALL[i].record, buf) != ESP_OK) {
+            if (recover_one(SMALL[i].rel, SMALL[i].record) != ESP_OK) {
                 ret = ESP_FAIL;
             }
         }
     }
-    free(buf);
     unlock();
     return ret;
 }

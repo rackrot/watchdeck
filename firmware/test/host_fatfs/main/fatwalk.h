@@ -17,6 +17,11 @@ typedef struct {
     // only after linking it, so a cut between the two leaves stale bytes there; FatFs's lookups stop at the marker,
     // but it can still place a new entry past them, where no lookup finds it.
     uint32_t hidden_dir_clusters;
+    uint32_t dir_clusters; // clusters in every directory's chain, the root's included
+    // Long-name entries that no valid 8.3 entry claims: a sequence broken off (a cut between the sector with its
+    // long-name parts and the one with its 8.3 entry), out of order, or with the wrong checksum. FatFs and fsck.fat
+    // skip them; each still takes a slot.
+    uint32_t orphan_lfn;
     char problem[200]; // the first structural problem, "" when there is none
 } fatwalk_t;
 

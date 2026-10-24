@@ -2,18 +2,31 @@
 
 // The only writer to the TF card. Every path is relative to the root given to cardfs_init and passes one
 // allowlist: `wifi.txt`, or `watchdeck/<name>` with <name> 1 to 63 of [a-z0-9._-], no leading '.', no "..", and
-// not ending in ".new" (the suffix of the intent records). Nothing here ever renames: an interrupted FatFs
-// f_rename leaves two names on one cluster chain.
+// not ending in ".new" (the suffix of the intent records). A lowercase 8.3 name (one dot at most, a body of 1 to 8
+// and an extension of up to 3) takes one directory entry; any other takes one more per 13 characters, so callers
+// pick 8.3 names where they can. Nothing here ever renames or truncates: an
+// interrupted FatFs f_rename leaves two names on one cluster chain, and f_truncate frees a chain before it updates
+// the entry.
 //
-// Small files (wifi.txt, watchdeck/sleep.json) are written as an intent record `watchdeck/<key>.new` (a 48-byte
+// Small files (wifi.txt, watchdeck/sleep.cfg) are written as an intent record `watchdeck/<key>.new` (a 48-byte
 // header with the length, a write counter, the payload's SHA-256 and a CRC32 of the header, then the payload),
 // then in place, then the record is emptied. cardfs_recover, run after every mount, redoes a valid record and
 // empties a torn one, so a cut leaves each small file old or new. A record is emptied, never deleted, so after the
-// first write its directory entry exists and FatFs never grows a directory for it (a cut while FatFs grows one can
-// leave stale bytes in it). Big files (images) are written once under a content-addressed name and trusted only
-// after cardfs_verify. A file just created must be found by name, or the write fails.
+// first write its directory entry exists. Big files (images) are written once under their own name and trusted only
+// after cardfs_verify.
 //
-// Every call takes one mutex, so a write in progress finishes before cardfs_set_writable(false) returns.
+// No call ever makes FatFs grow a directory. FatFs links a directory's new cluster before it zeroes it (ff.c
+// dir_next, then dir_clear), so a cut between the two leaves stale bytes in the directory: FatFs can then place a
+// later entry past them, where no lookup finds it, and a PC sees them as junk entries. So before a call adds an
+// entry it asks the room function whether the directory's allocated clusters can take it, and refuses with
+// CARDFS_ERR_DIR_FULL when they can't. A file just created must also be found by name, or the write fails.
+//
+// A recovery redoes a valid record whatever wifi.txt holds by then: a person who edits wifi.txt on a PC after a cut,
+// before the board mounts the card again, has that edit replaced by the write the cut interrupted.
+//
+// Boot order, after the card is mounted read-write and before anything else touches it: cardfs_init, then
+// cardfs_set_writable(true), then cardfs_recover. Before USB takes the card: cardfs_set_writable(false), which waits
+// for a call in progress. Every call takes one mutex.
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -26,9 +39,24 @@
 #define CARDFS_PIECE 32768    // writes and reads go in pieces this big, so ESP-Hosted's SDIO traffic interleaves
 #define CARDFS_RECORD_HDR 48  // "WDI1", u32 length, u32 generation, SHA-256, u32 CRC32 of the first 44 bytes
 
-// Sets the root (e.g. "/sdcard", at most 15 characters) and creates the mutex. Writes are refused until
-// cardfs_set_writable(true).
-esp_err_t cardfs_init(const char *root);
+// The card's root directory or watchdeck/ has no run of free entries long enough for a new name in the clusters it
+// has, so FatFs would have to grow it, or it holds entries past its end marker (only a cut while FatFs grew it
+// leaves those). Nothing was written. Deleting a few files from that directory on a PC makes room.
+#define CARDFS_ERR_DIR_FULL 0x7D01
+
+// Checks whether dir ("" for the root, or "watchdeck") can take n new entry runs, runs[i] entries each, allocated
+// in that order the way FatFs's dir_alloc does, without FatFs growing it. ESP_OK: it can. CARDFS_ERR_DIR_FULL: it
+// can't, or it has entries past its end marker. ESP_FAIL: a read error.
+typedef esp_err_t (*cardfs_room_fn_t)(const char *dir, const uint8_t *runs, size_t n, void *ctx);
+
+// The room function for FatFs (cardfs_fat.c): it reads the directory's entries and FAT chain straight from the disk
+// and replays dir_alloc over them, so it's exact while FatFs has nothing unsynced (true between cardfs calls). ctx
+// is the FatFs drive, e.g. "0:", as sdcard.c registered it.
+esp_err_t cardfs_fat_room(const char *dir, const uint8_t *runs, size_t n, void *ctx);
+
+// Sets the root (e.g. "/sdcard", at most 15 characters), the room function and its ctx (kept, not copied), and
+// creates the mutex. Writes are refused until cardfs_set_writable(true).
+esp_err_t cardfs_init(const char *root, cardfs_room_fn_t room, void *room_ctx);
 
 // Allows or refuses writes, removes and recovery. Waits for a call in progress to finish.
 void cardfs_set_writable(bool writable);
@@ -37,14 +65,16 @@ bool cardfs_writable(void);
 // The allowlist. Lowercase only: FAT is case-insensitive, so other casings are refused, not folded.
 bool cardfs_name_ok(const char *rel);
 
-// Replaces a small file through its intent record. rel is "wifi.txt" or "watchdeck/sleep.json".
+// Replaces a small file through its intent record. rel is "wifi.txt" or "watchdeck/sleep.cfg". First resolves a
+// record an earlier failed write left, and refuses if that fails, so a pending write is never lost to a new one.
 // ESP_ERR_INVALID_ARG: rel isn't a small file. ESP_ERR_INVALID_SIZE: len > CARDFS_SMALL_MAX.
-// ESP_ERR_INVALID_STATE: not writable. ESP_FAIL: an I/O error; rel is old, or new once recovery has run.
+// ESP_ERR_INVALID_STATE: not writable. CARDFS_ERR_DIR_FULL: see above; nothing written.
+// ESP_FAIL: an I/O error; rel is as an earlier write left it, or new once recovery has run.
 esp_err_t cardfs_write_small(const char *rel, const void *data, size_t len);
 
 // Creates rel and writes it once, fsynced at the end. ESP_ERR_NOT_ALLOWED: rel exists (delete an invalid file
-// first). ESP_FAIL: an I/O error; the partial file is deleted if the card still answers, and cardfs_verify
-// detects it otherwise.
+// first). CARDFS_ERR_DIR_FULL: see above; nothing written. ESP_FAIL: an I/O error; the partial file is deleted if
+// the card still answers, and cardfs_verify detects it otherwise.
 esp_err_t cardfs_write_new(const char *rel, const void *data, size_t len);
 
 // Reads rel whole into buf. ESP_ERR_NOT_FOUND: absent. ESP_ERR_INVALID_SIZE: larger than cap.
@@ -57,13 +87,16 @@ esp_err_t cardfs_verify(const char *rel, size_t len, const uint8_t *digest, size
 // Deletes rel. ESP_ERR_NOT_FOUND: absent. ESP_ERR_INVALID_STATE: not writable.
 esp_err_t cardfs_remove(const char *rel);
 
-// Calls cb for every entry of watchdeck/, including names the allowlist refuses (a file a person copied there).
-// ESP_ERR_NOT_FOUND: no watchdeck/ directory.
+// Calls cb for every entry of watchdeck/, including names the allowlist refuses (a file a person copied there) and
+// the empty intent records. The entries are read first and cb runs after the mutex is released, so cb may call
+// cardfs. ESP_ERR_NOT_FOUND: no watchdeck/ directory. ESP_ERR_NO_MEM, or ESP_FAIL on a read or stat error: cb is
+// never called.
 typedef void (*cardfs_list_cb_t)(const char *name, size_t size, bool is_dir, void *ctx);
 esp_err_t cardfs_list(cardfs_list_cb_t cb, void *ctx);
 
 // Resolves every intent record: a valid one is applied (rel rewritten if it differs) and emptied, a torn one is
 // emptied, an empty or absent one means no write was in progress. Idempotent, so a cut during recovery is recovered
 // the same way at the next mount.
-// ESP_ERR_INVALID_STATE: not writable. ESP_FAIL: an I/O error left a record in place.
+// ESP_ERR_INVALID_STATE: not writable. ESP_FAIL: an I/O error, or no room to recreate a missing file, left a record
+// in place for the next mount.
 esp_err_t cardfs_recover(void);

@@ -1,5 +1,6 @@
-// Host tests for cardfs.c on the host's own file system: the allowlist, the small-file write and the recovery
-// logic. host_fatfs runs the same code on FatFs and cuts the power at every sector write.
+// Host tests for cardfs.c on the host's own file system: the allowlist, the small-file write, the recovery logic
+// and which new entries a call asks the room function about. host_fatfs runs the same code on FatFs, with the real
+// room function, and cuts the power at every sector write.
 #define _XOPEN_SOURCE 700
 #include <ftw.h>
 #include <stdio.h>
@@ -15,13 +16,26 @@
 
 static char root[] = "/tmp/cfsXXXXXX";
 static bool have_root;
+static char s_room_log[256]; // "<dir>:<run>,<run>;" for every room call
+static esp_err_t s_room_result;
+
+static esp_err_t stub_room(const char *dir, const uint8_t *runs, size_t n, void *ctx)
+{
+    size_t len = strlen(s_room_log);
+    len += snprintf(s_room_log + len, sizeof(s_room_log) - len, "%s:", dir);
+    for (size_t i = 0; i < n; i++) {
+        len += snprintf(s_room_log + len, sizeof(s_room_log) - len, "%s%u", i ? "," : "", (unsigned)runs[i]);
+    }
+    snprintf(s_room_log + len, sizeof(s_room_log) - len, ";");
+    return s_room_result;
+}
 
 static int remove_one(const char *path, const struct stat *st, int flag, struct FTW *ftw)
 {
     return remove(path);
 }
 
-// A fresh, empty, writable root for each test.
+// A fresh, empty, writable root for each test, with room everywhere.
 static void fresh_root(void)
 {
     if (have_root) {
@@ -30,7 +44,9 @@ static void fresh_root(void)
     }
     TEST_ASSERT_NOT_NULL(mkdtemp(root));
     have_root = true;
-    TEST_ASSERT_EQUAL(ESP_OK, cardfs_init(root));
+    s_room_log[0] = '\0';
+    s_room_result = ESP_OK;
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_init(root, stub_room, NULL));
     cardfs_set_writable(true);
 }
 
@@ -72,7 +88,18 @@ static void plant_str(const char *rel, const char *text)
 
 static bool exists(const char *rel)
 {
-    return slurp(rel) != NULL;
+    char path[128];
+    path_of(path, rel);
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+static long size_of(const char *rel)
+{
+    char path[128];
+    path_of(path, rel);
+    struct stat st;
+    return stat(path, &st) == 0 ? (long)st.st_size : -1;
 }
 
 static void make_dir(const char *rel)
@@ -105,9 +132,11 @@ static size_t make_record(uint8_t *out, const char *payload)
 void test_cardfs_allowlist_passes_our_names(void)
 {
     TEST_ASSERT_TRUE(cardfs_name_ok("wifi.txt"));
-    TEST_ASSERT_TRUE(cardfs_name_ok("watchdeck/sleep.json"));
-    TEST_ASSERT_TRUE(cardfs_name_ok("watchdeck/sleep-5b1f0c7e9d3a2b4c6d8e0f1a2b3c4d5e.rgb565"));
+    TEST_ASSERT_TRUE(cardfs_name_ok("watchdeck/sleep.cfg"));
+    TEST_ASSERT_TRUE(cardfs_name_ok("watchdeck/sl5b1f0c7e.img"));
     TEST_ASSERT_TRUE(cardfs_name_ok("watchdeck/a_b-c.9"));
+    TEST_ASSERT_TRUE(cardfs_name_ok("watchdeck/noext"));
+    TEST_ASSERT_TRUE(cardfs_name_ok("watchdeck/selftest.json")); // a long name is allowed, it just takes more entries
     char name[80] = "watchdeck/";
     memset(name + 10, 'a', 63);
     name[73] = '\0';
@@ -118,7 +147,7 @@ void test_cardfs_allowlist_refuses_everything_else(void)
 {
     TEST_ASSERT_FALSE(cardfs_name_ok("WIFI.TXT"));
     TEST_ASSERT_FALSE(cardfs_name_ok("Wifi.txt"));
-    TEST_ASSERT_FALSE(cardfs_name_ok("watchdeck/Sleep.json"));
+    TEST_ASSERT_FALSE(cardfs_name_ok("watchdeck/Sleep.cfg"));
     TEST_ASSERT_FALSE(cardfs_name_ok("watchdeck/../wifi.txt"));
     TEST_ASSERT_FALSE(cardfs_name_ok("/wifi.txt"));
     TEST_ASSERT_FALSE(cardfs_name_ok("watchdeck/.x"));
@@ -147,9 +176,9 @@ void test_cardfs_write_small_creates_a_new_file_and_leaves_no_record(void)
 void test_cardfs_write_small_replaces_a_file(void)
 {
     fresh_root();
-    TEST_ASSERT_EQUAL(ESP_OK, cardfs_write_small("watchdeck/sleep.json", "{\"a\":1111111111}", 16));
-    TEST_ASSERT_EQUAL(ESP_OK, cardfs_write_small("watchdeck/sleep.json", "{}", 2));
-    TEST_ASSERT_EQUAL_STRING("{}", slurp("watchdeck/sleep.json"));
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_write_small("watchdeck/sleep.cfg", "{\"a\":1111111111}", 16));
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_write_small("watchdeck/sleep.cfg", "{}", 2));
+    TEST_ASSERT_EQUAL_STRING("{}", slurp("watchdeck/sleep.cfg"));
     TEST_ASSERT_EQUAL_STRING("", slurp("watchdeck/sleep.new"));
 }
 
@@ -157,7 +186,7 @@ void test_cardfs_write_small_refuses_other_names_and_sizes(void)
 {
     fresh_root();
     static uint8_t big[CARDFS_SMALL_MAX + 1];
-    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, cardfs_write_small("watchdeck/x.json", "{}", 2));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, cardfs_write_small("watchdeck/x.cfg", "{}", 2));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, cardfs_write_small("WIFI.TXT", "x\n", 2));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_SIZE, cardfs_write_small("wifi.txt", big, sizeof(big)));
     TEST_ASSERT_EQUAL(ESP_OK, cardfs_write_small("wifi.txt", big, CARDFS_SMALL_MAX));
@@ -187,12 +216,89 @@ void test_cardfs_write_whose_record_cannot_be_created_keeps_the_old_file(void)
     TEST_ASSERT_EQUAL_STRING("Old\n", slurp("wifi.txt"));
 }
 
+void test_cardfs_init_needs_a_room_function(void)
+{
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, cardfs_init("/tmp", NULL, NULL));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, cardfs_init("/a/root/too/long", stub_room, NULL));
+}
+
+// The runs follow the order of the creates: watchdeck/ (a long name: 2 entries) before wifi.txt, the record
+// before the file. A file that exists, and anything inside a watchdeck/ this call creates, needs no room. The
+// 8.3 names take one entry, sl0a1b2c3d.img (14 characters, a 10-character body) three.
+void test_cardfs_room_is_asked_for_each_new_entry_in_order(void)
+{
+    fresh_root();
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_write_small("wifi.txt", "Home\n", 5));
+    TEST_ASSERT_EQUAL_STRING(":2,1;", s_room_log);
+    s_room_log[0] = '\0';
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_write_small("wifi.txt", "Away\n", 5));
+    TEST_ASSERT_EQUAL_STRING("", s_room_log);
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_write_small("watchdeck/sleep.cfg", "{}", 2));
+    TEST_ASSERT_EQUAL_STRING("watchdeck:1,1;", s_room_log);
+    s_room_log[0] = '\0';
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_write_new("watchdeck/sl0a1b2c3d.img", "abc", 3));
+    TEST_ASSERT_EQUAL_STRING("watchdeck:3;", s_room_log);
+    s_room_log[0] = '\0';
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_write_new("watchdeck/0a1b2c3d.img", "abc", 3));
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_write_new("watchdeck/a.b.c", "abc", 3)); // two dots: a long name
+    TEST_ASSERT_EQUAL_STRING("watchdeck:1;watchdeck:2;", s_room_log);
+
+    fresh_root();
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_write_new("watchdeck/sl0a1b2c3d.img", "abc", 3));
+    TEST_ASSERT_EQUAL_STRING(":2;", s_room_log);
+}
+
+void test_cardfs_full_directory_refuses_before_writing_anything(void)
+{
+    fresh_root();
+    s_room_result = CARDFS_ERR_DIR_FULL;
+    TEST_ASSERT_EQUAL(CARDFS_ERR_DIR_FULL, cardfs_write_small("wifi.txt", "Home\n", 5));
+    TEST_ASSERT_EQUAL(CARDFS_ERR_DIR_FULL, cardfs_write_new("watchdeck/a.bin", "x", 1));
+    TEST_ASSERT_FALSE(exists("watchdeck"));
+    TEST_ASSERT_FALSE(exists("wifi.txt"));
+
+    make_dir("watchdeck");
+    plant_str("wifi.txt", "Old\n");
+    TEST_ASSERT_EQUAL(CARDFS_ERR_DIR_FULL, cardfs_write_small("wifi.txt", "New\n", 4)); // the record is new
+    TEST_ASSERT_EQUAL_STRING("Old\n", slurp("wifi.txt"));
+    TEST_ASSERT_FALSE(exists("watchdeck/wifi.new"));
+    s_room_result = ESP_FAIL;
+    TEST_ASSERT_EQUAL(ESP_FAIL, cardfs_write_new("watchdeck/a.bin", "x", 1));
+    TEST_ASSERT_FALSE(exists("watchdeck/a.bin"));
+}
+
+// A record an earlier write left is applied before a new write to the same key, and while it can't be, the new
+// write is refused and the record kept.
+void test_cardfs_pending_record_is_applied_before_a_new_write_and_never_dropped(void)
+{
+    fresh_root();
+    make_dir("watchdeck");
+    uint8_t rec[128];
+    const size_t rec_len = make_record(rec, "New\n");
+    plant("watchdeck/wifi.new", rec, rec_len); // wifi.txt is absent, so the redo must create it
+    s_room_result = CARDFS_ERR_DIR_FULL;
+    TEST_ASSERT_EQUAL(CARDFS_ERR_DIR_FULL, cardfs_write_small("wifi.txt", "Newer\n", 6));
+    TEST_ASSERT_EQUAL(rec_len, size_of("watchdeck/wifi.new"));
+    TEST_ASSERT_EQUAL(ESP_FAIL, cardfs_recover());
+    TEST_ASSERT_EQUAL(rec_len, size_of("watchdeck/wifi.new"));
+    TEST_ASSERT_FALSE(exists("wifi.txt"));
+
+    s_room_result = ESP_OK;
+    plant_str("wifi.txt", "Ne"); // torn
+    s_room_log[0] = '\0';
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_write_small("wifi.txt", "Newer\n", 6));
+    TEST_ASSERT_EQUAL_STRING("Newer\n", slurp("wifi.txt"));
+    TEST_ASSERT_EQUAL_STRING("", slurp("watchdeck/wifi.new"));
+    TEST_ASSERT_EQUAL_STRING("", s_room_log);
+}
+
 void test_cardfs_recover_with_no_record_touches_nothing(void)
 {
     fresh_root();
     plant_str("wifi.txt", "Old\n");
     TEST_ASSERT_EQUAL(ESP_OK, cardfs_recover());
     TEST_ASSERT_EQUAL_STRING("Old\n", slurp("wifi.txt"));
+    TEST_ASSERT_FALSE(exists("watchdeck"));
 }
 
 void test_cardfs_recover_with_an_empty_record_touches_nothing(void)
@@ -204,6 +310,7 @@ void test_cardfs_recover_with_an_empty_record_touches_nothing(void)
     TEST_ASSERT_EQUAL(ESP_OK, cardfs_recover());
     TEST_ASSERT_EQUAL_STRING("Old\n", slurp("wifi.txt"));
     TEST_ASSERT_EQUAL_STRING("", slurp("watchdeck/wifi.new"));
+    TEST_ASSERT_FALSE(exists("watchdeck/sleep.new")); // an absent record stays absent
 }
 
 // Plants wifi.txt "Old\n" and a record for "New\n" damaged by damage(), then recovers.
@@ -286,6 +393,7 @@ static void recover_good(const char *current)
     TEST_ASSERT_EQUAL(ESP_OK, cardfs_recover());
     TEST_ASSERT_EQUAL_STRING("New\n", slurp("wifi.txt"));
     TEST_ASSERT_EQUAL_STRING("", slurp("watchdeck/wifi.new"));
+    TEST_ASSERT_EQUAL_STRING(current ? "" : ":1;", s_room_log); // only a missing wifi.txt needs a new entry
     TEST_ASSERT_EQUAL(ESP_OK, cardfs_recover());
     TEST_ASSERT_EQUAL_STRING("New\n", slurp("wifi.txt"));
 }
@@ -305,7 +413,7 @@ void test_cardfs_recover_handles_both_records_at_once(void)
     fresh_root();
     plant_str("wifi.txt", "Old\n");
     make_dir("watchdeck");
-    plant_str("watchdeck/sleep.json", "{\"old\":1}");
+    plant_str("watchdeck/sleep.cfg", "{\"old\":1}");
     uint8_t rec[128];
     plant("watchdeck/wifi.new", rec, make_record(rec, "New\n"));
     size_t len = make_record(rec, "{}");
@@ -313,7 +421,7 @@ void test_cardfs_recover_handles_both_records_at_once(void)
     plant("watchdeck/sleep.new", rec, len);
     TEST_ASSERT_EQUAL(ESP_OK, cardfs_recover());
     TEST_ASSERT_EQUAL_STRING("New\n", slurp("wifi.txt"));
-    TEST_ASSERT_EQUAL_STRING("{\"old\":1}", slurp("watchdeck/sleep.json"));
+    TEST_ASSERT_EQUAL_STRING("{\"old\":1}", slurp("watchdeck/sleep.cfg"));
     TEST_ASSERT_EQUAL_STRING("", slurp("watchdeck/wifi.new"));
     TEST_ASSERT_EQUAL_STRING("", slurp("watchdeck/sleep.new"));
 }
@@ -328,11 +436,13 @@ void test_cardfs_write_new_is_write_once_and_verify_checks_size_and_hash(void)
     uint8_t sha[32];
     size_t sha_len;
     TEST_ASSERT_EQUAL(PSA_SUCCESS, psa_hash_compute(PSA_ALG_SHA_256, img, sizeof(img), sha, 32, &sha_len));
-    const char *rel = "watchdeck/sleep-0123.rgb565";
+    const char *rel = "watchdeck/sl012345.img";
 
     TEST_ASSERT_EQUAL(ESP_ERR_NOT_FOUND, cardfs_verify(rel, sizeof(img), sha, 16));
     TEST_ASSERT_EQUAL(ESP_OK, cardfs_write_new(rel, img, sizeof(img)));
+    s_room_log[0] = '\0';
     TEST_ASSERT_EQUAL(ESP_ERR_NOT_ALLOWED, cardfs_write_new(rel, img, 10));
+    TEST_ASSERT_EQUAL_STRING("", s_room_log);
     TEST_ASSERT_EQUAL(ESP_OK, cardfs_verify(rel, sizeof(img), sha, 16));
     TEST_ASSERT_EQUAL(ESP_OK, cardfs_verify(rel, sizeof(img), sha, 32));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_CRC, cardfs_verify(rel, sizeof(img) - 1, sha, 16));
@@ -341,7 +451,7 @@ void test_cardfs_write_new_is_write_once_and_verify_checks_size_and_hash(void)
     sha[3] ^= 1;
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, cardfs_verify(rel, sizeof(img), sha, 33));
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, cardfs_write_new("wifi.txt", "x\n", 2));
-    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, cardfs_write_new("watchdeck/sleep.json", "{}", 2));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, cardfs_write_new("watchdeck/sleep.cfg", "{}", 2));
 
     // A flipped byte in the middle: same size, wrong hash.
     char path[128];
@@ -377,12 +487,21 @@ void test_cardfs_read_remove_and_list(void)
     TEST_ASSERT_TRUE(exists("watchdeck/Photo.JPG"));
 }
 
+// Records each entry, and reads it back through cardfs: the callback runs outside the mutex.
 static void count_entry(const char *name, size_t size, bool is_dir, void *ctx)
 {
     char *seen = ctx;
     char line[96];
     snprintf(line, sizeof(line), "%s:%u:%d;", name, (unsigned)size, is_dir);
     strcat(seen, line);
+    char rel[64];
+    snprintf(rel, sizeof(rel), "watchdeck/%s", name);
+    char buf[8];
+    size_t len;
+    if (!is_dir && cardfs_name_ok(rel)) {
+        TEST_ASSERT_EQUAL(ESP_OK, cardfs_read(rel, buf, sizeof(buf), &len));
+        TEST_ASSERT_EQUAL(size, len);
+    }
 }
 
 void test_cardfs_list_shows_every_entry_of_watchdeck(void)
@@ -399,6 +518,19 @@ void test_cardfs_list_shows_every_entry_of_watchdeck(void)
     TEST_ASSERT_NOT_NULL(strstr(seen, "sub:"));
 }
 
+// An entry that can't be stat'ed (here a dangling link) fails the whole listing, with no callback at all.
+void test_cardfs_list_reports_a_stat_error_as_an_error(void)
+{
+    fresh_root();
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_write_new("watchdeck/a.bin", "abc", 3));
+    char path[128];
+    path_of(path, "watchdeck/gone");
+    TEST_ASSERT_EQUAL(0, symlink("/nonexistent/target", path));
+    char seen[256] = "";
+    TEST_ASSERT_EQUAL(ESP_FAIL, cardfs_list(count_entry, seen));
+    TEST_ASSERT_EQUAL_STRING("", seen);
+}
+
 void test_cardfs_run(void)
 {
     RUN_TEST(test_cardfs_allowlist_passes_our_names);
@@ -408,6 +540,10 @@ void test_cardfs_run(void)
     RUN_TEST(test_cardfs_write_small_refuses_other_names_and_sizes);
     RUN_TEST(test_cardfs_write_while_not_writable_fails_and_keeps_the_old_bytes);
     RUN_TEST(test_cardfs_write_whose_record_cannot_be_created_keeps_the_old_file);
+    RUN_TEST(test_cardfs_init_needs_a_room_function);
+    RUN_TEST(test_cardfs_room_is_asked_for_each_new_entry_in_order);
+    RUN_TEST(test_cardfs_full_directory_refuses_before_writing_anything);
+    RUN_TEST(test_cardfs_pending_record_is_applied_before_a_new_write_and_never_dropped);
     RUN_TEST(test_cardfs_recover_with_no_record_touches_nothing);
     RUN_TEST(test_cardfs_recover_with_an_empty_record_touches_nothing);
     RUN_TEST(test_cardfs_recover_clears_a_record_with_a_bad_magic);
@@ -419,6 +555,7 @@ void test_cardfs_run(void)
     RUN_TEST(test_cardfs_write_new_is_write_once_and_verify_checks_size_and_hash);
     RUN_TEST(test_cardfs_read_remove_and_list);
     RUN_TEST(test_cardfs_list_shows_every_entry_of_watchdeck);
+    RUN_TEST(test_cardfs_list_reports_a_stat_error_as_an_error);
     if (have_root) {
         nftw(root, remove_one, 8, FTW_DEPTH | FTW_PHYS);
     }

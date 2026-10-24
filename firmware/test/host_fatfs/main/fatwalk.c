@@ -101,6 +101,56 @@ static void short_name(const uint8_t *d, char out[13])
     out[n] = '\0';
 }
 
+static uint8_t sfn_sum(const uint8_t *d)
+{
+    uint8_t sum = 0;
+    for (int i = 0; i < 11; i++) {
+        sum = (uint8_t)(((sum & 1) << 7) + (sum >> 1) + d[i]);
+    }
+    return sum;
+}
+
+// A long-name sequence being read: its parts so far, the order number the next one needs and the checksum.
+typedef struct {
+    uint32_t parts;
+    uint8_t next_ord, sum;
+} lfn_t;
+
+static void lfn_drop(lfn_t *l)
+{
+    g.out->orphan_lfn += l->parts;
+    l->parts = 0;
+}
+
+// A long-name part: starts a sequence (the 0x40 flag) or continues it, else it's an orphan.
+static void lfn_part(lfn_t *l, const uint8_t *d)
+{
+    const uint8_t ord = d[0] & 0x3F;
+    if (d[0] & 0x40) {
+        lfn_drop(l);
+        if (ord == 0) {
+            g.out->orphan_lfn++;
+            return;
+        }
+        *l = (lfn_t){.parts = 1, .next_ord = (uint8_t)(ord - 1), .sum = d[13]};
+    } else if (l->parts > 0 && ord == l->next_ord && ord > 0 && d[13] == l->sum) {
+        l->parts++;
+        l->next_ord--;
+    } else {
+        lfn_drop(l);
+        g.out->orphan_lfn++;
+    }
+}
+
+// The 8.3 entry after a sequence: it claims the sequence when the order numbers ran out and the checksum is its own.
+static void lfn_end(lfn_t *l, const uint8_t *d)
+{
+    if (l->parts > 0 && (l->next_ord != 0 || l->sum != sfn_sum(d))) {
+        lfn_drop(l);
+    }
+    l->parts = 0;
+}
+
 static bool walk_dir(uint32_t start, const char *path, int depth)
 {
     uint32_t clusters[DIR_CLUSTERS_MAX];
@@ -109,8 +159,10 @@ static bool walk_dir(uint32_t start, const char *path, int depth)
         return false;
     }
     g.out->dirs++;
+    g.out->dir_clusters += n;
     const uint32_t cluster_bytes = g.spc * RAMDISK_SECTOR;
     bool ended = false; // past the end marker, where every byte should be zero
+    lfn_t lfn = {0};
     for (uint32_t i = 0; i < n; i++) {
         bool hidden = false;
         for (uint32_t s = 0; s < g.spc; s++) {
@@ -119,6 +171,7 @@ static bool walk_dir(uint32_t start, const char *path, int depth)
                 const uint8_t *d = sector + e * 32;
                 if (!ended && d[0] == 0x00) {
                     ended = true;
+                    lfn_drop(&lfn);
                 }
                 if (ended) {
                     for (int b = 0; b < 32 && !hidden; b++) {
@@ -127,8 +180,17 @@ static bool walk_dir(uint32_t start, const char *path, int depth)
                     continue;
                 }
                 const uint8_t attr = d[11];
-                if (d[0] == 0xE5 || (attr & 0x3F) == 0x0F || (attr & 0x08) || d[0] == '.') {
-                    continue; // deleted, a long-name part, the volume label, or . and ..
+                if (d[0] == 0xE5) {
+                    lfn_drop(&lfn);
+                    continue; // deleted
+                }
+                if ((attr & 0x3F) == 0x0F) {
+                    lfn_part(&lfn, d);
+                    continue;
+                }
+                lfn_end(&lfn, d);
+                if ((attr & 0x08) || d[0] == '.') {
+                    continue; // the volume label, or . and ..
                 }
                 char name[13];
                 short_name(d, name);
@@ -161,6 +223,7 @@ static bool walk_dir(uint32_t start, const char *path, int depth)
         }
         g.out->hidden_dir_clusters += hidden;
     }
+    lfn_drop(&lfn);
     return true;
 }
 
