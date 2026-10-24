@@ -51,10 +51,11 @@ _Static_assert(GRID_SCREEN_W == DISPLAY_H_RES && GRID_SCREEN_H == DISPLAY_V_RES,
 // A touch that goes this far up, and more than DRAG_SWIPE_RATIO times as far up as sideways, opens settings: a third of
 // the screen, 4x DRAG_SWIPE_PX and LVGL's 50 px gesture, so no flick, page turn or tap comes near it.
 #define SETTINGS_SWIPE_PX 200
-// Status mode's Settings button: right of the Wi-Fi line, as Licenses is right of the USB line.
+// Status mode's Settings button, on the touch line.
 #define OPEN_SETTINGS_W 220
 #define OPEN_SETTINGS_H 34
-#define OPEN_SETTINGS_Y 5
+#define OPEN_SETTINGS_Y 120                                                    // on the touch line (y 118), centered
+#define OPEN_SETTINGS_X (DISPLAY_H_RES - 20 - FORGET_W - 12 - OPEN_SETTINGS_W) // 12 px left of Forget pairing
 
 // The status bar, 1024 px wide, in Roboto Mono Regular 20 so that every text of a group has a fixed width. Left to
 // right: CPU, RAM, GPU, NET, then the date and time. CPU starts BAR_MARGIN from the left edge and the clock ends
@@ -442,13 +443,14 @@ static void status_mode_start(void)
     lv_obj_set_size(s_status_view, DISPLAY_H_RES, STATUS_H);
     lv_obj_set_scrollable(s_status_view, false);
     lv_obj_set_clickable(s_status_view, false);
-    lv_obj_t *wifi = add_status(s_status_view, STATUS_WIFI, LV_PALETTE_CYAN, 4);
-    lv_obj_set_width(wifi, DISPLAY_H_RES - 60 - OPEN_SETTINGS_W); // the Settings button sits right of it
+    add_status(s_status_view, STATUS_WIFI, LV_PALETTE_CYAN, 4); // full width: it holds SSIDs and reasons
     add_status(s_status_view, STATUS_SD, LV_PALETTE_LIGHT_GREEN, 42);
     lv_obj_t *usb = add_status(s_status_view, STATUS_USB, LV_PALETTE_AMBER, 80);
     lv_obj_set_width(usb, DISPLAY_H_RES - 60 - LICENSES_W); // "USB: error (ESP_ERR_NOT_SUPPORTED)" is 655 px of 744
     lv_obj_t *touch = add_status(s_status_view, STATUS_TOUCH, LV_PALETTE_PINK, 118);
-    lv_obj_set_width(touch, DISPLAY_H_RES - 60 - FORGET_W); // the touch text is short
+    // The touch text is short ("Touch: starting", under 300 px), so the Settings button sits left of Forget pairing on
+    // its line, which leaves the Wi-Fi, SD and USB lines their width.
+    lv_obj_set_width(touch, OPEN_SETTINGS_X - 20 - 20);
     add_status(s_status_view, STATUS_DAEMON, LV_PALETTE_PURPLE, 156);
     s_forget = ui_add_forget(s_status_view);
     lv_obj_align(s_forget, LV_ALIGN_TOP_RIGHT, -20, 114);
@@ -457,7 +459,7 @@ static void status_mode_start(void)
 
     s_open_settings = lv_button_create(s_status_view);
     lv_obj_set_size(s_open_settings, OPEN_SETTINGS_W, OPEN_SETTINGS_H);
-    lv_obj_align(s_open_settings, LV_ALIGN_TOP_RIGHT, -20, OPEN_SETTINGS_Y);
+    lv_obj_set_pos(s_open_settings, OPEN_SETTINGS_X, OPEN_SETTINGS_Y);
     lv_obj_set_style_bg_color(s_open_settings, lv_palette_darken(LV_PALETTE_GREY, 2), 0);
     lv_obj_add_event_cb(s_open_settings, open_settings_tapped, LV_EVENT_CLICKED, NULL);
     lv_obj_t *label = lv_label_create(s_open_settings);
@@ -834,6 +836,11 @@ ui_mode_t ui_mode(void)
     return s_mode;
 }
 
+bool ui_paired(void)
+{
+    return s_paired;
+}
+
 const char *ui_status_text(status_t i)
 {
     return s_texts[i];
@@ -894,7 +901,7 @@ void ui_settings_close(void)
 static void settings_enter(void *user_data)
 {
     const ui_mode_t from = (ui_mode_t)(intptr_t)user_data;
-    if (s_mode != from || (from == MODE_STATUS && s_attempt_shown)) {
+    if (s_mode != from || (from == MODE_GRID && !s_grid) || (from == MODE_STATUS && s_attempt_shown)) {
         return;
     }
     if (from == MODE_GRID) {
@@ -1288,6 +1295,10 @@ static void daemon_tapped(lv_event_t *e)
     size_t i = (size_t)(intptr_t)lv_event_get_user_data(e);
     if (i < s_n_daemons) {
         ESP_LOGI(TAG, "pair with %s", s_daemons[i].name);
+        // Hidden from the tap on, not only once the code shows; the end of the attempt shows it again.
+        if (s_open_settings) {
+            lv_obj_set_hidden(s_open_settings, true);
+        }
         link_pair(&s_daemons[i]);
     }
 }

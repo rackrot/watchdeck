@@ -39,6 +39,9 @@ typedef enum {
 
 ui_mode_t ui_mode(void);
 
+/** Whether the board holds a pairing. */
+bool ui_paired(void);
+
 /** The kept text of status line `i`. The daemon's has no "Daemon: " prefix and only printable ASCII. */
 const char *ui_status_text(status_t i);
 

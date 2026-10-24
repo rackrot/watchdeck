@@ -46,6 +46,7 @@ typedef enum {
 } row_t;
 
 static lv_obj_t *s_rows[ROW_COUNT];
+static lv_obj_t *s_forget;                       // hidden while unpaired
 static char s_row_text[ROW_COUNT][ROW_TEXT_MAX]; // what each row was last given: LONG_DOT edits the label's own text
 
 static void set_row(row_t r, const char *text)
@@ -92,7 +93,11 @@ void tab_status_tick(void)
     model_unlock();
     snprintf(text, sizeof(text), "Icons %u, %u KiB", (unsigned)icons, (unsigned)(icon_bytes / 1024));
     set_row(ROW_ICONS, text);
-    snprintf(text, sizeof(text), "Layout rev %u, page %u of %u", (unsigned)rev, shown + 1u, (unsigned)pages);
+    if (pages > 0) {
+        snprintf(text, sizeof(text), "Layout rev %u, page %u of %u", (unsigned)rev, shown + 1u, (unsigned)pages);
+    } else {
+        strlcpy(text, "Layout --", sizeof(text));
+    }
     set_row(ROW_LAYOUT, text);
 
     // wifi.c's texts carry no prefix, unlike the SD, USB and Touch ones. A "Wi-Fi: " one would not fit the column
@@ -115,6 +120,9 @@ void tab_status_tick(void)
     set_row(ROW_SD, ui_status_text(STATUS_SD));
     set_row(ROW_USB, ui_status_text(STATUS_USB));
     set_row(ROW_TOUCH, ui_status_text(STATUS_TOUCH));
+
+    // Forget pairing only means something while paired; a pairing change shows within a second.
+    lv_obj_set_hidden(s_forget, !ui_paired());
 }
 
 static lv_obj_t *place_button(lv_obj_t *btn, lv_align_t align, int x)
@@ -142,7 +150,7 @@ void tab_status_build(lv_obj_t *parent)
     }
 
     place_button(ui_add_licenses_button(parent), LV_ALIGN_BOTTOM_LEFT, SETTINGS_PAD);
-    place_button(ui_add_forget(parent), LV_ALIGN_BOTTOM_MID, 0);
+    s_forget = place_button(ui_add_forget(parent), LV_ALIGN_BOTTOM_MID, 0);
 
     tab_status_tick();
 }
@@ -150,4 +158,5 @@ void tab_status_build(lv_obj_t *parent)
 void tab_status_leave(void)
 {
     memset(s_rows, 0, sizeof(s_rows));
+    s_forget = NULL;
 }

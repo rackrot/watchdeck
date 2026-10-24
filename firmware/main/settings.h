@@ -42,6 +42,12 @@ void settings_delete(void);
 
 bool settings_is_open(void);
 
+/**
+ * Let the shown tab turn off the page's swipe-down close while a view that needs drags is up (the Wi-Fi editor's
+ * keyboard and text areas). Back on at every tab switch and page open, so a tab turns it on and off itself.
+ */
+void settings_set_swipe_close(bool on);
+
 /** The first set applied under settings opened from status mode: the bar is back, so drop the "Settings" band title. */
 void settings_bar_returned(void);
 

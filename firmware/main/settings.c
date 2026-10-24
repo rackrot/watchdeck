@@ -12,8 +12,8 @@
 #define SETTINGS_IDLE_MS 60000 // settings closes after this long without a touch
 #define SETTINGS_REFRESH_MS 1000
 #define TAB_GAP 8
-#define TAB_W 156 // five tabs, Close and the gaps fill the 1024 px row (T2 to T4 add the other four)
-#define TAB_H 56
+#define TAB_W 156                // five tabs, Close and the gaps fill the 1024 px row (T2 to T4 add the other four)
+#define TAB_H SETTINGS_TAB_ROW_H // the buttons fill the row, about 14 mm
 #define CLOSE_W 160
 
 // The tabs, in the order of the row. A tab is one row here and its own tab_*.c; the row shows them all, so a new tab
@@ -36,6 +36,12 @@ static lv_obj_t *s_tab_btns[TAB_COUNT];
 static lv_timer_t *s_timer;
 static size_t s_tab;      // the tab shown, valid while the page is open
 static size_t s_last_tab; // the tab shown last, until reboot
+static bool s_swipe_close = true;
+
+void settings_set_swipe_close(bool on)
+{
+    s_swipe_close = on;
+}
 
 static void style_tabs(void)
 {
@@ -55,6 +61,7 @@ static void tab_show(size_t i)
         lv_obj_delete(s_content);
     }
     s_tab = s_last_tab = i;
+    s_swipe_close = true; // a tab that needs drags (T3's keyboard) turns it off while that view is up
     s_content = lv_obj_create(s_page);
     lv_obj_remove_style_all(s_content);
     lv_obj_set_size(s_content, SETTINGS_CONTENT_W, SETTINGS_CONTENT_H);
@@ -91,7 +98,7 @@ static void page_gesture(lv_event_t *e)
     (void)e;
     lv_indev_t *indev = lv_indev_active();
     lv_indev_wait_release(indev);
-    if (lv_indev_get_gesture_dir(indev) == LV_DIR_BOTTOM) {
+    if (s_swipe_close && lv_indev_get_gesture_dir(indev) == LV_DIR_BOTTOM) {
         ui_settings_close();
     }
 }
@@ -120,7 +127,7 @@ static lv_obj_t *add_row_button(const char *text, int x, int w, lv_event_cb_t cb
 {
     lv_obj_t *btn = lv_button_create(s_page);
     lv_obj_set_size(btn, w, TAB_H);
-    lv_obj_set_pos(btn, x, GRID_TOP + (SETTINGS_TAB_ROW_H - TAB_H) / 2);
+    lv_obj_set_pos(btn, x, GRID_TOP);
     lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, user_data);
     lv_obj_t *label = lv_label_create(btn);
     lv_label_set_text(label, text);
