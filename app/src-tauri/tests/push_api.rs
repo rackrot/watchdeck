@@ -270,6 +270,14 @@ impl ServerCertVerifier for Pinned {
 
 /// A TLS connection to `addr` that accepts only the daemon's certificate.
 async fn connect_tls(addr: SocketAddr) -> tokio_rustls::client::TlsStream<TcpStream> {
+    connect_tls_over(addr, TcpStream::connect(addr).await.unwrap()).await
+}
+
+/// [`connect_tls`] over the open connection `tcp` to `addr`.
+async fn connect_tls_over(
+    addr: SocketAddr,
+    tcp: TcpStream,
+) -> tokio_rustls::client::TlsStream<TcpStream> {
     let provider = Arc::new(aws_lc_rs::default_provider());
     let verifier = Pinned {
         cert: CertificateDer::from_pem_slice(identity().cert_pem().as_bytes()).unwrap(),
@@ -281,7 +289,6 @@ async fn connect_tls(addr: SocketAddr) -> tokio_rustls::client::TlsStream<TcpStr
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verifier))
         .with_no_client_auth();
-    let tcp = TcpStream::connect(addr).await.unwrap();
     TlsConnector::from(Arc::new(config))
         .connect(ServerName::IpAddress(addr.ip().into()), tcp)
         .await
@@ -530,6 +537,24 @@ async fn a_slow_header_is_dropped_at_five_seconds() {
         "dropped after {took:?}"
     );
     assert!(!String::from_utf8_lossy(&buf).contains("201"));
+}
+
+#[tokio::test]
+async fn on_the_lan_port_the_handshake_counts_toward_the_five_seconds() {
+    let rig = start_with(&config_text(true, BOTH), "127.0.0.1:0".parse().unwrap()).await;
+    let lan = rig.bound(|b| b.lan.is_some()).await.lan.unwrap();
+    let tcp = TcpStream::connect(lan).await.unwrap();
+    let started = Instant::now();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let tls = connect_tls_over(lan, tcp).await;
+    let (mut read, _write) = tokio::io::split(tls);
+    let mut buf = Vec::new();
+    let _ = timeout(Duration::from_secs(12), read.read_to_end(&mut buf)).await;
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(4500) && took < Duration::from_millis(6500),
+        "dropped after {took:?}"
+    );
 }
 
 #[tokio::test]

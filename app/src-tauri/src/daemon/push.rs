@@ -28,7 +28,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinSet;
-use tokio::time::{sleep, timeout, Instant};
+use tokio::time::{sleep, timeout, timeout_at, Instant};
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 
@@ -43,7 +43,7 @@ pub const LOOPBACK_PORT: u16 = 47822;
 pub const LAN_PORT: u16 = 47823;
 /// The largest body read. One byte more is a 413.
 pub const MAX_BODY_BYTES: usize = 8 * 1024;
-/// From the TCP accept to the end of the headers (for HTTPS, the handshake gets as long again).
+/// From the TCP accept to the end of the headers, the TLS handshake included.
 pub const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 /// The body, once the headers are in.
 const BODY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -249,18 +249,21 @@ async fn connection(
     tls: Option<TlsAcceptor>,
     gate: Arc<Gate>,
 ) {
+    // The handshake and the headers share the one deadline.
+    let deadline = Instant::now() + HEADER_TIMEOUT;
     let Some(tls) = tls else {
-        return serve(stream, peer, gate).await;
+        return serve(stream, peer, gate, deadline).await;
     };
-    match timeout(HEADER_TIMEOUT, tls.accept(stream)).await {
-        Ok(Ok(stream)) => serve(stream, peer, gate).await,
+    match timeout_at(deadline, tls.accept(stream)).await {
+        Ok(Ok(stream)) => serve(stream, peer, gate, deadline).await,
         Ok(Err(e)) => log::debug!("{peer}: push TLS handshake failed: {e}"),
         Err(_) => log::debug!("{peer}: push TLS handshake did not finish in {HEADER_TIMEOUT:?}"),
     }
 }
 
-/// One request, then the reply, then a short drain and the close.
-async fn serve<S>(stream: S, peer: SocketAddr, gate: Arc<Gate>)
+/// One request, then the reply, then a short drain and the close. The headers must be in by
+/// `deadline`.
+async fn serve<S>(stream: S, peer: SocketAddr, gate: Arc<Gate>, deadline: Instant)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -270,7 +273,7 @@ where
     });
     let conn = http1::Builder::new()
         .timer(TokioTimer::new())
-        .header_read_timeout(HEADER_TIMEOUT)
+        .header_read_timeout(deadline.saturating_duration_since(Instant::now()))
         .keep_alive(false)
         .max_buf_size(MAX_HEAD_BYTES)
         .max_headers(MAX_HEADERS)
