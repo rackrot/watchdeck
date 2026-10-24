@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "diag.h"
 #include "diskio_impl.h"
 #include "driver/sdmmc_host.h"
 #include "esp_check.h"
@@ -40,6 +41,7 @@ static DRESULT part_disk_read(unsigned char pdrv, unsigned char *buf, uint32_t s
     }
     esp_err_t err = sdmmc_read_sectors(s_card, buf, s_part_first_lba + sector, count);
     if (err != ESP_OK) {
+        diag_count(DIAG_CARD_ERROR, esp_err_to_name(err));
         ESP_LOGE(TAG, "read sector %lu x%u: %s", (unsigned long)sector, count, esp_err_to_name(err));
         return RES_ERROR;
     }

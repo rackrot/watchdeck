@@ -109,6 +109,8 @@ jobs:
         working-directory: app
       - run: cargo clippy --locked -- -D warnings
         working-directory: app/src-tauri
+      # The generator compiles with the app crate, so it runs here and not in the lint job.
+      - run: mise run logo:check
       - run: cargo test --locked
         working-directory: app/src-tauri
       - run: pnpm tauri build --debug --no-bundle

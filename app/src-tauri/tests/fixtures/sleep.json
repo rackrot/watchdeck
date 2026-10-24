@@ -1,0 +1,13 @@
+{
+  "t": "sleep",
+  "image": "5b1f0c7e9d3a2b4c6d8e0f1a2b3c4d5e",
+  "bg": 0,
+  "fg": 16777215,
+  "show": ["clock", "date", "host"],
+  "text": "Back soon",
+  "anchor": "bottom_left",
+  "spinner": "arc",
+  "spinner_color": 3718648,
+  "offline_after_s": 10,
+  "backlight": 100
+}

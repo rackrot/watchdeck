@@ -405,11 +405,71 @@ ha = "Bearer paste-your-token-here"
 
 - The file must have mode 0600, or the app won't read it and logs the fix: `chmod 600 "${XDG_CONFIG_HOME:-$HOME/.config}"/watchdeck/secrets.toml`.
 - A value goes out as an HTTP header, so it must be printable ASCII on one line, up to 4096 bytes. The app won't read a file with any other value, and the error names the secret.
-- A button that names a missing secret holds back the whole config. Adding the secret applies it.
-- The Secrets page can remove a secret, after a confirmation. It refuses while the running config still names the secret in a button's action or a tile's source, and the message lists the buttons. Change those buttons first, then remove it.
+- A button or integration that names a missing secret holds back the whole config. Adding the secret applies it.
+- The Secrets page can remove a secret, after a confirmation. It refuses while the running config still names the secret in a button's action, a tile's source, a stat integration's source or a push integration's token, and the message lists those buttons and integrations by id. Change them first, then remove it.
 - Secret values never appear in logs or error messages. Errors name the secret, and a syntax error in `secrets.toml` gives only its line number.
 - On the device, exact copies of a value in a reply show as `<secret>`, even one cut short by the 64 KB limit. An encoded copy, such as base64 or URL-encoded, isn't caught.
 - The file is plain text. Anything running as your user can read it.
+
+## Sleep screen
+
+An optional `[sleep]` table sets the screen the board shows once its link to the desktop has been down for a while, or after a long swipe down. The keys are checked now. The board doesn't show the screen yet, and a change to `[sleep]` pushes no layout.
+
+```toml
+[sleep]
+image = "lake.jpg"                 # a file in screens/ beside config.toml. Absent: the logo
+fit = "cover"                      # "cover" fills and crops, "contain" shows it whole on bg
+bg = "#000000"
+fg = "#ffffff"
+show = ["clock", "date", "host"]   # any of clock, date, host and text, each once
+text = "Back soon"                 # needed when show has "text"
+anchor = "bottom_left"             # center, top_left, top_right, bottom_left or bottom_right
+spinner = "arc"                    # arc, dots, bar, pulse or none
+spinner_color = "#38bdf8"
+offline_after_s = 10               # 0 to 3600. 0 never sleeps for a lost link
+backlight = 100                    # 0 to 100, the backlight while asleep
+```
+
+- Every key is optional. An absent key takes the default: black `bg`, light grey `fg`, `show` of `clock` and `date`, anchor `bottom_left`, the `arc` spinner in `#38bdf8`, `offline_after_s` 10, `backlight` 100, and the logo when `image` is absent.
+- `image` is a plain file name: letters, digits, `_`, `-` or `.`, at most 63 bytes, not starting with a dot. It names a file in `screens/`.
+- `text` is printable ASCII, at most 47 characters.
+- Colors are `#rrggbb`.
+
+## Integrations
+
+Each `[[integration]]` table is a source of notes or cards on the feed page. Its keys:
+
+- `id`: 1 to 63 letters, digits, `_`, `-` or `.`. Two integrations can't share an id.
+- `label`: printable ASCII, at most 23 characters. It is the source shown on each of its notes and cards.
+- `kind`: `push` or `stat`.
+
+A `push` integration takes notes and cards from the push API. `token_secret` names a secret in `secrets.toml` of at least 32 characters, which is the token the sender must send. Two push integrations can't share a token, so each sender has its own.
+
+A `stat` integration polls `source` every `every_s` seconds, from 2 to 86400, and shows the value as a card. `json_pointer` picks the value out of the output, as a tile's does. `source` takes the same rules as a tile's source: a shell or HTTP action, with `secret_headers` for secrets.
+
+```toml
+[[integration]]
+id = "ha"
+kind = "push"
+label = "Home Assistant"
+token_secret = "push-ha"
+
+[[integration]]
+id = "nas-load"
+kind = "stat"
+label = "NAS load"
+every_s = 30
+json_pointer = "/load"
+source = { kind = "http", method = "GET", url = "http://nas.lan/api/load" }
+```
+
+There are at most 16 integrations, and at most 8 of them cards (`stat` now, `prometheus` later).
+
+## Push API
+
+`[push]` has one key, `lan`. With `lan` off, the push API listens on this computer only. With `lan = true`, it also listens on the LAN over HTTPS, with the daemon's own certificate. Plain HTTP is never served on the LAN, since the token would cross the network in clear.
+
+The API's requests and the `watchdeck notify` command are described in `integrations.md`, which arrives with the API.
 
 ## Results
 

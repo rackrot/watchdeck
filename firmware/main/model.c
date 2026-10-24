@@ -18,14 +18,17 @@ static uint32_t s_rev;
 static char s_shown_id[PROTO_ID_MAX]; // the page on screen, by id, so it survives a new set and a reconnect
 static proto_tile_t *s_tiles;         // MODEL_MAX_TILES slots
 static size_t s_n_tiles;
+static proto_feed_t *s_feed; // the latest snapshot, in PSRAM
+static bool s_have_feed;
 
 esp_err_t model_init(void)
 {
     ESP_RETURN_ON_FALSE(!s_lock, ESP_ERR_INVALID_STATE, TAG, "already started");
     s_pages = heap_caps_calloc(PROTO_MAX_PAGES, sizeof(*s_pages), MALLOC_CAP_SPIRAM);
     s_tiles = heap_caps_calloc(MODEL_MAX_TILES, sizeof(*s_tiles), MALLOC_CAP_SPIRAM);
+    s_feed = heap_caps_calloc(1, sizeof(*s_feed), MALLOC_CAP_SPIRAM);
     s_lock = xSemaphoreCreateMutex();
-    ESP_RETURN_ON_FALSE(s_pages && s_tiles && s_lock, ESP_ERR_NO_MEM, TAG, "alloc");
+    ESP_RETURN_ON_FALSE(s_pages && s_tiles && s_feed && s_lock, ESP_ERR_NO_MEM, TAG, "alloc");
     return icons_init();
 }
 
@@ -139,8 +142,20 @@ void model_clear_tiles(void)
     s_n_tiles = 0;
 }
 
+void model_set_feed(const proto_feed_t *feed)
+{
+    *s_feed = *feed;
+    s_have_feed = true;
+}
+
+const proto_feed_t *model_feed(void)
+{
+    return s_have_feed ? s_feed : NULL;
+}
+
 void model_clear(void)
 {
+    s_have_feed = false;
     s_n_pages = 0;
     s_rev = 0;
     s_shown_id[0] = '\0';

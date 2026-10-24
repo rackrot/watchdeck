@@ -11,6 +11,8 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "mdns.h"
+#include "diag.h"
+#include "logcap.h"
 #include "sdcard.h"
 #include "wifitxt.h"
 
@@ -109,6 +111,7 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         reconnect_cb(NULL);
     } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *ev = data;
+        diag_count(DIAG_WIFI_DROP, wifi_reason_name(ev->reason));
         report("connecting to %s (retry, reason %d)", s_ssid, ev->reason);
         esp_err_t err = esp_timer_start_once(s_reconnect_timer, RECONNECT_DELAY_US);
         if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) { // INVALID_STATE: retry already armed
@@ -150,6 +153,7 @@ esp_err_t wifi_start(wifi_status_cb_t status_cb)
         return ESP_ERR_INVALID_ARG;
     }
     strlcpy(s_ssid, ssid, sizeof(s_ssid));
+    logcap_set_password(pass); // so the log ring redacts it
 
     report("connecting to %s (source: %s)", s_ssid, source);
 

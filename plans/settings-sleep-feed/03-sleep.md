@@ -68,11 +68,11 @@ Entering sleep closes the license viewer and the result modal, deletes settings 
   - Chunks go into a 1 MiB PSRAM buffer. When the last arrives, the SHA-256 is checked; a mismatch drops the image (logged) and keeps the old one.
   - The verified image swaps in under the LVGL lock (the sleep screen, if up, re-points its image).
   - **Persistence has one owner, `sleepstore.c`, and works on snapshots.** The applied state is `{generation, frame text, image id, image buffer}`; each new `sleep` frame or verified image makes a new generation, and the previous buffer is freed only when nothing references it (the screen, a running save). One save job at most is queued or running: a new generation while one runs only sets "dirty", and the job, when done, saves again if the generation moved (so ten quick edits cost at most two saves). The job takes an immutable snapshot (the frame text copied, the image buffer referenced) and:
-    1. If the image isn't on the card **as a valid file** (its size is 1,048,576 and its SHA-256 matches the id; checked once per boot and cached), writes it write-once to `watchdeck/sleep-<id>.rgb565`, deleting an invalid file of that name first.
-    2. Writes `watchdeck/sleep.json` (the frame text) with `cardfs_write_small`.
-    3. Only then deletes every other `sleep-*.rgb565`: the committed `sleep.json` no longer names them. A cut before step 3 leaves an extra file, which the next save removes.
+    1. If the image isn't on the card **as a valid file** (its size is 1,048,576 and its SHA-256 matches the id; checked once per boot and cached), writes it write-once to `watchdeck/sl<8hex>.img` (the first 8 hex digits of the id), deleting an invalid file of that name first.
+    2. Writes `watchdeck/sleep.cfg` (the frame text) with `cardfs_write_small`.
+    3. Only then deletes every other `sl*.img`: the committed `sleep.cfg` no longer names them. A cut before step 3 leaves an extra file, which the next save removes.
   - With the card shared or missing, the save job does nothing and the Storage tab says "sleep screen not saved". Nothing is queued across a share: Stop sharing reboots (G2), and on the next connect the daemon sends `sleep` again and the board saves it then.
-  - At boot, after the mount and `cardfs_recover`, a svc job reads `sleep.json`, parses it with the same `proto_parse`, and loads the named image into PSRAM with the size and hash checks. A file that fails is deleted and logged, the logo shows, and the next `sleep` frame fetches it again. That's before Wi-Fi, so an offline boot shows the custom screen.
+  - At boot, after the mount and `cardfs_recover`, a svc job reads `sleep.cfg`, parses it with the same `proto_parse`, and loads the named image into PSRAM with the size and hash checks. A file that fails is deleted and logged, the logo shows, and the next `sleep` frame fetches it again. That's before Wi-Fi, so an offline boot shows the custom screen.
 - One parser for the frame and the file means one set of host cases and no second format.
 
 ## Goal and done
@@ -119,16 +119,16 @@ Entering sleep closes the license viewer and the result modal, deletes settings 
 ### P3 Board: sleep config, image download, persistence
 
 - **Files**: `link.c` (dispatch `sleep`, `asset_get` after icons settle, the hello names `sleep` in this commit), `assetdl.c/.h` (new, pure: the expected offset, the chunk checks, the final hash, the 5 s deadline from a caller-given clock, like `pageset.c`), `sleepstore.c/.h` (new: the generations and snapshots, the dirty flag and the one save job, the boot load job; its decisions split into a pure `sleepsave.c` for host cases: coalescing, the step order, what GC may delete), `sleep.c` (apply a new config live), `main.c` (the boot load job), `tab_storage.c` (the sleep rows), host `test_assetdl.c`.
-- **Host cases** (`sleepsave`): a new generation during a save runs exactly one more; GC never lists the image the newest committed `sleep.json` names; an invalid file of the target name is deleted before the write. (`assetdl`): four good chunks complete; a chunk at the wrong offset, of the wrong length, or for another id is refused and the download keeps waiting; a flipped byte fails the hash at the end; a new id mid-download restarts; the deadline passes with no frame.
+- **Host cases** (`sleepsave`): a new generation during a save runs exactly one more; GC never lists the image the newest committed `sleep.cfg` names; an invalid file of the target name is deleted before the write. (`assetdl`): four good chunks complete; a chunk at the wrong offset, of the wrong length, or for another id is refused and the download keeps waiting; a flipped byte fails the hash at the end; a new id mid-download restarts; the deadline passes with no frame.
 - **Acceptance (batch B, against the P2 daemon)**:
   - Save a 4000 x 3000 JPEG in the app: the board logs four `asset_get`s, `sleep image <id> verified`, and the persist job's three steps, within 5 s; the privacy screen shows it.
   - Restart the board with the daemon stopped: after 10 s the offline screen shows the same image.
-  - Change only `spinner` in the app: no `asset_get`, a new `sleep.json`, the spinner changes live.
+  - Change only `spinner` in the app: no `asset_get`, a new `sleep.cfg`, the spinner changes live.
   - With the card shared: "sleep screen not saved" on the Storage tab; Stop sharing reboots; after the reconnect the save runs and the tab shows the files.
-  - Ten spinner changes saved in the app within 5 s: at most two `sleep.json` saves in the log, and the last one holds the last change.
+  - Ten spinner changes saved in the app within 5 s: at most two `sleep.cfg` saves in the log, and the last one holds the last change.
   - Corrupt the image file on the card from a computer (one byte), boot with the daemon stopped: `sleep image <id> invalid, deleted`, the logo shows; start the daemon: the image is fetched and saved again.
   - A bad image is covered by `test_assetdl.c`; on the board, the log shows `sleep image <id> verified` with its time for each download.
-  - The card's `watchdeck/` holds exactly `sleep.json` and one image after three image changes.
+  - The card's `watchdeck/` holds exactly `sleep.cfg` and one image after three image changes.
   - PSRAM free during and after a download is logged: at most 2 MiB more during, 1 MiB after.
 - **Cheapest check**: `mise run fw:build`, then batch B.
 - **Owner**: design judgment, firmware.

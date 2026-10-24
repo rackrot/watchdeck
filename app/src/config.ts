@@ -88,6 +88,56 @@ export type StatusBarConfig = {
 /** The steps a metric without a key gets, for each temperature unit (`ConfigView`). */
 export type StatusBarDefaults = Record<TempUnit, Required<Thresholds>>;
 
+/** `[sleep]`. Absent keys take the device's defaults. The strings are checked by Rust, as `[status_bar]`'s are. */
+export type SleepConfig = {
+  /** A file in `screens/` beside the config. Absent: the logo. */
+  image?: string;
+  /** `cover` or `contain`. */
+  fit?: string;
+  /** `#rrggbb`. */
+  bg?: string;
+  /** `#rrggbb`, the text's color. */
+  fg?: string;
+  /** Any of `clock`, `date`, `host` and `text`, each once. */
+  show?: string[];
+  /** Needed when `show` has `text`. Printable ASCII, at most 47 characters. */
+  text?: string;
+  /** `center`, `top_left`, `top_right`, `bottom_left` or `bottom_right`. */
+  anchor?: string;
+  /** `arc`, `dots`, `bar`, `pulse` or `none`. */
+  spinner?: string;
+  /** `#rrggbb`. */
+  spinner_color?: string;
+  /** 0 to 3600 seconds. 0 never sleeps for a lost link. */
+  offline_after_s?: number;
+  /** 0 to 100, the backlight while asleep. */
+  backlight?: number;
+};
+
+/** `[push]`. */
+export type PushConfig = {
+  /** Also serves https on the LAN, with the daemon's own certificate. */
+  lan?: boolean;
+};
+
+/** `[[integration]]`, tagged by `kind`. Its `id` and `label` name its notes and cards. */
+export type IntegrationConfig =
+  | {
+      kind: "push";
+      id: string;
+      label: string;
+      /** The name of a secret in `secrets.toml`, at least 32 characters. */
+      token_secret: string;
+    }
+  | {
+      kind: "stat";
+      id: string;
+      label: string;
+      every_s: number;
+      json_pointer?: string;
+      source: Action;
+    };
+
 export type Config = {
   version: number;
   /** `font` is the grid's default font id. Absent: Montserrat. */
@@ -96,8 +146,15 @@ export type Config = {
   page?: PageConfig[];
   /** The TOML array of tables is `[[button]]`. */
   button: ButtonConfig[];
-  /** Never part of a layout. A layout edit must carry it along, since a save rewrites the file. */
+  /**
+   * Never part of a layout. A layout edit must carry it along, since a save rewrites the file. The
+   * same goes for `sleep`, `push` and `integration`.
+   */
   status_bar?: StatusBarConfig;
+  sleep?: SleepConfig;
+  push?: PushConfig;
+  /** The TOML array of tables is `[[integration]]`. */
+  integration?: IntegrationConfig[];
 };
 
 /** `get_config`, and the `config-status` event without the config. */

@@ -10,6 +10,7 @@
 #include "crash.h"
 #include "display.h"
 #include "link.h"
+#include "logcap.h"
 #include "model.h"
 #include "sdcard.h"
 #include "touch.h"
@@ -37,11 +38,16 @@ static esp_err_t power_init(void)
 
 void app_main(void)
 {
+    // First, so the log from here on reaches the Logs tab. The ring is ready before the hook is installed.
+    const esp_err_t logcap_err = logcap_init();
     esp_chip_info_t info;
     esp_chip_info(&info);
     size_t psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
     ESP_LOGI(TAG, "watchdeck starting: chip rev v%d.%d, PSRAM %u bytes", info.revision / 100, info.revision % 100,
              (unsigned)psram);
+    if (logcap_err != ESP_OK) {
+        ESP_LOGE(TAG, "log capture is off: %s", esp_err_to_name(logcap_err));
+    }
 
     crash_init();
     ESP_ERROR_CHECK(power_init());
@@ -92,6 +98,7 @@ void app_main(void)
         .on_result = ui_show_result,
         .on_tile = ui_set_tile,
         .on_stats = ui_set_stats,
+        .on_feed = ui_set_feed,
         .on_paired = ui_set_paired,
         .on_daemons = ui_show_daemons,
         .on_pair_code = ui_show_pair_code,

@@ -5,6 +5,7 @@
 #include <strings.h>
 
 #include "crash.h"
+#include "diag.h"
 #include "display.h"
 #include "esp_app_desc.h"
 #include "esp_check.h"
@@ -24,6 +25,7 @@
 #include "mbedtls/x509.h"
 #include "mdns.h"
 #include "icons.h"
+#include "logcap.h"
 #include "model.h"
 #include "pageset.h"
 #include "pairing.h"
@@ -78,6 +80,7 @@ typedef enum {
     EV_WS_BAD,      // oversize or broken frame: close the link
     EV_WS_BAD_CERT, // the daemon's cert is not the pinned one
     EV_PRESS,
+    EV_FEED_DISMISS, // a note id in press.btn
     EV_PAIR,         // the user picked a daemon to pair with
     EV_PAIR_CANCEL,  // the user abandoned the attempt, or said No to its question
     EV_PAIR_CONFIRM, // the user said Yes, the desktop shows the pairing
@@ -606,6 +609,7 @@ static void drop_client(void)
 // Drop the session and back off, showing `reason` on the status line.
 static void lost_as(const char *why, const char *reason)
 {
+    diag_count(DIAG_LINK_DROP, why);
     ESP_LOGW(TAG, "link lost: %s", why);
     drop_client();
     if (s.cbs.on_down) {
@@ -739,8 +743,9 @@ static void send_hello(void)
     }
     // Only names this build fully supports: "fonts" means ui.c draws every font id in font_list.h, and "pages" that
     // pageset.c assembles sets of up to PROTO_MAX_PAGES and ui.c lays out the paged grid, and "status_bar" that ui.c
-    // reads `stats` frames.
-    static const char *const caps[] = {"fonts", "pages", "status_bar"};
+    // reads `stats` frames, and "feed" that ui.c shows the -1 page from `feed` frames and dismisses with feed_dismiss.
+    // The hello must stay under 256 bytes: test_proto.c pins its size for this list, and for the list with "sleep".
+    static const char *const caps[] = {"fonts", "pages", "status_bar", "feed"};
     char buf[256];
     size_t len = proto_build_hello(buf, sizeof(buf), device, s.pairing->token, esp_app_get_description()->version,
                                    DISPLAY_H_RES, DISPLAY_V_RES, caps, sizeof(caps) / sizeof(caps[0]));
@@ -776,6 +781,7 @@ static void set_paired(bool paired)
 {
     bool was_paired = s.paired;
     s.paired = paired;
+    logcap_set_token(paired ? s.pairing->token : NULL); // so the log ring redacts it
     if (paired) {
         if (proto_fp(s.pairing->cert_pem, s.fp) != ESP_OK) {
             s.fp[0] = '\0'; // matches no instance, so the status will say why
@@ -1053,6 +1059,7 @@ static bool handle_icon_frame(uint8_t *frame, size_t len)
 // Drop the link over a broken set, so the next session sends a complete one. The backoff grows until a set completes.
 static void set_broken(const char *why)
 {
+    diag_count(DIAG_SET_BROKEN, why);
     ESP_LOGW(TAG, "layout set broken: %s", why);
     s.set_broke = true;
     lost_as("layout set broken", "layout set broken");
@@ -1223,6 +1230,21 @@ static void handle_msg(const char *json, size_t len)
             }
         }
         break;
+    case PROTO_MSG_FEED:
+        if (!s.welcomed) {
+            ESP_LOGW(TAG, "message before welcome, ignored");
+        } else {
+            ESP_LOGI(TAG, "feed: %u source%s, %u card%s, %u note%s", m->feed.sources, m->feed.sources == 1 ? "" : "s",
+                     (unsigned)m->feed.n_cards, m->feed.n_cards == 1 ? "" : "s", (unsigned)m->feed.n_notes,
+                     m->feed.n_notes == 1 ? "" : "s");
+            model_lock();
+            model_set_feed(&m->feed);
+            model_unlock();
+            if (s.cbs.on_feed) {
+                s.cbs.on_feed();
+            }
+        }
+        break;
     case PROTO_MSG_UNKNOWN:
         ESP_LOGW(TAG, "unknown message type \"%s\", ignored", m->unknown_t);
         break;
@@ -1326,6 +1348,19 @@ static void handle_event(link_ev_t *ev)
             ESP_LOGW(TAG, "link down, press %u dropped", (unsigned)ev->press.seq);
         }
         break;
+    case EV_FEED_DISMISS:
+        if (s.state == ST_UP && s.welcomed) {
+            char buf[2 * PROTO_ID_MAX + 32]; // an id of 63 characters may all be escaped
+            size_t len = proto_build_feed_dismiss(buf, sizeof(buf), ev->press.btn);
+            if (len > 0) {
+                send_text(buf, len, NULL);
+            } else {
+                ESP_LOGW(TAG, "feed dismiss for %s not built, dropped", ev->press.btn);
+            }
+        } else {
+            ESP_LOGW(TAG, "link down, feed dismiss dropped");
+        }
+        break;
     case EV_PAIR:
         if (!s.paired && s.state == ST_BROWSE) {
             start_pairing(&ev->daemon);
@@ -1418,6 +1453,7 @@ static void link_task(void *arg)
             } else if (pageset_expired(&s.set, now)) {
                 set_broken("still incomplete 5 s after its first page");
             } else if (s.n_want > 0 && now > s.want_deadline_ms) {
+                diag_count(DIAG_ICON_TIMEOUT, "icon_get unanswered");
                 ESP_LOGW(TAG, "icon_get timed out with %u icon(s) not received", (unsigned)s.n_want);
                 s.n_missed += s.n_want;
                 request_icons();
@@ -1498,6 +1534,19 @@ esp_err_t link_press(const char *btn, uint32_t seq)
     ESP_RETURN_ON_FALSE(strlen(btn) < sizeof(ev.press.btn), ESP_ERR_INVALID_ARG, TAG, "id too long");
     strcpy(ev.press.btn, btn);
     return post(&ev) ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+esp_err_t link_feed_dismiss(const char *id)
+{
+    ESP_RETURN_ON_FALSE(s.queue, ESP_ERR_INVALID_STATE, TAG, "not started");
+    link_ev_t ev = {.type = EV_FEED_DISMISS};
+    ESP_RETURN_ON_FALSE(strlen(id) < sizeof(ev.press.btn), ESP_ERR_INVALID_ARG, TAG, "id too long");
+    strcpy(ev.press.btn, id);
+    if (!post(&ev)) {
+        ESP_LOGW(TAG, "feed dismiss for %s not queued", id);
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
 }
 
 esp_err_t link_pair(const link_daemon_t *daemon)
