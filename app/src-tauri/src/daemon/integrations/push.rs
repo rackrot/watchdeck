@@ -44,6 +44,10 @@ fn segment<'a>(path: &'a str, prefix: &str) -> Result<&'a str, PushError> {
 }
 
 impl Receiver for Routes {
+    fn routes(&self) -> &'static [&'static str] {
+        &["notes", "cards"]
+    }
+
     fn accept(&self, req: &PushRequest) -> Result<Vec<Update>, PushError> {
         let path = req.path.as_str();
         match (req.method.as_str(), path) {

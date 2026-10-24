@@ -13,6 +13,7 @@ pub mod integrations;
 pub mod mdns;
 pub mod pairing;
 pub mod protocol;
+pub mod push;
 pub mod screens;
 pub mod secrets;
 pub mod server;

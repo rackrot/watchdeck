@@ -44,7 +44,7 @@ pub const MAX_EVERY_S: u64 = 24 * 60 * 60;
 const MAX_INTEGRATIONS: usize = 16;
 const MAX_CARD_SOURCES: usize = 8;
 /// A push token, in characters. The daemon generates 64 hex digits.
-const MIN_TOKEN_BYTES: usize = 32;
+pub const MIN_TOKEN_BYTES: usize = 32;
 const MAX_INTEGRATION_LABEL: usize = 23;
 /// An integration's id, which starts every note and card id on the wire (63 characters in all).
 const MAX_INTEGRATION_ID: usize = 31;
