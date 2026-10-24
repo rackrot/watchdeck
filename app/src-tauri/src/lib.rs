@@ -1,3 +1,4 @@
+pub mod cli;
 mod commands;
 pub mod daemon;
 mod tray;
@@ -25,7 +26,7 @@ use tokio_rustls::rustls::crypto::aws_lc_rs;
 
 /// Where the daemon keeps its files: `$XDG_CONFIG_HOME/watchdeck`, or `~/.config/watchdeck` when
 /// the variable is unset, empty or not an absolute path (the XDG spec says to ignore those).
-fn config_dir(xdg: Option<OsString>, home: &Path) -> PathBuf {
+pub(crate) fn config_dir(xdg: Option<OsString>, home: &Path) -> PathBuf {
     match xdg.map(PathBuf::from) {
         Some(base) if base.is_absolute() => base.join("watchdeck"),
         _ => home.join(".config").join("watchdeck"),
