@@ -9,6 +9,7 @@
 #include "esp_lvgl_port.h"
 #include "esp_timer.h"
 #include "display.h"
+#include "feedpage.h"
 #include "font_licenses.h"
 #include "fonts.h"
 #include "grid.h"
@@ -81,7 +82,8 @@ static lv_obj_t *s_status_labels[STATUS_COUNT];
 static lv_obj_t *s_forget;        // status mode's Forget pairing, shown while paired
 static lv_obj_t *s_open_settings; // status mode's Settings button, hidden during a pairing attempt
 
-static lv_obj_t *s_grid;         // the page on screen, NULL in status mode and while settings is open
+static lv_obj_t *s_grid;         // the page on screen (the feed page too), NULL in status mode and while settings is open
+static bool s_on_feed;           // the -1 page is the page on screen, or settings will return to it. Cleared by an unpair
 static lv_obj_t *s_pair_view;    // unpaired: the daemon list, the pairing code, or its question
 static lv_obj_t *s_licenses;     // the font license viewer on the top layer, NULL while closed
 static uint32_t s_settings_tick; // when the long swipe that opens settings was recognized
@@ -562,6 +564,16 @@ static bool drag_consumed(const char *what)
     return true;
 }
 
+void ui_touch_track(lv_event_t *e)
+{
+    touch_track(e);
+}
+
+bool ui_drag_consumed(const char *what)
+{
+    return drag_consumed(what);
+}
+
 static void grid_click(lv_event_t *e)
 {
     (void)e;
@@ -631,13 +643,15 @@ static void grid_gesture(lv_event_t *e)
     }
 }
 
-// Replace the grid with page `l` of a set of `pages`. With 2 or more pages the cells give up a strip at the bottom for
-// "Page x of y". The grid keeps its full height either way, and never scrolls.
-static void build_grid(const proto_layout_t *l, uint8_t pages)
+// Replace the page on screen with a new, empty page object that takes the gestures and the touch tracking: the grid and
+// the feed page are both built on it, so one fix to either handler covers both. The feed page's state goes with the old
+// page.
+static void page_create(void)
 {
     if (s_grid) {
         lv_obj_delete(s_grid);
     }
+    feedpage_close();
     s_grid = lv_obj_create(lv_screen_active());
     lv_obj_remove_style_all(s_grid);
     // Children bubble gestures by default (lv_obj.c), so a swipe that starts on a button lands here.
@@ -649,6 +663,13 @@ static void build_grid(const proto_layout_t *l, uint8_t pages)
     lv_obj_set_size(s_grid, DISPLAY_H_RES, DISPLAY_V_RES - GRID_TOP);
     lv_obj_set_pos(s_grid, 0, GRID_TOP);
     lv_obj_set_scrollable(s_grid, false);
+}
+
+// Replace the grid with page `l` of a set of `pages`. With 2 or more pages the cells give up a strip at the bottom for
+// "Page x of y". The grid keeps its full height either way, and never scrolls.
+static void build_grid(const proto_layout_t *l, uint8_t pages)
+{
+    page_create();
 
     // The daemon sizes icons to what is left (icons.rs box_px), so both sides use grid_geometry.
     const grid_geometry_t geo = grid_geometry(l->cols, l->rows, pages >= 2);
@@ -758,12 +779,41 @@ static void show_tile(size_t i, const proto_tile_t *t)
     lv_obj_set_style_bg_color(s_cells[i], tile_bg(t->state, s_cell_bgs[i]), 0);
 }
 
+bool ui_clock_now(uint64_t *now)
+{
+    if (!s_have_stats) {
+        return false;
+    }
+    *now = s_stats.time + (uint64_t)((esp_timer_get_time() - s_stats_at_us) / 1000000);
+    return true;
+}
+
+// Under the LVGL lock, then the model lock: the feed page in the page's place, from the model's snapshot.
+static void build_feed(const proto_feed_t *feed)
+{
+    page_create();
+    s_n_buttons = 0; // the grid's cells went with the old page, so ui_set_icon and ui_set_tile find none
+    uint64_t now = 0;
+    feedpage_set_online(s_online);
+    feedpage_fill(s_grid, feed, ui_clock_now(&now), now);
+}
+
 // Under the LVGL lock, then the model lock: build the page shown from the model's set, with the icons and tile values
-// the model already holds. Leaves s_online alone, and dims the page while the link is down. Returns its index.
+// the model already holds, or the feed page while s_on_feed. Leaves s_online alone, and dims the page while the link is
+// down. Returns the index of the set's page shown, which stays the home page's under the feed.
 static uint8_t build_page(void)
 {
     const uint8_t shown = model_shown();
-    build_grid(model_page(shown), model_pages());
+    const proto_feed_t *feed = model_feed();
+    if (s_on_feed && !(feed && feed->sources > 0)) {
+        ESP_LOGI(TAG, "feed page gone: the daemon has no integration, back to page %u", shown + 1);
+        s_on_feed = false;
+    }
+    if (s_on_feed) {
+        build_feed(feed);
+    } else {
+        build_grid(model_page(shown), model_pages());
+    }
     for (size_t i = 0; i < s_n_buttons; i++) {
         const lv_image_dsc_t *dsc = s_has_icon[i] ? icons_find(s_icon_ids[i]) : NULL;
         if (dsc) {
@@ -780,20 +830,43 @@ static uint8_t build_page(void)
 
 // Runs in the LVGL task, so under the LVGL lock. `user_data` is the direction (+1 next, -1 previous), resolved against
 // the page shown now, since a new set may have applied since the swipe. Sends nothing to the link, and works offline.
+// Past page 1 on the left is the feed page, when the daemon has an integration. The model's shown page stays page 1's
+// id under it, so a left swipe from the feed is the way back and a right swipe there is an outward one at the end.
 static void swipe_page(void *user_data)
 {
     const int dir = (int)(intptr_t)user_data;
     model_lock();
     const uint32_t locked_at = lv_tick_get();
-    if (!s_grid || model_pages() == 0 || !model_step(dir)) {
+    const proto_feed_t *feed = model_feed();
+    const bool was_on_feed = s_on_feed;
+    if (!s_grid || model_pages() == 0) {
         model_unlock();
-        return; // no set, or an outward swipe at an end
+        return; // no set
+    }
+    if (s_on_feed) {
+        if (dir < 0) {
+            model_unlock();
+            return; // outward at the feed's end
+        }
+        s_on_feed = false;
+    } else if (dir < 0 && model_shown() == 0 && feed && feed->sources > 0) {
+        s_on_feed = true;
+    } else if (!model_step(dir)) {
+        model_unlock();
+        return; // an outward swipe at an end
     }
     const uint8_t shown = build_page();
     const uint8_t pages = model_pages();
     model_unlock();
     const uint32_t held_ms = lv_tick_elaps(locked_at);
-    ESP_LOGI(TAG, "page %u/%u shown in %u ms", shown + 1, pages, (unsigned)lv_tick_elaps(s_swipe_tick));
+    if (s_on_feed) {
+        ESP_LOGI(TAG, "feed page shown in %u ms", (unsigned)lv_tick_elaps(s_swipe_tick));
+    } else {
+        ESP_LOGI(TAG, "page %u/%u shown in %u ms", shown + 1, pages, (unsigned)lv_tick_elaps(s_swipe_tick));
+    }
+    if (s_on_feed != was_on_feed) {
+        ui_log_heap(s_on_feed ? "feed built" : "page built");
+    }
     if (held_ms > SWIPE_LOCK_WARN_MS) {
         ESP_LOGW(TAG, "page build held the model lock %u ms, copy the page out under it", (unsigned)held_ms);
     }
@@ -907,6 +980,7 @@ static void settings_enter(void *user_data)
     if (from == MODE_GRID) {
         lv_obj_delete(s_grid);
         s_grid = NULL;
+        feedpage_close(); // s_on_feed stays, so closing settings returns to the feed page
         s_n_buttons = 0; // so ui_set_icon and ui_set_tile find no cells while the grid is gone
     } else {
         status_mode_end();
@@ -1137,6 +1211,32 @@ void ui_set_stats(const proto_stats_t *stats)
     s_stats_at_us = esp_timer_get_time();
     s_have_stats = true;
     bar_refresh();
+    if (s_on_feed && s_grid) {
+        uint64_t now = 0;
+        const bool have_clock = ui_clock_now(&now);
+        feedpage_tick(have_clock, now);
+    }
+    lvgl_port_unlock();
+}
+
+void ui_set_feed(void)
+{
+    if (!s_ready) {
+        return;
+    }
+    lvgl_port_lock(0);
+    if (s_on_feed && s_grid) {
+        model_lock();
+        const proto_feed_t *feed = model_feed();
+        if (feed && feed->sources > 0) {
+            uint64_t now = 0;
+            const bool have_clock = ui_clock_now(&now);
+            feedpage_fill(s_grid, feed, have_clock, now);
+        } else {
+            build_page(); // the daemon has no integration any more: back to the grid
+        }
+        model_unlock();
+    }
     lvgl_port_unlock();
 }
 
@@ -1210,6 +1310,7 @@ void ui_link_down(void)
     lvgl_port_lock(0);
     s_online = false;
     s_n_pending = 0;
+    feedpage_set_online(false);
     if (s_grid) {
         lv_obj_set_style_opa(s_grid, LV_OPA_30, 0);
     }
@@ -1381,6 +1482,8 @@ void ui_set_paired(bool paired)
             lv_obj_delete(s_grid);
             s_grid = NULL;
         }
+        s_on_feed = false;
+        feedpage_close();
         result_hide();
         s_online = false;
         s_n_pending = 0;

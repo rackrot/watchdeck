@@ -8,6 +8,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "lvgl.h"
 
@@ -16,8 +17,8 @@
  * runs from the first set until an unpair. Settings replaces the grid (or status mode's lines) while open and goes
  * back to the mode it came from.
  *
- * Hooks: P1 adds MODE_SLEEP here and in ui.c's mode switch. N3 adds no mode: the feed page is a sub-state of
- * MODE_GRID (an `on_feed` flag in ui.c).
+ * Hooks: P1 adds MODE_SLEEP here and in ui.c's mode switch. The feed page adds no mode: it is a sub-state of MODE_GRID
+ * (s_on_feed in ui.c), shown in the grid's place by build_page.
  */
 typedef enum {
     MODE_STATUS,
@@ -61,6 +62,17 @@ lv_obj_t *ui_add_licenses_button(lv_obj_t *parent);
 
 /** True while the font license viewer is up. */
 bool ui_licenses_open(void);
+
+/**
+ * For the feed page (feedpage.c), whose note rows track touches and take taps like the grid's cells: the touch tracking
+ * that opens settings on a long swipe up, and the check a tap runs first, true when the touch was a drag (and then it
+ * may have turned the page).
+ */
+void ui_touch_track(lv_event_t *e);
+bool ui_drag_consumed(const char *what);
+
+/** The host's clock in Unix seconds, run on from the latest `stats` frame. Returns false, and leaves `now`, before the first. */
+bool ui_clock_now(uint64_t *now);
 
 /** Close settings and rebuild the mode it came from. Asks through lv_async_call, so it is safe in any widget's event.
  */

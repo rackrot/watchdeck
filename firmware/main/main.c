@@ -98,6 +98,7 @@ void app_main(void)
         .on_result = ui_show_result,
         .on_tile = ui_set_tile,
         .on_stats = ui_set_stats,
+        .on_feed = ui_set_feed,
         .on_paired = ui_set_paired,
         .on_daemons = ui_show_daemons,
         .on_pair_code = ui_show_pair_code,

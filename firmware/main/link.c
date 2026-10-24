@@ -80,7 +80,8 @@ typedef enum {
     EV_WS_BAD,      // oversize or broken frame: close the link
     EV_WS_BAD_CERT, // the daemon's cert is not the pinned one
     EV_PRESS,
-    EV_PAIR,         // the user picked a daemon to pair with
+    EV_FEED_DISMISS, // a note id in press.btn
+    EV_PAIR,        // the user picked a daemon to pair with
     EV_PAIR_CANCEL,  // the user abandoned the attempt, or said No to its question
     EV_PAIR_CONFIRM, // the user said Yes, the desktop shows the pairing
     EV_FORGET,       // the user asked to forget the pairing
@@ -742,8 +743,9 @@ static void send_hello(void)
     }
     // Only names this build fully supports: "fonts" means ui.c draws every font id in font_list.h, and "pages" that
     // pageset.c assembles sets of up to PROTO_MAX_PAGES and ui.c lays out the paged grid, and "status_bar" that ui.c
-    // reads `stats` frames.
-    static const char *const caps[] = {"fonts", "pages", "status_bar"};
+    // reads `stats` frames, and "feed" that ui.c shows the -1 page from `feed` frames and dismisses with feed_dismiss.
+    // The hello must stay under 256 bytes: test_proto.c pins it with the full list.
+    static const char *const caps[] = {"fonts", "pages", "status_bar", "feed"};
     char buf[256];
     size_t len = proto_build_hello(buf, sizeof(buf), device, s.pairing->token, esp_app_get_description()->version,
                                    DISPLAY_H_RES, DISPLAY_V_RES, caps, sizeof(caps) / sizeof(caps[0]));
@@ -1228,6 +1230,21 @@ static void handle_msg(const char *json, size_t len)
             }
         }
         break;
+    case PROTO_MSG_FEED:
+        if (!s.welcomed) {
+            ESP_LOGW(TAG, "message before welcome, ignored");
+        } else {
+            ESP_LOGI(TAG, "feed: %u source%s, %u card%s, %u note%s", m->feed.sources, m->feed.sources == 1 ? "" : "s",
+                     (unsigned)m->feed.n_cards, m->feed.n_cards == 1 ? "" : "s", (unsigned)m->feed.n_notes,
+                     m->feed.n_notes == 1 ? "" : "s");
+            model_lock();
+            model_set_feed(&m->feed);
+            model_unlock();
+            if (s.cbs.on_feed) {
+                s.cbs.on_feed();
+            }
+        }
+        break;
     case PROTO_MSG_UNKNOWN:
         ESP_LOGW(TAG, "unknown message type \"%s\", ignored", m->unknown_t);
         break;
@@ -1329,6 +1346,17 @@ static void handle_event(link_ev_t *ev)
             }
         } else {
             ESP_LOGW(TAG, "link down, press %u dropped", (unsigned)ev->press.seq);
+        }
+        break;
+    case EV_FEED_DISMISS:
+        if (s.state == ST_UP && s.welcomed) {
+            char buf[PROTO_ID_MAX + 32];
+            size_t len = proto_build_feed_dismiss(buf, sizeof(buf), ev->press.btn);
+            if (len > 0) {
+                send_text(buf, len, NULL);
+            }
+        } else {
+            ESP_LOGW(TAG, "link down, feed dismiss dropped");
         }
         break;
     case EV_PAIR:
@@ -1503,6 +1531,15 @@ esp_err_t link_press(const char *btn, uint32_t seq)
     link_ev_t ev = {.type = EV_PRESS, .press.seq = seq};
     ESP_RETURN_ON_FALSE(strlen(btn) < sizeof(ev.press.btn), ESP_ERR_INVALID_ARG, TAG, "id too long");
     strcpy(ev.press.btn, btn);
+    return post(&ev) ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+esp_err_t link_feed_dismiss(const char *id)
+{
+    ESP_RETURN_ON_FALSE(s.queue, ESP_ERR_INVALID_STATE, TAG, "not started");
+    link_ev_t ev = {.type = EV_FEED_DISMISS};
+    ESP_RETURN_ON_FALSE(strlen(id) < sizeof(ev.press.btn), ESP_ERR_INVALID_ARG, TAG, "id too long");
+    strcpy(ev.press.btn, id);
     return post(&ev) ? ESP_OK : ESP_ERR_NO_MEM;
 }
 

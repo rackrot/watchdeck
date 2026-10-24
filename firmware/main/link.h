@@ -34,6 +34,7 @@ typedef struct {
     void (*on_result)(const proto_result_t *result);               // valid only during the call
     void (*on_tile)(const proto_tile_t *tile);                     // stored in the model already; valid during the call
     void (*on_stats)(const proto_stats_t *stats);                  // about once a second; valid only during the call
+    void (*on_feed)(void);                                         // a snapshot is in the model: refresh the -1 page
     void (*on_paired)(bool paired);                                // at start and on every change
     void (*on_daemons)(const link_daemon_t *daemons, size_t n);    // unpaired: the pairable list changed
     void (*on_pair_code)(const char *code, const char *name);      // show the code, or NULL when the attempt ends
@@ -49,6 +50,12 @@ esp_err_t link_start(const link_cbs_t *cbs);
 
 /** Queue a press for the link task to send. Safe from any task. Dropped while the link is down. */
 esp_err_t link_press(const char *btn, uint32_t seq);
+
+/**
+ * Queue a feed_dismiss for note `id` (1 to 63 printable ASCII characters) for the link task to send. Safe from any
+ * task. Dropped while the link is down.
+ */
+esp_err_t link_feed_dismiss(const char *id);
 
 /** Pair with `daemon`. Ignored unless unpaired and idle. Safe from any task. */
 esp_err_t link_pair(const link_daemon_t *daemon);

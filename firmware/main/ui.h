@@ -51,6 +51,13 @@ void ui_icons_settled(void);
  */
 void ui_set_stats(const proto_stats_t *stats);
 
+/**
+ * A `feed` snapshot is in the model. With the -1 page on screen, rebuild its cards and notes from it, or go back to page
+ * 1 if the daemon no longer has an integration. Otherwise nothing is on screen to change: a right swipe on page 1 reads
+ * the model when it shows the page. Thread-safe, but not under the model lock.
+ */
+void ui_set_feed(void);
+
 /** Grey out the grid and block presses until the next ui_show_set. Thread-safe. */
 void ui_link_down(void);
 
