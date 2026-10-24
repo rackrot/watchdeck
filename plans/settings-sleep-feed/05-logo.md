@@ -32,7 +32,8 @@ Today the app has Tauri's default icons, the Vite favicon and a text-only wordma
 | Drawn from LVGL rectangles and arcs | none | 10 to 20 objects (2 to 3 KB of pool) | ties the design to boxes and circles, and every change is C code |
 | A PNG on the TF card | none | a decoder that's off (F22) | must work with no card |
 
-- One size, 240 px, is drawn on the boot screen and centered in the sleep screen's image area. Recoloring to the sleep screen's `fg` comes free with A4.
+- One size, 240 px, is drawn on the boot screen and centered in the sleep screen's image area.
+- **Decided after L2 (2026-10-23): I4.** In one color, mark A's lit key merges into the panel. So the user chose two colors: the panel #e7edf3 and the key #38bdf8, with blended edge entries, 28,864 bytes. The palette is fixed, so the logo is not recolored to the sleep screen's `fg`, and L4 must not rely on that.
 
 ### The pipeline (L2)
 

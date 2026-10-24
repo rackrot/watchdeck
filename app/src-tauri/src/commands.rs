@@ -203,10 +203,44 @@ pub async fn import_icon(
     app: AppHandle,
     daemon: State<'_, Daemon>,
 ) -> Result<Option<String>, String> {
+    let Some(path) = pick_image(&app, "Import an icon").await? else {
+        return Ok(None);
+    };
+    let configs = daemon.configs.clone();
+    blocking(move || configs.import_icon(&path))
+        .await?
+        .map(Some)
+}
+
+/// The files in `screens/` that `[sleep]`'s `image` could name.
+#[tauri::command]
+pub async fn list_screen_images(daemon: State<'_, Daemon>) -> Result<Vec<String>, String> {
+    let configs = daemon.configs.clone();
+    blocking(move || configs.list_screen_images()).await?
+}
+
+/// Like [`import_icon`], for the sleep screen: copies the picked image into `screens/` and
+/// returns the file name for `[sleep]`'s `image`, or `None` if the user cancels.
+#[tauri::command]
+pub async fn import_screen_image(
+    app: AppHandle,
+    daemon: State<'_, Daemon>,
+) -> Result<Option<String>, String> {
+    let Some(path) = pick_image(&app, "Import a sleep screen image").await? else {
+        return Ok(None);
+    };
+    let configs = daemon.configs.clone();
+    blocking(move || configs.import_screen_image(&path))
+        .await?
+        .map(Some)
+}
+
+/// Asks the user for a PNG, JPEG, WebP or SVG in a native file dialog, or `None` if they cancel.
+async fn pick_image(app: &AppHandle, title: &str) -> Result<Option<std::path::PathBuf>, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog()
         .file()
-        .set_title("Import an icon")
+        .set_title(title)
         .add_filter("Images", &["png", "jpg", "jpeg", "webp", "svg"])
         .pick_file(move |picked| {
             // The receiver only goes away if the command was dropped.
@@ -215,16 +249,13 @@ pub async fn import_icon(
     let picked = rx
         .await
         .map_err(|_| "the file dialog closed unexpectedly".to_string())?;
-    let Some(picked) = picked else {
-        return Ok(None);
-    };
-    let path = picked
-        .into_path()
-        .map_err(|e| format!("not a local file: {e}"))?;
-    let configs = daemon.configs.clone();
-    blocking(move || configs.import_icon(&path))
-        .await?
-        .map(Some)
+    picked
+        .map(|picked| {
+            picked
+                .into_path()
+                .map_err(|e| format!("not a local file: {e}"))
+        })
+        .transpose()
 }
 
 /// Runs `work` on the blocking pool, since it may decode images or wait on the config lock.

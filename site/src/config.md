@@ -413,7 +413,7 @@ ha = "Bearer paste-your-token-here"
 
 ## Sleep screen
 
-An optional `[sleep]` table sets the screen the board shows once its link to the desktop has been down for a while, or after a long swipe down. The keys are checked now. The board doesn't show the screen yet, and a change to `[sleep]` pushes no layout.
+An optional `[sleep]` table sets the screen the board shows once its link to the desktop has been down for a while, or after a long swipe down. A board that names `sleep` in its `hello` gets the settings and the picture whenever they change, and a change to `[sleep]` alone pushes no layout. A board that doesn't name it is sent nothing.
 
 ```toml
 [sleep]
@@ -430,8 +430,10 @@ offline_after_s = 10               # 0 to 3600. 0 never sleeps for a lost link
 backlight = 100                    # 0 to 100, the backlight while asleep
 ```
 
-- Every key is optional. An absent key takes the default: black `bg`, light grey `fg`, `show` of `clock` and `date`, anchor `bottom_left`, the `arc` spinner in `#38bdf8`, `offline_after_s` 10, `backlight` 100, and the logo when `image` is absent.
-- `image` is a plain file name: letters, digits, `_`, `-` or `.`, at most 63 bytes, not starting with a dot. It names a file in `screens/`.
+- Every key is optional, and so is the whole table. An absent key takes the default: black `bg`, light grey (`#d0d0d0`) `fg`, `show` of `clock` and `date`, anchor `bottom_left`, the `arc` spinner in `#38bdf8`, `offline_after_s` 10, `backlight` 100, `fit` of `cover`, and the logo when `image` is absent. The app fills these in, so the board shows what you see here.
+- `image` is a plain file name: letters, digits, `_`, `-` or `.`, at most 63 bytes, not starting with a dot. It names a file in `screens/` beside `config.toml`, and a name with no such file holds the config back with `sleep.image "x": no such file in screens/`.
+- The picture is a PNG, JPEG, WebP or SVG, checked like an [icon](#icons) (the same decoding, the SVG subset and the drawing-cost estimate, here for the whole 1024 × 512 area), except that the file may be up to 16 MB (an SVG still at most 256 KB). The app scales it to 1024 × 512: `cover` fills the area and cuts off the overflow equally at both ends, `contain` shows all of it with `bg` around it. Transparency shows `bg`. The result is 1,048,576 bytes of RGB565, and the first 16 bytes of its SHA-256 are its id on the wire.
+- Adding, removing or changing the file `image` names reloads the config, as it does for an icon.
 - `text` is printable ASCII, at most 47 characters.
 - Colors are `#rrggbb`.
 

@@ -29,10 +29,11 @@ use super::config::{Action, Layout, Live, MAX_COLS, MAX_ROWS};
 use super::hoststats::{self, HostSources, HostStats};
 use super::integrations::{self, FeedHandle, FeedSlots, Integrations};
 use super::protocol::{
-    decode_hex, encode_hex, valid_device_id, Colors, ErrorCode, Feed, Message, Report, Token, CAPS,
-    CAP_FEED, CAP_FONTS, CAP_PAGES, CAP_STATUS_BAR, ICON_ID_BYTES, MAX_MESSAGE_BYTES,
-    MAX_REPORTS_PER_SESSION, TOKEN_BYTES, VERSION,
+    decode_hex, encode_asset_frame, encode_hex, valid_device_id, Colors, ErrorCode, Feed, Message,
+    Report, Token, ASSET_ID_BYTES, CAPS, CAP_FEED, CAP_FONTS, CAP_PAGES, CAP_SLEEP, CAP_STATUS_BAR,
+    ICON_ID_BYTES, MAX_MESSAGE_BYTES, MAX_REPORTS_PER_SESSION, TOKEN_BYTES, VERSION,
 };
+use super::screens::IMAGE_BYTES;
 use super::store::Store;
 use super::tiles::{self, Sent, Tiles, Values};
 
@@ -786,6 +787,14 @@ where
     if let Some(kicked) = tiles.push(tx, &mut kick, &layout, &live).await? {
         return end_kicked(tx, kicked, device).await;
     }
+    // What the device knows of the sleep screen, and the picture its `asset_get`s are answered
+    // from. Nothing is kept for a session that did not name `sleep`.
+    let sleep_cap = caps.iter().any(|cap| cap == CAP_SLEEP);
+    let mut sleeping = sleep_cap.then(|| live.sleep());
+    let mut screen = sleep_cap.then(|| live.screen.clone()).flatten();
+    if let Some(frame) = &sleeping {
+        send(tx, &Message::Sleep(frame.clone())).await?;
+    }
 
     let feed = shared.integrations.handle();
     let feed_on = caps.iter().any(|cap| cap == CAP_FEED);
@@ -833,6 +842,16 @@ where
                     if let Some(kicked) = tiles.push(tx, &mut kick, &layout, &live).await? {
                         return end_kicked(tx, kicked, device).await;
                     }
+                }
+                // An edit to `[sleep]` alone changes this and not the layout.
+                if let Some(known) = &mut sleeping {
+                    let next = live.sleep();
+                    if next != *known {
+                        log::info!("{device}: pushing sleep");
+                        send(tx, &Message::Sleep(next.clone())).await?;
+                        *known = next;
+                    }
+                    screen = live.screen.clone();
                 }
                 continue;
             }
@@ -958,6 +977,37 @@ where
                 // An unknown id is ignored: another board may have dismissed it first.
                 if feed.dismiss(&dismiss.id) {
                     log::info!("{device}: dismissed note {:?}", dismiss.id);
+                }
+            }
+            Incoming::Msg(Message::AssetGet(get)) if sleep_cap => {
+                // The size of an image is fixed, so a request past its end is malformed whichever
+                // image it names. Only an id that is not the current image goes unanswered.
+                let refused = get.check().err().or_else(|| {
+                    (get.offset >= IMAGE_BYTES as u64)
+                        .then(|| format!("offset is not below the image's {IMAGE_BYTES} bytes"))
+                });
+                if let Some(why) = refused {
+                    send_error(tx, ErrorCode::BadRequest, why).await?;
+                    return Ok(());
+                }
+                let id = decode_hex::<ASSET_ID_BYTES>(&get.id).expect("checked with the request");
+                match kick.try_recv() {
+                    Err(oneshot::error::TryRecvError::Empty) => {}
+                    kicked => return end_kicked(tx, kicked.ok(), device).await,
+                }
+                let frame = screen.as_ref().filter(|image| image.id == id).map(|image| {
+                    image
+                        .chunk(get.offset)
+                        .and_then(|chunk| encode_asset_frame(&id, get.offset, chunk))
+                });
+                match frame {
+                    Some(Some(frame)) => {
+                        send_frame(tx, WsMessage::Binary(Bytes::from(frame))).await?
+                    }
+                    // Unreachable for a checked offset below the size. Dropped, the device's
+                    // timeout ends the download.
+                    Some(None) => log::error!("{device}: no chunk at {}", get.offset),
+                    None => log::info!("{device}: asset {} is not the current image", get.id),
                 }
             }
             Incoming::Msg(Message::Report(report)) => {

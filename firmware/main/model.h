@@ -64,5 +64,12 @@ const proto_tile_t *model_tile(const char *btn);
 /** Forget every stored tile value. */
 void model_clear_tiles(void);
 
-/** Forget the applied set, the page shown, the tile values and every cached icon. Needs the LVGL lock first too. */
+/** Keep `feed` as the latest snapshot, replacing the last. It outlives the session, so the -1 page shows it dimmed. */
+void model_set_feed(const proto_feed_t *feed);
+
+/** The latest feed snapshot, or NULL before the first one and after an unpair. Valid until the lock is released. */
+const proto_feed_t *model_feed(void);
+
+/** Forget the applied set, the page shown, the tile values, the feed and every cached icon. Needs the LVGL lock first
+ * too. */
 void model_clear(void);

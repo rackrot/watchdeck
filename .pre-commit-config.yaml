@@ -59,7 +59,7 @@ repos:
         language: system
         entry: clang-format --dry-run -Werror
         files: ^firmware/.*\.(c|h)$
-        exclude: ^firmware/main/fonts/
+        exclude: ^firmware/main/(fonts/|logo_img\.[ch]$)
 
       - id: fonts-generated
         name: fonts generated

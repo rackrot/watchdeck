@@ -12,7 +12,7 @@ pub use super::units::{NetUnit, TempUnit};
 pub const VERSION: u32 = 1;
 
 /// The capabilities a session keeps from `hello.caps`; any other name is dropped.
-pub const CAPS: [&str; 4] = [CAP_FONTS, CAP_PAGES, CAP_STATUS_BAR, CAP_FEED];
+pub const CAPS: [&str; 5] = [CAP_FONTS, CAP_PAGES, CAP_STATUS_BAR, CAP_SLEEP, CAP_FEED];
 /// The device draws every font in `fonts_gen::FONT_IDS` and reads the layout's font fields.
 pub const CAP_FONTS: &str = "fonts";
 /// The device assembles a set of up to 4 `layout` pages and lays out the shorter grid for 2 or
