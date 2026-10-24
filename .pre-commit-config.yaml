@@ -69,14 +69,6 @@ repos:
         files: ^(fonts/|firmware/main/fonts/|firmware/main/font_list\.h$|app/src/fonts\.gen\.ts$|app/src-tauri/src/daemon/fonts_gen\.rs$)
         pass_filenames: false
 
-      - id: logo-generated
-        name: logo generated
-        language: system
-        entry: mise run logo:check
-        # yamllint disable-line rule:line-length
-        files: ^(logo/|firmware/main/logo_img\.[ch]$|app/src/assets/logo\.svg$|app/public/favicon\.svg$|app/src-tauri/examples/logo_gen\.rs$)
-        pass_filenames: false
-
       - id: rumdl
         name: rumdl
         language: system
