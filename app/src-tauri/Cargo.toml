@@ -92,6 +92,15 @@ opt-level = 3
 [profile.dev.package.usvg]
 opt-level = 3
 
+# Sleep screen photos. A 12 megapixel JPEG is decoded and scaled on every config reload, and
+# unoptimized that takes seconds. The image crate does the scaling; zune-jpeg and image-webp decode.
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+[profile.dev.package.image-webp]
+opt-level = 3
+
 [dev-dependencies]
 tempfile = "3.27.0"
 tokio = { version = "1.53.2", features = [

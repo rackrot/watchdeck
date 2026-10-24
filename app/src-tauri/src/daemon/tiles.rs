@@ -430,6 +430,7 @@ mod tests {
         Arc::new(Live {
             config,
             icons: IconSet::new(),
+            screen: None,
         })
     }
 
