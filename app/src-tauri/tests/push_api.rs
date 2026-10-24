@@ -573,45 +573,172 @@ async fn bursts_past_thirty_get_429() {
     assert!(statuses[30..].contains(&429), "{statuses:?}");
 }
 
+/// A connection to `addr` from the loopback address `source`, such as `127.0.0.2`: any address in
+/// 127/8 reaches the listener, and stands in for a LAN peer.
+async fn connect_from(source: &str, addr: SocketAddr) -> TcpStream {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind(format!("{source}:0").parse().unwrap()).unwrap();
+    socket.connect(addr).await.unwrap()
+}
+
+async fn post_from(source: &str, addr: SocketAddr, auth: Option<&str>) -> (u16, String) {
+    let request = raw("POST", "/v1/notes", auth, r#"{"title":"t"}"#);
+    exchange(connect_from(source, addr).await, &request).await
+}
+
+/// Whether the listener closes `stream` at once, without a reply.
+async fn dropped(mut stream: TcpStream) -> bool {
+    let mut buf = [0u8; 16];
+    let read = timeout(Duration::from_secs(1), stream.read(&mut buf)).await;
+    matches!(read, Ok(Ok(0) | Err(_)))
+}
+
 #[tokio::test]
-async fn twenty_refused_tokens_get_a_peer_429_for_a_minute() {
+async fn twenty_refused_bearers_shut_a_peer_out_but_never_localhost() {
     let rig = start().await;
     let addr = rig.loopback().await;
+    let wrong = format!("Bearer {WRONG}");
+    let good = format!("Bearer {TOKEN_HA}");
     for i in 0..push::MAX_FAILED_AUTHS {
         assert_eq!(
-            post_note(addr, WRONG, r#"{"title":"t"}"#).await.0,
+            post_from("127.0.0.1", addr, Some(&wrong)).await.0,
+            401,
+            "try {i}"
+        );
+        assert_eq!(
+            post_from("127.0.0.2", addr, Some(&wrong)).await.0,
             401,
             "try {i}"
         );
     }
-    let (status, body) = post_note(addr, TOKEN_HA, r#"{"title":"t"}"#).await;
+    // Every local sender is 127.0.0.1, so it is never shut out.
+    assert_eq!(post_from("127.0.0.1", addr, Some(&good)).await.0, 201);
+    // Another address is, at accept, even with the right token.
+    let shut_out = connect_from("127.0.0.2", addr).await;
+    assert!(dropped(shut_out).await, "dropped before any reply");
     assert_eq!(
-        (status, body.as_str()),
-        (429, r#"{"error":"too many requests"}"#)
+        post_from("127.0.0.3", addr, Some(&good)).await.0,
+        201,
+        "only that peer"
     );
-    assert!(rig.feed().notes.is_empty(), "even the right token waits");
 }
 
 #[tokio::test]
-async fn connections_beyond_32_are_dropped_until_one_frees_up() {
+async fn requests_without_a_bearer_never_shut_a_peer_out() {
     let rig = start().await;
     let addr = rig.loopback().await;
+    for _ in 0..push::MAX_FAILED_AUTHS + 5 {
+        assert_eq!(post_from("127.0.0.2", addr, None).await.0, 401);
+        assert_eq!(
+            post_from("127.0.0.4", addr, Some(&format!("Basic {WRONG}")))
+                .await
+                .0,
+            401
+        );
+    }
+    let good = format!("Bearer {TOKEN_HA}");
+    assert_eq!(post_from("127.0.0.2", addr, Some(&good)).await.0, 201);
+    assert_eq!(post_from("127.0.0.4", addr, Some(&good)).await.0, 201);
+}
+
+#[tokio::test]
+async fn a_browser_request_is_refused_and_costs_the_peer_nothing() {
+    let rig = start().await;
+    let addr = rig.loopback().await;
+    let good = format!("Bearer {TOKEN_HA}");
+    // Past the burst of 30, so a request that counted would end in 429.
+    for i in 0..40 {
+        let header = if i % 2 == 0 {
+            "Origin: https://evil.example"
+        } else {
+            "Sec-Fetch-Site: cross-site"
+        };
+        let request = format!(
+            "POST /v1/notes HTTP/1.1\r\nHost: watchdeck\r\n{header}\r\nAuthorization: {good}\r\n\
+             Content-Length: 13\r\n\r\n{{\"title\":\"t\"}}"
+        );
+        let (status, body) =
+            exchange(connect_from("127.0.0.2", addr).await, request.as_bytes()).await;
+        assert_eq!(
+            (status, body.as_str()),
+            (403, r#"{"error":"browsers may not call the push API"}"#)
+        );
+    }
+    assert!(rig.feed().notes.is_empty());
+    assert_eq!(post_from("127.0.0.2", addr, Some(&good)).await.0, 201);
+}
+
+#[tokio::test]
+async fn one_peer_holds_at_most_four_connections() {
+    let rig = start().await;
+    let addr = rig.loopback().await;
+    let mut held = Vec::new();
+    for _ in 0..push::MAX_PEER_CONNECTIONS {
+        held.push(connect_from("127.0.0.2", addr).await);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(dropped(connect_from("127.0.0.2", addr).await).await);
+    let good = format!("Bearer {TOKEN_HA}");
+    assert_eq!(
+        post_from("127.0.0.3", addr, Some(&good)).await.0,
+        201,
+        "others still get in"
+    );
+    drop(held.pop());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        post_from("127.0.0.2", addr, Some(&good)).await.0,
+        201,
+        "a slot came back"
+    );
+}
+
+#[tokio::test]
+async fn each_listener_has_its_own_32_connections() {
+    let rig = start_with(&config_text(true, BOTH), "127.0.0.1:0".parse().unwrap()).await;
+    let bound = rig.bound(|b| b.loopback.is_some() && b.lan.is_some()).await;
+    let (addr, lan) = (bound.loopback.unwrap(), bound.lan.unwrap());
+    // From 127.0.0.1, which has no per-peer cap, so only the listener's slots stop it.
     let mut held = Vec::new();
     for _ in 0..MAX_CONNECTIONS {
         held.push(TcpStream::connect(addr).await.unwrap());
     }
-    // Let the listener take them all before the extra one arrives.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let mut extra = TcpStream::connect(addr).await.unwrap();
-    let mut buf = [0u8; 16];
-    let read = timeout(Duration::from_secs(1), extra.read(&mut buf))
-        .await
-        .expect("the extra connection is closed at once");
-    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+    assert!(dropped(TcpStream::connect(addr).await.unwrap()).await);
+    // The LAN port's slots are its own.
+    let request = raw(
+        "POST",
+        "/v1/notes",
+        Some(&format!("Bearer {TOKEN_HA}")),
+        r#"{"title":"t"}"#,
+    );
+    assert_eq!(exchange(connect_tls(lan).await, &request).await.0, 201);
 
     drop(held.pop());
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(post_note(addr, TOKEN_HA, r#"{"title":"t"}"#).await.0, 201);
+}
+
+#[tokio::test]
+async fn a_changed_token_works_within_a_second_with_no_config_change() {
+    let rig = start().await;
+    let addr = rig.loopback().await;
+    let secrets = Secrets::new(rig.dir.path());
+    let rotated = "rotated-token-11111111111111111111111111111";
+    secrets.set("push-ha", rotated).unwrap();
+    let started = Instant::now();
+    while post_note(addr, rotated, r#"{"title":"t"}"#).await.0 != 201 {
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the new token never worked"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        post_note(addr, TOKEN_HA, r#"{"title":"t"}"#).await.0,
+        401,
+        "the old one is gone"
+    );
 }
 
 #[tokio::test]
@@ -650,6 +777,14 @@ async fn the_listeners_follow_the_config_and_the_lan_one_speaks_only_tls() {
         String::from_utf8_lossy(&reply)
     );
     assert_eq!(rig.feed().notes.len(), 1);
+    let warned = format!(
+        "plain HTTP on port {} from 127.0.0.1; replace that sender's token",
+        lan.port()
+    );
+    assert!(
+        LINES.lock().unwrap().iter().any(|l| l.contains(&warned)),
+        "the sender is named so its token can be replaced"
+    );
 
     rig.reconfigure(&config_text(false, BOTH));
     rig.bound(|b| b.lan.is_none()).await;
