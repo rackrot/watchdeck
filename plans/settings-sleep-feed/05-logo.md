@@ -40,7 +40,7 @@ Today the app has Tauri's default icons, the Vite favicon and a text-only wordma
 - `mise run logo:gen`:
   1. `pnpm tauri icon ../logo/app-icon.svg` from `app/` (the Tauri CLI version pinned by the lock) writes the whole set into `app/src-tauri/icons/` (F39).
   2. `cargo run --example logo_gen` in `app/src-tauri` renders `mark.svg` with resvg at 240 px, quantizes alpha to A4 (or the palette to I4), and writes `firmware/main/logo_img.c` and `logo_img.h` (an `lv_image_dsc_t` named `wd_logo`). It also copies `mark.svg` to `app/src/assets/logo.svg` and `app/public/favicon.svg`.
-- `mise run logo:check` regenerates the C file into a temp dir and fails on any difference, like `fonts:check`. The PNGs from `tauri icon` are checked in and not diffed (encoder output may differ between versions), only regenerated on a change to the source.
+- `mise run logo:check` regenerates the C file into a temp dir and fails on any difference, like `fonts:check`. The PNG files from `tauri icon` are checked in and not diffed (encoder output may differ between versions), only regenerated on a change to the source.
 - `firmware/main/logo_img.c`, like the generated fonts, is never edited by hand (CLAUDE.md conventions gain the line).
 - Why not LVGL's `LVGLImage.py` (F36): it needs `pypng`, which nothing pins, and a second image tool when resvg already renders our SVGs.
 
