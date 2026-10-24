@@ -62,6 +62,8 @@ const MAX_SVG_LAYER_PIXELS: f64 = 8.0 * 1024.0 * 1024.0;
 /// usvg and resvg recurse once per nesting level, `<use>` copies included, and debug frames are
 /// large, so an SVG is drawn on a thread of its own with this much stack.
 const SVG_STACK_BYTES: usize = 16 * 1024 * 1024;
+/// How far from the canvas, in canvas pixels, a drawing's shapes may reach.
+const MAX_SVG_REACH_PX: f64 = (1 << 20) as f64;
 const SVG_NS: &str = "http://www.w3.org/2000/svg";
 const XLINK_NS: &str = "http://www.w3.org/1999/xlink";
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
@@ -314,7 +316,9 @@ impl Icons {
     /// ([`name_error`]) of regular files that decode within the limits and don't link out of the
     /// directory. An absent directory holds none.
     pub fn list(&self) -> Result<Vec<String>, String> {
-        list_in(&self.dir, MAX_FILE_BYTES, Target::Icon(1))
+        list_in(&self.dir, |name, path| {
+            decodes(name, path, MAX_FILE_BYTES, Target::Icon(1))
+        })
     }
 }
 
@@ -358,7 +362,10 @@ pub(super) fn import_into(
 /// The files in `dir`, sorted, that a config could name: valid names ([`plain_name`]) of regular
 /// files of at most `max` bytes that decode for `target` and don't link out of the directory. An
 /// absent directory holds none.
-pub(super) fn list_in(dir: &Path, max: u64, target: Target) -> Result<Vec<String>, String> {
+pub(super) fn list_in(
+    dir: &Path,
+    decodes: impl Fn(&str, &Path) -> bool,
+) -> Result<Vec<String>, String> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -372,13 +379,19 @@ pub(super) fn list_in(dir: &Path, max: u64, target: Target) -> Result<Vec<String
         .filter(|name| {
             let path = dir.join(name);
             fs::canonicalize(&path).is_ok_and(|real| real.starts_with(&root))
-                && read_image(&path, max).is_ok_and(|bytes| {
-                    name_matches_contents(name, &bytes).is_ok() && decode(&bytes, target).is_ok()
-                })
+                && decodes(name, &path)
         })
         .collect();
     names.sort();
     Ok(names)
+}
+
+/// Whether the file at `path`, called `name`, is an image of at most `max` bytes that decodes for
+/// `target` and whose name fits what is in it.
+pub(super) fn decodes(name: &str, path: &Path, max: u64, target: Target) -> bool {
+    read_image(path, max).is_ok_and(|bytes| {
+        name_matches_contents(name, &bytes).is_ok() && decode(&bytes, target).is_ok()
+    })
 }
 
 pub(super) fn file_stamp(path: &Path) -> Result<FileStamp, String> {
@@ -603,6 +616,28 @@ fn svg_tree(doc: &roxmltree::Document, costed_for: Target) -> Result<usvg::Tree,
         return Err(format!(
             "the SVG's size {w}x{h} is outside 0.001 to {MAX_SOURCE_SIDE} units a side"
         ));
+    }
+    // tiny-skia asserts when a path's edges reach too far (it panicked at 1e9 px), and the release
+    // profile aborts on a panic. A drawing stretched by a very thin viewBox gets there with an
+    // ordinary shape.
+    let canvas = costed_for.canvas(&tree);
+    let bounds = tree.root().abs_layer_bounding_box();
+    let reach = [
+        f64::from(bounds.left()) * f64::from(canvas.scale.0) + f64::from(canvas.offset.0),
+        f64::from(bounds.right()) * f64::from(canvas.scale.0) + f64::from(canvas.offset.0),
+        f64::from(bounds.top()) * f64::from(canvas.scale.1) + f64::from(canvas.offset.1),
+        f64::from(bounds.bottom()) * f64::from(canvas.scale.1) + f64::from(canvas.offset.1),
+    ];
+    // A NaN would compare as within bounds, so it is refused by name.
+    if reach
+        .iter()
+        .any(|px| px.is_nan() || px.abs() > MAX_SVG_REACH_PX)
+    {
+        return Err(
+            "the SVG's shapes reach too far past its box to draw: make its viewBox bigger or \
+             its shapes smaller"
+                .into(),
+        );
     }
     let (work, layers) = render_cost(&tree, costed_for);
     // A NaN would compare as within bounds, so it is refused by name.
@@ -2734,6 +2769,148 @@ mod tests {
                 refused(what, &make(n + 1), next);
                 // usvg builds the tree before it is costed, and the XML limits keep that quick.
                 refused(what, &make(most), at_most);
+            }
+        }
+    }
+
+    /// The costliest drawings of a few families on the sleep screen's 1024 x 512 canvas, which has
+    /// eight times the pixels of the largest icon, under both fits.
+    #[test]
+    fn the_costliest_svgs_draw_on_the_screen_canvas_in_under_two_seconds() {
+        let stops: String = (0..MAX_SVG_GRADIENT_STOPS)
+            .map(|i| {
+                format!(
+                    "<stop offset='{}' stop-color='#{:02x}00ff'/>",
+                    i as f32 / 31.0,
+                    i * 8
+                )
+            })
+            .collect();
+        let gradients: String = (0..MAX_SVG_STOPS / MAX_SVG_GRADIENT_STOPS)
+            .map(|i| format!("<linearGradient id='g{i}'>{stops}</linearGradient>"))
+            .collect();
+        let rects = |n: usize, at: &str| -> String {
+            (0..n)
+                .map(|i| {
+                    format!(
+                        "<rect {at} fill='url(#g{})' stroke='url(#g{})'/>",
+                        i % 8,
+                        (i + 1) % 8
+                    )
+                })
+                .collect()
+        };
+        let fan = |n: usize| -> String {
+            (0..n / 2)
+                .map(|i| {
+                    let y = i as f32 * 8.0 / (n / 2) as f32;
+                    format!("L0 {y:.3}L8 {:.3}", 8.0 - y)
+                })
+                .collect()
+        };
+        let sized = |w: &str, h: &str, body: String| -> Vec<u8> {
+            format!(
+                "<svg xmlns='http://www.w3.org/2000/svg' width='{w}' height='{h}' \
+                 viewBox='0 0 {w} {h}'><defs>{gradients}</defs>{body}</svg>"
+            )
+            .into_bytes()
+        };
+        type Make<'a> = Box<dyn Fn(usize) -> Vec<u8> + 'a>;
+        let families: Vec<(&str, Make, usize)> = vec![
+            (
+                "gradient fills and strokes over a square",
+                Box::new(|n| sized("8", "8", rects(n, "x='-1' y='-1' width='10' height='10'"))),
+                MAX_SVG_NODES,
+            ),
+            (
+                "opacity layers past the box",
+                Box::new(|n| {
+                    let shapes = rects(n, "x='-100' y='-100' width='200' height='200'")
+                        .replace("<rect", "<rect opacity='.5'");
+                    sized("8", "8", shapes)
+                }),
+                MAX_SVG_NODES,
+            ),
+            (
+                "a filled and stroked path of crossing segments",
+                Box::new(|n| {
+                    sized(
+                        "8",
+                        "8",
+                        format!("<path d='M0 0{}' fill='url(#g0)' stroke='red'/>", fan(n)),
+                    )
+                }),
+                MAX_SVG_PATH_DATA / 9,
+            ),
+            (
+                "gradients filling a drawing 0.001 wide and 4096 high",
+                Box::new(|n| sized("0.001", "4096", rects(n, "width='0.001' height='4096'"))),
+                MAX_SVG_NODES,
+            ),
+            (
+                "gradients far past a drawing 0.001 wide and 4096 high",
+                Box::new(|n| {
+                    sized(
+                        "0.001",
+                        "4096",
+                        rects(n, "x='-1000' y='-10' width='2000' height='8200'"),
+                    )
+                }),
+                MAX_SVG_NODES,
+            ),
+            (
+                "opacity layers over a drawing 4096 wide and 0.001 high",
+                Box::new(|n| {
+                    let shapes = rects(n, "x='-8192' y='-0.002' width='20480' height='0.005'")
+                        .replace("<rect", "<rect opacity='.5'");
+                    sized("4096", "0.001", shapes)
+                }),
+                MAX_SVG_NODES,
+            ),
+        ];
+        for (what, make, most) in families {
+            for cover in [true, false] {
+                let target = Target::Screen { cover };
+                let passes = |bytes: &[u8]| -> bool {
+                    let Ok(doc) = check_svg(std::str::from_utf8(bytes).unwrap()) else {
+                        return false;
+                    };
+                    svg_tree(&doc, target).is_ok()
+                };
+                if !passes(&make(1)) {
+                    // One layer past the canvas is 5x5 canvases, over the 32 MB layer limit at
+                    // this size. Refused up front, which is the point.
+                    let one = make(1);
+                    let doc = check_svg(std::str::from_utf8(&one).unwrap()).unwrap();
+                    let e = svg_tree(&doc, target).unwrap_err();
+                    eprintln!("{what}, cover {cover}: refused: {e}");
+                    assert!(
+                        ["memory", "too long", "reach too far"]
+                            .iter()
+                            .any(|needle| e.contains(needle)),
+                        "{what}: {e}"
+                    );
+                    continue;
+                }
+                let (mut lo, mut hi) = (1, most);
+                while lo < hi {
+                    let mid = (lo + hi).div_ceil(2);
+                    if passes(&make(mid)) {
+                        lo = mid;
+                    } else {
+                        hi = mid - 1;
+                    }
+                }
+                let start = std::time::Instant::now();
+                let (picture, _) = decode(&make(lo), target)
+                    .unwrap_or_else(|e| panic!("{what}, cover {cover}: {e}"));
+                let took = start.elapsed();
+                eprintln!("{what}, cover {cover}: {lo} of at most {most} drawn in {took:?}");
+                assert!(picture.width() <= 1024 && picture.height() <= 512);
+                assert!(
+                    took.as_secs_f64() < 2.0,
+                    "{what}, cover {cover}: {lo} took {took:?}"
+                );
             }
         }
     }

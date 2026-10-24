@@ -778,7 +778,7 @@ where
     // from. Nothing is kept for a session that did not name `sleep`.
     let sleep_cap = caps.iter().any(|cap| cap == CAP_SLEEP);
     let mut sleeping = sleep_cap.then(|| live.sleep());
-    let mut screen = live.screen.clone();
+    let mut screen = sleep_cap.then(|| live.screen.clone()).flatten();
     if let Some(frame) = &sleeping {
         send(tx, &Message::Sleep(frame.clone())).await?;
     }

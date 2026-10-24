@@ -3,6 +3,7 @@
 //! the panel's own format. The first 16 bytes of the pixels' SHA-256 name it on the wire. This
 //! module also turns `[sleep]` into the `sleep` frame, with the defaults for absent keys.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -11,8 +12,8 @@ use sha2::{Digest, Sha256};
 
 use super::config::{color, SleepConfig};
 use super::icons::{
-    self, decode, file_stamp, import_into, list_in, name_matches_contents, read_image, resize,
-    FileStamp, Kind, Target,
+    self, decode, decodes, file_stamp, import_into, list_in, name_matches_contents, read_image,
+    resize, FileStamp, Kind, Target,
 };
 use super::protocol::{
     Sleep, SleepAnchor, SleepShow, SleepSpinner, ASSET_CHUNK_BYTES, ASSET_ID_BYTES,
@@ -97,6 +98,11 @@ struct Cached {
 pub struct Screens {
     dir: PathBuf,
     cache: Mutex<Option<Cached>>,
+    /// Held while decoding, so two callers that want the same new picture (a prewarm and a save)
+    /// decode it once, not twice at the same time.
+    rendering: Mutex<()>,
+    /// Whether each listed file decoded, by name, for the version of the file it was checked at.
+    listed: Mutex<HashMap<String, (FileStamp, bool)>>,
 }
 
 impl Screens {
@@ -104,6 +110,8 @@ impl Screens {
         Self {
             dir,
             cache: Mutex::default(),
+            rendering: Mutex::default(),
+            listed: Mutex::default(),
         }
     }
 
@@ -138,8 +146,18 @@ impl Screens {
         }
         let stamp = file_stamp(&path)?;
         let key = (name.to_string(), stamp, fit, bg);
-        if let Some(hit) = self.cache().as_ref().filter(|hit| hit.key == key) {
-            return Ok(hit.image.clone());
+        let hit = |this: &Self| {
+            (this.cache().as_ref())
+                .filter(|hit| hit.key == key)
+                .map(|hit| hit.image.clone())
+        };
+        if let Some(image) = hit(self) {
+            return Ok(image);
+        }
+        let _one_at_a_time = self.rendering.lock().expect("screen render poisoned");
+        // Whoever held the lock may have rendered this very picture.
+        if let Some(image) = hit(self) {
+            return Ok(image);
         }
         let bytes = read_image(&path, MAX_FILE_BYTES)?;
         name_matches_contents(name, &bytes)?;
@@ -166,9 +184,22 @@ impl Screens {
         )
     }
 
-    /// The files in the directory that `image` could name, sorted.
+    /// The files in the directory that `image` could name, sorted. Whether a file decodes is
+    /// remembered by the version of the file, so listing again decodes only what is new.
     pub fn list(&self) -> Result<Vec<String>, String> {
-        list_in(&self.dir, MAX_FILE_BYTES, Target::Screen { cover: true })
+        list_in(&self.dir, |name, path| {
+            let Ok(stamp) = file_stamp(path) else {
+                return false;
+            };
+            if let Some((seen, ok)) = self.listed.lock().expect("listing poisoned").get(name) {
+                if *seen == stamp {
+                    return *ok;
+                }
+            }
+            let ok = decodes(name, path, MAX_FILE_BYTES, Target::Screen { cover: true });
+            (self.listed.lock().expect("listing poisoned")).insert(name.to_string(), (stamp, ok));
+            ok
+        })
     }
 }
 
@@ -623,6 +654,150 @@ mod tests {
             assert_eq!(json["anchor"], anchor);
             assert_eq!(json["spinner"], spinner);
         }
+    }
+
+    fn encoded(picture: &RgbaImage, format: ImageFormat) -> Vec<u8> {
+        let mut out = Cursor::new(Vec::new());
+        match format {
+            ImageFormat::Jpeg => image::DynamicImage::ImageRgba8(picture.clone())
+                .to_rgb8()
+                .write_to(&mut out, format),
+            _ => picture.write_to(&mut out, format),
+        }
+        .unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn jpeg_and_webp_render_like_png() {
+        let solid = RgbaImage::from_pixel(64, 32, GREEN);
+        for format in [ImageFormat::Jpeg, ImageFormat::WebP] {
+            let image = render(&encoded(&solid, format), Fit::Cover, 0)
+                .unwrap_or_else(|e| panic!("{format:?}: {e}"));
+            assert_eq!(image.pixels().len(), IMAGE_BYTES);
+            // JPEG is lossy, so the shade may be off by a step in the low bits.
+            let [lo, hi] = at(&image, 512, 256);
+            let value = u16::from_le_bytes([lo, hi]);
+            assert!(
+                value >> 11 <= 1 && (value >> 5) & 63 >= 62 && value & 31 <= 1,
+                "{format:?}: {value:#06x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_jpeg_is_turned_upright_by_its_exif_orientation_before_it_is_fitted() {
+        // 8x4, red on the left and blue on the right.
+        let wide = RgbaImage::from_fn(8, 4, |x, _| if x < 4 { RED } else { BLUE });
+        let jpeg = encoded(&wide, ImageFormat::Jpeg);
+        // An APP1 segment with one IFD entry, Orientation (0x0112) = 6: rotate 90 degrees.
+        let mut exif = b"Exif\0\0II*\0\x08\0\0\0\x01\0".to_vec();
+        exif.extend_from_slice(&[0x12, 0x01, 0x03, 0x00, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0]);
+        let mut turned = jpeg[..2].to_vec();
+        turned.extend_from_slice(&[0xff, 0xe1]);
+        turned.extend_from_slice(&(exif.len() as u16 + 2).to_be_bytes());
+        turned.extend(exif);
+        turned.extend_from_slice(&jpeg[2..]);
+
+        // Wide, it fills the area and is red on the left. Turned, it is a portrait in the middle
+        // of the area, red above and blue below, with the background at its sides.
+        let plain = render(&jpeg, Fit::Contain, 0x00_ff00).unwrap();
+        assert_eq!(at(&plain, 100, 256), RED565);
+        let upright = render(&turned, Fit::Contain, 0x00_ff00).unwrap();
+        assert_eq!(at(&upright, 100, 256), GREEN565, "pillarbox");
+        assert_eq!(at(&upright, 512, 20), RED565);
+        assert_eq!(at(&upright, 512, 490), BLUE565);
+    }
+
+    #[test]
+    fn an_svg_loads_through_screens_and_is_drawn_for_the_fit() {
+        let dir = dir_with(
+            "mark.svg",
+            &svg(100, 50, "<rect width='100' height='50' fill='#f00'/>"),
+        );
+        let screens = Screens::new(dir.path().to_path_buf());
+        let table = sleep_table("image = \"mark.svg\"\nfit = \"contain\"\nbg = \"#0000ff\"");
+        let image = screens.load(Some(&table)).unwrap().unwrap();
+        // 2:1, so it fills the area.
+        assert_eq!(at(&image, 0, 0), RED565);
+        assert_eq!(at(&image, 1023, 511), RED565);
+        assert_eq!(screens.list(), Ok(vec!["mark.svg".to_string()]));
+    }
+
+    #[test]
+    fn a_file_over_16_mib_and_a_picture_over_4096_wide_say_so() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("big.png"),
+            vec![0; MAX_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+        fs::write(dir.path().join("wide.png"), png(&RgbaImage::new(4097, 1))).unwrap();
+        let screens = Screens::new(dir.path().to_path_buf());
+        let e = screens
+            .load(Some(&sleep_table("image = \"big.png\"")))
+            .unwrap_err();
+        assert_eq!(e, ["sleep.image \"big.png\": over 16384 KB"]);
+        let e = screens
+            .load(Some(&sleep_table("image = \"wide.png\"")))
+            .unwrap_err();
+        assert_eq!(
+            e,
+            [
+                "sleep.image \"wide.png\": can't decode the image (at most 4096x4096): \
+              Image size exceeds limit"
+            ]
+        );
+        // Neither is listed, and the exact size is fine.
+        assert_eq!(screens.list(), Ok(vec![]));
+    }
+
+    #[test]
+    fn listing_remembers_a_file_until_it_changes() {
+        let dir = dir_with("a.png", &png(&bands()));
+        let screens = Screens::new(dir.path().to_path_buf());
+        assert_eq!(screens.list(), Ok(vec!["a.png".to_string()]));
+        // Same version of the file: the answer comes from memory, not from reading it.
+        let stamp = file_stamp(&dir.path().join("a.png")).unwrap();
+        assert_eq!(screens.listed.lock().unwrap()["a.png"], (stamp, true));
+        fs::write(dir.path().join("a.png"), b"junk now").unwrap();
+        assert_eq!(screens.list(), Ok(vec![]));
+        assert!(!screens.listed.lock().unwrap()["a.png"].1);
+    }
+
+    #[test]
+    fn two_callers_that_want_the_same_new_picture_decode_it_once() {
+        let dir = dir_with("a.png", &png(&bands()));
+        let screens = Arc::new(Screens::new(dir.path().to_path_buf()));
+        let table = sleep_table("image = \"a.png\"");
+        let loads: Vec<_> = (0..4)
+            .map(|_| {
+                let (screens, table) = (screens.clone(), table.clone());
+                std::thread::spawn(move || screens.load(Some(&table)).unwrap().unwrap())
+            })
+            .collect();
+        let images: Vec<_> = loads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert!(images
+            .windows(2)
+            .all(|pair| Arc::ptr_eq(&pair[0], &pair[1])));
+    }
+
+    /// `cargo test --lib twelve_megapixel -- --ignored --nocapture` for the figure.
+    #[test]
+    #[ignore = "a timing, not a rule"]
+    fn a_twelve_megapixel_jpeg_renders() {
+        let photo = RgbaImage::from_fn(4000, 3000, |x, y| {
+            Rgba([(x % 256) as u8, (y % 256) as u8, ((x ^ y) % 256) as u8, 255])
+        });
+        let jpeg = encoded(&photo, ImageFormat::Jpeg);
+        let start = std::time::Instant::now();
+        let image = render(&jpeg, Fit::Cover, 0).unwrap();
+        eprintln!(
+            "12 MP JPEG ({} KB): {:?}",
+            jpeg.len() / 1024,
+            start.elapsed()
+        );
+        assert_eq!(image.pixels().len(), IMAGE_BYTES);
     }
 
     fn dir_with(name: &str, bytes: &[u8]) -> tempfile::TempDir {

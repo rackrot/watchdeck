@@ -3497,3 +3497,32 @@ async fn a_missing_or_bad_sleep_image_is_refused_and_pushes_nothing() {
     );
     assert_only_a_result_follows(&mut c, 1).await;
 }
+
+#[tokio::test]
+async fn a_paged_set_comes_first_then_the_known_tile_then_sleep() {
+    let daemon = start().await;
+    let paged = tile_config(2, "echo up")
+        .replacen(
+            "[[button]]",
+            "[[page]]\nid = \"main\"\n\n[[page]]\nid = \"more\"\n\n[[button]]",
+            1,
+        )
+        .replace("label = \"Plain\"", "label = \"Plain\"\npage = \"more\"");
+    assert_eq!(daemon.reconfigure(&paged), Ok(true));
+
+    // One device polls the tile, so its value is known when the next one connects.
+    let mut first = session_with_caps(daemon.addr, DEVICE, &TOKEN, &["pages"]).await;
+    let _ = recv_set(&mut first).await;
+    assert_eq!(recv_tile(&mut first, 5).await.0, "up");
+
+    daemon
+        .devices
+        .pair(OTHER, Sha256::digest(OTHER_TOKEN).into())
+        .unwrap();
+    let mut c = session_with_caps(daemon.addr, OTHER, &OTHER_TOKEN, &["pages", "sleep"]).await;
+    let set = recv_set(&mut c).await;
+    assert_eq!(set.len(), 2, "both pages come first");
+    assert_eq!(recv_tile(&mut c, 5).await.0, "up");
+    let sleep = next_sleep(&mut c).await;
+    assert_eq!(sleep.check(), Ok(()));
+}
