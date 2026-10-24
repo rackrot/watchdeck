@@ -39,6 +39,28 @@ pub const MAX_TIMEOUT_S: u64 = 600;
 /// A tile polls at most this often, and at least this rarely (a day).
 pub const MIN_EVERY_S: u64 = 2;
 pub const MAX_EVERY_S: u64 = 24 * 60 * 60;
+/// `[[integration]]`: at most this many, and at most this many of them `stat` card sources.
+const MAX_INTEGRATIONS: usize = 16;
+const MAX_CARD_SOURCES: usize = 8;
+/// A push token, in characters. The daemon generates 64 hex digits.
+const MIN_TOKEN_BYTES: usize = 32;
+const MAX_INTEGRATION_LABEL: usize = 23;
+/// `[sleep]`. The sleep screen's text is in characters the device can draw, at most this many.
+const MAX_SLEEP_TEXT: usize = 47;
+const MAX_OFFLINE_S: i64 = 3600;
+const MAX_BACKLIGHT: i64 = 100;
+const SLEEP_SHOW: [&str; 4] = ["clock", "date", "host", "text"];
+const SLEEP_ANCHORS: [&str; 5] = [
+    "center",
+    "top_left",
+    "top_right",
+    "bottom_left",
+    "bottom_right",
+];
+const SLEEP_SPINNERS: [&str; 5] = ["arc", "dots", "bar", "pulse", "none"];
+/// Every secret's name and length in bytes, or why `secrets.toml` can't be read. The rules see
+/// these and never a value (`Secrets::sizes`).
+pub type SecretSizes = io::Result<BTreeMap<String, usize>>;
 /// How many `config.toml.bak.*` files a repairing save leaves behind.
 const KEEP_BACKUPS: usize = 5;
 const DEFAULT_TIMEOUT_S: u64 = 10;
@@ -81,10 +103,19 @@ pub struct Config {
     pub pages: Vec<PageConfig>,
     #[serde(default, rename = "button")]
     pub buttons: Vec<ButtonConfig>,
-    /// The status bar's GPU, units and color steps. It never reaches a layout. Last, because TOML
-    /// wants the tables that hold arrays of tables after the plain ones.
+    /// The status bar's GPU, units and color steps. It never reaches a layout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_bar: Option<StatusBarConfig>,
+    /// The sleep screen. It never reaches a layout, as `status_bar` doesn't.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleep: Option<SleepConfig>,
+    /// The push API's listeners.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push: Option<PushConfig>,
+    /// Where notes and cards come from. Last, because TOML wants the arrays of tables after the
+    /// plain tables.
+    #[serde(default, rename = "integration", skip_serializing_if = "Vec::is_empty")]
+    pub integrations: Vec<IntegrationConfig>,
 }
 
 /// `[status_bar]`. Every key is a plain string, as `bg` and `font` are, so a bad value gets the
@@ -362,6 +393,245 @@ impl StatusBarConfig {
         }
         Ok(next)
     }
+}
+
+/// `[sleep]`. Each key is optional: an absent key takes the device's default. Strings are checked in
+/// [`SleepConfig::check`], as the status bar's are, so a typo gets the rule's message.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SleepConfig {
+    /// A file in `screens/` beside the config. Absent: the logo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// `cover` (fills and crops) or `contain` (shows it whole on `bg`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fit: Option<String>,
+    /// `#rrggbb`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg: Option<String>,
+    /// `#rrggbb`, the text's color.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fg: Option<String>,
+    /// Any of `clock`, `date`, `host` and `text`, each at most once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show: Option<Vec<String>>,
+    /// Shown when `show` names `text`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Where the clock, date, host and text sit in the image area.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
+    /// `arc`, `dots`, `bar`, `pulse` or `none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spinner: Option<String>,
+    /// `#rrggbb`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spinner_color: Option<String>,
+    /// Sleep after the link has been down this long, 0 to 3600 seconds. 0 never sleeps for a lost
+    /// link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline_after_s: Option<i64>,
+    /// The backlight while asleep, 0 to 100 percent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backlight: Option<i64>,
+}
+
+impl SleepConfig {
+    /// Every rule this table breaks.
+    fn check(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if let Some(image) = self.image.as_deref().filter(|i| !icons::plain_name(i)) {
+            errors.push(format!(
+                "sleep.image {image:?} must be a plain file name in screens/"
+            ));
+        }
+        if let Some(fit) = self
+            .fit
+            .as_deref()
+            .filter(|f| !matches!(*f, "cover" | "contain"))
+        {
+            errors.push(format!("sleep.fit {fit:?} is not cover or contain"));
+        }
+        let colors = [
+            ("bg", &self.bg),
+            ("fg", &self.fg),
+            ("spinner_color", &self.spinner_color),
+        ];
+        for (key, value) in colors {
+            if let Some(value) = value.as_deref().filter(|v| color(v).is_none()) {
+                errors.push(format!("sleep.{key} {value:?} is not a #rrggbb color"));
+            }
+        }
+        errors.extend(
+            (self.anchor.as_deref()).and_then(|a| choice_error("sleep.anchor", a, &SLEEP_ANCHORS)),
+        );
+        errors.extend(
+            (self.spinner.as_deref())
+                .and_then(|s| choice_error("sleep.spinner", s, &SLEEP_SPINNERS)),
+        );
+        if let Some(show) = &self.show {
+            let mut seen = HashSet::new();
+            for name in show {
+                if let Some(problem) = choice_error("sleep.show:", name, &SLEEP_SHOW) {
+                    errors.push(problem);
+                } else if !seen.insert(name.as_str()) {
+                    errors.push(format!("sleep.show: {name:?} is listed twice"));
+                }
+            }
+        }
+        let shows_text = self.show.iter().flatten().any(|s| s == "text");
+        match self.text.as_deref() {
+            None | Some("") if shows_text => {
+                errors.push("sleep.text is needed when show has \"text\"".into());
+            }
+            Some(text) if !printable_ascii(text) || text.len() > MAX_SLEEP_TEXT => {
+                errors.push(format!(
+                    "sleep.text: at most {MAX_SLEEP_TEXT} printable ASCII characters"
+                ));
+            }
+            _ => {}
+        }
+        if let Some(s) = self
+            .offline_after_s
+            .filter(|s| !(0..=MAX_OFFLINE_S).contains(s))
+        {
+            errors.push(format!(
+                "sleep.offline_after_s {s} is outside 0 to {MAX_OFFLINE_S}"
+            ));
+        }
+        if let Some(b) = self.backlight.filter(|b| !(0..=MAX_BACKLIGHT).contains(b)) {
+            errors.push(format!(
+                "sleep.backlight {b} is outside 0 to {MAX_BACKLIGHT}"
+            ));
+        }
+        errors
+    }
+}
+
+/// `[push]`. The API's tokens are `secrets.toml` entries, named by each push integration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PushConfig {
+    /// Serves https on the LAN too, with the daemon's own certificate. Off: loopback only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lan: bool,
+}
+
+/// `[[integration]]`, tagged by `kind`. Its id and label are the source's name in notes and cards.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum IntegrationConfig {
+    /// Notes and cards posted to the push API with `token_secret`'s token.
+    Push {
+        id: String,
+        label: String,
+        /// The name of a secret in `secrets.toml`, at least 32 characters.
+        token_secret: String,
+    },
+    /// A value polled from `source` and shown as a card, as a tile's value is.
+    Stat {
+        id: String,
+        label: String,
+        every_s: u64,
+        /// Picks the value out of the source's JSON, as a tile's does.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        json_pointer: Option<String>,
+        source: Action,
+    },
+}
+
+impl IntegrationConfig {
+    fn id(&self) -> &str {
+        match self {
+            Self::Push { id, .. } | Self::Stat { id, .. } => id,
+        }
+    }
+
+    fn uses_secret(&self, name: &str) -> bool {
+        match self {
+            Self::Push { token_secret, .. } => token_secret == name,
+            Self::Stat { source, .. } => action_uses_secret(source, name),
+        }
+    }
+
+    /// Every rule this integration breaks, each message prefixed with its id.
+    fn check(&self, secrets: &SecretSizes) -> Vec<String> {
+        let (id, label) = match self {
+            Self::Push { id, label, .. } | Self::Stat { id, label, .. } => (id, label),
+        };
+        let mut problems = Vec::new();
+        if !id_ok(id) {
+            problems.push(format!(
+                "id must be 1 to {MAX_ID_BYTES} letters, digits, '_', '-' or '.'"
+            ));
+        }
+        if label.len() > MAX_INTEGRATION_LABEL || !printable_ascii(label) {
+            problems.push(format!(
+                "label: at most {MAX_INTEGRATION_LABEL} printable ASCII characters"
+            ));
+        }
+        match self {
+            Self::Push { token_secret, .. } => match secrets {
+                Ok(sizes) => match sizes.get(token_secret) {
+                    None => problems.push(format!(
+                        "token_secret {token_secret:?} is not in secrets.toml"
+                    )),
+                    Some(bytes) if *bytes < MIN_TOKEN_BYTES => problems.push(format!(
+                        "token {token_secret:?} is shorter than {MIN_TOKEN_BYTES} characters"
+                    )),
+                    Some(_) => {}
+                },
+                Err(e) => problems.push(format!(
+                    "token_secret {token_secret:?} is set, but secrets.toml can't be read: {e}"
+                )),
+            },
+            Self::Stat {
+                every_s,
+                json_pointer,
+                source,
+                ..
+            } => {
+                problems.extend(every_s_error("every_s", *every_s));
+                problems.extend(
+                    (json_pointer.as_deref()).and_then(|p| json_pointer_error("json_pointer", p)),
+                );
+                problems.extend(
+                    source
+                        .check(secrets)
+                        .into_iter()
+                        .map(|problem| format!("source: {problem}")),
+                );
+            }
+        }
+        problems
+            .into_iter()
+            .map(|problem| format!("integration {id:?}: {problem}"))
+            .collect()
+    }
+}
+
+/// `value` is one of `choices`, or the message `prefix "value" is not one of ...`.
+fn choice_error(prefix: &str, value: &str, choices: &[&str]) -> Option<String> {
+    (!choices.contains(&value))
+        .then(|| format!("{prefix} {value:?} is not one of {}", choices.join(", ")))
+}
+
+/// Why a poll interval isn't allowed, for a tile (`key` is `tile.every_s`) or a stat integration.
+fn every_s_error(key: &str, every_s: u64) -> Option<String> {
+    (!(MIN_EVERY_S..=MAX_EVERY_S).contains(&every_s))
+        .then(|| format!("{key} is {every_s}, expected {MIN_EVERY_S} to {MAX_EVERY_S}"))
+}
+
+/// Why a JSON pointer isn't allowed. "" names the whole document, which is never a short value, and
+/// RFC 6901 pointers that select something start with '/'.
+fn json_pointer_error(key: &str, pointer: &str) -> Option<String> {
+    (!pointer.starts_with('/')).then(|| format!("{key} must start with '/', like \"/state\""))
+}
+
+/// Whether `action` sends secret `name` in a header.
+fn action_uses_secret(action: &Action, name: &str) -> bool {
+    matches!(action, Action::Http { secret_headers, .. }
+        if secret_headers.values().any(|s| s == name))
 }
 
 /// A page of the grid. Buttons name theirs with `page`.
@@ -677,6 +947,9 @@ impl Config {
             pages: Vec::new(),
             buttons: Vec::new(),
             status_bar: None,
+            sleep: None,
+            push: None,
+            integrations: Vec::new(),
         }
     }
 
@@ -693,22 +966,26 @@ impl Config {
         self.buttons.iter().find(|b| b.id == id)
     }
 
-    /// The ids of the buttons whose action or tile source sends secret `name`.
+    /// The ids of the buttons and integrations that send secret `name`: a button's action or tile
+    /// source with a secret header, or a push integration's token.
     pub fn secret_users(&self, name: &str) -> Vec<String> {
-        let uses = |action: &Action| {
-            matches!(action, Action::Http { secret_headers, .. }
-                if secret_headers.values().any(|s| s == name))
-        };
-        self.buttons
-            .iter()
-            .filter(|b| uses(&b.action) || b.tile.as_ref().is_some_and(|t| uses(&t.source)))
-            .map(|b| b.id.clone())
-            .collect()
+        let buttons = (self.buttons.iter())
+            .filter(|b| {
+                action_uses_secret(&b.action, name)
+                    || b.tile
+                        .as_ref()
+                        .is_some_and(|t| action_uses_secret(&t.source, name))
+            })
+            .map(|b| b.id.clone());
+        let integrations = (self.integrations.iter())
+            .filter(|i| i.uses_secret(name))
+            .map(|i| i.id().to_string());
+        buttons.chain(integrations).collect()
     }
 
-    /// Every rule this config breaks. `secrets` holds the names in `secrets.toml`, and is
-    /// consulted only for buttons that use a secret.
-    pub fn check(&self, secrets: &io::Result<Vec<String>>) -> Vec<String> {
+    /// Every rule this config breaks. `secrets` holds each secret's name and length, and is
+    /// consulted only for buttons and integrations that use a secret.
+    pub fn check(&self, secrets: &SecretSizes) -> Vec<String> {
         let mut errors = Vec::new();
         if self.version != 1 {
             errors.push(format!("version is {}, expected 1", self.version));
@@ -827,31 +1104,47 @@ impl Config {
         if let Some(status_bar) = &self.status_bar {
             errors.extend(status_bar.check());
         }
+        if let Some(sleep) = &self.sleep {
+            errors.extend(sleep.check());
+        }
+        if self.integrations.len() > MAX_INTEGRATIONS {
+            errors.push(format!(
+                "{} integrations, at most {MAX_INTEGRATIONS}",
+                self.integrations.len()
+            ));
+        }
+        let mut integration_ids = HashSet::new();
+        for integration in &self.integrations {
+            if !integration_ids.insert(integration.id()) {
+                errors.push(format!(
+                    "integration ids must be unique: {:?}",
+                    integration.id()
+                ));
+            }
+            errors.extend(integration.check(secrets));
+        }
+        let cards = (self.integrations.iter())
+            .filter(|i| matches!(i, IntegrationConfig::Stat { .. }))
+            .count();
+        if cards > MAX_CARD_SOURCES {
+            errors.push(format!(
+                "{cards} card sources (stat and prometheus), at most {MAX_CARD_SOURCES}"
+            ));
+        }
         errors
     }
 }
 
 impl TileConfig {
-    fn check(&self, secrets: &io::Result<Vec<String>>) -> Vec<String> {
+    fn check(&self, secrets: &SecretSizes) -> Vec<String> {
         let mut errors = Vec::new();
-        if !(MIN_EVERY_S..=MAX_EVERY_S).contains(&self.every_s) {
-            errors.push(format!(
-                "tile.every_s is {}, expected {MIN_EVERY_S} to {MAX_EVERY_S}",
-                self.every_s
-            ));
-        }
+        errors.extend(every_s_error("tile.every_s", self.every_s));
         if let Some(problem) = (self.font.as_deref()).and_then(|f| font_error("tile.font", f)) {
             errors.push(problem);
         }
-        // "" names the whole document, which is never a short value; RFC 6901 pointers that
-        // select something start with '/'.
-        if self
-            .json_pointer
-            .as_deref()
-            .is_some_and(|p| !p.starts_with('/'))
-        {
-            errors.push("tile.json_pointer must start with '/', like \"/state\"".into());
-        }
+        errors.extend(
+            (self.json_pointer.as_deref()).and_then(|p| json_pointer_error("tile.json_pointer", p)),
+        );
         errors.extend(
             self.source
                 .check(secrets)
@@ -897,7 +1190,7 @@ impl Action {
         )
     }
 
-    fn check(&self, secrets: &io::Result<Vec<String>>) -> Vec<String> {
+    fn check(&self, secrets: &SecretSizes) -> Vec<String> {
         let mut errors = Vec::new();
         let timeout_s = self.timeout().as_secs();
         if !(1..=MAX_TIMEOUT_S).contains(&timeout_s) {
@@ -977,7 +1270,7 @@ impl Action {
                 }
                 for (header, secret) in secret_headers {
                     match secrets {
-                        Ok(names) if names.contains(secret) => {}
+                        Ok(sizes) if sizes.contains_key(secret) => {}
                         Ok(_) => errors.push(format!(
                             "header {header:?} uses secret {secret:?}, which is not in secrets.toml"
                         )),
@@ -993,7 +1286,7 @@ impl Action {
 }
 
 /// Parses `text` and checks it against every rule.
-pub fn parse(text: &str, secrets: &io::Result<Vec<String>>) -> Result<Config, Vec<String>> {
+pub fn parse(text: &str, secrets: &SecretSizes) -> Result<Config, Vec<String>> {
     let config: Config = toml::from_str(text).map_err(|e| vec![toml_error(text, &e)])?;
     let errors = config.check(secrets);
     if errors.is_empty() {
@@ -1105,7 +1398,7 @@ impl Configs {
         let loaded = read_capped(&self.path).and_then(|bytes| {
             revision = sha256_hex(&bytes);
             let text = String::from_utf8(bytes).map_err(|_| vec!["not UTF-8".to_string()])?;
-            let config = parse(&text, &self.secrets.names())?;
+            let config = parse(&text, &self.secrets.sizes())?;
             self.watch(&config);
             icons_before = Some(self.stamp().icons);
             let icons = self.icons.load(&config)?;
@@ -1147,7 +1440,7 @@ impl Configs {
     /// every check passes. When the file on disk is not live (it breaks a rule), this is how the
     /// window repairs it, and the text it replaces is kept as `config.toml.bak.<UTC time>`, newest 5 kept.
     pub fn save(&self, config: Config, revision: &str) -> Result<String, Vec<String>> {
-        let errors = config.check(&self.secrets.names());
+        let errors = config.check(&self.secrets.sizes());
         if !errors.is_empty() {
             return Err(errors);
         }
@@ -1156,7 +1449,7 @@ impl Configs {
         self.icons.load(&config)?;
         let _read = self.locked();
         // Again under the lock, since a secret may have been deleted since the first check.
-        let errors = config.check(&self.secrets.names());
+        let errors = config.check(&self.secrets.sizes());
         if !errors.is_empty() {
             return Err(errors);
         }
@@ -1275,7 +1568,7 @@ impl Configs {
         let users = self.current().secret_users(name);
         if !users.is_empty() {
             return Err(format!(
-                "Secret {name:?} is used by button {}. Change {} first.",
+                "Secret {name:?} is used by {}. Change {} first.",
                 users.join(", "),
                 if users.len() == 1 { "it" } else { "them" }
             ));
@@ -1298,7 +1591,7 @@ impl Configs {
         let Ok(text) = String::from_utf8(bytes) else {
             return;
         };
-        if let Ok(config) = parse(&text, &self.secrets.names()) {
+        if let Ok(config) = parse(&text, &self.secrets.sizes()) {
             let _ = self.icons.load(&config);
         }
     }
@@ -1497,13 +1790,18 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
 
     const EXAMPLE_URL: &str = "url = \"https://ha.lan:8123/api/services/light/toggle\"";
 
-    fn names() -> io::Result<Vec<String>> {
-        Ok(vec!["ha".into()])
+    /// `secrets.toml` with `ha` (64 bytes), `push-ha` (40) and `push-short` (31).
+    fn sizes() -> SecretSizes {
+        Ok(BTreeMap::from([
+            ("ha".to_string(), 64),
+            ("push-ha".to_string(), 40),
+            ("push-short".to_string(), 31),
+        ]))
     }
 
     /// The errors from `text`, which must parse as TOML and as a config.
     fn errors(text: &str) -> Vec<String> {
-        parse(text, &names()).expect_err("the config must be refused")
+        parse(text, &sizes()).expect_err("the config must be refused")
     }
 
     /// The example with its first button's `from` replaced by `to`.
@@ -1522,7 +1820,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
 
     #[test]
     fn the_example_and_the_default_pass() {
-        let config = parse(EXAMPLE, &names()).unwrap();
+        let config = parse(EXAMPLE, &sizes()).unwrap();
         assert_eq!(config.buttons.len(), 2);
         let office = config.button("office-light").unwrap();
         assert_eq!(
@@ -1537,7 +1835,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
             (0x1e88e5, 0xffffff)
         );
 
-        let default = parse(DEFAULT, &Ok(Vec::new())).unwrap();
+        let default = parse(DEFAULT, &Ok(BTreeMap::new())).unwrap();
         assert_eq!(default.buttons[0].id, "hello");
         assert!(matches!(
             &default.buttons[0].action,
@@ -1585,7 +1883,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
 
     #[test]
     fn a_tile_with_a_shell_or_http_source_passes() {
-        let config = parse(&with_tile("every_s = 15, source = SHELL"), &names()).unwrap();
+        let config = parse(&with_tile("every_s = 15, source = SHELL"), &sizes()).unwrap();
         let tile = config.buttons[0].tile.as_ref().unwrap();
         assert_eq!((tile.every_s, tile.json_pointer.as_deref()), (15, None));
         assert!(config.buttons[1].tile.is_none());
@@ -1595,7 +1893,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
                source = { kind = "http", method = "GET", url = "https://ha.lan:8123/api/states/light.office",
                           secret_headers = { Authorization = "ha" }, timeout_s = 5 }"#,
         );
-        let config = parse(&http, &names()).unwrap();
+        let config = parse(&http, &sizes()).unwrap();
         let tile = config.buttons[0].tile.as_ref().unwrap();
         assert_eq!(tile.json_pointer.as_deref(), Some("/state"));
         assert_eq!(tile.source.timeout(), Duration::from_secs(5));
@@ -1617,7 +1915,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
             (86_401, false),
         ] {
             let text = with_tile(&format!("every_s = {every_s}, source = SHELL"));
-            match parse(&text, &names()) {
+            match parse(&text, &sizes()) {
                 Ok(_) => assert!(ok, "every_s = {every_s} must be refused"),
                 Err(errors) => {
                     assert!(!ok, "every_s = {every_s}: {errors:?}");
@@ -1696,7 +1994,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
                 &format!("label = \"Plex\"\nicon = {icon:?}"),
             )
         };
-        let config = parse(&with_icon("3f2a9c.png"), &names()).unwrap();
+        let config = parse(&with_icon("3f2a9c.png"), &sizes()).unwrap();
         assert_eq!(config.buttons[0].icon.as_deref(), Some("3f2a9c.png"));
         assert_eq!(config.buttons[1].icon, None);
         for bad in ["", "../a.png", "a/b.png", ".hidden.png", "a b.png"] {
@@ -1725,7 +2023,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
         let big = EXAMPLE
             .replacen("cols = 5", "cols = 8", 1)
             .replacen("rows = 3", "rows = 5", 1);
-        parse(&big, &names()).unwrap();
+        parse(&big, &sizes()).unwrap();
     }
 
     #[test]
@@ -1741,7 +2039,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
             );
         }
         let longest = example_with("id = \"plex\"", &format!("id = {:?}", "a".repeat(63)));
-        parse(&longest, &names()).unwrap();
+        parse(&longest, &sizes()).unwrap();
     }
 
     #[test]
@@ -1773,7 +2071,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
         let long = format!("label = {:?}", "a".repeat(48));
         assert_refused(&example_with("label = \"Plex\"", &long), "at most 47");
         let longest = format!("label = {:?}", "~".repeat(47));
-        parse(&example_with("label = \"Plex\"", &longest), &names()).unwrap();
+        parse(&example_with("label = \"Plex\"", &longest), &sizes()).unwrap();
     }
 
     #[test]
@@ -1790,7 +2088,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
         );
         parse(
             &example_with("bg = \"#1e88e5\"", "bg = \"#ABCdef\""),
-            &names(),
+            &sizes(),
         )
         .unwrap();
     }
@@ -1830,7 +2128,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
             1,
         );
         assert_refused(&http, "timeout_s is 0");
-        parse(&example_with("timeout_s = 30", "timeout_s = 600"), &names()).unwrap();
+        parse(&example_with("timeout_s = 30", "timeout_s = 600"), &sizes()).unwrap();
     }
 
     #[test]
@@ -1850,7 +2148,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
         }
         parse(
             &EXAMPLE.replacen(EXAMPLE_URL, "url = \"https://ha.lan/x\"", 1),
-            &names(),
+            &sizes(),
         )
         .unwrap();
     }
@@ -1867,7 +2165,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
             "http://LOCALHOST/x",
         ] {
             let text = EXAMPLE.replacen(EXAMPLE_URL, &format!("url = {here:?}"), 1);
-            let config = parse(&text, &names()).unwrap();
+            let config = parse(&text, &sizes()).unwrap();
             assert!(!config.buttons[1].action.secrets_in_clear(), "{here}");
         }
         let opted_in = plain.replacen(
@@ -1875,16 +2173,16 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
             "insecure_http = true, secret_headers = {",
             1,
         );
-        let config = parse(&opted_in, &names()).unwrap();
+        let config = parse(&opted_in, &sizes()).unwrap();
         assert!(config.buttons[1].action.secrets_in_clear());
         let without_secrets =
             plain.replacen(", secret_headers = { Authorization = \"ha\" }", "", 1);
-        parse(&without_secrets, &names()).unwrap();
+        parse(&without_secrets, &sizes()).unwrap();
     }
 
     #[test]
     fn insecure_tls_is_off_by_default_and_only_for_https_http_actions() {
-        let config = parse(EXAMPLE, &names()).unwrap();
+        let config = parse(EXAMPLE, &sizes()).unwrap();
         assert!(!config.buttons[1].action.insecure_tls());
 
         let https = EXAMPLE.replacen(EXAMPLE_URL, "url = \"https://ha.lan/x\"", 1);
@@ -1893,7 +2191,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
             "insecure_tls = true, secret_headers = {",
             1,
         );
-        let config = parse(&on, &names()).unwrap();
+        let config = parse(&on, &sizes()).unwrap();
         assert!(config.buttons[1].action.insecure_tls());
         assert!(!config.buttons[0].action.insecure_tls());
 
@@ -1912,7 +2210,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
         let with = |headers: &str| EXAMPLE.replacen(secret, &format!("{headers}, {secret}"), 1);
         let config = parse(
             &with("headers = { \"Content-Type\" = \"application/json\" }"),
-            &names(),
+            &sizes(),
         )
         .unwrap();
         let Action::Http { headers, .. } = &config.buttons[1].action else {
@@ -1978,7 +2276,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
 
     #[test]
     fn secret_headers_name_secrets_that_exist() {
-        let errors = parse(EXAMPLE, &Ok(vec!["other".into()])).unwrap_err();
+        let errors = parse(EXAMPLE, &Ok(BTreeMap::from([("other".to_string(), 1)]))).unwrap_err();
         assert!(
             errors[0].contains("secret \"ha\", which is not in secrets.toml"),
             "{errors:?}"
@@ -2002,7 +2300,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
             "bg = \"blue\"",
             1,
         );
-        let errors = parse(&text, &Ok(Vec::new())).unwrap_err();
+        let errors = parse(&text, &Ok(BTreeMap::new())).unwrap_err();
         assert_eq!(errors.len(), 3, "{errors:?}");
     }
 
@@ -2043,7 +2341,7 @@ action = { kind = "http", method = "POST", url = "https://ha.lan:8123/api/servic
                 }),
             });
         }
-        assert!(config.check(&Ok(Vec::new())).is_empty());
+        assert!(config.check(&Ok(BTreeMap::new())).is_empty());
         let mut live = live(config);
         live.icons
             .insert("i.png".into(), Arc::new(IconFrame::new(1, 1, vec![0; 4])));
@@ -2164,11 +2462,11 @@ action = { kind = "shell", argv = ["true"] }
     #[test]
     fn a_file_without_pages_saves_without_page_keys_and_parses_back_equal() {
         for text in [EXAMPLE, DEFAULT] {
-            let config = parse(text, &names()).unwrap();
+            let config = parse(text, &sizes()).unwrap();
             assert!(config.pages.is_empty());
             let saved = toml::to_string(&config).unwrap();
             assert!(!saved.contains("page"), "{saved}");
-            assert_eq!(parse(&saved, &names()).unwrap(), config);
+            assert_eq!(parse(&saved, &sizes()).unwrap(), config);
         }
     }
 
@@ -2182,14 +2480,14 @@ action = { kind = "shell", argv = ["true"] }
              source = {{ kind = \"shell\", argv = [\"true\"] }}\n",
             paged_with("cols = 5", "cols = 5\nfont = \"inter\"")
         );
-        let config = parse(&text, &names()).unwrap();
+        let config = parse(&text, &sizes()).unwrap();
         assert_eq!(config.pages.len(), 2);
         assert_eq!(config.pages[1].label.as_deref(), Some("Media"));
         assert_eq!(config.buttons[0].page, None, "implicit membership");
         assert_eq!(config.buttons[1].page.as_deref(), Some("media"));
         assert_eq!(config.buttons[2].page.as_deref(), Some("main"), "explicit");
         let saved = toml::to_string(&config).unwrap();
-        assert_eq!(parse(&saved, &names()).unwrap(), config, "{saved}");
+        assert_eq!(parse(&saved, &sizes()).unwrap(), config, "{saved}");
         assert_eq!(saved.matches("[[page]]").count(), 2, "{saved}");
     }
 
@@ -2217,7 +2515,7 @@ action = { kind = "shell", argv = ["true"] }
         }
         // 63 bytes is the longest that passes.
         let longest = "a".repeat(63);
-        parse(&PAGED.replace("media", &longest), &names()).unwrap();
+        parse(&PAGED.replace("media", &longest), &sizes()).unwrap();
         assert_refused(
             &paged_with("id = \"media\"", "id = \"main\""),
             "page \"main\": another page has this id",
@@ -2227,7 +2525,7 @@ action = { kind = "shell", argv = ["true"] }
     #[test]
     fn a_page_label_is_printable_ascii_of_at_most_24_characters() {
         let label = |text: &str| paged_with("label = \"Media\"", &format!("label = {text:?}"));
-        parse(&label(&"m".repeat(24)), &names()).unwrap();
+        parse(&label(&"m".repeat(24)), &sizes()).unwrap();
         assert_refused(
             &label(&"m".repeat(25)),
             "page \"media\": label is 25 characters, at most 24",
@@ -2245,18 +2543,18 @@ action = { kind = "shell", argv = ["true"] }
     #[test]
     fn at_most_four_pages() {
         let mut config = spread(4, 1, 0);
-        assert!(config.check(&names()).is_empty());
+        assert!(config.check(&sizes()).is_empty());
         config.pages.push(PageConfig {
             id: "p4".into(),
             label: None,
         });
-        assert_eq!(config.check(&names()), ["5 pages, at most 4"]);
+        assert_eq!(config.check(&sizes()), ["5 pages, at most 4"]);
     }
 
     #[test]
     fn a_cell_is_taken_once_per_page() {
         // The same cell on two pages passes: PAGED puts `a` and `b` at [0, 0].
-        parse(PAGED, &names()).unwrap();
+        parse(PAGED, &sizes()).unwrap();
         // `b` joins `a` on the first page, a button that names no page.
         assert_refused(
             &paged_with("page = \"media\"", "page = \"main\""),
@@ -2283,10 +2581,10 @@ action = { kind = "shell", argv = ["true"] }
     #[test]
     fn at_most_forty_tiles_across_all_pages() {
         let config = spread(4, 10, 40);
-        assert!(config.check(&names()).is_empty());
+        assert!(config.check(&sizes()).is_empty());
         let config = spread(4, 11, 41);
         assert_eq!(
-            config.check(&names()),
+            config.check(&sizes()),
             ["41 tiles across all pages, at most 40"]
         );
         // The same count on one page of the 8x5 grid is the old ceiling, and passes.
@@ -2295,12 +2593,12 @@ action = { kind = "shell", argv = ["true"] }
         for b in &mut one.buttons {
             b.page = None;
         }
-        assert!(one.check(&names()).is_empty());
+        assert!(one.check(&sizes()).is_empty());
     }
 
     #[test]
     fn layout_builds_pages_from_membership_and_keeps_labels_off_it() {
-        let layout = live(parse(PAGED, &names()).unwrap()).layout();
+        let layout = live(parse(PAGED, &sizes()).unwrap()).layout();
         let ids: Vec<_> = layout
             .pages
             .iter()
@@ -2333,7 +2631,7 @@ action = { kind = "shell", argv = ["true"] }
         // A label edit changes nothing a device sees.
         let relabeled = parse(
             &paged_with("label = \"Media\"", "label = \"Films\""),
-            &names(),
+            &sizes(),
         )
         .unwrap();
         assert_eq!(live(relabeled).layout(), layout);
@@ -2342,7 +2640,7 @@ action = { kind = "shell", argv = ["true"] }
     #[test]
     fn a_config_without_pages_sends_todays_layout_bytes_with_and_without_fonts() {
         let text = font_config(None, None, None);
-        let layout = live(parse(&text, &names()).unwrap()).layout();
+        let layout = live(parse(&text, &sizes()).unwrap()).layout();
         assert_eq!(layout.pages.len(), 1);
         let json = |layout: &Layout| {
             let messages = layout.messages(1);
@@ -2355,7 +2653,7 @@ action = { kind = "shell", argv = ["true"] }
         assert_eq!(json(&layout.clone().home_only()), plain);
 
         let text = font_config(Some("inter"), Some("orbitron"), Some(Some("fira-code")));
-        let fonted = live(parse(&text, &names()).unwrap()).layout();
+        let fonted = live(parse(&text, &sizes()).unwrap()).layout();
         let with = json(&fonted);
         assert_eq!(
             with,
@@ -2367,18 +2665,18 @@ action = { kind = "shell", argv = ["true"] }
 
     #[test]
     fn a_page_table_or_a_page_rename_leaves_the_one_page_view_equal() {
-        let view = |text: &str| live(parse(text, &names()).unwrap()).layout().home_only();
+        let view = |text: &str| live(parse(text, &sizes()).unwrap()).layout().home_only();
         // Adding a single [[page]] to a file without pages.
         assert_eq!(
             view(EXAMPLE),
             view(&format!("{EXAMPLE}\n[[page]]\nid = \"main\"\n"))
         );
-        let single = live(parse(EXAMPLE, &names()).unwrap()).layout();
+        let single = live(parse(EXAMPLE, &sizes()).unwrap()).layout();
         let one = format!(
             "version = 1\n[[page]]\nid = \"solo\"\n{}",
             &EXAMPLE["\nversion = 1\n".len()..]
         );
-        assert_eq!(live(parse(&one, &names()).unwrap()).layout(), single);
+        assert_eq!(live(parse(&one, &sizes()).unwrap()).layout(), single);
         // Renaming page 0 of two.
         assert_eq!(
             view(PAGED),
@@ -2396,7 +2694,7 @@ action = { kind = "shell", argv = ["true"] }
 
     #[test]
     fn without_fonts_strips_every_page() {
-        let mut config = parse(PAGED, &names()).unwrap();
+        let mut config = parse(PAGED, &sizes()).unwrap();
         config.layout.font = Some("inter".into());
         config.buttons[1].font = Some("orbitron".into());
         let layout = live(config).layout();
@@ -2415,7 +2713,7 @@ action = { kind = "shell", argv = ["true"] }
 
     #[test]
     fn home_only_keeps_page_zero_and_only_the_icons_it_names() {
-        let mut config = parse(PAGED, &names()).unwrap();
+        let mut config = parse(PAGED, &sizes()).unwrap();
         config.buttons[0].icon = Some("home.png".into());
         config.buttons[1].icon = Some("away.png".into());
         let mut live = live(config);
@@ -2465,7 +2763,7 @@ action = { kind = "shell", argv = ["true"] }
             button.page = Some(format!("{p:0>63}"));
         }
         config.layout.font = Some(longest.into());
-        assert!(config.check(&Ok(Vec::new())).is_empty());
+        assert!(config.check(&Ok(BTreeMap::new())).is_empty());
         let mut live = live(config);
         live.icons
             .insert("i.png".into(), Arc::new(IconFrame::new(1, 1, vec![0; 4])));
@@ -2517,7 +2815,7 @@ action = { kind = "shell", argv = ["true"] }
 
     /// The font fields a layout of `text` puts on the wire: the message's, then the one button's.
     fn wire_fonts(text: &str) -> (Option<String>, Option<String>, Option<String>) {
-        let layout = live(parse(text, &names()).unwrap()).layout();
+        let layout = live(parse(text, &sizes()).unwrap()).layout();
         let button = &layout.pages[0].buttons[0];
         (
             layout.font.clone(),
@@ -2548,7 +2846,7 @@ action = { kind = "shell", argv = ["true"] }
         }
         // Every real id passes, at every level.
         for id in FONT_IDS {
-            parse(&font_config(Some(id), Some(id), Some(Some(id))), &names()).unwrap();
+            parse(&font_config(Some(id), Some(id), Some(Some(id))), &sizes()).unwrap();
         }
     }
 
@@ -2650,7 +2948,7 @@ action = { kind = "shell", argv = ["true"] }
 
     #[test]
     fn a_config_without_font_keys_sends_the_same_layout_bytes_with_and_without_the_cap() {
-        let layout = live(parse(EXAMPLE, &names()).unwrap()).layout();
+        let layout = live(parse(EXAMPLE, &sizes()).unwrap()).layout();
         let json = |layout: &Layout| serde_json::to_string(&layout.messages(1)[0]).unwrap();
         assert!(!json(&layout).contains("font"), "{}", json(&layout));
         assert_eq!(json(&layout), json(&layout.clone().without_fonts()));
@@ -2660,7 +2958,7 @@ action = { kind = "shell", argv = ["true"] }
     #[test]
     fn without_fonts_strips_every_font_field_and_only_those() {
         let text = font_config(Some("inter"), Some("orbitron"), Some(Some("fira-code")));
-        let layout = live(parse(&text, &names()).unwrap()).layout();
+        let layout = live(parse(&text, &sizes()).unwrap()).layout();
         let stripped = layout.clone().without_fonts();
         assert_eq!(
             wire_fonts(&text),
@@ -2687,7 +2985,7 @@ action = { kind = "shell", argv = ["true"] }
         let revision = configs.status().borrow().revision.clone();
         let mut config = parse(
             &font_config(Some("inter"), Some("orbitron"), Some(Some("fira-code"))),
-            &names(),
+            &sizes(),
         )
         .unwrap();
         // A second button with no font keys must not gain any.
@@ -2698,7 +2996,7 @@ action = { kind = "shell", argv = ["true"] }
         configs.save(config.clone(), &revision).unwrap();
         let text = fs::read_to_string(tmp.path().join(FILE)).unwrap();
         assert_eq!(text.matches("font = ").count(), 3, "{text}");
-        assert_eq!(parse(&text, &names()).unwrap(), config);
+        assert_eq!(parse(&text, &sizes()).unwrap(), config);
         assert_eq!(configs.current().config, config);
     }
 
@@ -2742,18 +3040,18 @@ net_tx = []
 
     #[test]
     fn a_status_bar_with_every_key_passes() {
-        let config = parse(&with_bar(FULL_BAR), &names()).unwrap();
+        let config = parse(&with_bar(FULL_BAR), &sizes()).unwrap();
         let bar = config.status_bar.as_ref().unwrap();
         assert_eq!(bar.gpu.as_deref(), Some("0000:01:00.0"));
         let th = bar.thresholds.as_ref().unwrap();
         assert_eq!(th.mem.as_ref().unwrap().len(), 2);
         assert_eq!(th.gpu, Some(Vec::new()), "[] is not the same as absent");
         // The example has no [status_bar], and still loads as before.
-        assert_eq!(parse(EXAMPLE, &names()).unwrap().status_bar, None);
+        assert_eq!(parse(EXAMPLE, &sizes()).unwrap().status_bar, None);
         // An empty table and an absent one differ, and so do [] and an absent key.
-        let empty = parse(&with_bar("[status_bar]"), &names()).unwrap();
+        let empty = parse(&with_bar("[status_bar]"), &sizes()).unwrap();
         assert_eq!(empty.status_bar, Some(StatusBarConfig::default()));
-        let none = parse(&with_steps("", "net_rx", "[]"), &names()).unwrap();
+        let none = parse(&with_steps("", "net_rx", "[]"), &sizes()).unwrap();
         let th = none.status_bar.unwrap().thresholds.unwrap();
         assert_eq!((th.net_rx, th.net_tx), (Some(Vec::new()), None));
     }
@@ -2781,7 +3079,7 @@ net_tx = []
             "status_bar.gpu \"0000:01:00.A\" is not auto",
         );
         for gpu in ["auto", "off", "0000:01:00.0", "75aa:ff:1f.7"] {
-            parse(&bar(&format!("gpu = {gpu:?}")), &names()).unwrap();
+            parse(&bar(&format!("gpu = {gpu:?}")), &sizes()).unwrap();
         }
         assert_refused(
             &bar("temp_unit = \"k\""),
@@ -2820,7 +3118,7 @@ net_tx = []
                 "mem",
                 &four.replace(", { at = 4, color = \"#112233\" }", ""),
             ),
-            &names(),
+            &sizes(),
         )
         .unwrap();
         assert_refused(
@@ -2881,7 +3179,7 @@ net_tx = []
                     key,
                     &format!("[{{ at = {at}, color = \"#112233\" }}]"),
                 ),
-                &names(),
+                &sizes(),
             )
         };
         assert!(step("temp_unit = \"f\"", "cpu_temp", 190).is_ok());
@@ -2922,7 +3220,7 @@ net_tx = []
                 }),
                 ..Config::empty()
             };
-            assert_eq!(config.check(&names()), Vec::<String>::new());
+            assert_eq!(config.check(&sizes()), Vec::<String>::new());
         }
         assert_eq!(both.c.cpu_temp.as_ref().unwrap()[1].color, "#e53935");
         assert_eq!(both.c.cpu_temp.as_ref().unwrap()[0].color, "#ffb300");
@@ -3013,26 +3311,30 @@ net_tx = []
 
     #[test]
     fn a_status_bar_only_change_leaves_the_layout_equal() {
-        let before = parse(EXAMPLE, &names()).unwrap();
-        let after = parse(&with_bar(FULL_BAR), &names()).unwrap();
+        let before = parse(EXAMPLE, &sizes()).unwrap();
+        let after = parse(&with_bar(FULL_BAR), &sizes()).unwrap();
         assert_ne!(before, after);
         assert_eq!(live(before).layout(), live(after).layout());
     }
 
     #[test]
     fn the_status_bar_survives_a_save_and_parse() {
-        let config = parse(&with_bar(FULL_BAR), &names()).unwrap();
+        let config = parse(&with_bar(FULL_BAR), &sizes()).unwrap();
         let saved = toml::to_string(&config).unwrap();
-        assert_eq!(parse(&saved, &names()).unwrap(), config, "{saved}");
+        assert_eq!(parse(&saved, &sizes()).unwrap(), config, "{saved}");
 
         let tmp = tempfile::tempdir().unwrap();
         let configs = open(tmp.path());
         let loaded = configs.status().borrow().revision.clone();
         let mut config = configs.current().config.clone();
-        config.status_bar = parse(&with_bar(FULL_BAR), &names()).unwrap().status_bar;
+        config.status_bar = parse(&with_bar(FULL_BAR), &sizes()).unwrap().status_bar;
         let revision = configs.save(config.clone(), &loaded).unwrap();
         let text = fs::read_to_string(tmp.path().join(FILE)).unwrap();
-        assert_eq!(parse(&text, &Ok(Vec::new())).unwrap(), config, "{text}");
+        assert_eq!(
+            parse(&text, &Ok(BTreeMap::new())).unwrap(),
+            config,
+            "{text}"
+        );
         assert_eq!(configs.current().config, config);
         assert_eq!(configs.reload(), Ok(false), "{revision}");
         // A second save of the reloaded config keeps every key.
@@ -3040,6 +3342,339 @@ net_tx = []
             .save(configs.current().config.clone(), &revision)
             .unwrap();
         assert_eq!(again, revision);
+    }
+
+    // ---- [sleep], [push] and [[integration]] ----
+
+    /// The example with `tables` appended.
+    fn with_new(tables: &str) -> String {
+        format!("{EXAMPLE}\n{tables}\n")
+    }
+
+    /// The example with a `[sleep]` table of `keys`.
+    fn sleep_with(keys: &str) -> String {
+        with_new(&format!("[sleep]\n{keys}"))
+    }
+
+    /// A push integration `id` with `token_secret` `secret`.
+    fn push_table(id: &str, label: &str, secret: &str) -> String {
+        format!(
+            "[[integration]]\nid = \"{id}\"\nkind = \"push\"\nlabel = \"{label}\"\n\
+             token_secret = \"{secret}\"\n"
+        )
+    }
+
+    /// A stat integration `id` with `every_s`, `json_pointer` and `source`, all as TOML text.
+    fn stat_table(id: &str, every_s: &str, pointer: &str, source: &str) -> String {
+        format!(
+            "[[integration]]\nid = \"{id}\"\nkind = \"stat\"\nlabel = \"Load\"\n\
+             every_s = {every_s}\njson_pointer = \"{pointer}\"\nsource = {source}\n"
+        )
+    }
+
+    const SHELL_TRUE: &str = r#"{ kind = "shell", argv = ["true"] }"#;
+
+    /// A grid with no buttons, for the tests that add tables and need no secret.
+    const BARE: &str = "version = 1\n[layout]\ncols = 5\nrows = 3\n";
+
+    /// Every new key with a value the rules accept, and one push and one stat integration.
+    const FULL_NEW: &str = r##"
+[sleep]
+image = "lake.jpg"
+fit = "contain"
+bg = "#000000"
+fg = "#ffffff"
+show = ["clock", "date", "host", "text"]
+text = "Back soon"
+anchor = "top_left"
+spinner = "pulse"
+spinner_color = "#38bdf8"
+offline_after_s = 0
+backlight = 0
+
+[push]
+lan = true
+
+[[integration]]
+id = "ha"
+kind = "push"
+label = "Home Assistant"
+token_secret = "push-ha"
+
+[[integration]]
+id = "nas-load"
+kind = "stat"
+label = "NAS load"
+every_s = 30
+json_pointer = "/load"
+source = { kind = "http", method = "GET", url = "http://nas.lan/api/load" }
+"##;
+
+    #[test]
+    fn the_sleep_push_and_integration_tables_with_every_key_pass() {
+        let config = parse(&with_new(FULL_NEW), &sizes()).unwrap();
+        let sleep = config.sleep.as_ref().unwrap();
+        assert_eq!(sleep.image.as_deref(), Some("lake.jpg"));
+        assert_eq!(sleep.offline_after_s, Some(0));
+        assert_eq!(sleep.show.as_ref().unwrap().len(), 4);
+        assert_eq!(config.push, Some(PushConfig { lan: true }));
+        let ids: Vec<&str> = config.integrations.iter().map(|i| i.id()).collect();
+        assert_eq!(ids, ["ha", "nas-load"]);
+        // The example has none of them and loads as before. An empty table is not an absent one.
+        let plain = parse(EXAMPLE, &sizes()).unwrap();
+        assert_eq!((plain.sleep, plain.push), (None, None));
+        assert!(plain.integrations.is_empty());
+        let empty = parse(&with_new("[sleep]\n[push]"), &sizes()).unwrap();
+        assert_eq!(
+            (empty.sleep, empty.push),
+            (Some(SleepConfig::default()), Some(PushConfig::default()))
+        );
+    }
+
+    #[test]
+    fn the_sleep_rules_say_what_is_wrong() {
+        let refused = |keys: &str, expected: &str| assert_refused(&sleep_with(keys), expected);
+        refused(
+            "image = \"../x.png\"",
+            "sleep.image \"../x.png\" must be a plain file name in screens/",
+        );
+        refused(
+            "fit = \"stretch\"",
+            "sleep.fit \"stretch\" is not cover or contain",
+        );
+        refused("bg = \"red\"", "sleep.bg \"red\" is not a #rrggbb color");
+        refused("fg = \"#fff\"", "sleep.fg \"#fff\" is not a #rrggbb color");
+        refused(
+            "spinner_color = \"#GGGGGG\"",
+            "sleep.spinner_color \"#GGGGGG\" is not a #rrggbb color",
+        );
+        refused(
+            "anchor = \"middle\"",
+            "sleep.anchor \"middle\" is not one of center, top_left, top_right, bottom_left, bottom_right",
+        );
+        refused(
+            "spinner = \"spin\"",
+            "sleep.spinner \"spin\" is not one of arc, dots, bar, pulse, none",
+        );
+        refused(
+            "show = [\"clock\", \"weather\"]",
+            "sleep.show: \"weather\" is not one of clock, date, host, text",
+        );
+        refused(
+            "show = [\"date\", \"date\"]",
+            "sleep.show: \"date\" is listed twice",
+        );
+        refused(
+            "show = [\"text\"]",
+            "sleep.text is needed when show has \"text\"",
+        );
+        refused(
+            &format!("show = [\"text\"]\ntext = \"{}\"", "a".repeat(48)),
+            "sleep.text: at most 47 printable ASCII characters",
+        );
+        refused(
+            "offline_after_s = 4000",
+            "sleep.offline_after_s 4000 is outside 0 to 3600",
+        );
+        refused(
+            "offline_after_s = -1",
+            "sleep.offline_after_s -1 is outside 0 to 3600",
+        );
+        refused("backlight = 120", "sleep.backlight 120 is outside 0 to 100");
+        // Each value the rules name is accepted, and text is only needed when it is shown.
+        for keys in [
+            "fit = \"cover\"\nanchor = \"center\"\nspinner = \"none\"",
+            "anchor = \"bottom_right\"\nspinner = \"bar\"\nshow = []",
+            "show = [\"clock\"]\ntext = \"x\"",
+            "show = [\"text\"]\ntext = \"a\"",
+            "backlight = 1\noffline_after_s = 3600",
+        ] {
+            parse(&sleep_with(keys), &sizes()).unwrap_or_else(|e| panic!("{keys}: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn the_sleep_table_refuses_an_unknown_key() {
+        assert_refused(&sleep_with("font = \"x\""), "unknown field `font`");
+    }
+
+    #[test]
+    fn the_integration_id_label_and_token_rules_say_what_is_wrong() {
+        assert_refused(
+            &with_new(&push_table("", "HA", "push-ha")),
+            "integration \"\": id must be 1 to 63 letters, digits, '_', '-' or '.'",
+        );
+        assert_refused(
+            &with_new(&push_table("ha", &"x".repeat(24), "push-ha")),
+            "integration \"ha\": label: at most 23 printable ASCII characters",
+        );
+        assert_refused(
+            &with_new(&push_table("ha", "HA", "absent")),
+            "integration \"ha\": token_secret \"absent\" is not in secrets.toml",
+        );
+        assert_refused(
+            &with_new(&push_table("ha", "HA", "push-short")),
+            "integration \"ha\": token \"push-short\" is shorter than 32 characters",
+        );
+        let twice = format!(
+            "{}{}",
+            push_table("ha", "HA", "push-ha"),
+            push_table("ha", "Again", "push-ha")
+        );
+        assert_refused(&with_new(&twice), "integration ids must be unique: \"ha\"");
+        // A secret that can't be read is named as unreadable, not as missing.
+        let unreadable = parse(
+            &with_new(&push_table("ha", "HA", "push-ha")),
+            &Err(io::Error::other("bad file")),
+        );
+        assert!(unreadable
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("can't be read")));
+        // A kind that is not one of the two is a decode error.
+        let kind = with_new("[[integration]]\nid = \"x\"\nkind = \"prometheus\"\nlabel = \"x\"\n");
+        assert!(parse(&kind, &sizes()).is_err());
+        // Unknown keys are refused for each kind.
+        let extra = with_new("[[integration]]\nid = \"x\"\nkind = \"push\"\nlabel = \"x\"\ntoken_secret = \"push-ha\"\nevery_s = 3\n");
+        assert_refused(&extra, "unknown field `every_s`");
+    }
+
+    #[test]
+    fn the_stat_integration_takes_the_tile_rules_and_the_action_rules() {
+        assert_refused(
+            &with_new(&stat_table("load", "1", "/load", SHELL_TRUE)),
+            "integration \"load\": every_s is 1, expected 2 to 86400",
+        );
+        assert_refused(
+            &with_new(&stat_table("load", "30", "load", SHELL_TRUE)),
+            "integration \"load\": json_pointer must start with '/', like \"/state\"",
+        );
+        assert_refused(
+            &with_new(&stat_table(
+                "load",
+                "30",
+                "/load",
+                r#"{ kind = "shell", argv = [] }"#,
+            )),
+            "integration \"load\": source: argv is empty",
+        );
+        assert_refused(
+            &with_new(&stat_table(
+                "load",
+                "30",
+                "/load",
+                r#"{ kind = "http", method = "FETCH", url = "https://nas.lan/" }"#,
+            )),
+            "integration \"load\": source: method \"FETCH\" is not one of",
+        );
+        assert_refused(
+            &with_new(&stat_table(
+                "load",
+                "30",
+                "/load",
+                r#"{ kind = "http", method = "GET", url = "https://nas.lan/", secret_headers = { Authorization = "nope" } }"#,
+            )),
+            "source: header \"Authorization\" uses secret \"nope\", which is not in secrets.toml",
+        );
+        // The same poll interval and pointer pass, and a missing pointer is the first line of output.
+        parse(
+            &with_new(&stat_table("load", "2", "/load", SHELL_TRUE)),
+            &sizes(),
+        )
+        .unwrap();
+        parse(
+            &with_new("[[integration]]\nid = \"up\"\nkind = \"stat\"\nlabel = \"Up\"\nevery_s = 86400\nsource = { kind = \"shell\", argv = [\"true\"] }\n"),
+            &sizes(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn integrations_are_at_most_16_and_8_of_them_cards() {
+        let stat = |i: usize| stat_table(&format!("s{i}"), "30", "/v", SHELL_TRUE);
+        let many = |n: usize| with_new(&(0..n).map(stat).collect::<String>());
+        assert_refused(&many(17), "17 integrations, at most 16");
+        assert_refused(&many(9), "9 card sources (stat and prometheus), at most 8");
+        parse(&many(8), &sizes()).unwrap();
+        // Push integrations don't count as cards.
+        let pushes = with_new(
+            &(0..9)
+                .map(|i| push_table(&format!("p{i}"), "P", "push-ha"))
+                .collect::<String>(),
+        );
+        parse(&pushes, &sizes()).unwrap();
+    }
+
+    #[test]
+    fn a_sleep_push_or_integration_only_change_leaves_the_layout_equal() {
+        let before = parse(EXAMPLE, &sizes()).unwrap();
+        let after = parse(&with_new(FULL_NEW), &sizes()).unwrap();
+        assert_ne!(before, after);
+        assert_eq!(live(before).layout(), live(after).layout());
+    }
+
+    #[test]
+    fn the_new_tables_survive_a_save_and_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let secrets = Arc::new(Secrets::new(tmp.path()));
+        secrets.set("push-ha", &"a".repeat(40)).unwrap();
+        // The example's button sends `ha`.
+        secrets.set("ha", "Bearer x").unwrap();
+        let configs = Configs::open(tmp.path(), secrets).unwrap();
+        let revision = configs.status().borrow().revision.clone();
+        let config = parse(&with_new(FULL_NEW), &sizes()).unwrap();
+
+        configs.save(config.clone(), &revision).unwrap();
+        let text = fs::read_to_string(tmp.path().join(FILE)).unwrap();
+        for table in ["[sleep]", "[push]", "[[integration]]"] {
+            assert!(text.contains(table), "{text}");
+        }
+        assert_eq!(parse(&text, &sizes()).unwrap(), config, "{text}");
+        assert_eq!(configs.current().config, config);
+        assert_eq!(configs.reload(), Ok(false));
+    }
+
+    #[test]
+    fn a_file_without_the_new_tables_saves_without_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let configs = open(tmp.path());
+        let revision = configs.status().borrow().revision.clone();
+        configs
+            .save(parse(DEFAULT, &sizes()).unwrap(), &revision)
+            .unwrap();
+        let text = fs::read_to_string(tmp.path().join(FILE)).unwrap();
+        for table in ["[sleep]", "[push]", "[[integration]]"] {
+            assert!(!text.contains(table), "{text}");
+        }
+    }
+
+    #[test]
+    fn deleting_a_secret_a_push_or_a_stat_source_uses_is_refused_with_its_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let secrets = Arc::new(Secrets::new(tmp.path()));
+        secrets.set("push-ha", &"a".repeat(40)).unwrap();
+        secrets.set("nas-token", &"b".repeat(20)).unwrap();
+        let configs = Configs::open(tmp.path(), secrets.clone()).unwrap();
+        let revision = configs.status().borrow().revision.clone();
+        let text = format!(
+            "{BARE}{}{}",
+            push_table("ha", "HA", "push-ha"),
+            stat_table(
+                "load",
+                "30",
+                "/load",
+                r#"{ kind = "http", method = "GET", url = "https://nas.lan/", secret_headers = { Authorization = "nas-token" } }"#,
+            )
+        );
+        configs
+            .save(parse(&text, &secrets.sizes()).unwrap(), &revision)
+            .unwrap();
+
+        let err = configs.delete_secret("push-ha").unwrap_err();
+        assert!(err.contains("used by ha."), "{err}");
+        let err = configs.delete_secret("nas-token").unwrap_err();
+        assert!(err.contains("used by load."), "{err}");
+        assert_eq!(secrets.names().unwrap(), ["nas-token", "push-ha"]);
     }
 
     // ---- The file ----
@@ -3105,7 +3740,7 @@ net_tx = []
         assert!(status.errors.is_empty() && status.loaded);
         assert_eq!(status.revision, revision);
         assert_eq!(
-            parse(&fs::read_to_string(&path).unwrap(), &Ok(Vec::new())).unwrap(),
+            parse(&fs::read_to_string(&path).unwrap(), &Ok(BTreeMap::new())).unwrap(),
             config
         );
     }
@@ -3315,7 +3950,7 @@ net_tx = []
         assert_eq!(mode(&path), 0o600);
         assert_eq!(configs.current().buttons[0].label, "Saved");
         assert_eq!(
-            parse(&fs::read_to_string(&path).unwrap(), &Ok(Vec::new())).unwrap(),
+            parse(&fs::read_to_string(&path).unwrap(), &Ok(BTreeMap::new())).unwrap(),
             config
         );
         assert_eq!(
@@ -3594,7 +4229,7 @@ net_tx = []
         let revision = configs.save(config.clone(), &revision).unwrap();
         assert_eq!(configs.current().buttons[0].icon, Some(name));
         let text = fs::read_to_string(tmp.path().join(FILE)).unwrap();
-        assert_eq!(parse(&text, &names()).unwrap(), config);
+        assert_eq!(parse(&text, &sizes()).unwrap(), config);
         assert_eq!(configs.reload(), Ok(false), "{revision}");
     }
 
@@ -3648,9 +4283,9 @@ net_tx = []
         configs.save(config, &revision).unwrap();
 
         let err = configs.delete_secret("ha").unwrap_err();
-        assert!(err.contains("button a, c"), "{err}");
+        assert!(err.contains("used by a, c."), "{err}");
         let err = configs.delete_secret("tile-only").unwrap_err();
-        assert!(err.contains("button b"), "{err}");
+        assert!(err.contains("used by b."), "{err}");
         assert_eq!(secrets.names().unwrap(), ["ha", "spare", "tile-only"]);
 
         configs.delete_secret("spare").unwrap();
@@ -3742,6 +4377,6 @@ net_tx = []
         assert_eq!(text.matches("insecure_http").count(), 1, "{text}");
         // Only the true ones are written: "web" (action and tile source), not "lan".
         assert_eq!(text.matches("insecure_tls").count(), 2, "{text}");
-        assert_eq!(parse(&text, &names()).unwrap(), config);
+        assert_eq!(parse(&text, &sizes()).unwrap(), config);
     }
 }

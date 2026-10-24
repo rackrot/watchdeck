@@ -94,6 +94,15 @@ impl Secrets {
         Ok(self.load()?.into_keys().collect())
     }
 
+    /// Every secret's name and length in bytes. The config rules see these, never a value.
+    pub fn sizes(&self) -> io::Result<BTreeMap<String, usize>> {
+        Ok(self
+            .load()?
+            .into_iter()
+            .map(|(name, value)| (name, value.expose().len()))
+            .collect())
+    }
+
     /// Adds or replaces `name`, whose value must pass [`valid_value`]. Errors never repeat the
     /// value.
     pub fn set(&self, name: &str, value: &str) -> Result<(), String> {
@@ -171,6 +180,18 @@ mod tests {
         let all = secrets.load().unwrap();
         assert_eq!(all["ha"].expose(), "replaced");
         assert_eq!(format!("{:?}", all["ha"]), "Secret(<redacted>)");
+    }
+
+    #[test]
+    fn sizes_give_each_secret_its_length_in_bytes_and_no_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let secrets = Secrets::new(tmp.path());
+        secrets.set("ha", VALUE).unwrap();
+        secrets.set("other", "x").unwrap();
+        let sizes = secrets.sizes().unwrap();
+        assert_eq!(sizes.get("ha"), Some(&VALUE.len()));
+        assert_eq!(sizes.get("other"), Some(&1));
+        assert_eq!(sizes.len(), 2);
     }
 
     #[test]
