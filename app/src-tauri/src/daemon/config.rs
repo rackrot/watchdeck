@@ -44,7 +44,7 @@ pub const MAX_EVERY_S: u64 = 24 * 60 * 60;
 const MAX_INTEGRATIONS: usize = 16;
 const MAX_CARD_SOURCES: usize = 8;
 /// A push token, in characters. The daemon generates 64 hex digits.
-const MIN_TOKEN_BYTES: usize = 32;
+pub const MIN_TOKEN_BYTES: usize = 32;
 const MAX_INTEGRATION_LABEL: usize = 23;
 /// An integration's id, which starts every note and card id on the wire (63 characters in all).
 const MAX_INTEGRATION_ID: usize = 31;
@@ -1777,10 +1777,10 @@ impl Configs {
 /// When a file last changed, as far as polling can tell: mtime, size and inode, since editors
 /// often save by renaming a new file into place, then mode and owner, so the chmod or chown that
 /// makes `secrets.toml` readable takes effect at once.
-type Stamp = (SystemTime, u64, u64, u32, u32);
+pub(crate) type Stamp = (SystemTime, u64, u64, u32, u32);
 /// A [`Stamp`] plus the SHA-256 of the file's bytes (`None` if they can't be read or are over the
 /// cap), because an edit of the same length inside one coarse mtime tick leaves the stamp alone.
-type HashedStamp = (Stamp, Option<String>);
+pub(crate) type HashedStamp = (Stamp, Option<String>);
 /// What the poller watches.
 #[derive(Clone, Default, PartialEq)]
 struct Stamps {
@@ -1812,7 +1812,7 @@ fn stamp(path: &Path) -> Option<Stamp> {
 
 /// The stamp, then the bytes read once and hashed. Metadata comes first, so a write between the
 /// two shows up as a stamp that differs from the next poll's.
-fn hashed_stamp(path: &Path) -> Option<HashedStamp> {
+pub(crate) fn hashed_stamp(path: &Path) -> Option<HashedStamp> {
     let stamp = stamp(path)?;
     Some((
         stamp,

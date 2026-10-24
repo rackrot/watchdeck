@@ -12,6 +12,7 @@ use crate::daemon::config::{Config, Configs, StatusBarConfig, StatusBarDefaults}
 use crate::daemon::gpu::GpuList;
 use crate::daemon::pairing::{Pairing, PairingState};
 use crate::daemon::protocol::Feed;
+use crate::daemon::push;
 use crate::daemon::secrets::Secrets;
 use crate::daemon::server::{DeviceInfo, Devices};
 use crate::daemon::tiles::TileView;
@@ -160,6 +161,20 @@ pub async fn set_secret(
         // A config held back for want of this secret can go live now. reload logs its own outcome.
         let _ = configs.reload();
         Ok(())
+    })
+    .await?
+}
+
+/// Makes a new token for push integration `id`, stores it as the secret `push-<id>` (replacing
+/// any earlier one) and returns it. This is the only time it is shown, and it is never logged.
+#[tauri::command]
+pub async fn create_push_token(daemon: State<'_, Daemon>, id: String) -> Result<String, String> {
+    let (configs, secrets) = (daemon.configs.clone(), daemon.secrets.clone());
+    blocking(move || {
+        let token = push::create_token(&secrets, &id)?;
+        // A config held back for want of this secret can go live now. reload logs its own outcome.
+        let _ = configs.reload();
+        Ok(token)
     })
     .await?
 }

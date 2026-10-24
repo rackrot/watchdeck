@@ -2,6 +2,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    // `watchdeck notify ...` and the other push commands, before anything of the app starts.
+    if let Some(code) = watchdeck_lib::cli::main() {
+        std::process::exit(code);
+    }
+
     // WebKitGTK's DMA-BUF renderer crashes on Wayland with NVIDIA ("Error 71 (Protocol error)
     // dispatching to Wayland display"), which takes the daemon down with the window. Set the
     // variable to 0 in the environment to opt back in. This runs before any threads start.

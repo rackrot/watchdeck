@@ -1,3 +1,4 @@
+pub mod cli;
 mod commands;
 pub mod daemon;
 mod tray;
@@ -13,6 +14,7 @@ use daemon::config::Configs;
 use daemon::hoststats::HostSources;
 use daemon::mdns::{self, MdnsStatus};
 use daemon::pairing::{Pairing, PAIR_PORT, PAIR_WINDOW};
+use daemon::push;
 use daemon::secrets::Secrets;
 use daemon::server::{DaemonEvent, Server, PORT};
 use daemon::store::Store;
@@ -33,7 +35,7 @@ pub fn ms_since_launch() -> u128 {
 
 /// Where the daemon keeps its files: `$XDG_CONFIG_HOME/watchdeck`, or `~/.config/watchdeck` when
 /// the variable is unset, empty or not an absolute path (the XDG spec says to ignore those).
-fn config_dir(xdg: Option<OsString>, home: &Path) -> PathBuf {
+pub(crate) fn config_dir(xdg: Option<OsString>, home: &Path) -> PathBuf {
     match xdg.map(PathBuf::from) {
         Some(base) if base.is_absolute() => base.join("watchdeck"),
         _ => home.join(".config").join("watchdeck"),
@@ -160,6 +162,19 @@ pub fn run() {
             tauri::async_runtime::spawn(configs.clone().watch_files());
 
             let devices = server.devices();
+            // The push API is optional, so a port it can't bind is logged and tried again, and
+            // never stops the app. Managed, so it lives as long as the app does.
+            let push_tls = identity.server_config()?;
+            let push = tauri::async_runtime::block_on(async {
+                push::spawn(
+                    configs.subscribe(),
+                    secrets.clone(),
+                    devices.feed(),
+                    push_tls,
+                    push::Addrs::default(),
+                )
+            });
+            app.manage(push);
             // Subscribe before the tray reads its first status, so no device event slips between.
             let mut events = server.subscribe();
             let status_item = tray::build(app.handle(), &devices.list())?;
@@ -306,6 +321,7 @@ pub fn run() {
             commands::test_action,
             commands::tile_values,
             commands::feed_snapshot,
+            commands::create_push_token,
             commands::config_dir,
         ])
         .build(tauri::generate_context!())

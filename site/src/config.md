@@ -471,7 +471,7 @@ There are at most 16 integrations, and at most 8 of them cards (`stat` now, `pro
 
 `[push]` has one key, `lan`. With `lan` off, the push API listens on this computer only. With `lan = true`, it also listens on the LAN over HTTPS, with the daemon's own certificate. Plain HTTP is never served on the LAN, since the token would cross the network in clear.
 
-The API's requests and the `watchdeck notify` command are described in `integrations.md`, which arrives with the API.
+The API's requests, its limits and the `watchdeck notify` command are in [Integrations and the push API](integrations.md).
 
 ## Results
 

@@ -72,6 +72,13 @@ simplecss = "0.2.2"
 # It dlopen()s libnvidia-ml.so.1 at runtime and links nothing, so a host without the driver
 # still builds and runs. No default features: that leaves out the optional serde.
 nvml-wrapper = { version = "=0.13.0", default-features = false }
+# The push API's listeners (`daemon/push.rs`). HTTP/1.1 only, no http2 (that would add h2).
+# `server` adds httpdate 1.0.3, vetted by hand in settings-sleep-feed V1.
+hyper = { version = "1.12.0", features = ["server", "http1"] }
+# TokioIo and TokioTimer. Already on in the lock through reqwest.
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+# Limited and BodyExt::collect for the 8 KB body cap.
+http-body-util = "0.1.5"
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

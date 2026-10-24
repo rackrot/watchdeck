@@ -25,7 +25,9 @@ use tokio::time::{sleep, sleep_until, Instant};
 pub use stat::FeedSlots;
 
 use super::config::{IntegrationConfig, Live};
-use super::feed::{Applied, Card, FeedStore, Snapshot, SourceInfo, StoreError, Update};
+use super::feed::{
+    Applied, Card, FeedStore, Snapshot, SourceInfo, StoreError, Update, MAX_SOURCE_CARDS,
+};
 use super::protocol::Feed;
 use super::tiles::{Sample, Task, COOLDOWN, STALE_AFTER};
 
@@ -76,6 +78,13 @@ impl From<StoreError> for PushError {
             StoreError::UnknownSource => Self::new(404, "no such integration"),
             StoreError::NotFound => Self::new(404, "not found"),
             StoreError::CardsFull => Self::new(409, "all card slots are taken"),
+            StoreError::SourceCardsFull => Self::new(
+                409,
+                format!("this integration has {MAX_SOURCE_CARDS} cards, the most one may have"),
+            ),
+            StoreError::NotesFull => {
+                Self::new(409, "all note slots hold other integrations' notes")
+            }
             StoreError::BadId => Self::new(400, "id is too long"),
         }
     }
@@ -83,6 +92,10 @@ impl From<StoreError> for PushError {
 
 /// A source that gets requests.
 pub trait Receiver: Send + Sync + 'static {
+    /// The first path segments under `/v1/` that this kind answers, such as `notes`. A token is
+    /// refused on any other route, as if it were wrong.
+    fn routes(&self) -> &'static [&'static str];
+
     /// What a request changes. The caller applies the updates in order and stops at the first
     /// that fails.
     fn accept(&self, req: &PushRequest) -> Result<Vec<Update>, PushError>;
@@ -165,6 +178,15 @@ impl FeedHandle {
             .into_iter()
             .map(|update| Ok(self.store.apply(integration, update)?))
             .collect()
+    }
+
+    /// Whether the push integration `integration` answers `path` (under `/v1/`), by its first
+    /// segment. False for an integration that isn't a push one.
+    pub fn answers(&self, integration: &str, path: &str) -> bool {
+        let first = path.split('/').next().unwrap_or_default();
+        (self.receivers.lock().expect("receivers poisoned"))
+            .get(integration)
+            .is_some_and(|r| r.routes().contains(&first))
     }
 
     fn is_push(&self, integration: &str) -> bool {
@@ -660,6 +682,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_request_goes_through_the_receiver_into_the_store() {
         let rig = rig(PUSH);
+        assert!(rig.feed.answers("ha", "notes") && rig.feed.answers("ha", "cards/x"));
+        assert!(!rig.feed.answers("ha", "grafana") && !rig.feed.answers("ha", ""));
+        assert!(!rig.feed.answers("nope", "notes"));
         let post = |path: &str, method: &str, body: &str| {
             rig.feed.receive(
                 "ha",
@@ -689,13 +714,13 @@ mod tests {
                 .status,
             404
         );
-        for i in 0..9 {
+        for i in 0..=MAX_SOURCE_CARDS {
             let r = post(
                 &format!("cards/c{i}"),
                 "PUT",
                 r#"{"label":"L","value":"1"}"#,
             );
-            assert_eq!(r.is_err(), i == 8, "card {i}");
+            assert_eq!(r.is_err(), i == MAX_SOURCE_CARDS, "card {i}");
             if let Err(e) = r {
                 assert_eq!(e.status, 409);
             }
