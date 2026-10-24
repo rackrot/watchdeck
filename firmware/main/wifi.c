@@ -14,6 +14,7 @@
 #include "diag.h"
 #include "logcap.h"
 #include "sdcard.h"
+#include "wifitxt.h"
 
 #define RECONNECT_DELAY_US (3 * 1000 * 1000)
 #define HOSTNAME "watchdeck"
@@ -45,48 +46,33 @@ static void report(const char *fmt, ...)
     }
 }
 
-#define SSID_MAX 32
-#define PASS_MAX 64
+#define SSID_MAX WIFITXT_SSID_MAX
+#define PASS_MAX WIFITXT_PASS_MAX
 
-// Read one line, strip the line ending, and enforce max_len. Returns false on EOF or an
-// over-long line (buf must hold max_len plus CR, LF, and NUL). Only the length is logged.
-static bool read_line(FILE *f, char *buf, size_t buf_len, size_t max_len, const char *what)
-{
-    if (!fgets(buf, buf_len, f)) {
-        return false;
-    }
-    bool has_newline = strchr(buf, '\n') != NULL;
-    buf[strcspn(buf, "\r\n")] = '\0';
-    if ((!has_newline && !feof(f)) || strlen(buf) > max_len) {
-        ESP_LOGE(TAG, "%s in %s is longer than %u chars", what, WIFI_FILE, (unsigned)max_len);
-        return false;
-    }
-    return true;
-}
-
-// Read SSID and password from the card. Returns false when the file is absent or invalid.
-static bool read_card_credentials(char *ssid, size_t ssid_len, char *pass, size_t pass_len)
+// Read SSID and password from the card. Returns false when the file is absent or invalid. Only lengths are logged.
+static bool read_card_credentials(char ssid[SSID_MAX + 1], char pass[PASS_MAX + 1])
 {
     FILE *f = fopen(WIFI_FILE, "r");
     if (!f) {
         ESP_LOGI(TAG, "no %s, using Kconfig credentials", WIFI_FILE);
         return false;
     }
-    bool ok = read_line(f, ssid, ssid_len, SSID_MAX, "SSID");
-    if (!ok && feof(f)) {
-        ESP_LOGW(TAG, "%s is empty", WIFI_FILE);
-    }
-    if (ok) {
-        int c = fgetc(f);
-        if (c == EOF) {
-            pass[0] = '\0'; // open network: password line missing
-        } else {
-            ungetc(c, f);
-            ok = read_line(f, pass, pass_len, PASS_MAX, "password");
-        }
-    }
+    const wifitxt_result_t res = wifitxt_parse(f, ssid, pass);
     fclose(f);
-    return ok;
+    switch (res) {
+    case WIFITXT_OK:
+        return true;
+    case WIFITXT_EMPTY:
+        ESP_LOGW(TAG, "%s is empty", WIFI_FILE);
+        break;
+    case WIFITXT_SSID_LONG:
+        ESP_LOGE(TAG, "SSID in %s is longer than %u chars", WIFI_FILE, SSID_MAX);
+        break;
+    case WIFITXT_PASS_LONG:
+        ESP_LOGE(TAG, "password in %s is longer than %u chars", WIFI_FILE, PASS_MAX);
+        break;
+    }
+    return false;
 }
 
 // Set the DHCP hostname and answer as HOSTNAME.local. Failures are logged and boot continues.
@@ -145,10 +131,10 @@ esp_err_t wifi_start(wifi_status_cb_t status_cb)
 {
     s_status_cb = status_cb;
 
-    char ssid[SSID_MAX + 3] = "";
-    char pass[PASS_MAX + 3] = "";
+    char ssid[SSID_MAX + 1] = "";
+    char pass[PASS_MAX + 1] = "";
     const char *source = "sd";
-    if (!read_card_credentials(ssid, sizeof(ssid), pass, sizeof(pass))) {
+    if (!read_card_credentials(ssid, pass)) {
         source = "config";
         if (strlen(CONFIG_WATCHDECK_WIFI_SSID) > SSID_MAX || strlen(CONFIG_WATCHDECK_WIFI_PASSWORD) > PASS_MAX) {
             ESP_LOGE(TAG, "Kconfig SSID or password is too long");

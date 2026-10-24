@@ -1,0 +1,2 @@
+# FatFs as firmware/sdkconfig.defaults sets it; everything else at the IDF defaults the board also uses.
+CONFIG_FATFS_LFN_HEAP=y

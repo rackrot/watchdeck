@@ -1,0 +1,3 @@
+[default.extend-identifiers]
+# FatFs's f_mkfs parameter type, used by the FatFs power-cut test.
+MKFS_PARM = "MKFS_PARM"
