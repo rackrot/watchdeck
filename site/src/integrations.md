@@ -19,10 +19,10 @@ label = "Home Assistant"
 token_secret = "push-ha"
 ```
 
-To make a token by hand, add 64 random hex digits to `secrets.toml`:
+Add the token on the app's Secrets page, which keeps the file 0600, with 64 random hex digits from `openssl rand -hex 32` as its value. To add it by hand instead, keep the file private, since the daemon refuses a `secrets.toml` that isn't 0600:
 
 ```sh
-printf 'push-ha = "%s"\n' "$(openssl rand -hex 32)" >> ~/.config/watchdeck/secrets.toml
+(umask 077; printf 'push-ha = "%s"\n' "$(openssl rand -hex 32)" >> ~/.config/watchdeck/secrets.toml)
 ```
 
 A token opens only its own integration: what it posts shows that integration's label, and it can't touch another integration's notes or cards. Two push integrations can't share a token. The daemon reads `secrets.toml` on every request, so a new or changed token works at once.
