@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use image::RgbaImage;
+use image::{imageops, RgbaImage};
 use sha2::{Digest, Sha256};
 
 use super::config::{color, SleepConfig};
@@ -194,21 +194,40 @@ pub fn render(bytes: &[u8], fit: Fit, bg: u32) -> Result<ScreenImage, String> {
     Ok(ScreenImage { id, pixels })
 }
 
-/// A raster scaled, keeping its shape, until it fills the area (`Cover`, so it is at least as big
-/// on both sides) or fits inside it (`Contain`, so it is at most as big), up as well as down.
+/// A raster scaled, keeping its shape, until it fills the area exactly (`Cover`, which first cuts
+/// the picture to the area's shape, equally at both ends, so the scaled copy is never bigger than
+/// the area) or fits inside it (`Contain`), up as well as down.
 fn fitted(picture: RgbaImage, fit: Fit) -> RgbaImage {
     let (w, h) = picture.dimensions();
     let (wide, high) = (u64::from(w), u64::from(h));
+    let (area_w, area_h) = (u64::from(IMAGE_W), u64::from(IMAGE_H));
     // Whether the picture is at least as wide as the area, which decides the side that touches it.
-    let wide_as_area = wide * u64::from(IMAGE_H) >= high * u64::from(IMAGE_W);
-    let (nw, nh) = if wide_as_area == (fit == Fit::Cover) {
-        let nw = (wide * u64::from(IMAGE_H) + high / 2) / high;
-        (nw as u32, IMAGE_H)
-    } else {
-        let nh = (high * u64::from(IMAGE_W) + wide / 2) / wide;
-        (IMAGE_W, nh as u32)
+    let wide_as_area = wide * area_h >= high * area_w;
+    let (picture, nw, nh) = match fit {
+        Fit::Cover => {
+            let (cw, ch) = if wide_as_area {
+                (((high * area_w + area_h / 2) / area_h).min(wide), high)
+            } else {
+                (wide, ((wide * area_h + area_w / 2) / area_w).min(high))
+            };
+            let (cw, ch) = (cw as u32, ch as u32);
+            let picture = if (cw, ch) == (w, h) {
+                picture
+            } else {
+                imageops::crop_imm(&picture, (w - cw) / 2, (h - ch) / 2, cw, ch).to_image()
+            };
+            (picture, IMAGE_W, IMAGE_H)
+        }
+        Fit::Contain if wide_as_area => {
+            let nh = (high * area_w + wide / 2) / wide;
+            (picture, IMAGE_W, nh as u32)
+        }
+        Fit::Contain => {
+            let nw = (wide * area_h + high / 2) / high;
+            (picture, nw as u32, IMAGE_H)
+        }
     };
-    if (nw, nh) == (w, h) {
+    if picture.dimensions() == (nw, nh.max(1)) {
         picture
     } else {
         resize(picture, nw.max(1), nh.max(1))
@@ -395,8 +414,29 @@ mod tests {
         });
         let image = render(&png(&wide), Fit::Cover, 0).unwrap();
         // 2048 x 512 with 512 off each side: the red quarter is gone, and so is the blue one.
-        assert_eq!(at(&image, 20, 256), GREEN565);
-        assert_eq!(at(&image, 1003, 256), GREEN565);
+        assert_eq!(at(&image, 0, 256), GREEN565);
+        assert_eq!(at(&image, 1023, 256), GREEN565);
+    }
+
+    #[test]
+    fn an_extreme_shape_is_cut_before_it_is_scaled_so_it_never_allocates_more_than_the_area() {
+        // Scaled whole to cover, a 4096 x 1 picture would be 2,097,152 x 512 pixels (4 GiB).
+        for (w, h) in [(4096, 1), (1, 4096), (4096, 2), (3, 4096)] {
+            let thin = RgbaImage::from_pixel(w, h, RED);
+            for fit in [Fit::Cover, Fit::Contain] {
+                let image = render(&png(&thin), fit, 0x00_00ff)
+                    .unwrap_or_else(|e| panic!("{w}x{h} {fit:?}: {e}"));
+                assert_eq!(image.pixels().len(), IMAGE_BYTES, "{w}x{h} {fit:?}");
+                // Contain leaves a one pixel strip of it at the very least.
+                assert!(
+                    image.pixels().chunks(2).any(|p| p == RED565),
+                    "{w}x{h} {fit:?}"
+                );
+                if fit == Fit::Cover {
+                    assert_eq!(at(&image, 512, 256), RED565, "{w}x{h}");
+                }
+            }
+        }
     }
 
     #[test]

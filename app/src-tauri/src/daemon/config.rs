@@ -444,7 +444,7 @@ impl SleepConfig {
         if let Some(image) = self.image.as_deref().filter(|i| !icons::plain_name(i)) {
             errors.push(format!(
                 "sleep.image {image:?} must be {}",
-                icons::name_rule("screens")
+                icons::name_rule(screens::DIR)
             ));
         }
         if let Some(fit) = self
