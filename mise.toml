@@ -103,6 +103,21 @@ run = [
   "node fonts/generate.mjs --check",
 ]
 
+# Renders logo/ into the app icon images (tauri icon also writes icns and ico) and the text outputs
+# that `logo:check` compares. The icon images are not diffed, only regenerated when logo/ changes.
+[tasks."logo:gen"]
+description = "Regenerate the logo outputs from logo/ (app icons, device bitmap, app copies)"
+dir = "app"
+run = [
+  "pnpm tauri icon ../logo/app-icon.svg",
+  "cargo run --manifest-path src-tauri/Cargo.toml --example logo_gen",
+]
+
+[tasks."logo:check"]
+description = "Fail if the checked-in logo text outputs differ from a fresh generation"
+dir = "{{config_root}}"
+run = "cargo run --manifest-path app/src-tauri/Cargo.toml --example logo_gen -- --check"
+
 [tasks.lint]
 description = "Run all pre-commit hooks on every file"
 run = "prek run --all-files"
