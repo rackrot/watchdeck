@@ -1,0 +1,41 @@
+/* The splash shows before the bundle runs, so it can't use theme.css's variables; the values
+   below are theme.css's --bg-0, --bg-3 and --accent. The app is dark only (theme.css sets
+   color-scheme: dark), so the splash has one background, the app's. It's a linked stylesheet,
+   not inline, because the production CSP sets style-src 'self'. */
+#splash {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 24px;
+  background: #0a0d11;
+}
+
+#splash img {
+  width: 96px;
+  height: 96px;
+}
+
+.splash-spinner {
+  width: 20px;
+  height: 20px;
+  border: 2px solid #212b36;
+  border-top-color: #38bdf8;
+  border-radius: 50%;
+  animation: splash-spin 0.9s linear infinite;
+}
+
+@keyframes splash-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .splash-spinner {
+    animation-duration: 3s;
+  }
+}

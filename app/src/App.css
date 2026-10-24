@@ -19,11 +19,20 @@
 }
 
 .wordmark {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-family: var(--font-mono);
   font-size: 13px;
   font-weight: 600;
   letter-spacing: 0.04em;
   color: var(--accent);
+}
+
+.brand-mark {
+  width: 20px;
+  height: 20px;
+  flex: none;
 }
 
 .tabs {

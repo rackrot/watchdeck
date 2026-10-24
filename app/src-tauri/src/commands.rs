@@ -1,7 +1,7 @@
 //! Tauri commands for the window. They only forward to the daemon, which owns the rules.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use serde::Serialize;
 use tauri::{AppHandle, State};
@@ -85,6 +85,13 @@ pub struct ConfigView {
 
 #[tauri::command]
 pub fn get_config(daemon: State<'_, Daemon>) -> ConfigView {
+    static FIRST: Once = Once::new();
+    FIRST.call_once(|| {
+        log::info!(
+            "first config load answered {} ms after launch",
+            crate::ms_since_launch()
+        )
+    });
     let status = daemon.configs.status().borrow().clone();
     ConfigView {
         config: daemon.configs.current().config.clone(),

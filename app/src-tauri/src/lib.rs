@@ -5,7 +5,8 @@ mod tray;
 use std::ffi::OsString;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use daemon::actions::Actions;
 use daemon::config::Configs;
@@ -21,6 +22,14 @@ use tauri::{Emitter, Manager, WindowEvent};
 use tauri_plugin_log::{RotationStrategy, Target, TargetKind};
 use tokio::sync::{broadcast, watch};
 use tokio_rustls::rustls::crypto::aws_lc_rs;
+
+/// When `run` began, for the start-up timing lines.
+static LAUNCHED: OnceLock<Instant> = OnceLock::new();
+
+/// Milliseconds since `run` began, for the start-up timing lines.
+pub fn ms_since_launch() -> u128 {
+    LAUNCHED.get().map_or(0, |t| t.elapsed().as_millis())
+}
 
 /// Where the daemon keeps its files: `$XDG_CONFIG_HOME/watchdeck`, or `~/.config/watchdeck` when
 /// the variable is unset, empty or not an absolute path (the XDG spec says to ignore those).
@@ -67,6 +76,7 @@ fn migrate_config_dir(old: &Path, new: &Path) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let _ = LAUNCHED.set(Instant::now());
     // The process's one rustls crypto provider, for any TLS user that doesn't name its own.
     aws_lc_rs::default_provider()
         .install_default()
@@ -109,6 +119,7 @@ pub fn run() {
                 .build(),
         )
         .setup(|app| {
+            let setup_started = Instant::now();
             let home = std::env::home_dir().ok_or("HOME is not set")?;
             let dir = config_dir(std::env::var_os("XDG_CONFIG_HOME"), &home);
             migrate_config_dir(&app.path().app_config_dir()?, &dir)?;
@@ -266,6 +277,11 @@ pub fn run() {
 
             if !std::env::args().any(|a| a == tray::HIDDEN_ARG) {
                 tray::show_window(app.handle());
+                log::info!(
+                    "window shown {} ms after launch, {} ms into setup",
+                    ms_since_launch(),
+                    setup_started.elapsed().as_millis()
+                );
             }
             Ok(())
         })
