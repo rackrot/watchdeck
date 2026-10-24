@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdbool.h>
+
 #include "esp_err.h"
 
 typedef void (*usb_status_cb_t)(const char *text);
@@ -27,6 +29,15 @@ esp_err_t usb_share(void);
  * Ask the user to eject the drive on the computer first.
  */
 void usb_stop_sharing(void);
+
+/** Whether a computer has the device configured. There is no VBUS sensing, so an unplug may go unnoticed. */
+bool usb_connected(void);
+
+/** Whether a share is queued or running. Once it ends, sdcard_owner() and usb_error() are final. */
+bool usb_share_busy(void);
+
+/** Why USB failed to start or the last share failed, ESP_OK after a share worked. */
+esp_err_t usb_error(void);
 
 /** Shows the USB status line again; called when the card's owner changes. */
 void usb_refresh_status(void);

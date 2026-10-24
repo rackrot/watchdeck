@@ -11,19 +11,20 @@
 #include "psa/crypto.h"
 #include "unity.h"
 
-void test_grid_run(void);      // test_grid.c
-void test_pageset_run(void);   // test_pageset.c
-void test_hoststat_run(void);  // test_hoststat.c
-void test_logring_run(void);   // test_logring.c
-void test_diag_run(void);      // test_diag.c
-void test_uimode_run(void);    // test_uimode.c
-void test_sleepcfg_run(void);  // test_sleepcfg.c
-void test_feedfmt_run(void);   // test_feedfmt.c
-void test_cardfs_run(void);    // test_cardfs.c
-void test_wifitxt_run(void);   // test_wifitxt.c
-void test_svc_run(void);       // test_svc.c
-void test_kbmap_run(void);     // test_kbmap.c
-void test_wifistate_run(void); // test_wifistate.c
+void test_grid_run(void);       // test_grid.c
+void test_pageset_run(void);    // test_pageset.c
+void test_hoststat_run(void);   // test_hoststat.c
+void test_logring_run(void);    // test_logring.c
+void test_diag_run(void);       // test_diag.c
+void test_uimode_run(void);     // test_uimode.c
+void test_sleepcfg_run(void);   // test_sleepcfg.c
+void test_feedfmt_run(void);    // test_feedfmt.c
+void test_cardfs_run(void);     // test_cardfs.c
+void test_wifitxt_run(void);    // test_wifitxt.c
+void test_svc_run(void);        // test_svc.c
+void test_kbmap_run(void);      // test_kbmap.c
+void test_wifistate_run(void);  // test_wifistate.c
+void test_storagefmt_run(void); // test_storagefmt.c
 
 static uint8_t frame[PROTO_MAX_ICON_FRAME];
 static char json[8192];
@@ -1564,6 +1565,7 @@ void app_main(void)
     test_svc_run();
     test_kbmap_run();
     test_wifistate_run();
+    test_storagefmt_run();
 
     // Returning from app_main does not end a linux-target process, so the failure count becomes the exit status.
     exit(UNITY_END());

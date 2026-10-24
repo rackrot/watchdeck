@@ -86,6 +86,9 @@ void tab_wifi_leave(void);
 bool tab_wifi_editing(void);
 /** Whether a trial connect or a save is running. Close and the tab buttons do nothing until it ends. */
 bool tab_wifi_busy(void);
+void tab_storage_build(lv_obj_t *parent);
+void tab_storage_tick(void);
+void tab_storage_leave(void);
 void tab_logs_build(lv_obj_t *parent);
 void tab_logs_tick(void);
 void tab_logs_leave(void);

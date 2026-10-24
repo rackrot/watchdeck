@@ -109,9 +109,9 @@ static esp_err_t map_card(void)
 
 static void share_job(void *arg)
 {
-    s_share_queued = false;
     if (sdcard_owner() != SDCARD_DEVICE) {
         ESP_LOGW(TAG, "share: the card isn't the device's, nothing to do");
+        s_share_queued = false;
         return;
     }
     esp_err_t err = sdcard_release_fs(); // waits for a cardfs call in progress, then unmounts
@@ -129,6 +129,22 @@ static void share_job(void *arg)
     } else {
         usb_refresh_status();
     }
+    s_share_queued = false; // after the owner and the error are set, so usb_share_busy() false means they are final
+}
+
+bool usb_connected(void)
+{
+    return s_attached;
+}
+
+bool usb_share_busy(void)
+{
+    return s_share_queued;
+}
+
+esp_err_t usb_error(void)
+{
+    return s_error;
 }
 
 esp_err_t usb_share(void)
