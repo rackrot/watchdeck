@@ -46,8 +46,9 @@ static void fresh_root(void)
     have_root = true;
     s_room_log[0] = '\0';
     s_room_result = ESP_OK;
-    TEST_ASSERT_EQUAL(ESP_OK, cardfs_init(root, stub_room, NULL));
-    cardfs_set_writable(true);
+    static const cardfs_volume_t vol = {.room = stub_room};
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_init(root, &vol));
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_set_writable(true));
 }
 
 static void path_of(char *out, const char *rel)
@@ -216,10 +217,80 @@ void test_cardfs_write_whose_record_cannot_be_created_keeps_the_old_file(void)
     TEST_ASSERT_EQUAL_STRING("Old\n", slurp("wifi.txt"));
 }
 
-void test_cardfs_init_needs_a_room_function(void)
+// The failed read of that record taints cardfs: nothing writes until writes are turned off and on (the remount).
+void test_cardfs_failed_access_stops_writes_until_writes_are_turned_off_and_on(void)
 {
-    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, cardfs_init("/tmp", NULL, NULL));
-    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, cardfs_init("/a/root/too/long", stub_room, NULL));
+    fresh_root();
+    make_dir("watchdeck");
+    make_dir("watchdeck/wifi.new");
+    TEST_ASSERT_EQUAL(ESP_FAIL, cardfs_write_small("wifi.txt", "New\n", 4));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, cardfs_write_small("watchdeck/sleep.cfg", "{}", 2));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, cardfs_write_new("watchdeck/a.bin", "x", 1));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, cardfs_recover());
+    plant_str("watchdeck/b.bin", "y");
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, cardfs_remove("watchdeck/b.bin"));
+    char buf[4];
+    size_t len;
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_read("watchdeck/b.bin", buf, sizeof(buf), &len)); // reads go on
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_set_writable(true));                              // not enough on its own
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, cardfs_write_small("watchdeck/sleep.cfg", "{}", 2));
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_set_writable(false));
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_set_writable(true));
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_write_small("watchdeck/sleep.cfg", "{}", 2));
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_remove("watchdeck/b.bin"));
+}
+
+static int s_prepare_calls;
+static esp_err_t s_prepare_result;
+
+static esp_err_t stub_prepare(void *ctx)
+{
+    s_prepare_calls++;
+    return s_prepare_result;
+}
+
+void test_cardfs_init_needs_a_volume_and_runs_its_prepare(void)
+{
+    const cardfs_volume_t no_room = {0};
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, cardfs_init("/tmp", NULL));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, cardfs_init("/tmp", &no_room));
+    const cardfs_volume_t vol = {.prepare = stub_prepare, .room = stub_room};
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_ARG, cardfs_init("/a/root/too/long", &vol));
+
+    fresh_root();
+    s_prepare_calls = 0;
+    s_prepare_result = ESP_ERR_NOT_SUPPORTED; // a volume cardfs can't write, e.g. not FAT32
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_SUPPORTED, cardfs_init(root, &vol));
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_SUPPORTED, cardfs_set_writable(true));
+    TEST_ASSERT_FALSE(cardfs_writable());
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, cardfs_write_small("wifi.txt", "x\n", 2));
+    s_prepare_result = ESP_OK;
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_set_writable(true)); // after a remount
+    TEST_ASSERT_TRUE(cardfs_writable());
+    TEST_ASSERT_EQUAL(3, s_prepare_calls);
+}
+
+// A hash that fails is not a torn record: the record stays, and nothing reports success.
+void test_cardfs_record_that_cannot_be_hashed_is_kept(void)
+{
+    fresh_root();
+    plant_str("wifi.txt", "Old\n");
+    make_dir("watchdeck");
+    uint8_t rec[128];
+    const size_t rec_len = make_record(rec, "New\n");
+    plant("watchdeck/wifi.new", rec, rec_len);
+    cardfs_test_fail_sha256(0);
+    TEST_ASSERT_EQUAL(ESP_FAIL, cardfs_recover());
+    TEST_ASSERT_EQUAL(rec_len, size_of("watchdeck/wifi.new"));
+    TEST_ASSERT_EQUAL_STRING("Old\n", slurp("wifi.txt"));
+    cardfs_test_fail_sha256(0);
+    TEST_ASSERT_EQUAL(ESP_FAIL, cardfs_write_small("wifi.txt", "Newer\n", 6)); // its pending record can't be checked
+    TEST_ASSERT_EQUAL(rec_len, size_of("watchdeck/wifi.new"));
+    TEST_ASSERT_EQUAL_STRING("Old\n", slurp("wifi.txt"));
+    cardfs_test_fail_sha256(-1);
+    TEST_ASSERT_EQUAL(ESP_OK, cardfs_recover());
+    TEST_ASSERT_EQUAL_STRING("New\n", slurp("wifi.txt"));
+    TEST_ASSERT_EQUAL_STRING("", slurp("watchdeck/wifi.new"));
 }
 
 // The runs follow the order of the creates: watchdeck/ (a long name: 2 entries) before wifi.txt, the record
@@ -540,7 +611,9 @@ void test_cardfs_run(void)
     RUN_TEST(test_cardfs_write_small_refuses_other_names_and_sizes);
     RUN_TEST(test_cardfs_write_while_not_writable_fails_and_keeps_the_old_bytes);
     RUN_TEST(test_cardfs_write_whose_record_cannot_be_created_keeps_the_old_file);
-    RUN_TEST(test_cardfs_init_needs_a_room_function);
+    RUN_TEST(test_cardfs_failed_access_stops_writes_until_writes_are_turned_off_and_on);
+    RUN_TEST(test_cardfs_init_needs_a_volume_and_runs_its_prepare);
+    RUN_TEST(test_cardfs_record_that_cannot_be_hashed_is_kept);
     RUN_TEST(test_cardfs_room_is_asked_for_each_new_entry_in_order);
     RUN_TEST(test_cardfs_full_directory_refuses_before_writing_anything);
     RUN_TEST(test_cardfs_pending_record_is_applied_before_a_new_write_and_never_dropped);

@@ -11,11 +11,12 @@ static uint32_t s_n_dirty;
 static uint32_t s_sectors;
 static uint32_t s_seed;
 static uint32_t s_writes;
-static enum { ARM_NONE, ARM_CUT, ARM_FAIL } s_arm;
+static enum { ARM_NONE, ARM_CUT, ARM_FAIL, ARM_FAIL_ONCE } s_arm;
 static uint32_t s_left;
 static ramdisk_tear_t s_tear;
 static bool s_off;
 static bool s_failing;
+static uint32_t s_failed_lba = UINT32_MAX;
 
 static void *xmalloc(size_t n)
 {
@@ -99,6 +100,12 @@ void ramdisk_restore(void)
     s_n_dirty = 0;
     ramdisk_power_on();
     s_writes = 0;
+    s_failed_lba = UINT32_MAX;
+}
+
+uint32_t ramdisk_failed_lba(void)
+{
+    return s_failed_lba;
 }
 
 void ramdisk_cut_after(uint32_t whole, ramdisk_tear_t tear)
@@ -111,6 +118,12 @@ void ramdisk_cut_after(uint32_t whole, ramdisk_tear_t tear)
 void ramdisk_fail_after(uint32_t whole)
 {
     s_arm = ARM_FAIL;
+    s_left = whole;
+}
+
+void ramdisk_fail_once_after(uint32_t whole)
+{
+    s_arm = ARM_FAIL_ONCE;
     s_left = whole;
 }
 
@@ -179,8 +192,14 @@ static DRESULT ram_write(unsigned char pdrv, const unsigned char *buf, uint32_t 
         const uint8_t *src = buf + (size_t)i * RAMDISK_SECTOR;
         if (s_arm != ARM_NONE) {
             if (s_left == 0) {
+                if (s_arm == ARM_FAIL_ONCE) {
+                    s_arm = ARM_NONE;
+                    s_failed_lba = sector + i;
+                    return RES_ERROR;
+                }
                 if (s_arm == ARM_FAIL) {
                     s_failing = true;
+                    s_failed_lba = sector + i;
                     return RES_ERROR;
                 }
                 s_off = true;

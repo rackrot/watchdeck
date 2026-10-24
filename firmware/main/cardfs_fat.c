@@ -1,8 +1,9 @@
-// cardfs's room function for FatFs. It reads a directory's entries and FAT chain straight from the disk and replays
-// dir_alloc (ff.c) for the entry runs a call will add: each run goes at the first run of free entries (first byte
-// 0x00 or 0xE5) long enough, scanning from the start, and dir_alloc grows the directory only when it scans off the
-// end of its last cluster. Only cardfs writes to the card and it holds its mutex here, and every FatFs call it makes
-// syncs before it returns, so the disk holds what FatFs would read.
+// cardfs's volume functions for FatFs, FAT32 only (the card is FAT32; FAT12/16 have a fixed root and other FAT
+// entry sizes this code doesn't handle). The room function reads a directory's entries and FAT chain straight from
+// the disk and replays dir_alloc (ff.c) for the entry runs a call will add: each run goes at the first run of free
+// entries (first byte 0x00 or 0xE5) long enough, scanning from the start, and dir_alloc grows the directory only
+// when it scans off the end of its last cluster. Only cardfs writes to the card and it holds its mutex here, and
+// every FatFs call it makes syncs before it returns, so the disk holds what FatFs would read.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +30,38 @@ typedef struct {
     size_t n_slots, cap;
 } scan_t;
 
+// The mounted FAT32 volume on drive ctx, and the start cluster of dir on it (0 for the root).
+static esp_err_t open_volume(void *ctx, const char *dir, FATFS **fs, DWORD *start)
+{
+    char path[32];
+    snprintf(path, sizeof(path), "%s/%s", (const char *)ctx, dir);
+    FF_DIR dj = {0};
+    const FRESULT res = f_opendir(&dj, path);
+    if (res != FR_OK) {
+        ESP_LOGE(TAG, "f_opendir %s: FRESULT %d", path, res);
+        return ESP_FAIL;
+    }
+    *fs = dj.obj.fs;
+    *start = dj.obj.sclust;
+    f_closedir(&dj);
+    if ((*fs)->fs_type != FS_FAT32) {
+        ESP_LOGE(TAG, "the card is FAT type %d, not FAT32", (*fs)->fs_type);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    return ESP_OK;
+}
+
+esp_err_t cardfs_fat_prepare(void *ctx)
+{
+    FATFS *fs;
+    DWORD start;
+    const esp_err_t err = open_volume(ctx, "", &fs, &start);
+    if (err == ESP_OK) {
+        fs->free_clst = fs->last_clst = 0xFFFFFFFF; // FSINFO's hints, which a cut can leave stale: count afresh
+    }
+    return err;
+}
+
 static bool read_sector(scan_t *s, LBA_t lba)
 {
     if (s->sec_valid && s->sec_lba == lba) {
@@ -39,44 +72,16 @@ static bool read_sector(scan_t *s, LBA_t lba)
     return s->sec_valid;
 }
 
-static bool fat_bytes(scan_t *s, DWORD off, uint8_t *b, int n)
-{
-    for (int i = 0; i < n; i++) {
-        if (!read_sector(s, s->fs->fatbase + (off + i) / s->ss)) {
-            return false;
-        }
-        b[i] = s->sec[(off + i) % s->ss];
-    }
-    return true;
-}
-
 // The cluster after c in its chain, CHAIN_END at the end, or false on a read error.
 static bool fat_next(scan_t *s, DWORD c, DWORD *next)
 {
-    uint8_t b[4];
-    switch (s->fs->fs_type) {
-    case FS_FAT12:
-        if (!fat_bytes(s, c + c / 2, b, 2)) {
-            return false;
-        }
-        *next = c & 1 ? (b[0] | (DWORD)b[1] << 8) >> 4 : (b[0] | (DWORD)b[1] << 8) & 0xFFF;
-        *next = *next >= 0xFF8 ? CHAIN_END : *next;
-        return true;
-    case FS_FAT16:
-        if (!fat_bytes(s, c * 2, b, 2)) {
-            return false;
-        }
-        *next = b[0] | (DWORD)b[1] << 8;
-        *next = *next >= 0xFFF8 ? CHAIN_END : *next;
-        return true;
-    default:
-        if (!fat_bytes(s, c * 4, b, 4)) {
-            return false;
-        }
-        *next = (b[0] | (DWORD)b[1] << 8 | (DWORD)b[2] << 16 | (DWORD)b[3] << 24) & 0x0FFFFFFF;
-        *next = *next >= 0x0FFFFFF8 ? CHAIN_END : *next;
-        return true;
+    if (!read_sector(s, s->fs->fatbase + c * 4 / s->ss)) {
+        return false;
     }
+    const uint8_t *b = s->sec + c * 4 % s->ss;
+    *next = (b[0] | (DWORD)b[1] << 8 | (DWORD)b[2] << 16 | (DWORD)b[3] << 24) & 0x0FFFFFFF;
+    *next = *next >= 0x0FFFFFF8 ? CHAIN_END : *next;
+    return true;
 }
 
 static esp_err_t add_sector(scan_t *s, LBA_t lba)
@@ -101,20 +106,10 @@ static esp_err_t add_sector(scan_t *s, LBA_t lba)
     return ESP_OK;
 }
 
-// Every entry of the directory whose table starts at cluster c (0: the root) into s->slot.
+// Every entry of the directory whose chain starts at cluster c into s->slot.
 static esp_err_t scan_dir(scan_t *s, DWORD c)
 {
     FATFS *fs = s->fs;
-    if (c == 0 && fs->fs_type != FS_FAT32) { // the FAT12/16 root: a fixed table, never grown
-        esp_err_t err = ESP_OK;
-        for (UINT i = 0; err == ESP_OK && i < (UINT)fs->n_rootdir * ENTRY / s->ss; i++) {
-            err = add_sector(s, fs->dirbase + i);
-        }
-        return err;
-    }
-    if (c == 0) {
-        c = (DWORD)fs->dirbase;
-    }
     const size_t clusters_max = DIR_BYTES_MAX / ((size_t)fs->csize * s->ss);
     for (size_t k = 0;; k++) {
         if (c < 2 || c >= fs->n_fatent || k == clusters_max) {
@@ -150,6 +145,7 @@ static esp_err_t replay(scan_t *s, const char *dir, const uint8_t *runs, size_t 
             return CARDFS_ERR_DIR_FULL;
         }
     }
+    const size_t per_sector = s->ss / ENTRY;
     for (size_t r = 0; r < n; r++) {
         size_t len = 0;
         size_t i = 0;
@@ -161,31 +157,40 @@ static esp_err_t replay(scan_t *s, const char *dir, const uint8_t *runs, size_t 
                      (unsigned)runs[r], (unsigned)s->n_slots);
             return CARDFS_ERR_DIR_FULL;
         }
-        memset(s->slot + i - len, SLOT_USED, len);
+        const size_t first = i - len;
+        // FatFs writes the sector with the long-name entries before the one with the 8.3 entry, so a cut between
+        // them would leave orphan long-name entries.
+        if (first / per_sector != (i - 1) / per_sector) {
+            ESP_LOGW(TAG, "room: a new name's %u entries in /%s would cross a sector boundary at entry %u",
+                     (unsigned)len, dir, (unsigned)first);
+            return CARDFS_ERR_DIR_FULL;
+        }
+        memset(s->slot + first, SLOT_USED, len);
     }
     return ESP_OK;
 }
 
 esp_err_t cardfs_fat_room(const char *dir, const uint8_t *runs, size_t n, void *ctx)
 {
-    char path[32];
-    snprintf(path, sizeof(path), "%s/%s", (const char *)ctx, dir);
-    FF_DIR dj = {0};
-    const FRESULT res = f_opendir(&dj, path);
-    if (res != FR_OK) {
-        ESP_LOGE(TAG, "room: f_opendir %s: FRESULT %d", path, res);
+    scan_t s = {0};
+    DWORD start;
+    esp_err_t err = open_volume(ctx, dir, &s.fs, &start);
+    if (err != ESP_OK) {
+        return err;
+    }
+    const DWORD root = (DWORD)s.fs->dirbase;
+    if (dir[0] && (start == 0 || start == root)) {
+        // A damaged entry: FatFs reads a directory with start cluster 0 as the root.
+        ESP_LOGE(TAG, "room: /%s starts at the root's cluster; check the card on a PC", dir);
         return ESP_FAIL;
     }
-    scan_t s = {.fs = dj.obj.fs};
-    const DWORD start = dj.obj.sclust;
-    f_closedir(&dj);
 #if FF_MAX_SS != FF_MIN_SS
     s.ss = s.fs->ssize;
 #else
     s.ss = FF_MAX_SS;
 #endif
     s.sec = malloc(s.ss);
-    esp_err_t err = s.sec ? scan_dir(&s, start) : ESP_ERR_NO_MEM;
+    err = s.sec ? scan_dir(&s, start ? start : root) : ESP_ERR_NO_MEM;
     if (err == ESP_OK) {
         err = replay(&s, dir, runs, n);
     } else if (err == ESP_FAIL) {

@@ -36,6 +36,10 @@ void ramdisk_restore(void);
 void ramdisk_cut_after(uint32_t whole, ramdisk_tear_t tear);
 // From the write after `whole` more land, every write fails with RES_ERROR and lands nothing, power on.
 void ramdisk_fail_after(uint32_t whole);
+// Only the write after `whole` more land fails with RES_ERROR; the ones after it land.
+void ramdisk_fail_once_after(uint32_t whole);
+// The sector the last failed write was for, UINT32_MAX when none failed since the restore.
+uint32_t ramdisk_failed_lba(void);
 // Powers on and disarms a cut or a failure, keeping the disk as it is.
 void ramdisk_power_on(void);
 

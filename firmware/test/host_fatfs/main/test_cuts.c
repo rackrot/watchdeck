@@ -12,7 +12,13 @@
 // before it zeroes the cluster), so cardfs checks first that the directory has room (cardfs_fat.c). The "nearly
 // full" cards have one entry too few: the operation must be refused with no write at all, and the same creates
 // done straight through FatFs must grow a directory, so the check refuses exactly when FatFs would grow. The
-// "exactly enough" cards and the hole card have just enough room, and must never grow.
+// "exactly enough" cards and the hole card have just enough room, and must never grow. Nor may a name's entries
+// cross a sector boundary: FatFs writes them sector by sector, so a cut between leaves orphan long-name entries.
+// The "across a sector" cards must be refused, and the same creates straight through FatFs, cut at each write,
+// must leave an orphan at some cut. No check anywhere may find one.
+//
+// mount() is what G2 does after every mount: reset FatFs's FSINFO hints, cardfs_init, cardfs_set_writable(true).
+// A failed card access taints cardfs until then.
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -36,10 +42,12 @@
 #define FAT32_CLUSTERS 66000 // FAT32 needs over 65,525 clusters
 #define TREE_MAX 300
 #define IMAGE_LEN (1024 * 1024)
-#define OLD_IMAGE "watchdeck/sl00112233.img"
+#define OLD_IMAGE "watchdeck/00112233.img"
+#define LONG_NAME "watchdeck/a-long-name.img" // 16 characters: two long-name entries and the 8.3 one
 
 static FATFS *s_fs;
 static char s_drive[3];
+static const cardfs_volume_t s_vol = {.prepare = cardfs_fat_prepare, .room = cardfs_fat_room, .ctx = s_drive};
 
 // As in host_proto: on the linux target the static link leaves mbedtls's heap hooks unresolved once PSA is used
 // (esp_mem.c sits in an archive that the linker has already passed). Supply them with libc here.
@@ -79,8 +87,9 @@ typedef struct {
     const char *target; // relative to ROOT
     const uint8_t *data;
     size_t len;
-    bool refused; // the card has no room: CARDFS_ERR_DIR_FULL, nothing written
-    bool exact;   // the operation fills the last free entry of fill's last cluster
+    bool refused;  // the card has no room: CARDFS_ERR_DIR_FULL, nothing written
+    bool straddle; // refused because a name's entries would cross a sector boundary
+    bool exact;    // the operation fills the last free entry of fill's last cluster
     uint8_t sha[32];
 } op_t;
 
@@ -88,7 +97,7 @@ typedef struct {
 typedef struct {
     uint32_t writes, cuts[3], recovery_cuts;
     uint32_t old, new_, img_absent, img_valid, img_invalid;
-    uint32_t lost, fat_differ, fsinfo_stale, orphan_lfn;
+    uint32_t lost, fat_differ, fsinfo_stale;
 } stats_t;
 
 static stats_t s_stats;
@@ -119,6 +128,14 @@ static void mount(void)
     const FRESULT res = f_mount(s_fs, s_drive, 1);
     if (res != FR_OK) {
         fail("mount: FRESULT %d", res);
+    }
+    s_fs->free_clst = s_fs->last_clst = 0xFFFFFFFF; // as cardfs_fat_prepare does
+    esp_err_t err = cardfs_init(ROOT, &s_vol);
+    if (err == ESP_OK) {
+        err = cardfs_set_writable(true);
+    }
+    if (err != ESP_OK) {
+        fail("cardfs after mount: %s", esp_err_to_name(err));
     }
 }
 
@@ -326,7 +343,7 @@ static esp_err_t run_op(const op_t *op)
     }
 }
 
-// No broken chain, no directory grown, nothing past an end marker.
+// No broken chain, no directory grown, nothing past an end marker, no orphan long-name entry.
 static void check_volume(fatwalk_t *w)
 {
     if (!fatwalk(w)) {
@@ -334,6 +351,9 @@ static void check_volume(fatwalk_t *w)
     }
     if (w->hidden_dir_clusters > 0) {
         fail("%lu directory clusters hold bytes past the end marker", (unsigned long)w->hidden_dir_clusters);
+    }
+    if (w->orphan_lfn > 0) {
+        fail("%lu orphan long-name entries", (unsigned long)w->orphan_lfn);
     }
     if (w->dir_clusters - w->dirs != s_extra_dir_clusters) {
         fail("a directory grew: %lu clusters past the first, %lu before", (unsigned long)(w->dir_clusters - w->dirs),
@@ -409,7 +429,6 @@ static void check_recovered(const op_t *op, const tree_t *before, esp_err_t rec)
     s_stats.lost += w.lost > 0;
     s_stats.fat_differ += w.fat_sectors_differ > 0;
     s_stats.fsinfo_stale += w.fsinfo_free != 0xFFFFFFFF && w.fsinfo_free != w.free;
-    s_stats.orphan_lfn += w.orphan_lfn > 0;
 
     scan(&after);
     check_target(op, before, &after);
@@ -524,30 +543,68 @@ static void build_card(const op_t *op)
     s_extra_dir_clusters = w.dir_clusters - w.dirs;
 }
 
-// The creates a refused operation would have made, done straight through FatFs: one of them must grow a directory.
-static void check_refusal_was_needed(const op_t *op)
+static void create_if_absent(const char *rel)
 {
     char path[128];
+    snprintf(path, sizeof(path), ROOT "/%s", rel);
     struct stat st;
-    if (stat(ROOT "/watchdeck", &st) != 0) {
-        TEST_ASSERT_EQUAL(0, mkdir(ROOT "/watchdeck", 0755));
-    }
-    if (op->kind == OP_SMALL) {
-        const char *record = strcmp(op->target, "wifi.txt") == 0 ? "watchdeck/wifi.new" : "watchdeck/sleep.new";
-        snprintf(path, sizeof(path), ROOT "/%s", record);
-        if (stat(path, &st) != 0) {
-            plant(record, 0, 0);
+    if (stat(path, &st) != 0) {
+        const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            close(fd);
         }
     }
-    snprintf(path, sizeof(path), ROOT "/%s", op->target);
-    if (stat(path, &st) != 0) {
-        plant(op->target, 0, 0);
+}
+
+// The creates a refused operation would have made, in its order, done straight through FatFs. Errors are ignored:
+// a cut may stop them.
+static void raw_creates(const op_t *op)
+{
+    struct stat st;
+    if (stat(ROOT "/watchdeck", &st) != 0) {
+        mkdir(ROOT "/watchdeck", 0755);
     }
+    if (op->kind == OP_SMALL) {
+        create_if_absent(strcmp(op->target, "wifi.txt") == 0 ? "watchdeck/wifi.new" : "watchdeck/sleep.new");
+    }
+    create_if_absent(op->target);
+}
+
+// Mounted: the raw creates must grow a directory.
+static void check_growth_was_coming(const op_t *op)
+{
+    raw_creates(op);
     unmount();
     fatwalk_t w;
     TEST_ASSERT_TRUE(fatwalk(&w));
     TEST_ASSERT_TRUE_MESSAGE(w.dir_clusters - w.dirs > s_extra_dir_clusters, "refused, but FatFs had room");
     mount();
+}
+
+// The raw creates, cut at each of their writes, must leave an orphan long-name entry at some cut. Returns the cuts
+// that did.
+static uint32_t check_orphan_was_coming(const op_t *op)
+{
+    ramdisk_restore();
+    mount();
+    ramdisk_reset_count();
+    raw_creates(op);
+    const uint32_t writes = ramdisk_writes();
+    unmount();
+    uint32_t orphans = 0;
+    for (uint32_t m = 0; m < writes; m++) {
+        ramdisk_restore();
+        mount();
+        ramdisk_cut_after(m, RAMDISK_WHOLE);
+        raw_creates(op);
+        unmount();
+        ramdisk_power_on();
+        fatwalk_t w;
+        TEST_ASSERT_TRUE(fatwalk(&w));
+        orphans += w.orphan_lfn > 0;
+    }
+    TEST_ASSERT_TRUE_MESSAGE(orphans > 0, "refused, but no cut of FatFs's own creates leaves an orphan");
+    return orphans;
 }
 
 static void print_stats(const op_t *op)
@@ -564,10 +621,8 @@ static void print_stats(const op_t *op)
         printf("  %s after recovery: %lu old, %lu new\n", op->target, (unsigned long)s_stats.old,
                (unsigned long)s_stats.new_);
     }
-    printf("  recoveries that left: lost clusters %lu, FAT copies differing %lu, a stale FSINFO free count %lu, "
-           "orphan long-name entries %lu\n",
-           (unsigned long)s_stats.lost, (unsigned long)s_stats.fat_differ, (unsigned long)s_stats.fsinfo_stale,
-           (unsigned long)s_stats.orphan_lfn);
+    printf("  recoveries that left: lost clusters %lu, FAT copies differing %lu, a stale FSINFO free count %lu\n",
+           (unsigned long)s_stats.lost, (unsigned long)s_stats.fat_differ, (unsigned long)s_stats.fsinfo_stale);
 }
 
 static void run_cuts(op_t *op, bool cut_recoveries)
@@ -595,7 +650,15 @@ static void run_cuts(op_t *op, bool cut_recoveries)
         compare(&before, &after, NULL);
         fatwalk_t w;
         check_volume(&w);
-        check_refusal_was_needed(op);
+        if (op->straddle) {
+            unmount();
+            const uint32_t orphans = check_orphan_was_coming(op);
+            printf("%s: refused with no sector write; the same creates through FatFs leave an orphan long-name entry "
+                   "at %lu cut points\n",
+                   op->name, (unsigned long)orphans);
+            return;
+        }
+        check_growth_was_coming(op);
         unmount();
         printf("%s: refused with no sector write; the same creates through FatFs grow a directory\n", op->name);
         return;
@@ -699,39 +762,63 @@ void test_cuts_1_mib_image(void)
     run_cuts(&op, false);
 }
 
-// The image's name (sl<8 hex>.img, not 8.3) takes three entries. watchdeck/'s last cluster is full, but deleting
-// three files in a row on a PC left a hole FatFs reuses.
+// watchdeck/'s last cluster is full, but deleting a file on a PC left a hole FatFs reuses for the image's one
+// entry.
 void test_cuts_1_mib_image_into_a_hole_in_a_full_watchdeck(void)
 {
     op_t op = {.name = "1 MiB image, hole in a full watchdeck",
                .card = CARD_OLD_FILES,
                .fill = "watchdeck",
                .fill_left = 0,
-               .hole = 3,
+               .hole = 1,
                IMAGE};
     run_cuts(&op, false);
 }
 
-void test_cuts_1_mib_image_into_a_nearly_full_watchdeck_is_refused(void)
+void test_cuts_1_mib_image_into_a_full_watchdeck_is_refused(void)
 {
-    op_t op = {.name = "1 MiB image, watchdeck nearly full",
-               .card = CARD_OLD_FILES,
-               .fill = "watchdeck",
-               .fill_left = 2,
-               .refused = true,
-               IMAGE};
-    run_cuts(&op, false);
-}
-
-void test_cuts_1_mib_image_into_a_too_small_hole_is_refused(void)
-{
-    op_t op = {.name = "1 MiB image, hole too small in a full watchdeck",
+    op_t op = {.name = "1 MiB image, watchdeck full",
                .card = CARD_OLD_FILES,
                .fill = "watchdeck",
                .fill_left = 0,
-               .hole = 2,
                .refused = true,
                IMAGE};
+    run_cuts(&op, false);
+}
+
+static const uint8_t LONG_DATA[600] = {1, 2, 3};
+#define LONG .kind = OP_IMAGE, .target = LONG_NAME, .data = LONG_DATA, .len = sizeof(LONG_DATA)
+
+// A three-entry name within one sector: watchdeck/ filled to entry 8, so the name takes entries 8 to 10 of its
+// one-sector cluster. (Entries 6 to 8 would cross the middle of the sector, where this RAM disk tears a sector,
+// and a torn write would leave an orphan; cardfs only keeps names within a sector, which FatFs writes whole.)
+void test_cuts_a_long_name_within_a_sector(void)
+{
+    op_t op = {
+        .name = "a long name within a sector", .card = CARD_OLD_FILES, .fill = "watchdeck", .fill_left = 16 - 8, LONG};
+    run_cuts(&op, false);
+}
+
+// 4 KiB clusters, watchdeck/ filled to entry 14: the name would take entries 14 and 15 of one sector and entry 0
+// of the next.
+void test_cuts_a_long_name_across_a_sector_is_refused(void)
+{
+    op_t op = {.name = "a long name across a sector, 4 KiB clusters",
+               .card = CARD_OLD_FILES,
+               .cluster = 4096,
+               .fill = "watchdeck",
+               .fill_left = 128 - 14,
+               .refused = true,
+               .straddle = true,
+               LONG};
+    run_cuts(&op, false);
+}
+
+// The same for watchdeck/ itself, whose name takes two entries: the root filled to entry 15.
+void test_cuts_first_wifi_txt_with_watchdeck_across_a_sector_is_refused(void)
+{
+    op_t op = SMALL_OP(.name = "first wifi.txt, watchdeck/ across a sector, 4 KiB clusters", .cluster = 4096,
+                       .fill = "", .fill_left = 128 - 15, .refused = true, .straddle = true, WIFI(HOME_WIFI));
     run_cuts(&op, false);
 }
 
@@ -775,8 +862,8 @@ void test_cuts_1_mib_image_with_4_kib_clusters(void)
 }
 
 // A write error with the power on, after the record of write 1 has landed, leaves wifi.txt torn and the record
-// pending. Write 2 must apply that record before its own step 1 empties it, so a cut anywhere in write 2 leaves
-// wifi.txt old, as write 1 left it, or new.
+// pending. The error taints cardfs, so write 2 comes after a remount, and it must apply that record before its own
+// step 1 empties it, so a cut anywhere in write 2 leaves wifi.txt old, as write 1 left it, or new.
 void test_cuts_retry_after_a_write_error_never_leaves_a_torn_wifi_txt(void)
 {
     static const char NEWER_WIFI[] = "The newest network\nand-its-password\n";
@@ -801,14 +888,21 @@ void test_cuts_retry_after_a_write_error_never_leaves_a_torn_wifi_txt(void)
     uint32_t runs = 0, failed = 0, pending = 0;
     for (uint32_t k = 0; k < first_writes; k++) {
         // The retry's own write count, with no cut.
+        snprintf(s_where, sizeof(s_where), "write error after %lu writes", (unsigned long)k);
         ramdisk_restore();
         mount();
         ramdisk_fail_after(k);
-        failed += run_op(&first) != ESP_OK;
+        const bool write_failed = run_op(&first) != ESP_OK;
+        failed += write_failed;
         ramdisk_power_on();
+        if (write_failed) {
+            TEST_ASSERT_EQUAL_HEX(ESP_ERR_INVALID_STATE, run_op(&retry)); // tainted until the remount
+        }
         char rec_path[64] = ROOT "/watchdeck/wifi.new";
         struct stat st;
         pending += stat(rec_path, &st) == 0 && st.st_size > 0;
+        unmount();
+        mount();
         ramdisk_reset_count();
         TEST_ASSERT_EQUAL(ESP_OK, run_op(&retry));
         const uint32_t retry_writes = ramdisk_writes();
@@ -822,6 +916,8 @@ void test_cuts_retry_after_a_write_error_never_leaves_a_torn_wifi_txt(void)
                 ramdisk_fail_after(k);
                 run_op(&first);
                 ramdisk_power_on();
+                unmount();
+                mount();
                 ramdisk_cut_after(m, (ramdisk_tear_t)t);
                 run_op(&retry);
                 unmount();
@@ -831,11 +927,7 @@ void test_cuts_retry_after_a_write_error_never_leaves_a_torn_wifi_txt(void)
                     fail("cardfs_recover failed");
                 }
                 fatwalk_t w;
-                unmount();
-                if (!fatwalk(&w)) {
-                    fail("fatwalk: %s", w.problem);
-                }
-                mount();
+                check_volume(&w);
                 scan(&after);
                 compare(&before, &after, "wifi.txt");
                 const entry_t *now = find(&after, "wifi.txt");
@@ -854,6 +946,111 @@ void test_cuts_retry_after_a_write_error_never_leaves_a_torn_wifi_txt(void)
            "write: %lu runs\n",
            (unsigned long)first_writes, (unsigned long)failed, (unsigned long)pending, (unsigned long)runs);
     TEST_ASSERT_TRUE(pending > 0);
+}
+
+// One write fails, the next ones land: where it hits wifi.txt itself, the write tries its record once more and
+// succeeds, so it returns ESP_OK with wifi.txt new, and taints cardfs all the same. With the record's hash failing
+// as well, the second try can't check the record, so it fails and leaves the record for the next mount.
+void test_cuts_one_failed_write_is_retried_from_the_record(void)
+{
+    op_t op = SMALL_OP(.name = "wifi.txt write with one failed sector", .card = CARD_OLD_FILES, WIFI(NEW_WIFI));
+    sha256(op.data, op.len, op.sha);
+    build_card(&op);
+    ramdisk_restore();
+    mount();
+    static tree_t before;
+    static tree_t after;
+    scan(&before);
+    ramdisk_reset_count();
+    TEST_ASSERT_EQUAL(ESP_OK, run_op(&op));
+    const uint32_t writes = ramdisk_writes();
+    unmount();
+
+    uint32_t retried = 0, failed = 0, hash_failed = 0, unreported = 0;
+    for (uint32_t k = 0; k < writes; k++) {
+        for (int hash = 0; hash <= 1; hash++) {
+            snprintf(s_where, sizeof(s_where), "one failed write after %lu%s", (unsigned long)k,
+                     hash ? ", and the record's hash fails" : "");
+            ramdisk_restore();
+            mount();
+            ramdisk_reset_count();
+            ramdisk_fail_once_after(k);
+            // The write's hashes: its record's header, then the second try's check of the record.
+            cardfs_test_fail_sha256(hash ? 1 : -1);
+            const esp_err_t res = run_op(&op);
+            cardfs_test_fail_sha256(-1);
+            const bool second_try = ramdisk_writes() > writes;
+            struct stat st;
+            const bool pending = stat(ROOT "/watchdeck/wifi.new", &st) == 0 && st.st_size > 0;
+            if (res == ESP_OK) {
+                retried += second_try;
+                scan(&after);
+                if (!target_is_new(&op, &before, &after)) {
+                    fail("ESP_OK, but wifi.txt isn't new");
+                }
+            } else {
+                failed++;
+                hash_failed += hash && pending;
+            }
+            const esp_err_t again = run_op(&op);
+            if (res != ESP_OK || second_try) {
+                TEST_ASSERT_EQUAL_HEX(ESP_ERR_INVALID_STATE, again); // tainted either way
+            } else if (again != ESP_ERR_INVALID_STATE) {
+                TEST_ASSERT_EQUAL_HEX(ESP_OK, again);
+                // FatFs ignores a failed write of FAT 2 or FSINFO (ff.c sync_window, sync_fs): FAT 1 holds the
+                // chains and the FSINFO hints are reset at mount, so nothing needs a remount.
+                const uint8_t *bs = ramdisk_sector(0);
+                const uint32_t fat2 = (bs[14] | bs[15] << 8) + le32(bs + 36);
+                const uint32_t lba = ramdisk_failed_lba();
+                if (!((lba >= fat2 && lba < fat2 + le32(bs + 36)) || lba == (uint32_t)(bs[48] | bs[49] << 8))) {
+                    fail("a failed write of sector %lu went unreported", (unsigned long)lba);
+                }
+                unreported++;
+            }
+            unmount();
+            mount();
+            TEST_ASSERT_EQUAL(ESP_OK, cardfs_recover());
+            fatwalk_t w;
+            check_volume(&w);
+            scan(&after);
+            compare(&before, &after, "wifi.txt");
+            const bool is_new = target_is_new(&op, &before, &after); // fails when wifi.txt is neither old nor new
+            if (res == ESP_OK && !is_new) {
+                fail("wifi.txt isn't new after the remount");
+            }
+            if (pending && !is_new) {
+                fail("the pending record was lost");
+            }
+            unmount();
+        }
+    }
+    printf("one failed write at each of %lu writes, with and without a hash failure: %lu succeeded at the second "
+           "try, %lu failed (%lu of them because the second try couldn't hash the record), %lu FatFs didn't report\n",
+           (unsigned long)writes, (unsigned long)retried, (unsigned long)failed, (unsigned long)hash_failed,
+           (unsigned long)unreported);
+    TEST_ASSERT_TRUE(retried > 0);
+    TEST_ASSERT_TRUE(hash_failed > 0);
+}
+
+// The card is FAT32. A FAT16 volume is refused at init, when writes are turned on, and by the room function.
+void test_a_fat16_volume_is_refused(void)
+{
+    unmount();
+    ramdisk_create(40000, 0x5eed);
+    MKFS_PARM opt = {.fmt = FM_FAT | FM_SFD, .n_fat = 2, .au_size = RAMDISK_SECTOR};
+    static uint8_t work[4096];
+    TEST_ASSERT_EQUAL(FR_OK, f_mkfs(s_drive, &opt, work, sizeof(work)));
+    TEST_ASSERT_EQUAL(FR_OK, f_mount(s_fs, s_drive, 1));
+    TEST_ASSERT_EQUAL(FS_FAT16, s_fs->fs_type);
+    TEST_ASSERT_EQUAL_HEX(ESP_ERR_NOT_SUPPORTED, cardfs_init(ROOT, &s_vol));
+    TEST_ASSERT_EQUAL_HEX(ESP_ERR_NOT_SUPPORTED, cardfs_set_writable(true));
+    TEST_ASSERT_FALSE(cardfs_writable());
+    const uint8_t runs[] = {1};
+    TEST_ASSERT_EQUAL_HEX(ESP_ERR_NOT_SUPPORTED, cardfs_fat_room("", runs, 1, s_drive));
+    ramdisk_reset_count();
+    TEST_ASSERT_EQUAL_HEX(ESP_ERR_INVALID_STATE, cardfs_write_small("wifi.txt", HOME_WIFI, sizeof(HOME_WIFI) - 1));
+    TEST_ASSERT_EQUAL(0, ramdisk_writes());
+    unmount();
 }
 
 static uint32_t first_cluster(const char *rel)
@@ -966,6 +1163,36 @@ void test_room_refuses_a_directory_with_an_entry_past_its_end_marker(void)
     unmount();
 }
 
+// A watchdeck/ entry whose start cluster is 0 (FatFs then reads the root for it) or the root's own: the room
+// function refuses it rather than check the root for an entry meant for watchdeck/.
+void test_room_refuses_a_watchdeck_that_starts_at_the_root(void)
+{
+    op_t op = {.name = "room", .card = CARD_OLD_FILES};
+    build_card(&op);
+    const uint8_t *bs = ramdisk_sector(0);
+    const uint32_t root = (bs[14] | bs[15] << 8) + bs[16] * le32(bs + 36);
+    uint32_t offset = 0;
+    while (offset < RAMDISK_SECTOR && memcmp(ramdisk_sector(root) + offset, "WATCHD~1   ", 11) != 0) {
+        offset += 32;
+    }
+    TEST_ASSERT_TRUE(offset < RAMDISK_SECTOR);
+    const uint32_t clusters[] = {0, le32(bs + 44)};
+    for (int i = 0; i < 2; i++) {
+        ramdisk_restore();
+        const uint8_t hi[2] = {(uint8_t)(clusters[i] >> 16), (uint8_t)(clusters[i] >> 24)};
+        const uint8_t lo[2] = {(uint8_t)clusters[i], (uint8_t)(clusters[i] >> 8)};
+        poke(root, offset + 20, hi, 2);
+        poke(root, offset + 26, lo, 2);
+        mount();
+        const uint8_t runs[] = {1};
+        TEST_ASSERT_EQUAL_HEX(ESP_FAIL, cardfs_fat_room("watchdeck", runs, 1, s_drive));
+        ramdisk_reset_count();
+        TEST_ASSERT_EQUAL_HEX(ESP_FAIL, cardfs_write_new(s_image_name, s_image, 10));
+        TEST_ASSERT_EQUAL(0, ramdisk_writes());
+        unmount();
+    }
+}
+
 static void make_data(void)
 {
     // About 1.5 KB, so the new sleep.cfg spans three clusters where the old one had one.
@@ -985,7 +1212,7 @@ static void make_data(void)
     }
     uint8_t sha[32];
     sha256(s_image, sizeof(s_image), sha);
-    snprintf(s_image_name, sizeof(s_image_name), "watchdeck/sl%02x%02x%02x%02x.img", sha[0], sha[1], sha[2], sha[3]);
+    snprintf(s_image_name, sizeof(s_image_name), "watchdeck/%02x%02x%02x%02x.img", sha[0], sha[1], sha[2], sha[3]);
 }
 
 void app_main(void)
@@ -1009,8 +1236,6 @@ void app_main(void)
         printf("esp_vfs_fat_register failed\n");
         exit(1);
     }
-    TEST_ASSERT_EQUAL(ESP_OK, cardfs_init(ROOT, cardfs_fat_room, s_drive));
-    cardfs_set_writable(true);
     esp_log_level_set("cardfs", ESP_LOG_NONE); // thousands of recoveries
     make_data();
 
@@ -1027,8 +1252,10 @@ void app_main(void)
     RUN_TEST(test_cuts_first_sleep_cfg_into_a_nearly_full_watchdeck_is_refused);
     RUN_TEST(test_cuts_1_mib_image);
     RUN_TEST(test_cuts_1_mib_image_into_a_hole_in_a_full_watchdeck);
-    RUN_TEST(test_cuts_1_mib_image_into_a_nearly_full_watchdeck_is_refused);
-    RUN_TEST(test_cuts_1_mib_image_into_a_too_small_hole_is_refused);
+    RUN_TEST(test_cuts_1_mib_image_into_a_full_watchdeck_is_refused);
+    RUN_TEST(test_cuts_a_long_name_within_a_sector);
+    RUN_TEST(test_cuts_a_long_name_across_a_sector_is_refused);
+    RUN_TEST(test_cuts_first_wifi_txt_with_watchdeck_across_a_sector_is_refused);
     RUN_TEST(test_cuts_remove_an_image);
     RUN_TEST(test_cuts_first_wifi_txt_with_4_kib_clusters);
     RUN_TEST(test_cuts_first_wifi_txt_into_a_root_with_exactly_enough_room_with_4_kib_clusters);
@@ -1036,6 +1263,9 @@ void app_main(void)
     RUN_TEST(test_cuts_sleep_cfg_replace_with_4_kib_clusters);
     RUN_TEST(test_cuts_1_mib_image_with_4_kib_clusters);
     RUN_TEST(test_cuts_retry_after_a_write_error_never_leaves_a_torn_wifi_txt);
+    RUN_TEST(test_cuts_one_failed_write_is_retried_from_the_record);
+    RUN_TEST(test_room_refuses_a_watchdeck_that_starts_at_the_root);
+    RUN_TEST(test_a_fat16_volume_is_refused);
     // Returning from app_main does not end a linux-target process, so the failure count becomes the exit status.
     exit(UNITY_END());
 }
