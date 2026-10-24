@@ -23,8 +23,10 @@ import {
   renamePage,
   rowsToRecord,
   sleepChanged,
+  sleepSent,
   withGpu,
   withGridFont,
+  withSleep,
   withSteps,
 } from "../src/edit.ts";
 import { hasErrors, mapErrors, numberErrors, unquote } from "../src/errors.ts";
@@ -92,7 +94,9 @@ test("sleep and integration messages land in their buckets, and a message with n
     'integration "ha": label: at most 23 printable ASCII characters',
     'integration ids must be unique: "ha"',
   ]);
-  assert.deepEqual(map.sleep, ['sleep.fit "x" is not cover or contain']);
+  assert.deepEqual(map.sleep, {
+    fit: ['sleep.fit "x" is not cover or contain'],
+  });
   assert.deepEqual(map.integrations.get("ha"), [
     'token_secret "y" is not in secrets.toml',
     "label: at most 23 printable ASCII characters",
@@ -100,6 +104,90 @@ test("sleep and integration messages land in their buckets, and a message with n
   assert.deepEqual(map.general, ['integration ids must be unique: "ha"']);
   assert.equal(hasErrors(map), true);
   assert.equal(hasErrors(mapErrors([])), false);
+});
+
+test("a [sleep]-only edit changes no layout and reaches no device as one", () => {
+  const edited: Config = {
+    ...config,
+    sleep: withSleep(undefined, { spinner: "dots", backlight: 0 }),
+  };
+  assert.equal(sleepChanged(config, edited), true);
+  assert.equal(layoutChanged(config, edited), false);
+  assert.deepEqual(
+    layoutTargets(config, edited, [
+      { id: "d", connected: true, caps: ["pages", "fonts", "sleep"] },
+      { id: "e", connected: true, caps: [] },
+    ]),
+    [],
+  );
+});
+
+test("sleepSent counts what the frame says: a default-equal write sends nothing", () => {
+  const sent = (sleep: Config["sleep"]) =>
+    sleepSent(config, { ...config, sleep });
+  assert.equal(sent({}), false);
+  assert.equal(
+    sent({ spinner: "arc", backlight: 100, show: ["clock", "date"] }),
+    false,
+  );
+  assert.equal(sent({ fit: "contain" }), false); // no image to fit
+  assert.equal(sent({ text: "hi" }), false); // text is not shown
+  assert.equal(sent({ spinner: "dots" }), true);
+  assert.equal(sent({ image: "a.png", fit: "contain" }), true);
+  assert.equal(sent({ show: ["text"], text: "hi" }), true);
+  assert.equal(sent({ bg: "#FFFFFF" }), true);
+});
+
+test("withSleep sets keys, drops undefined ones and the empty table", () => {
+  const one = withSleep(undefined, { image: "lake.jpg", fit: "contain" });
+  assert.deepEqual(one, { image: "lake.jpg", fit: "contain" });
+  assert.deepEqual(withSleep(one, { image: undefined }), { fit: "contain" });
+  assert.equal(withSleep({ fit: "cover" }, { fit: undefined }), undefined);
+  assert.equal(withSleep(undefined, {}), undefined);
+});
+
+test("each sleep.* rule message lands next to its field, whole", () => {
+  const cases: [string, string][] = [
+    ['sleep.image "../x.png" must be a file name in screens/', "image"],
+    ['sleep.image "x": no such file in screens/', "image"],
+    ['sleep.fit "stretch" is not cover or contain', "fit"],
+    ['sleep.bg "red" is not a #rrggbb color', "bg"],
+    ['sleep.fg "#fff" is not a #rrggbb color', "fg"],
+    ['sleep.spinner_color "#GGGGGG" is not a #rrggbb color', "spinner_color"],
+    ['sleep.anchor "middle" is not one of center, top_left', "anchor"],
+    [
+      'sleep.spinner "spin" is not one of arc, dots, bar, pulse, none',
+      "spinner",
+    ],
+    ['sleep.show: "weather" is not one of clock, date, host, text', "show"],
+    ['sleep.show: "date" is listed twice', "show"],
+    ['sleep.text is needed when show has "text"', "text"],
+    ["sleep.text: at most 47 printable ASCII characters", "text"],
+    ["sleep.offline_after_s 4000 is outside 0 to 3600", "offline_after_s"],
+    ["sleep.backlight 120 is outside 0 to 100", "backlight"],
+    ["sleep.mystery is new", "sleep"],
+  ];
+  for (const [message, field] of cases) {
+    assert.deepEqual(
+      mapErrors([message]).sleep,
+      { [field]: [message] },
+      message,
+    );
+  }
+});
+
+test("a sleep number that can't be sent is reported on its field", () => {
+  const bad: Config = {
+    ...config,
+    sleep: { offline_after_s: Number.NaN, backlight: 50 },
+  };
+  assert.deepEqual(numberErrors(bad).sleep, {
+    offline_after_s: ["sleep.offline_after_s must be a whole number"],
+  });
+  assert.equal(
+    hasErrors(numberErrors({ ...config, sleep: { backlight: 0 } })),
+    false,
+  );
 });
 
 test("header rows become a table, dropping blank rows and keeping the last of a repeat", () => {

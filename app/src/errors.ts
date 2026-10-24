@@ -45,6 +45,24 @@ export type StatusBarField =
 
 export type StatusBarErrors = Partial<Record<StatusBarField, string[]>>;
 
+/** A field of the sleep screen form. */
+export type SleepField =
+  | "image"
+  | "fit"
+  | "bg"
+  | "fg"
+  | "show"
+  | "text"
+  | "anchor"
+  | "spinner"
+  | "spinner_color"
+  | "offline_after_s"
+  | "backlight"
+  /** A `sleep.*` problem that no field owns. */
+  | "sleep";
+
+export type SleepErrors = Partial<Record<SleepField, string[]>>;
+
 export type ErrorMap = {
   /** Messages for the layout section: the grid size, its font, the version and the page and tile counts. */
   grid: string[];
@@ -56,8 +74,8 @@ export type ErrorMap = {
   pages: Map<string, string[]>;
   /** Messages about `[status_bar]`, by the field of the status bar form. */
   statusBar: StatusBarErrors;
-  /** Messages about `[sleep]`. */
-  sleep: string[];
+  /** Messages about `[sleep]`, by the field of the sleep screen form. */
+  sleep: SleepErrors;
   /** By integration id. Every message is about one integration. */
   integrations: Map<string, string[]>;
 };
@@ -68,7 +86,7 @@ export const emptyErrors = (): ErrorMap => ({
   buttons: new Map(),
   pages: new Map(),
   statusBar: {},
-  sleep: [],
+  sleep: {},
   integrations: new Map(),
 });
 
@@ -78,7 +96,7 @@ export const hasErrors = (map: ErrorMap): boolean =>
   map.buttons.size > 0 ||
   map.pages.size > 0 ||
   Object.keys(map.statusBar).length > 0 ||
-  map.sleep.length > 0 ||
+  Object.keys(map.sleep).length > 0 ||
   map.integrations.size > 0;
 
 function addStatusBarError(
@@ -105,6 +123,34 @@ function statusBarField(message: string): [StatusBarField, string] {
     return [`thresholds.${metric[1] as Metric}`, metric[2]];
   }
   return ["bar", message];
+}
+
+function addSleepError(map: ErrorMap, field: SleepField, message: string) {
+  map.sleep[field] = [...(map.sleep[field] ?? []), message];
+}
+
+const SLEEP_FIELDS: SleepField[] = [
+  "image",
+  "fit",
+  "bg",
+  "fg",
+  "show",
+  "text",
+  "anchor",
+  "spinner",
+  "spinner_color",
+  "offline_after_s",
+  "backlight",
+];
+
+/**
+ * Which field of the sleep form a `sleep.*` message is about: the key after the prefix, ended by a
+ * space or a colon (`sleep.show: "x" is not one of ...`, `sleep.text is needed ...`). The message
+ * stays whole.
+ */
+function sleepField(message: string): SleepField {
+  const key = message.match(/^sleep\.([a-z_]+)[ :]/)?.[1] as SleepField;
+  return SLEEP_FIELDS.includes(key) ? key : "sleep";
 }
 
 /** Which field of an action `problem` is about, from the start of Rust's message. */
@@ -256,7 +302,7 @@ export function mapErrors(
       const [field, text] = statusBarField(message);
       addStatusBarError(map, field, text);
     } else if (message.startsWith("sleep.")) {
-      map.sleep.push(message);
+      addSleepError(map, sleepField(message), message);
     } else if (integration) {
       const id = unquote(integration[1]);
       map.integrations.set(id, [
@@ -310,6 +356,12 @@ export function numberErrors(config: Config): ErrorMap {
   for (const [metric, steps] of Object.entries(thresholds)) {
     if (steps?.some((step) => !Number.isSafeInteger(step.at))) {
       addStatusBarError(map, `thresholds.${metric as Metric}`, `at ${whole}`);
+    }
+  }
+  for (const key of ["offline_after_s", "backlight"] as const) {
+    const value = config.sleep?.[key];
+    if (value !== undefined && !Number.isSafeInteger(value)) {
+      addSleepError(map, key, `sleep.${key} ${whole}`);
     }
   }
   return map;

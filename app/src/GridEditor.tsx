@@ -2,7 +2,6 @@ import {
   type KeyboardEvent,
   type PointerEvent,
   type ReactNode,
-  useEffect,
   useRef,
   useState,
 } from "react";
@@ -19,6 +18,7 @@ import {
 import type { FieldErrors } from "./errors";
 import { Field, FontSelect, NumberField, Problems } from "./fields";
 import { DEFAULT_FONT, fontInfo, resolveFonts, slotFont } from "./fonts";
+import { useWidth } from "./hooks";
 import {
   cellAt,
   cellRect,
@@ -55,24 +55,11 @@ type Props = {
   statusBarOpen: boolean;
   statusBarProblems: boolean;
   onStatusBar: () => void;
+  /** The same for the sleep screen form. */
+  sleepOpen: boolean;
+  sleepProblems: boolean;
+  onSleep: () => void;
 };
-
-/** The width of an element, kept current. */
-function useWidth() {
-  const ref = useRef<HTMLDivElement>(null);
-  const [width, setWidth] = useState(SCREEN_W);
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) {
-      return;
-    }
-    const watch = new ResizeObserver(() => setWidth(el.clientWidth));
-    watch.observe(el);
-    setWidth(el.clientWidth);
-    return () => watch.disconnect();
-  }, []);
-  return [ref, width] as const;
-}
 
 export default function GridEditor({
   config,
@@ -88,6 +75,9 @@ export default function GridEditor({
   statusBarOpen,
   statusBarProblems,
   onStatusBar,
+  sleepOpen,
+  sleepProblems,
+  onSleep,
 }: Props) {
   const [stage, stageWidth] = useWidth();
   const screen = useRef<HTMLDivElement>(null);
@@ -236,14 +226,24 @@ export default function GridEditor({
             />
           </Field>
         </div>
-        <button
-          type="button"
-          className={statusBarProblems ? "danger" : undefined}
-          aria-pressed={statusBarOpen}
-          onClick={onStatusBar}
-        >
-          Status bar{statusBarProblems && " (has problems)"}
-        </button>
+        <div className="inline">
+          <button
+            type="button"
+            className={statusBarProblems ? "danger" : undefined}
+            aria-pressed={statusBarOpen}
+            onClick={onStatusBar}
+          >
+            Status bar{statusBarProblems && " (has problems)"}
+          </button>
+          <button
+            type="button"
+            className={sleepProblems ? "danger" : undefined}
+            aria-pressed={sleepOpen}
+            onClick={onSleep}
+          >
+            Sleep screen{sleepProblems && " (has problems)"}
+          </button>
+        </div>
       </div>
       <Problems list={gridProblems} />
 

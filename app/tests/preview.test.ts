@@ -15,7 +15,80 @@ import {
   layoutButton,
   PAGER_H,
   pagerLabel,
+  SLEEP_AREA_H,
+  SLEEP_AREA_W,
+  SLEEP_HEIGHTS,
+  SLEEP_MARGIN,
+  SLEEP_STRIP_H,
+  sleepLayout,
+  sleepTextAlign,
 } from "../src/preview.ts";
+
+// test_sleepcfg_layout_every_anchor_stays_inside_the_margins in
+// firmware/test/host_proto/main/test_sleepcfg.c, case for case: the same heights and first y.
+test("the sleep preview's positions match test_sleepcfg.c for each anchor", () => {
+  const heights = [55, 37, 37, 37];
+  const colH = 55 + 37 + 37 + 37;
+  const cases: [string, number][] = [
+    ["top_left", SLEEP_MARGIN],
+    ["top_right", SLEEP_MARGIN],
+    ["bottom_left", SLEEP_AREA_H - SLEEP_MARGIN - colH],
+    ["bottom_right", SLEEP_AREA_H - SLEEP_MARGIN - colH],
+    ["center", (SLEEP_AREA_H - colH) / 2],
+  ];
+  for (const [anchor, firstY] of cases) {
+    let y = firstY;
+    const boxes = sleepLayout([true, true, true, true], anchor, heights);
+    boxes.forEach((box, i) => {
+      assert.deepEqual(
+        box,
+        {
+          x: SLEEP_MARGIN,
+          y,
+          w: SLEEP_AREA_W - 2 * SLEEP_MARGIN,
+          h: heights[i],
+        },
+        `${anchor} element ${i}`,
+      );
+      y += heights[i];
+    });
+    assert.ok(y <= SLEEP_AREA_H - SLEEP_MARGIN, anchor);
+  }
+});
+
+test("the sleep preview's constants are the firmware's", () => {
+  const header = readFileSync(
+    new URL("../../firmware/main/sleepcfg.h", import.meta.url),
+    "utf8",
+  );
+  const define = (name: string) =>
+    Number(header.match(new RegExp(`#define ${name} (\\d+)`))?.[1]);
+  assert.equal(define("SLEEP_AREA_W"), SLEEP_AREA_W);
+  assert.equal(define("SLEEP_AREA_H"), SLEEP_AREA_H);
+  assert.equal(define("SLEEP_STRIP_H"), SLEEP_STRIP_H);
+  assert.equal(define("SLEEP_MARGIN"), SLEEP_MARGIN);
+  // montserrat.ts has no 48 table, so only the 32 line height can be compared.
+  assert.equal(SLEEP_HEIGHTS[1], MONTSERRAT_32.lineHeight);
+});
+
+test("the sleep preview hides what is not shown and gives it no room, and aligns text by anchor", () => {
+  // Only the date and the text, at the bottom: the text is last, the date above it.
+  const boxes = sleepLayout(
+    [false, true, false, true],
+    "bottom_left",
+    [55, 37, 37, 37],
+  );
+  assert.equal(boxes[0], null);
+  assert.equal(boxes[2], null);
+  assert.equal(boxes[3]?.y, SLEEP_AREA_H - SLEEP_MARGIN - 37);
+  assert.equal(boxes[1]?.y, SLEEP_AREA_H - SLEEP_MARGIN - 2 * 37);
+  assert.deepEqual(
+    ["top_left", "bottom_left", "top_right", "bottom_right", "center"].map(
+      sleepTextAlign,
+    ),
+    ["left", "left", "right", "right", "center"],
+  );
+});
 
 test("the preview of a 5x3 grid is 97 px icons and no label, and with 2 pages 87 px and the label", () => {
   const preview = (pages: number, page: number) => ({

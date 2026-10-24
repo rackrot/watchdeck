@@ -114,6 +114,19 @@ export type SleepConfig = {
   backlight?: number;
 };
 
+/** What a device uses for an absent `[sleep]` key: `sleepcfg_defaults` in firmware/main/sleepcfg.c. */
+export const SLEEP_DEFAULTS = {
+  fit: "cover",
+  bg: "#000000",
+  fg: "#d0d0d0",
+  show: ["clock", "date"],
+  anchor: "bottom_left",
+  spinner: "arc",
+  spinner_color: "#38bdf8",
+  offline_after_s: 10,
+  backlight: 100,
+} as const;
+
 /** `[push]`. */
 export type PushConfig = {
   /** Also serves https on the LAN, with the daemon's own certificate. */

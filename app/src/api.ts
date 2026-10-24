@@ -69,6 +69,13 @@ export const importIcon = () => invoke<string | null>("import_icon");
 /** The files in the icons directory that a button's `icon` could name. */
 export const listIcons = () => invoke<string[]>("list_icons");
 
+/** Like `importIcon`, for the sleep screen's `image`: the pick goes into `screens/`. */
+export const importScreenImage = () =>
+  invoke<string | null>("import_screen_image");
+
+/** The files in `screens/` that `[sleep]`'s `image` could name. */
+export const listScreenImages = () => invoke<string[]>("list_screen_images");
+
 /** Mirrors `GpuInfo` in `src-tauri/src/daemon/gpu.rs`. `id` is the PCI address. */
 export type GpuInfo = {
   id: string;
@@ -120,5 +127,9 @@ export const testAction = (button: string) =>
  */
 export const iconUrl = (configDir: string, name: string) =>
   convertFileSrc(`${configDir}/icons/${name}`);
+
+/** The same for a sleep screen image in `screens/`, which the daemon allows at startup too. */
+export const screenUrl = (configDir: string, name: string) =>
+  convertFileSrc(`${configDir}/screens/${name}`);
 
 export const configDir = () => invoke<string>("config_dir");
