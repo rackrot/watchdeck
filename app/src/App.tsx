@@ -84,6 +84,7 @@ function App({ onConfigLoaded }: { onConfigLoaded: () => void }) {
           hidden={tab !== "layout"}
         >
           <ConfigPage
+            active={tab === "layout"}
             secrets={secrets}
             onSecretsChanged={refreshSecrets}
             onConfigLoaded={onConfigLoaded}

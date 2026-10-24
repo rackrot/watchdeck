@@ -42,6 +42,19 @@ export type IntegrationField =
   | "every_s"
   | "json_pointer"
   | `source.${ActionField}`
+  /** A prometheus integration's own fields. Its request's are the action fields without `source.`. */
+  | "url"
+  | "query"
+  | "decimals"
+  | "suffix"
+  | "bad_above"
+  | "bad_below"
+  | "secret_headers"
+  | "insecure_http"
+  | "insecure_tls"
+  | "timeout_s"
+  /** A grafana integration's severity table. */
+  | "levels"
   /** A problem with the integration that no field owns. */
   | "integration";
 
@@ -204,12 +217,31 @@ export function integrationFields(messages: string[]): IntegrationErrors {
       add(field ? `source.${field}` : "integration", message);
       continue;
     }
+    // A prometheus integration's request is an action built from its own keys, so the action's
+    // wording (`url`, a header, a secret) names the integration's field of the same name.
+    const bareHeaderName = /^"[^"]*" is not a valid header name/.test(message);
+    if (bareHeaderName) {
+      add("secret_headers", message);
+      continue;
+    }
     const rules: [RegExp, IntegrationField][] = [
       [/^id /, "id"],
       [/^label/, "label"],
       [/^token/, "token"],
       [/^every_s /, "every_s"],
       [/^json_pointer /, "json_pointer"],
+      [/^url /, "url"],
+      [/^query /, "query"],
+      [/^decimals /, "decimals"],
+      [/^suffix/, "suffix"],
+      [/^bad_above /, "bad_above"],
+      [/^bad_below /, "bad_below"],
+      [/^timeout_s /, "timeout_s"],
+      [/^secret_headers would cross/, "insecure_http"],
+      [/^insecure_tls /, "insecure_tls"],
+      [/^header .* uses secret /, "secret_headers"],
+      [/^header /, "secret_headers"],
+      [/^levels/, "levels"],
     ];
     add(
       rules.find(([pattern]) => pattern.test(message))?.[1] ?? "integration",
@@ -407,13 +439,25 @@ export function numberErrors(config: Config): ErrorMap {
     }
   }
   for (const i of config.integration ?? []) {
-    if (i.kind !== "stat") {
-      continue;
+    let bad: string[] = [];
+    if (i.kind === "stat") {
+      bad = [
+        ...(isCount(i.every_s) ? [] : [`every_s ${whole}`]),
+        ...(isCount(i.source.timeout_s) ? [] : [`source: timeout_s ${whole}`]),
+      ];
+    } else if (i.kind === "prometheus") {
+      const optionalCount = (value: number | undefined) =>
+        value === undefined || isCount(value);
+      const optionalNumber = (value: number | undefined) =>
+        value === undefined || Number.isFinite(value);
+      bad = [
+        ...(isCount(i.every_s) ? [] : [`every_s ${whole}`]),
+        ...(optionalCount(i.timeout_s) ? [] : [`timeout_s ${whole}`]),
+        ...(optionalCount(i.decimals) ? [] : [`decimals ${whole}`]),
+        ...(optionalNumber(i.bad_above) ? [] : ["bad_above must be a number"]),
+        ...(optionalNumber(i.bad_below) ? [] : ["bad_below must be a number"]),
+      ];
     }
-    const bad = [
-      ...(isCount(i.every_s) ? [] : [`every_s ${whole}`]),
-      ...(isCount(i.source.timeout_s) ? [] : [`source: timeout_s ${whole}`]),
-    ];
     if (bad.length > 0) {
       map.integrations.set(i.id, [
         ...(map.integrations.get(i.id) ?? []),

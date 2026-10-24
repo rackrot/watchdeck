@@ -149,7 +149,66 @@ export type IntegrationConfig =
       every_s: number;
       json_pointer?: string;
       source: Action;
+    }
+  | {
+      kind: "prometheus";
+      id: string;
+      label: string;
+      /** The server's base, such as `http://prom.lan:9090`: no query or fragment. */
+      url: string;
+      query: string;
+      every_s: number;
+      /** 0 to 3 digits after the point. Absent: the value as Prometheus gives it. */
+      decimals?: number;
+      /** At most 7 printable ASCII characters. Absent: none. */
+      suffix?: string;
+      bad_above?: number;
+      bad_below?: number;
+      /** Header name to the name of a secret. */
+      secret_headers?: Record<string, string>;
+      insecure_http?: boolean;
+      insecure_tls?: boolean;
+      /** 1 to the lesser of 30 and `every_s`. Absent: 10, or `every_s` if less. */
+      timeout_s?: number;
+    }
+  | {
+      kind: "grafana";
+      id: string;
+      label: string;
+      /** The name of a secret in `secrets.toml`, at least 32 characters. */
+      token_secret: string;
+      /** A severity label to the level its alerts get, over the built-in ones. */
+      levels?: Record<string, NoteLevel>;
     };
+
+/** The card sources the board holds (`MAX_CARD_SOURCES` in config.rs). */
+export const MAX_CARD_SOURCES = 8;
+
+/**
+ * Whether a kind shows a card, and so counts against `MAX_CARD_SOURCES`, as `is_card` in config.rs.
+ * Matched without a wildcard, so a new kind fails to compile until it decides here.
+ */
+export function kindIsCard(kind: IntegrationConfig["kind"]): boolean {
+  switch (kind) {
+    case "stat":
+    case "prometheus":
+      return true;
+    case "push":
+    case "grafana":
+      return false;
+    default: {
+      const unhandled: never = kind;
+      return unhandled;
+    }
+  }
+}
+
+export const isCard = (integration: IntegrationConfig): boolean =>
+  kindIsCard(integration.kind);
+
+/** The levels a note has (`NoteLevel` in protocol.rs). */
+export const NOTE_LEVELS = ["info", "ok", "warn", "error"] as const;
+export type NoteLevel = (typeof NOTE_LEVELS)[number];
 
 /** Rust's limits on `[[integration]]`: `MAX_INTEGRATIONS`, `MAX_INTEGRATION_ID` and `MAX_INTEGRATION_LABEL`. */
 export const MAX_INTEGRATIONS = 16;

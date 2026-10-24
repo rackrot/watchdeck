@@ -51,6 +51,35 @@ export function cliLine(id: string): string | null {
     : null;
 }
 
+/** The route Grafana's webhook contact point posts to (`/v1/grafana`). */
+export const GRAFANA_ROUTE = "/v1/grafana";
+
+/** The settings of the Grafana webhook contact point, in the order the Grafana form lists them. */
+export type ContactPointRow = { setting: string; value: string };
+
+/**
+ * What to enter in Grafana's webhook contact point: the URL (loopback over http, or with `lan` the
+ * https one on `LAN_HOST`), the method, the Authorization scheme and its credentials, which are the
+ * token (`<the token>` while `token` is null).
+ */
+export function grafanaContactPoint(opts: {
+  lan: boolean;
+  token: string | null;
+}): ContactPointRow[] {
+  const base = opts.lan
+    ? `https://${LAN_HOST}:${PUSH_LAN_PORT}`
+    : `http://127.0.0.1:${PUSH_PORT}`;
+  return [
+    { setting: "URL", value: `${base}${GRAFANA_ROUTE}` },
+    { setting: "HTTP method", value: "POST" },
+    { setting: "Authorization header: scheme", value: "Bearer" },
+    {
+      setting: "Authorization header: credentials",
+      value: opts.token ?? "<the token>",
+    },
+  ];
+}
+
 /**
  * Home Assistant's two files: `secrets.yaml` with the bearer header, and the `rest_command` block
  * for `configuration.yaml`. Over the LAN it names `LAN_HOST` and sets `verify_ssl: false`, which

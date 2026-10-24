@@ -75,17 +75,23 @@ type Saved = {
   feedDevices: number;
 };
 
-/** A feed edit reaches a connected device within this long: a snapshot goes out twice a second at most. */
-const FEED_WITHIN_S = 1;
+/**
+ * A feed edit reaches a connected device within this long: the daemon applies a save at once, and
+ * a snapshot goes out twice a second at most.
+ */
+const FEED_WITHIN_S = 2;
 
 /** A `[status_bar]` edit reaches a connected device within this long: the config poll and the next tick. */
 const BAR_WITHIN_S = 2;
 
 export default function ConfigPage({
+  active,
   secrets,
   onSecretsChanged,
   onConfigLoaded,
 }: {
+  /** The Layout panel is the one showing. A hidden panel stays mounted, so it must not hold a token. */
+  active: boolean;
   secrets: string[];
   /** Re-reads the secret names, after the Feed tab stored a token. */
   onSecretsChanged: () => void;
@@ -497,6 +503,7 @@ export default function ConfigPage({
         <FeedForm
           // A fresh form after the draft is replaced, so its rows start from it.
           key={formKey}
+          active={active}
           config={draft}
           saved={view.config}
           diskMoved={diskChanged}
@@ -711,7 +718,7 @@ function SavedStatus({
         (saved.feedDevices > 0 ? (
           <span className="chip ok">
             feed sources applied, no layout sent; a board follows within{" "}
-            {FEED_WITHIN_S} s (a new stat card fills after its first poll)
+            {FEED_WITHIN_S} s (a new polled card fills after its first poll)
           </span>
         ) : (
           <span className="chip bad">firmware has no feed page</span>

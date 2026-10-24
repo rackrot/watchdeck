@@ -54,6 +54,44 @@ export function parseWhole(text: string): number {
   return /^\d+$/.test(text.trim()) ? Number(text) : Number.NaN;
 }
 
+/**
+ * Names that more than one row uses once case is ignored, as grafana's `levels` severities are, in
+ * the case of their first use.
+ */
+export function caseDuplicateNames(rows: Row[]): string[] {
+  const first = new Map<string, string>();
+  const dupes = new Set<string>();
+  for (const { name } of rows) {
+    const earlier = first.get(name.toLowerCase());
+    if (earlier === undefined) {
+      first.set(name.toLowerCase(), name);
+    } else {
+      dupes.add(earlier);
+    }
+  }
+  return [...dupes];
+}
+
+/** A number, whole or decimal, from what was typed, or NaN, which `numberErrors` reports. */
+export function parseDecimal(text: string): number {
+  return /^-?\d+(\.\d+)?$/.test(text.trim()) ? Number(text) : Number.NaN;
+}
+
+/**
+ * `item` with `key` set to `value`, or without the key when `value` is undefined or empty text, so
+ * an unset optional setting stays out of the saved file.
+ */
+export function withOptional<T extends object, K extends keyof T>(
+  item: T,
+  key: K,
+  value: T[K] | undefined | "",
+): T {
+  const { [key]: _, ...rest } = item;
+  return (
+    value === undefined || value === "" ? rest : { ...rest, [key]: value }
+  ) as T;
+}
+
 /** The most pages a config can have (`MAX_PAGES` in config.rs). */
 export const MAX_PAGES = 4;
 
@@ -373,9 +411,37 @@ function freeIntegrationId(
   return `${kind}-${n}`;
 }
 
+/** A new integration of `kind` with id `id`. */
+function newIntegration(
+  kind: IntegrationConfig["kind"],
+  id: string,
+): IntegrationConfig {
+  switch (kind) {
+    case "push":
+      return { kind, id, label: "Push", token_secret: tokenSecretFor(id) };
+    case "grafana":
+      return { kind, id, label: "Grafana", token_secret: tokenSecretFor(id) };
+    case "stat":
+      return { kind, id, label: "Stat", every_s: 15, source: newShell() };
+    case "prometheus":
+      return {
+        kind,
+        id,
+        label: "Prometheus",
+        url: "http://localhost:9090",
+        query: "up",
+        every_s: 30,
+      };
+    default: {
+      const unhandled: never = kind;
+      return unhandled;
+    }
+  }
+}
+
 /**
- * `config` with a new integration of `kind` at the end. A push one names the secret `push-<id>`,
- * which does not exist until its token is generated.
+ * `config` with a new integration of `kind` at the end. A push or grafana one names the secret
+ * `push-<id>`, which does not exist until its token is generated.
  */
 export function addIntegration(
   config: Config,
@@ -383,17 +449,7 @@ export function addIntegration(
 ): Config {
   const list = config.integration ?? [];
   const id = freeIntegrationId(list, kind);
-  const next: IntegrationConfig =
-    kind === "push"
-      ? { kind, id, label: "Push", token_secret: tokenSecretFor(id) }
-      : {
-          kind,
-          id,
-          label: "Stat",
-          every_s: 15,
-          source: newShell(),
-        };
-  return { ...config, integration: [...list, next] };
+  return { ...config, integration: [...list, newIntegration(kind, id)] };
 }
 
 /** `config` with integration `index` replaced. */
@@ -443,9 +499,9 @@ export function withPushLan(config: Config, lan: boolean): Config {
 }
 
 /**
- * `config` with integration `index` given a new id. A push integration whose `token_secret` is the
- * conventional `push-<old id>` follows to `push-<new id>`, so the secret that Generate token
- * stores is the one it names. One with a secret of its own keeps it.
+ * `config` with integration `index` given a new id. A push or grafana integration whose
+ * `token_secret` is the conventional `push-<old id>` follows to `push-<new id>`, so the secret that
+ * Generate token stores is the one it names. One with a secret of its own keeps it.
  */
 export function withIntegrationId(
   config: Config,
@@ -454,7 +510,7 @@ export function withIntegrationId(
 ): Config {
   const current = (config.integration ?? [])[index];
   const next =
-    current.kind === "push" &&
+    (current.kind === "push" || current.kind === "grafana") &&
     current.token_secret === tokenSecretFor(current.id)
       ? { ...current, id, token_secret: tokenSecretFor(id) }
       : { ...current, id };
@@ -479,8 +535,8 @@ export function integrationIdProblem(
   ) {
     return `id must be 1 to ${MAX_INTEGRATION_ID} letters, digits, '_', '-' or '.'`;
   }
-  if (kind === "push" && id.includes(".")) {
-    return "A push integration's id can't hold '.': its token is stored as the secret push-<id>, and a secret name has only letters, digits, '_' and '-'.";
+  if ((kind === "push" || kind === "grafana") && id.includes(".")) {
+    return `A ${kind} integration's id can't hold '.': its token is stored as the secret push-<id>, and a secret name has only letters, digits, '_' and '-'.`;
   }
   if (list.some((other, j) => j !== index && other.id === id)) {
     return `integration ids must be unique: "${id}"`;

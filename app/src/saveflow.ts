@@ -79,7 +79,7 @@ export function testBlock(
 }
 
 /**
- * Why stat integration `integration` can't be tested yet, or null if it can: as for a button, a
+ * Why a stat or prometheus `integration` can't be tested yet, or null if it can: as for a button, a
  * test runs what was saved, so the draft must match the live config's integration with that id.
  */
 export function integrationTestBlock(

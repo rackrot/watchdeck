@@ -142,6 +142,42 @@ function PairRows({
   );
 }
 
+/**
+ * The secret headers of a request: header name to the name of a secret, which is never shown. An
+ * HTTP action and a prometheus integration both use it. The caller keeps `rows`, since a table
+ * can't hold the blank or repeated names a row can.
+ */
+export function SecretHeaderRows({
+  rows,
+  secrets,
+  problems,
+  onChange,
+}: {
+  rows: Row[];
+  /** The names `list_secrets` returned. */
+  secrets: string[];
+  problems: Problem;
+  onChange: (rows: Row[]) => void;
+}) {
+  return (
+    <fieldset className="field wide">
+      <legend className="field-label">
+        Secret headers
+        <span className="field-hint">
+          the value comes from a secret, never shown
+        </span>
+      </legend>
+      <PairRows
+        rows={rows}
+        names={["Header", "Secret"]}
+        pick={secrets}
+        onChange={onChange}
+      />
+      <Problems list={problems} />
+    </fieldset>
+  );
+}
+
 /** The form for a shell or HTTP action. A button and a tile source both use it. */
 export default function ActionForm({
   action,
@@ -287,24 +323,15 @@ export default function ActionForm({
         />
         <Problems list={problems("headers")} />
       </fieldset>
-      <fieldset className="field wide">
-        <legend className="field-label">
-          Secret headers
-          <span className="field-hint">
-            the value comes from a secret, never shown
-          </span>
-        </legend>
-        <PairRows
-          rows={secretRows}
-          names={["Header", "Secret"]}
-          pick={secrets}
-          onChange={(rows) => {
-            setSecretRows(rows);
-            setHttp({ secret_headers: rowsToRecord(rows) });
-          }}
-        />
-        <Problems list={problems("secret_headers")} />
-      </fieldset>
+      <SecretHeaderRows
+        rows={secretRows}
+        secrets={secrets}
+        problems={problems("secret_headers")}
+        onChange={(rows) => {
+          setSecretRows(rows);
+          setHttp({ secret_headers: rowsToRecord(rows) });
+        }}
+      />
       <div className="field wide">
         <label className="check">
           <input
