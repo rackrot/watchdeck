@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 
 use super::config::Config;
 use super::protocol::{encode_hex, IconFrame, ICON_MAX_SIDE};
+use super::screens::{IMAGE_H, IMAGE_W};
 use super::store::write_private;
 
 /// Where icons live, inside the config dir.
@@ -226,7 +227,7 @@ pub fn plain_name(name: &str) -> bool {
 }
 
 /// Which version of a file a rendered icon came from.
-type FileStamp = (SystemTime, u64, u64);
+pub(super) type FileStamp = (SystemTime, u64, u64);
 
 struct Cached {
     stamp: FileStamp,
@@ -288,7 +289,7 @@ impl Icons {
                 return Ok(hit.icon.clone());
             }
         }
-        let bytes = read_image(&path)?;
+        let bytes = read_image(&path, MAX_FILE_BYTES)?;
         name_matches_contents(name, &bytes)?;
         let icon = Arc::new(render(&bytes, side)?);
         self.cache().insert(
@@ -306,54 +307,81 @@ impl Icons {
     /// `3f2a9c1d0e44.png`, and returns that name for `icon` in `config.toml`. The same file gives
     /// the same name. Only a PNG, JPEG, WebP or SVG within the limits is copied.
     pub fn import(&self, src: &Path) -> Result<String, String> {
-        let bytes = read_image(src).map_err(|e| format!("{}: {e}", src.display()))?;
-        let (_, kind) = decode(&bytes, 1).map_err(|e| format!("{}: {e}", src.display()))?;
-        let ext = match kind {
-            Kind::Svg => "svg",
-            Kind::Raster(ImageFormat::Png) => "png",
-            Kind::Raster(ImageFormat::Jpeg) => "jpg",
-            Kind::Raster(_) => "webp",
-        };
-        let hash = encode_hex(&Sha256::digest(&bytes));
-        let name = format!("{}.{ext}", &hash[..12]);
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&self.dir)
-            .and_then(|()| write_private(&self.dir.join(&name), &bytes))
-            .map_err(|e| format!("Could not save the icon in {}: {e}", self.dir.display()))?;
-        log::info!("imported {src:?} as {DIR}/{name}");
-        Ok(name)
+        import_into(&self.dir, src, MAX_FILE_BYTES, &[Target::Icon(1)])
     }
 
     /// The files in the directory that a button's `icon` could name, sorted: valid names
     /// ([`name_error`]) of regular files that decode within the limits and don't link out of the
     /// directory. An absent directory holds none.
     pub fn list(&self) -> Result<Vec<String>, String> {
-        let entries = match fs::read_dir(&self.dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(format!("Could not read {}: {e}", self.dir.display())),
-        };
-        let root = fs::canonicalize(&self.dir).map_err(|e| e.to_string())?;
-        let mut names: Vec<String> = entries
-            .filter_map(Result::ok)
-            .filter_map(|entry| entry.file_name().into_string().ok())
-            .filter(|name| name_error(name).is_none())
-            .filter(|name| {
-                let path = self.dir.join(name);
-                fs::canonicalize(&path).is_ok_and(|real| real.starts_with(&root))
-                    && read_image(&path).is_ok_and(|bytes| {
-                        name_matches_contents(name, &bytes).is_ok() && decode(&bytes, 1).is_ok()
-                    })
-            })
-            .collect();
-        names.sort();
-        Ok(names)
+        list_in(&self.dir, MAX_FILE_BYTES, Target::Icon(1))
     }
 }
 
-fn file_stamp(path: &Path) -> Result<FileStamp, String> {
+/// Copies the image at `src` into `dir` under a name made from its content, such as
+/// `3f2a9c1d0e44.png`, and returns that name. The same file gives the same name. Only a PNG, JPEG,
+/// WebP or SVG of at most `max` bytes that decodes for `targets` is copied. A raster decodes the
+/// same for each, so only the first decodes it, and an SVG is drawn and costed for every target.
+pub(super) fn import_into(
+    dir: &Path,
+    src: &Path,
+    max: u64,
+    targets: &[Target],
+) -> Result<String, String> {
+    let fail = |e: String| format!("{}: {e}", src.display());
+    let bytes = read_image(src, max).map_err(fail)?;
+    let (first, rest) = targets.split_first().expect("a target to decode for");
+    let (_, kind) = decode(&bytes, *first).map_err(fail)?;
+    if kind == Kind::Svg {
+        for target in rest {
+            decode(&bytes, *target).map_err(fail)?;
+        }
+    }
+    let ext = match kind {
+        Kind::Svg => "svg",
+        Kind::Raster(ImageFormat::Png) => "png",
+        Kind::Raster(ImageFormat::Jpeg) => "jpg",
+        Kind::Raster(_) => "webp",
+    };
+    let hash = encode_hex(&Sha256::digest(&bytes));
+    let name = format!("{}.{ext}", &hash[..12]);
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .and_then(|()| write_private(&dir.join(&name), &bytes))
+        .map_err(|e| format!("Could not save the image in {}: {e}", dir.display()))?;
+    log::info!("imported {src:?} as {}", dir.join(&name).display());
+    Ok(name)
+}
+
+/// The files in `dir`, sorted, that a config could name: valid names ([`plain_name`]) of regular
+/// files of at most `max` bytes that decode for `target` and don't link out of the directory. An
+/// absent directory holds none.
+pub(super) fn list_in(dir: &Path, max: u64, target: Target) -> Result<Vec<String>, String> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("Could not read {}: {e}", dir.display())),
+    };
+    let root = fs::canonicalize(dir).map_err(|e| e.to_string())?;
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| plain_name(name))
+        .filter(|name| {
+            let path = dir.join(name);
+            fs::canonicalize(&path).is_ok_and(|real| real.starts_with(&root))
+                && read_image(&path, max).is_ok_and(|bytes| {
+                    name_matches_contents(name, &bytes).is_ok() && decode(&bytes, target).is_ok()
+                })
+        })
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+pub(super) fn file_stamp(path: &Path) -> Result<FileStamp, String> {
     let meta = fs::metadata(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => "not found".to_string(),
         _ => e.to_string(),
@@ -365,7 +393,7 @@ fn file_stamp(path: &Path) -> Result<FileStamp, String> {
 /// Decodes `bytes` and fits the picture to a `side` x `side` square, keeping its shape. A raster
 /// that already fits is left as it is; an SVG is drawn at the size that fills the square.
 pub fn render(bytes: &[u8], side: u32) -> Result<IconFrame, String> {
-    let (picture, kind) = decode(bytes, side)?;
+    let (picture, kind) = decode(bytes, Target::Icon(side))?;
     let (w, h) = picture.dimensions();
     let picture = if kind == Kind::Svg || (w <= side && h <= side) {
         picture
@@ -375,7 +403,7 @@ pub fn render(bytes: &[u8], side: u32) -> Result<IconFrame, String> {
         } else {
             ((w * side + h / 2) / h, side)
         };
-        shrink(picture, nw.max(1), nh.max(1))
+        resize(picture, nw.max(1), nh.max(1))
     };
     let (w, h) = picture.dimensions();
     // LVGL's ARGB8888 is B, G, R, A in memory.
@@ -387,9 +415,81 @@ pub fn render(bytes: &[u8], side: u32) -> Result<IconFrame, String> {
 }
 
 #[derive(PartialEq)]
-enum Kind {
+pub(super) enum Kind {
     Raster(ImageFormat),
     Svg,
+}
+
+/// The box an SVG is drawn for. A raster keeps its own size, and the caller fits it.
+#[derive(Clone, Copy)]
+pub(super) enum Target {
+    /// The largest rectangle of the drawing's shape inside a square of this side: an icon.
+    Icon(u32),
+    /// The sleep screen's image area. `cover` fills it and lets the overflow fall outside; else
+    /// the largest rectangle of the drawing's shape inside it.
+    Screen { cover: bool },
+}
+
+/// What [`render_cost`] is measured at for any icon: the largest box, which no smaller one exceeds.
+const ICON_COST_BOX: Target = Target::Icon(ICON_MAX_SIDE as u32);
+
+impl Target {
+    /// The box to estimate the cost for. A screen's is its own, since it has only one size.
+    fn cost_box(self) -> Self {
+        match self {
+            Target::Icon(_) => ICON_COST_BOX,
+            screen => screen,
+        }
+    }
+
+    fn canvas(self, tree: &usvg::Tree) -> Canvas {
+        let (w, h) = (tree.size().width(), tree.size().height());
+        match self {
+            Target::Icon(side) => Canvas::fit(w, h, side, side),
+            Target::Screen { cover: false } => Canvas::fit(w, h, IMAGE_W, IMAGE_H),
+            Target::Screen { cover: true } => {
+                let scale = (IMAGE_W as f32 / w).max(IMAGE_H as f32 / h);
+                Canvas {
+                    w: IMAGE_W,
+                    h: IMAGE_H,
+                    scale: (scale, scale),
+                    offset: (
+                        (IMAGE_W as f32 - w * scale) / 2.0,
+                        (IMAGE_H as f32 - h * scale) / 2.0,
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// The pixmap an SVG is drawn into, and the scale and offset that put the drawing in it.
+struct Canvas {
+    w: u32,
+    h: u32,
+    scale: (f32, f32),
+    offset: (f32, f32),
+}
+
+impl Canvas {
+    /// The drawing scaled to fit `box_w` x `box_h`, up as well as down, keeping its shape. Neither
+    /// side rounds to zero, so a very thin drawing is stretched across its one row or column.
+    fn fit(w: f32, h: f32, box_w: u32, box_h: u32) -> Self {
+        let scale = (f64::from(box_w) / f64::from(w)).min(f64::from(box_h) / f64::from(h));
+        let side = |n: f32, max: u32| ((f64::from(n) * scale).round() as u32).clamp(1, max);
+        let (pw, ph) = (side(w, box_w), side(h, box_h));
+        Self {
+            w: pw,
+            h: ph,
+            scale: (pw as f32 / w, ph as f32 / h),
+            offset: (0.0, 0.0),
+        }
+    }
+
+    fn transform(&self) -> tiny_skia::Transform {
+        tiny_skia::Transform::from_scale(self.scale.0, self.scale.1)
+            .post_translate(self.offset.0, self.offset.1)
+    }
 }
 
 /// SVG is text, so it has no magic number. Anything that begins with `<` (after a BOM and white
@@ -399,11 +499,11 @@ fn looks_like_svg(bytes: &[u8]) -> bool {
     bytes.trim_ascii_start().first() == Some(&b'<')
 }
 
-/// Decodes `bytes` to straight RGBA. An SVG is drawn to fit `side`; a raster keeps its own size.
+/// Decodes `bytes` to straight RGBA. An SVG is drawn for `target`; a raster keeps its own size.
 /// The preview loads the file through the asset protocol, which picks the content type from the
 /// name, so SVG text in a `.png` would be served as something else, and a picture in a `.svg`
 /// would not draw. Both are refused.
-fn name_matches_contents(name: &str, bytes: &[u8]) -> Result<(), String> {
+pub(super) fn name_matches_contents(name: &str, bytes: &[u8]) -> Result<(), String> {
     match (looks_like_svg(bytes), name.ends_with(".svg")) {
         (true, false) => Err("an SVG must be in a file whose name ends in .svg".into()),
         (false, true) => Err("a file named .svg must hold an SVG".into()),
@@ -411,9 +511,9 @@ fn name_matches_contents(name: &str, bytes: &[u8]) -> Result<(), String> {
     }
 }
 
-fn decode(bytes: &[u8], side: u32) -> Result<(RgbaImage, Kind), String> {
+pub(super) fn decode(bytes: &[u8], target: Target) -> Result<(RgbaImage, Kind), String> {
     if looks_like_svg(bytes) {
-        return draw_svg(bytes, side).map(|picture| (picture, Kind::Svg));
+        return draw_svg(bytes, target).map(|picture| (picture, Kind::Svg));
     }
     let mut reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
@@ -441,18 +541,20 @@ fn decode(bytes: &[u8], side: u32) -> Result<(RgbaImage, Kind), String> {
     Ok((picture.into_rgba8(), Kind::Raster(format)))
 }
 
-/// Draws an SVG, as untrusted input, into the largest rectangle of its shape that fits
-/// `side` x `side`, scaling up as well as down, and returns straight (not premultiplied) RGBA.
+/// Draws an SVG, as untrusted input, for `target`, scaling up as well as down, and returns
+/// straight (not premultiplied) RGBA. An icon, or a screen that is not covered, gets the largest
+/// rectangle of the drawing's shape that fits. A covered screen gets the whole image area, with
+/// the drawing centered and cut off at its edges.
 ///
 /// It runs on a thread of its own with a stack of [`SVG_STACK_BYTES`], and waits for it. A panic
 /// there is passed on as it is, as if it happened here; the release profile aborts on one, so
 /// nothing relies on catching it.
-fn draw_svg(bytes: &[u8], side: u32) -> Result<RgbaImage, String> {
+fn draw_svg(bytes: &[u8], target: Target) -> Result<RgbaImage, String> {
     std::thread::scope(|scope| {
         std::thread::Builder::new()
             .name("svg".into())
             .stack_size(SVG_STACK_BYTES)
-            .spawn_scoped(scope, || draw_svg_here(bytes, side))
+            .spawn_scoped(scope, || draw_svg_here(bytes, target))
             .map_err(|e| format!("can't start drawing the SVG: {e}"))?
             .join()
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
@@ -460,15 +562,14 @@ fn draw_svg(bytes: &[u8], side: u32) -> Result<RgbaImage, String> {
 }
 
 /// [`draw_svg`] on the calling thread.
-fn draw_svg_here(bytes: &[u8], side: u32) -> Result<RgbaImage, String> {
+fn draw_svg_here(bytes: &[u8], target: Target) -> Result<RgbaImage, String> {
     let text = std::str::from_utf8(bytes).map_err(|_| "can't read the SVG: not UTF-8")?;
     let doc = check_svg(text)?;
-    let tree = svg_tree(&doc)?;
-    let (pw, ph) = pixmap_size(&tree, side);
-    let (w, h) = (tree.size().width(), tree.size().height());
-    let mut pixmap = tiny_skia::Pixmap::new(pw, ph).ok_or("the SVG has no drawable size")?;
-    let transform = tiny_skia::Transform::from_scale(pw as f32 / w, ph as f32 / h);
-    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    let tree = svg_tree(&doc, target.cost_box())?;
+    let canvas = target.canvas(&tree);
+    let mut pixmap =
+        tiny_skia::Pixmap::new(canvas.w, canvas.h).ok_or("the SVG has no drawable size")?;
+    resvg::render(&tree, canvas.transform(), &mut pixmap.as_mut());
     let rgba = pixmap
         .pixels()
         .iter()
@@ -477,25 +578,15 @@ fn draw_svg_here(bytes: &[u8], side: u32) -> Result<RgbaImage, String> {
             [c.red(), c.green(), c.blue(), c.alpha()]
         })
         .collect();
-    RgbaImage::from_raw(pw, ph, rgba).ok_or_else(|| "the SVG drew an unexpected size".to_string())
-}
-
-/// The pixels `tree` is drawn into to fit `side` x `side`. Neither side rounds to zero, so a very
-/// thin drawing is stretched across its one row or column.
-fn pixmap_size(tree: &usvg::Tree, side: u32) -> (u32, u32) {
-    let (w, h) = (
-        f64::from(tree.size().width()),
-        f64::from(tree.size().height()),
-    );
-    let scale = f64::from(side) / w.max(h);
-    let fit = |n: f64| ((n * scale).round() as u32).clamp(1, side);
-    (fit(w), fit(h))
+    RgbaImage::from_raw(canvas.w, canvas.h, rgba)
+        .ok_or_else(|| "the SVG drew an unexpected size".to_string())
 }
 
 /// Builds usvg's tree from a document that passed [`check_svg`], and refuses it if its size is
-/// out of bounds or drawing it would cost more than [`render_cost`] allows. The file stands
-/// alone: both href resolvers refuse, `resources_dir` is unset and no fonts are loaded.
-fn svg_tree(doc: &roxmltree::Document) -> Result<usvg::Tree, String> {
+/// out of bounds or drawing it would cost more than [`render_cost`] allows when drawn for
+/// `costed_for`. The file stands alone: both href resolvers refuse, `resources_dir` is unset and
+/// no fonts are loaded.
+fn svg_tree(doc: &roxmltree::Document, costed_for: Target) -> Result<usvg::Tree, String> {
     let options = usvg::Options {
         resources_dir: None,
         image_href_resolver: usvg::ImageHrefResolver {
@@ -513,7 +604,7 @@ fn svg_tree(doc: &roxmltree::Document) -> Result<usvg::Tree, String> {
             "the SVG's size {w}x{h} is outside 0.001 to {MAX_SOURCE_SIDE} units a side"
         ));
     }
-    let (work, layers) = render_cost(&tree);
+    let (work, layers) = render_cost(&tree, costed_for);
     // A NaN would compare as within bounds, so it is refused by name.
     if work.is_nan() || work > MAX_SVG_RENDER_COST {
         return Err(format!(
@@ -531,13 +622,14 @@ fn svg_tree(doc: &roxmltree::Document) -> Result<usvg::Tree, String> {
     Ok(tree)
 }
 
-/// An upper estimate of what resvg spends drawing `tree` into the largest box, whatever box it
-/// is drawn into, and of the pixels it allocates for group layers. It follows what resvg 0.48
+/// An upper estimate of what resvg spends drawing `tree` for `costed_for`, and of the pixels it
+/// allocates for group layers. An icon is estimated at the largest box, whatever box it is drawn
+/// into ([`Target::cost_box`]). It follows what resvg 0.48
 /// does: a path is filled and stroked over its bounding box, cut to the canvas or to the layer of
 /// the group it is in, and each of its segments is walked once per row it spans. A group with
 /// opacity, or a clip (a `<symbol>` that `<use>` sizes), is drawn into a layer of its bounding
 /// box, at most 5 times the canvas a side, and then composited.
-fn render_cost(tree: &usvg::Tree) -> (f64, f64) {
+fn render_cost(tree: &usvg::Tree, costed_for: Target) -> (f64, f64) {
     // Weights, from the measurements at MAX_SVG_RENDER_COST, rounded up.
     const SOLID: f64 = 1.0;
     const GRADIENT: f64 = 16.0;
@@ -562,18 +654,19 @@ fn render_cost(tree: &usvg::Tree) -> (f64, f64) {
     }
     struct Walk {
         scale: (f64, f64),
+        offset: (f64, f64),
         reach: Box4,
         work: f64,
         layers: f64,
     }
     impl Walk {
         fn device(&self, r: usvg::Rect) -> Box4 {
-            let (sx, sy) = self.scale;
+            let ((sx, sy), (ox, oy)) = (self.scale, self.offset);
             [
-                f64::from(r.left()) * sx,
-                f64::from(r.top()) * sy,
-                f64::from(r.right()) * sx,
-                f64::from(r.bottom()) * sy,
+                f64::from(r.left()) * sx + ox,
+                f64::from(r.top()) * sy + oy,
+                f64::from(r.right()) * sx + ox,
+                f64::from(r.bottom()) * sy + oy,
             ]
         }
         fn paint(paint: &usvg::Paint) -> f64 {
@@ -623,16 +716,13 @@ fn render_cost(tree: &usvg::Tree) -> (f64, f64) {
         }
     }
 
-    // The pixmap draw_svg_here uses for the largest box. A smaller box has fewer pixels, or the
+    // The pixmap draw_svg_here uses for that box. A smaller icon box has fewer pixels, or the
     // same single row or column of a very thin drawing.
-    let (pw, ph) = pixmap_size(tree, ICON_MAX_SIDE as u32);
-    let (pw, ph) = (f64::from(pw), f64::from(ph));
-    let scale = (
-        pw / f64::from(tree.size().width()),
-        ph / f64::from(tree.size().height()),
-    );
+    let canvas = costed_for.canvas(tree);
+    let (pw, ph) = (f64::from(canvas.w), f64::from(canvas.h));
     let mut walk = Walk {
-        scale,
+        scale: (f64::from(canvas.scale.0), f64::from(canvas.scale.1)),
+        offset: (f64::from(canvas.offset.0), f64::from(canvas.offset.1)),
         // resvg's largest layer, `max_filter_bbox` in resvg's lib.rs.
         reach: [-2.0 * pw, -2.0 * ph, 3.0 * pw, 3.0 * ph],
         work: 0.0,
@@ -1039,7 +1129,7 @@ fn check_webp(bytes: &[u8]) -> Result<(), String> {
 
 /// Resizes through premultiplied alpha, which is what the filter assumes. Otherwise the color
 /// of fully transparent pixels bleeds into the edges.
-fn shrink(mut picture: RgbaImage, w: u32, h: u32) -> RgbaImage {
+pub(super) fn resize(mut picture: RgbaImage, w: u32, h: u32) -> RgbaImage {
     for p in picture.pixels_mut() {
         let a = u32::from(p[3]);
         for c in &mut p.0[..3] {
@@ -1059,8 +1149,8 @@ fn shrink(mut picture: RgbaImage, w: u32, h: u32) -> RgbaImage {
     small
 }
 
-/// A regular file of at most [`MAX_FILE_BYTES`].
-fn read_image(path: &Path) -> Result<Vec<u8>, String> {
+/// A regular file of at most `max` bytes.
+pub(super) fn read_image(path: &Path, max: u64) -> Result<Vec<u8>, String> {
     let meta = fs::metadata(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => "not found".into(),
         _ => e.to_string(),
@@ -1068,15 +1158,15 @@ fn read_image(path: &Path) -> Result<Vec<u8>, String> {
     if !meta.is_file() {
         return Err("not a regular file".into());
     }
-    let too_big = || format!("over {} KB", MAX_FILE_BYTES / 1024);
-    if meta.len() > MAX_FILE_BYTES {
+    let too_big = || format!("over {} KB", max / 1024);
+    if meta.len() > max {
         return Err(too_big());
     }
     let mut bytes = Vec::new();
     File::open(path)
-        .and_then(|file| file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes))
+        .and_then(|file| file.take(max + 1).read_to_end(&mut bytes))
         .map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > MAX_FILE_BYTES {
+    if bytes.len() as u64 > max {
         return Err(too_big());
     }
     Ok(bytes)
@@ -1786,7 +1876,8 @@ mod tests {
         // Far from the drawing budget, so a busier real icon has room.
         for icon in [LUCIDE_HOUSE, MATERIAL_HOME] {
             let doc = check_svg(icon).unwrap();
-            let (work, layers) = render_cost(&svg_tree(&doc).unwrap());
+            let (work, layers) =
+                render_cost(&svg_tree(&doc, ICON_COST_BOX).unwrap(), ICON_COST_BOX);
             eprintln!("estimated cost {work:.3e}, layers {layers} px");
             assert!(work < MAX_SVG_RENDER_COST / 20.0, "{work}");
         }
@@ -2324,7 +2415,7 @@ mod tests {
     /// Whether `bytes` pass every check before drawing.
     fn passes(bytes: &[u8]) -> Result<(), String> {
         let doc = check_svg(std::str::from_utf8(bytes).unwrap())?;
-        svg_tree(&doc).map(drop)
+        svg_tree(&doc, ICON_COST_BOX).map(drop)
     }
 
     /// The largest `n` up to `most` for which `make(n)` passes every check.
@@ -2624,7 +2715,8 @@ mod tests {
             let n = largest(what, &*make, most);
             let bytes = make(n);
             let doc = check_svg(std::str::from_utf8(&bytes).unwrap()).unwrap();
-            let (work, layers) = render_cost(&svg_tree(&doc).unwrap());
+            let (work, layers) =
+                render_cost(&svg_tree(&doc, ICON_COST_BOX).unwrap(), ICON_COST_BOX);
             let start = std::time::Instant::now();
             let icon =
                 render(&bytes, ICON_MAX_SIDE as u32).unwrap_or_else(|e| panic!("{what}: {e}"));
@@ -2677,7 +2769,7 @@ mod tests {
         // 16 MB of the drawing thread leave a wide margin.
         let small = std::thread::Builder::new()
             .stack_size(2 * 1024 * 1024)
-            .spawn(move || draw_svg_here(&bytes, ICON_MAX_SIDE as u32).map(|p| p.dimensions()))
+            .spawn(move || draw_svg_here(&bytes, ICON_COST_BOX).map(|p| p.dimensions()))
             .unwrap()
             .join()
             .unwrap();
