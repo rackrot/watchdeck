@@ -158,18 +158,20 @@ lv_obj_t *settings_log_line_create(lv_obj_t *parent, int x, int y, int w, int h,
 
 void settings_log_line_set(lv_obj_t *label, const logring_line_t *line)
 {
-    lv_obj_remove_style(label, &s_style_error, 0);
-    lv_obj_remove_style(label, &s_style_warn, 0);
-    if (!line) {
-        lv_label_set_text_static(label, "");
-        return;
+    // The applied level is kept in the label's user data, so a page of the same levels touches no styles.
+    const char want = line && (line->level == 'E' || line->level == 'W') ? line->level : 'I';
+    const char had = (char)(intptr_t)lv_obj_get_user_data(label);
+    if (had != want) {
+        lv_obj_remove_style(label, &s_style_error, 0);
+        lv_obj_remove_style(label, &s_style_warn, 0);
+        if (want == 'E') {
+            lv_obj_add_style(label, &s_style_error, 0);
+        } else if (want == 'W') {
+            lv_obj_add_style(label, &s_style_warn, 0);
+        }
+        lv_obj_set_user_data(label, (void *)(intptr_t)want);
     }
-    if (line->level == 'E') {
-        lv_obj_add_style(label, &s_style_error, 0);
-    } else if (line->level == 'W') {
-        lv_obj_add_style(label, &s_style_warn, 0);
-    }
-    lv_label_set_text_static(label, line->text);
+    lv_label_set_text_static(label, line ? line->text : "");
 }
 
 static void line_modal_tapped(lv_event_t *e)

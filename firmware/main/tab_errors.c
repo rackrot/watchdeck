@@ -45,7 +45,7 @@ static char s_left_text[LROW_COUNT][ROW_TEXT_MAX]; // what each row was last giv
 static char s_right_text[DIAG_KINDS][ROW_TEXT_MAX];
 static logring_line_t *s_lines; // the last RECENT_LINES E and W lines, in PSRAM
 static size_t s_n;
-static uint32_t s_seen_next; // logcap_next_seq() when the lines were read
+static uint32_t s_seen_error; // logcap_error_seq() when the lines were read
 
 static const char *reset_name(esp_reset_reason_t r)
 {
@@ -153,12 +153,12 @@ static void refresh_counters(void)
 // Reread the recent lines when any line arrived since the last read. Errors are rare, but the walk is cheap.
 static void refresh_recent(void)
 {
-    const uint32_t next = logcap_next_seq();
-    if (next == s_seen_next) {
+    const uint32_t err = logcap_error_seq();
+    if (err == s_seen_error) {
         return;
     }
-    s_seen_next = next;
-    s_n = logcap_read_before(next, true, s_lines, RECENT_LINES);
+    s_seen_error = err;
+    s_n = logcap_read_before(logcap_next_seq(), true, s_lines, RECENT_LINES);
     // Newest first would put the latest line where the eye starts, but the ring pages oldest first, so keep that order.
     for (size_t i = 0; i < RECENT_LINES; i++) {
         settings_log_line_set(s_recent[i], i < s_n ? &s_lines[i] : NULL);
@@ -196,7 +196,7 @@ void tab_errors_build(lv_obj_t *parent)
         return;
     }
     s_n = 0;
-    s_seen_next = 0; // never a real next_seq (the first is 1), so the first tick reads
+    s_seen_error = UINT32_MAX; // never a real seq, so the first tick reads
     memset(s_left_text, 0, sizeof(s_left_text));
     memset(s_right_text, 0, sizeof(s_right_text));
 

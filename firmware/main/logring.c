@@ -205,7 +205,11 @@ static void store(logring_t *r, const char *text, size_t len, uint32_t ms)
     uint8_t raw[LOGRING_HEADER];
     memcpy(raw, &r->next_seq, 4);
     memcpy(raw + 4, &ms, 4);
-    raw[8] = (uint8_t)level_of(text, len);
+    const char level = level_of(text, len);
+    raw[8] = (uint8_t)level;
+    if (level == 'E' || level == 'W') {
+        r->error_seq = r->next_seq;
+    }
     raw[9] = (uint8_t)len;
     const size_t tail = advance(r, r->head, r->used);
     ring_put(r, tail, raw, sizeof(raw));
@@ -252,6 +256,11 @@ uint32_t logring_oldest_seq(const logring_t *r)
 uint32_t logring_count(const logring_t *r)
 {
     return r->count;
+}
+
+uint32_t logring_error_seq(const logring_t *r)
+{
+    return r->error_seq;
 }
 
 // The offset of the record with sequence number `seq`, or of the nearest held record before it that a checkpoint or

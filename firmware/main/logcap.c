@@ -154,6 +154,14 @@ uint32_t logcap_next_seq(void)
     return n;
 }
 
+uint32_t logcap_error_seq(void)
+{
+    portENTER_CRITICAL(&s_mux);
+    const uint32_t n = s_ring.buf ? logring_error_seq(&s_ring) : 0;
+    portEXIT_CRITICAL(&s_mux);
+    return n;
+}
+
 uint32_t logcap_oldest_seq(void)
 {
     portENTER_CRITICAL(&s_mux);

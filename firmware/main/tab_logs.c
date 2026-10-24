@@ -76,7 +76,7 @@ static void load(move_t move)
     } else if (move == MOVE_NEWER) {
         n = s_n ? logcap_read_from(s_lines[s_n - 1].seq + 1, s_errors_only, s_lines, PAGE_LINES) : 0;
         if (n == PAGE_LINES) {
-            s_follow = false;
+            s_follow = s_lines[n - 1].seq + 1 == next; // a full page that ends at the newest line follows on
         } else {
             move = MOVE_NEWEST; // fewer than a page after it: that is the end, so show the last page
         }
