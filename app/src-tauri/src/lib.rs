@@ -120,14 +120,16 @@ pub fn run() {
             let secrets = Arc::new(Secrets::new(&dir));
             let configs = Configs::open(&dir, secrets.clone())
                 .map_err(|e| format!("config in {}: {e}", dir.display()))?;
-            // The window loads icons through the asset protocol, from this one folder only. The
-            // scope matches canonicalized request paths against patterns as given, so a symlinked
-            // config dir needs its real path allowed too. The dir exists by now.
+            // The window loads icons and sleep screen images through the asset protocol, from
+            // these two folders only. The scope matches canonicalized request paths against
+            // patterns as given, so a symlinked config dir needs its real path allowed too. The
+            // dir exists by now.
             let scope = app.asset_protocol_scope();
-            scope.allow_directory(dir.join("icons"), false)?;
-            if let Ok(real) = std::fs::canonicalize(&dir) {
-                if real != dir {
-                    scope.allow_directory(real.join("icons"), false)?;
+            let real = std::fs::canonicalize(&dir).ok().filter(|real| *real != dir);
+            for folder in ["icons", "screens"] {
+                scope.allow_directory(dir.join(folder), false)?;
+                if let Some(real) = &real {
+                    scope.allow_directory(real.join(folder), false)?;
                 }
             }
             // Shell actions run in the home directory, wherever the app was started from.
@@ -270,6 +272,8 @@ pub fn run() {
             commands::delete_secret,
             commands::import_icon,
             commands::list_icons,
+            commands::import_screen_image,
+            commands::list_screen_images,
             commands::list_gpus,
             commands::test_action,
             commands::tile_values,
