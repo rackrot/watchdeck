@@ -23,7 +23,7 @@ import {
   pageCount,
   pageIndexOf,
   pageName,
-  sleepChanged,
+  sleepSent,
   withSleep,
 } from "./edit";
 import {
@@ -63,17 +63,22 @@ type Saved = {
   connected: number;
   /** The save changed `[status_bar]`, which connected devices pick up without a layout. */
   bar: boolean;
-  /** The save changed `[sleep]`, which connected devices pick up as a `sleep` frame, not a layout. */
+  /** The save changed what a device is sent for `[sleep]`: a `sleep` frame, not a layout. */
   sleep: boolean;
+  /** Connected devices that name the "sleep" capability, which are the ones sent that frame. */
+  sleepDevices: number;
 };
 
 /** A `[status_bar]` edit reaches a connected device within this long: the config poll and the next tick. */
 const BAR_WITHIN_S = 2;
 
-/** A `[sleep]` edit does too, except for a new image, which the device then downloads. */
-const SLEEP_WITHIN_S = 5;
-
-export default function ConfigPage({ secrets }: { secrets: string[] }) {
+export default function ConfigPage({
+  secrets,
+  onConfigLoaded,
+}: {
+  secrets: string[];
+  onConfigLoaded: () => void;
+}) {
   const [view, setView] = useState<ConfigView | null>(null);
   const [draft, setDraft] = useState<Config | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
@@ -122,6 +127,7 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
   const refreshScreens = useCallback(async () => {
     try {
       setScreenFiles(await listScreenImages());
+      setScreenError("");
     } catch (e) {
       setScreenError(String(e));
     }
@@ -146,8 +152,11 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
       setLoadError("");
     } catch (e) {
       setLoadError(String(e));
+    } finally {
+      // The first answer, good or not, takes the splash away; an error shows on the page.
+      onConfigLoaded();
     }
-  }, [refreshIcons, refreshScreens]);
+  }, [refreshIcons, refreshScreens, onConfigLoaded]);
   // Listen first, then read, so no change falls between the two.
   useEffect(() => {
     const listeners = Promise.all([
@@ -171,7 +180,10 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
     ]);
     listeners.then(
       () => load(),
-      (e) => setLoadError(String(e)),
+      (e) => {
+        setLoadError(String(e));
+        onConfigLoaded();
+      },
     );
     return () => {
       listeners.then((stops) => {
@@ -180,7 +192,7 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
         }
       });
     };
-  }, [load]);
+  }, [load, onConfigLoaded]);
 
   const dirty = view !== null && draft !== null && isDirty(draft, view);
   const diskChanged = view !== null && diskMoved(view, onDisk);
@@ -282,7 +294,8 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
         connected: connected.length,
         targets,
         bar: barChanged(view.config, draft),
-        sleep: sleepChanged(view.config, draft),
+        sleep: sleepSent(view.config, draft),
+        sleepDevices: connected.filter((d) => d.caps.includes("sleep")).length,
       });
     } catch (e) {
       const messages = Array.isArray(e) ? (e as string[]) : [String(e)];
@@ -322,9 +335,12 @@ export default function ConfigPage({ secrets }: { secrets: string[] }) {
     setScreenError("");
     try {
       const name = await importScreenImage();
-      if (name !== null && draft) {
+      if (name !== null) {
         await refreshScreens();
-        set({ ...draft, sleep: withSleep(draft.sleep, { image: name }) });
+        // Functional, so an edit made while the dialog was open is kept.
+        setDraft(
+          (d) => d && { ...d, sleep: withSleep(d.sleep, { image: name }) },
+        );
       }
     } catch (e) {
       setScreenError(String(e));
@@ -612,7 +628,9 @@ function SavedStatus({
     ((saved.bar || saved.sleep) && saved.connected > 0)
       ? null
       : saved.connected === 0
-        ? "no device connected, so it gets the layout when it connects"
+        ? saved.sleep
+          ? "no device connected, so it gets the sleep screen when it connects"
+          : "no device connected, so it gets the layout when it connects"
         : "the layout is unchanged, so devices keep it";
   return (
     <>
@@ -622,11 +640,16 @@ function SavedStatus({
           status bar settings apply within {BAR_WITHIN_S} s
         </span>
       )}
-      {saved.sleep && saved.connected > 0 && (
-        <span className="chip ok">
-          sleep screen settings apply within {SLEEP_WITHIN_S} s
-        </span>
-      )}
+      {saved.sleep &&
+        saved.connected > 0 &&
+        (saved.sleepDevices > 0 ? (
+          <span className="chip ok">
+            sleep screen sent to the device within 1 s; a new picture downloads
+            after that
+          </span>
+        ) : (
+          <span className="chip bad">firmware has no sleep screen</span>
+        ))}
       {lines}
       {note && <span className="muted">{note}</span>}
     </>

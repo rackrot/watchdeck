@@ -19,11 +19,20 @@
 }
 
 .wordmark {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-family: var(--font-mono);
   font-size: 13px;
   font-weight: 600;
   letter-spacing: 0.04em;
   color: var(--accent);
+}
+
+.brand-mark {
+  width: 20px;
+  height: 20px;
+  flex: none;
 }
 
 .tabs {
@@ -620,8 +629,6 @@ button.chip.selected {
   top: 136px;
   width: 240px;
   height: 240px;
-  border-radius: 48px;
-  opacity: 0.35;
 }
 
 .sleep-el {
@@ -636,8 +643,8 @@ button.chip.selected {
   width: 100%;
   display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 24px;
+  padding-left: 32px;
+  gap: 16px;
   border-top: 2px dashed rgb(128 128 128 / 0.6);
   box-sizing: border-box;
 }
@@ -677,7 +684,7 @@ button.chip.selected {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 40px;
+  width: 56px;
   height: 28px;
   margin-right: 6px;
 }
@@ -713,7 +720,7 @@ button.chip.selected {
 }
 
 .spin-bar {
-  width: calc(var(--size) * 1.6);
+  width: calc(var(--size) * 2);
   height: calc(var(--size) / 6);
   overflow: hidden;
   border-radius: 99px;

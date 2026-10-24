@@ -17,7 +17,9 @@ import {
   pagerLabel,
   SLEEP_AREA_H,
   SLEEP_AREA_W,
+  SLEEP_HEIGHTS,
   SLEEP_MARGIN,
+  SLEEP_STRIP_H,
   sleepLayout,
   sleepTextAlign,
 } from "../src/preview.ts";
@@ -52,16 +54,21 @@ test("the sleep preview's positions match test_sleepcfg.c for each anchor", () =
     });
     assert.ok(y <= SLEEP_AREA_H - SLEEP_MARGIN, anchor);
   }
-  // The table above is the C test's: fail here if it moves.
-  const c = readFileSync(
-    new URL(
-      "../../firmware/test/host_proto/main/test_sleepcfg.c",
-      import.meta.url,
-    ),
+});
+
+test("the sleep preview's constants are the firmware's", () => {
+  const header = readFileSync(
+    new URL("../../firmware/main/sleepcfg.h", import.meta.url),
     "utf8",
   );
-  assert.ok(c.includes("{55, 37, 37, 37}"));
-  assert.ok(c.includes("(SLEEP_AREA_H - col_h) / 2"));
+  const define = (name: string) =>
+    Number(header.match(new RegExp(`#define ${name} (\\d+)`))?.[1]);
+  assert.equal(define("SLEEP_AREA_W"), SLEEP_AREA_W);
+  assert.equal(define("SLEEP_AREA_H"), SLEEP_AREA_H);
+  assert.equal(define("SLEEP_STRIP_H"), SLEEP_STRIP_H);
+  assert.equal(define("SLEEP_MARGIN"), SLEEP_MARGIN);
+  // montserrat.ts has no 48 table, so only the 32 line height can be compared.
+  assert.equal(SLEEP_HEIGHTS[1], MONTSERRAT_32.lineHeight);
 });
 
 test("the sleep preview hides what is not shown and gives it no room, and aligns text by anchor", () => {

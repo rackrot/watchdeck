@@ -1,4 +1,5 @@
-import type { CSSProperties, ReactNode } from "react";
+import { type CSSProperties, type ReactNode, useState } from "react";
+import logo from "./assets/logo.svg";
 import { SLEEP_DEFAULTS, type SleepConfig } from "./config";
 import { withSleep } from "./edit";
 import type { SleepErrors } from "./errors";
@@ -47,6 +48,10 @@ const PAD: (string | null)[] = [
   null,
   "bottom_right",
 ];
+
+/** The mark's size on the board (`wd_logo`, 240 px), and the spinner's (the bar is twice as wide). */
+const LOGO_PX = 240;
+const SPINNER_PX = 48;
 
 const SPINNERS = ["arc", "dots", "bar", "pulse", "none"] as const;
 
@@ -139,9 +144,12 @@ function Spinner({
 function SleepPreview({
   sleep,
   imageUrl,
+  onMissing,
 }: {
   sleep: SleepConfig | undefined;
+  /** Null for no image, or one whose file isn't there. */
   imageUrl: string | null;
+  onMissing: () => void;
 }) {
   const [stage, stageWidth] = useWidth();
   const scale = Math.min(1, stageWidth / SLEEP_AREA_W);
@@ -181,6 +189,7 @@ function SleepPreview({
             className="sleep-image"
             src={imageUrl}
             alt=""
+            onError={onMissing}
             style={{
               width: SLEEP_AREA_W,
               height: SLEEP_AREA_H,
@@ -188,10 +197,12 @@ function SleepPreview({
             }}
           />
         ) : (
-          // The logo goes here; until it does the device draws a rounded square in the text color.
-          <div
+          // As the board draws it (sleep.c image_create): the two-color mark, not recolored.
+          <img
             className="sleep-logo"
-            style={{ background: fg, left: (SLEEP_AREA_W - 240) / 2 }}
+            src={logo}
+            alt=""
+            style={{ left: (SLEEP_AREA_W - LOGO_PX) / 2 }}
           />
         )}
         {SLEEP_ELEMENTS.map((el, i) => {
@@ -224,7 +235,8 @@ function SleepPreview({
           style={{ top: SLEEP_AREA_H, height: SLEEP_STRIP_H }}
         >
           <span className="sleep-offline">while offline</span>
-          <Spinner kind={spinner} color={spinnerColor} size={48} />
+          {/* sleep.c: the spinner STRIP_PAD from the left, the status text STRIP_GAP after it. */}
+          <Spinner kind={spinner} color={spinnerColor} size={SPINNER_PX} />
           <span style={{ color: fg, fontFamily: family, fontSize: 32 }}>
             searching for devbox
           </span>
@@ -255,7 +267,12 @@ export default function SleepForm({
     sleep?.image && !images.includes(sleep.image)
       ? [...images, sleep.image].sort()
       : images;
-  const imageUrl = sleep?.image ? screenUrl(sleep.image) : null;
+  const url = sleep?.image ? screenUrl(sleep.image) : null;
+  // A load that failed, until the picture or the folder's listing changes.
+  const [failed, setFailed] = useState("");
+  const loadKey = `${url}|${images.join(",")}`;
+  const missing = url !== null && failed === loadKey;
+  const imageUrl = missing ? null : url;
 
   return (
     <div className="button-form sleep-form">
@@ -264,7 +281,11 @@ export default function SleepForm({
       </div>
       <Problems list={errors.sleep} />
 
-      <SleepPreview sleep={sleep} imageUrl={imageUrl} />
+      <SleepPreview
+        sleep={sleep}
+        imageUrl={imageUrl}
+        onMissing={() => setFailed(loadKey)}
+      />
 
       <section>
         <h4>Picture</h4>
@@ -287,8 +308,18 @@ export default function SleepForm({
               <button type="button" onClick={onImport}>
                 Import…
               </button>
-              {imageUrl && <img className="thumb" src={imageUrl} alt="" />}
+              {imageUrl && (
+                <img
+                  className="thumb"
+                  src={imageUrl}
+                  alt=""
+                  onError={() => setFailed(loadKey)}
+                />
+              )}
             </span>
+            {missing && (
+              <span className="muted">file not found in screens/</span>
+            )}
           </Field>
           <Choice
             label="Fit"

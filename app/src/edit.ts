@@ -10,7 +10,9 @@ import type {
   StatusBarConfig,
   Step,
 } from "./config";
+import { SLEEP_DEFAULTS } from "./config.ts";
 import { DEFAULT_FONT, resolveFonts } from "./fonts.ts";
+import { SLEEP_ELEMENTS } from "./preview.ts";
 
 export type Row = { name: string; value: string };
 
@@ -301,6 +303,34 @@ export const barChanged = (a: Config, b: Config): boolean =>
 /** Whether going from `a` to `b` changes `[sleep]`, which, like `[status_bar]`, never changes a layout. */
 export const sleepChanged = (a: Config, b: Config): boolean =>
   canon(a.sleep ?? null) !== canon(b.sleep ?? null);
+
+/**
+ * What the daemon's `sleep` frame says for `sleep` (`sleep_frame` in screens.rs): absent keys
+ * replaced by their defaults, the text only when it will be shown, the fit only when there is an
+ * image to fit. Two tables with the same view send the same frame.
+ */
+function sleepView(sleep: SleepConfig | undefined) {
+  const named: readonly string[] = sleep?.show ?? SLEEP_DEFAULTS.show;
+  const show = SLEEP_ELEMENTS.filter((el) => named.includes(el));
+  const lower = (c: string | undefined, d: string) => (c ?? d).toLowerCase();
+  return {
+    image: sleep?.image ?? null,
+    fit: sleep?.image ? (sleep.fit ?? SLEEP_DEFAULTS.fit) : null,
+    bg: lower(sleep?.bg, SLEEP_DEFAULTS.bg),
+    fg: lower(sleep?.fg, SLEEP_DEFAULTS.fg),
+    show,
+    text: show.includes("text") ? (sleep?.text ?? null) : null,
+    anchor: sleep?.anchor ?? SLEEP_DEFAULTS.anchor,
+    spinner: sleep?.spinner ?? SLEEP_DEFAULTS.spinner,
+    spinner_color: lower(sleep?.spinner_color, SLEEP_DEFAULTS.spinner_color),
+    offline_after_s: sleep?.offline_after_s ?? SLEEP_DEFAULTS.offline_after_s,
+    backlight: sleep?.backlight ?? SLEEP_DEFAULTS.backlight,
+  };
+}
+
+/** Whether going from `a` to `b` sends a device a new `sleep` frame: `[sleep]` changes by what it means. */
+export const sleepSent = (a: Config, b: Config): boolean =>
+  canon(sleepView(a.sleep)) !== canon(sleepView(b.sleep));
 
 /**
  * `sleep` with the keys of `patch` set. A key set to `undefined` is removed, and a table left with

@@ -23,6 +23,7 @@ import {
   renamePage,
   rowsToRecord,
   sleepChanged,
+  sleepSent,
   withGpu,
   withGridFont,
   withSleep,
@@ -119,6 +120,22 @@ test("a [sleep]-only edit changes no layout and reaches no device as one", () =>
     ]),
     [],
   );
+});
+
+test("sleepSent counts what the frame says: a default-equal write sends nothing", () => {
+  const sent = (sleep: Config["sleep"]) =>
+    sleepSent(config, { ...config, sleep });
+  assert.equal(sent({}), false);
+  assert.equal(
+    sent({ spinner: "arc", backlight: 100, show: ["clock", "date"] }),
+    false,
+  );
+  assert.equal(sent({ fit: "contain" }), false); // no image to fit
+  assert.equal(sent({ text: "hi" }), false); // text is not shown
+  assert.equal(sent({ spinner: "dots" }), true);
+  assert.equal(sent({ image: "a.png", fit: "contain" }), true);
+  assert.equal(sent({ show: ["text"], text: "hi" }), true);
+  assert.equal(sent({ bg: "#FFFFFF" }), true);
 });
 
 test("withSleep sets keys, drops undefined ones and the empty table", () => {

@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "esp_app_desc.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -15,6 +16,7 @@
 #include "grid.h"
 #include "hoststat.h"
 #include "icons.h"
+#include "logo_img.h"
 #include "link.h"
 #include "model.h"
 #include "settings.h"
@@ -626,6 +628,50 @@ static void cell_event(lv_event_t *e)
     }
 }
 
+// The boot view: the mark, the name and the firmware version, full screen on the top layer from ui_init. It only covers
+// the screen, so a mode change under it (a layout applying, a sleep) takes effect at once and shows when the view goes.
+// A fixed time between the 1.2 s floor and the 3 s ceiling keeps the status texts hidden for no longer than that.
+// Clickable and without handlers, so a touch on it reaches nothing below; the view is deleted whole, with the pool
+// logged at the crossing, so "page built" does not move.
+#define BOOT_VIEW_MS 1500
+
+static void boot_view_end(lv_timer_t *timer)
+{
+    lv_obj_t *view = lv_timer_get_user_data(timer);
+    lv_timer_delete(timer);
+    lv_obj_delete(view);
+    ui_log_heap("boot view gone");
+}
+
+static void boot_view_start(void)
+{
+    lv_obj_t *view = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(view);
+    lv_obj_set_size(view, DISPLAY_H_RES, DISPLAY_V_RES);
+    lv_obj_set_style_bg_color(view, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(view, LV_OPA_COVER, 0);
+    lv_obj_set_scrollable(view, false);
+    lv_obj_set_flex_flow(view, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(view, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(view, 12, 0);
+
+    lv_obj_t *mark = lv_image_create(view);
+    lv_image_set_src(mark, &wd_logo);
+
+    lv_obj_t *name = lv_label_create(view);
+    lv_obj_set_style_text_font(name, &lv_font_montserrat_32, 0);
+    lv_obj_set_style_text_color(name, lv_color_white(), 0);
+    lv_label_set_text(name, "watchdeck");
+
+    lv_obj_t *version = lv_label_create(view);
+    lv_obj_set_style_text_font(version, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(version, lv_palette_lighten(LV_PALETTE_GREY, 2), 0);
+    lv_label_set_text(version, esp_app_get_description()->version);
+
+    lv_timer_t *timer = lv_timer_create(boot_view_end, BOOT_VIEW_MS, view);
+    lv_timer_set_repeat_count(timer, 1);
+}
+
 esp_err_t ui_init(lv_display_t *disp)
 {
     ESP_RETURN_ON_FALSE(disp, ESP_ERR_INVALID_ARG, TAG, "no display");
@@ -642,6 +688,7 @@ esp_err_t ui_init(lv_display_t *disp)
     sleep_init();
     s_down_tick = lv_tick_get();
     lv_timer_create(sleep_watch, SLEEP_WATCH_MS, NULL);
+    boot_view_start();
     s_ready = true;
     lvgl_port_unlock();
     return ESP_OK;
