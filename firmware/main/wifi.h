@@ -107,3 +107,10 @@ typedef struct {
 } wifi_job_t;
 
 void wifi_job_get(wifi_job_t *out);
+
+/**
+ * After Format card, on the svc task: write wifi.txt from the network the board is on or retries (the one a trial
+ * made current, or the boot one), so the format keeps it. WIFI_SAVE_NONE: no network is set (or wifi_init didn't
+ * finish), nothing written, and wifi_file_state() says ABSENT. Takes no job slot. The password reaches no log.
+ */
+wifi_save_t wifi_save_current(void);

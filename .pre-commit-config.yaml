@@ -61,16 +61,23 @@ repos:
         files: ^firmware/.*\.(c|h)$
         exclude: ^firmware/main/(fonts/|logo_img\.[ch]$)
 
-      # The TF card holds user data in a GPT partition esp_tinyusb and FatFs would see as unformatted, so the
-      # firmware never formats it, never lets esp_tinyusb mount it to the app, and never takes it back from USB at
-      # run time (plans/settings-sleep-feed/01-groundwork.md, G2). The host tests format their RAM disk, so only
-      # firmware/main is checked.
+      # The TF card holds user data, so the firmware formats it only when a person asks (Settings > Storage > Format
+      # card, cardmkfs.c), never lets esp_tinyusb or IDF's VFS mount or format it on their own, and never takes it
+      # back from USB at run time (plans/settings-sleep-feed/01-groundwork.md, G2). The host tests format their disks,
+      # so only firmware/main is checked.
       - id: no-card-format
-        name: no card format or esp_tinyusb app mount
+        name: f_mkfs only in cardmkfs.c
+        language: pygrep
+        entry: '\bf_mkfs\s*\('
+        files: ^firmware/main/.*\.(c|h)$
+        exclude: ^firmware/main/cardmkfs\.c$
+
+      - id: no-tinyusb-app-mount
+        name: no esp_tinyusb app mount or VFS format
         language: pygrep
         # A banned call, a banned name anywhere (the app mount point, the format-on-fail flag), or clearing a guard.
         # yamllint disable-line rule:line-length
-        entry: '\b(tinyusb_msc_set_storage_mount_point|tinyusb_msc_format_storage|tinyusb_msc_delete_storage|tinyusb_msc_storage_mount|tinyusb_msc_storage_init_sdmmc|tinyusb_msc_new_storage_sdmmc|tinyusb_msc_new_storage_spiflash|f_mkfs|f_fdisk|esp_vfs_fat_sdcard_format|esp_vfs_fat_sdcard_format_cfg|esp_vfs_fat_sdmmc_mount|esp_vfs_fat_sdspi_mount)\s*\(|\b(TINYUSB_MSC_STORAGE_MOUNT_APP|format_if_mount_failed)\b|\b(auto_mount_off|do_not_format)\s*=\s*(0|false)\b'
+        entry: '\b(tinyusb_msc_set_storage_mount_point|tinyusb_msc_format_storage|tinyusb_msc_delete_storage|tinyusb_msc_storage_mount|tinyusb_msc_storage_init_sdmmc|tinyusb_msc_new_storage_sdmmc|tinyusb_msc_new_storage_spiflash|f_fdisk|esp_vfs_fat_sdcard_format|esp_vfs_fat_sdcard_format_cfg|esp_vfs_fat_sdmmc_mount|esp_vfs_fat_sdspi_mount)\s*\(|\b(TINYUSB_MSC_STORAGE_MOUNT_APP|format_if_mount_failed)\b|\b(auto_mount_off|do_not_format)\s*=\s*(0|false)\b'
         files: ^firmware/main/.*\.(c|h)$
 
       - id: fonts-generated
