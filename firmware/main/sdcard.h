@@ -81,12 +81,21 @@ void sdcard_set_shared(void);
  * mount it as at boot: cardfs_init (or cardfs_attach when it ran before), writes on, recovery. Works on a DEVICE card
  * (cardfs is detached and the card unmounted first) and on a NO_CARD one that answered the init but didn't mount
  * (no file system FatFs reads, such as exFAT, or a refused GPT). Blocks for the whole format, tens of seconds on a
- * large card. On a failure *step names what failed, the owner is NO_CARD with the error, and cardfs stays detached.
- * ESP_ERR_NOT_FOUND: no card answered at boot. ESP_ERR_INVALID_STATE: shared over USB (nothing written).
- * ESP_ERR_INVALID_SIZE: under 512 MiB, or not 512-byte sectors (nothing written). ESP_ERR_NO_MEM: no work buffer
- * (nothing written).
+ * large card. On a failure *step names what failed and *reached how far it got:
+ *   REFUSED: nothing was touched. ESP_ERR_NOT_FOUND: no card answered at boot. ESP_ERR_INVALID_STATE: shared over USB.
+ *            ESP_ERR_INVALID_SIZE: under 512 MiB, or not 512-byte sectors. ESP_ERR_NO_MEM: no work buffer.
+ *   UNTOUCHED: unmounted, then nothing was written (no free FatFs drive, or the first write failed), so the card was
+ *            mounted again as at boot.
+ *   PARTIAL: the old tables are gone and no new MBR was written: NO_CARD, cardfs detached; format again.
+ *   WRITTEN: the format finished but the card didn't mount: NO_CARD, cardfs detached; a restart may mount it.
  */
-esp_err_t sdcard_format(const char **step);
+typedef enum {
+    SDCARD_FORMAT_REFUSED,
+    SDCARD_FORMAT_UNTOUCHED,
+    SDCARD_FORMAT_PARTIAL,
+    SDCARD_FORMAT_WRITTEN,
+} sdcard_format_reached_t;
+esp_err_t sdcard_format(sdcard_format_reached_t *reached, const char **step);
 
 /**
  * Totals since boot of the read-back that checks every multi-block write (IDF 6.1 can report a failed one as

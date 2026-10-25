@@ -68,8 +68,8 @@ void cardmkfs_mbr(const cardmkfs_layout_t *layout, uint32_t disk_id, uint8_t out
 const char *cardmkfs_step_text(cardmkfs_step_t step)
 {
     switch (step) {
-    case CARDMKFS_STEP_LAYOUT:
-        return "sizing the partition";
+    case CARDMKFS_STEP_START:
+        return "starting";
     case CARDMKFS_STEP_WIPE:
         return "clearing the old partition table";
     case CARDMKFS_STEP_MKFS:
@@ -119,14 +119,18 @@ esp_err_t cardmkfs_run(const cardmkfs_io_t *io, const char *drive, uint32_t capa
                        uint32_t work_len, cardmkfs_step_t *step, int *fresult)
 {
     *fresult = FR_OK;
-    *step = CARDMKFS_STEP_LAYOUT;
+    *step = CARDMKFS_STEP_START;
     cardmkfs_layout_t layout;
     if (work_len < 2 * CARDMKFS_SECTOR || !cardmkfs_layout(capacity, &layout)) {
         return ESP_ERR_INVALID_SIZE;
     }
 
+    esp_err_t err = zero_range(io, 0, 1, work);
+    if (err != ESP_OK) {
+        return err; // still CARDMKFS_STEP_START: no write was reported done
+    }
     *step = CARDMKFS_STEP_WIPE;
-    esp_err_t err = zero_range(io, 0, CARDMKFS_HEAD_SECTORS, work);
+    err = zero_range(io, 1, CARDMKFS_HEAD_SECTORS - 1, work);
     if (err == ESP_OK) {
         err = zero_range(io, capacity - CARDMKFS_GPT_TAIL, CARDMKFS_GPT_TAIL, work);
     }
@@ -150,7 +154,13 @@ esp_err_t cardmkfs_run(const cardmkfs_io_t *io, const char *drive, uint32_t capa
     }
 
     *step = CARDMKFS_STEP_CHECK;
-    err = check_boot_sectors(io, layout.part_lba, work);
+    // f_mkfs ignores the result of its backup boot sector and FSINFO writes (ff.c 6514-6522), and over an old FAT32
+    // volume whose copies match each other the compare below can't tell, so a write error the diskio returned fails
+    // the format too.
+    err = io->write_error(io->ctx);
+    if (err == ESP_OK) {
+        err = check_boot_sectors(io, layout.part_lba, work);
+    }
     if (err != ESP_OK) {
         return err;
     }

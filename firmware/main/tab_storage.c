@@ -34,7 +34,7 @@
 #define WIFI_READ_MAX 256
 #define ARMED_TICKS 10   // a first tap on Share, Stop sharing or Format is forgotten after this many seconds
 #define ARM_GUARD_MS 600 // a second tap sooner than this after the first is a double tap, not a confirmation
-#define MSG_TEXT_MAX 192
+#define MSG_TEXT_MAX 256
 
 #define SHARE_WARNING                                                                                                  \
     "The device can't save the sleep screen or Wi-Fi while the card is shared. To take it back, the board restarts."
@@ -42,8 +42,10 @@
     "Eject the drive on your computer first. The board restarts to take the card back (about 8 s); the pairing stays."
 #define FREE_RUNNING "Counting free space... this can take 10 s on a large card."
 #define FORMAT_WARNING                                                                                                 \
-    "Erases everything on the card, including wifi.txt and the sleep screen files, and makes it FAT32. The Wi-Fi "     \
-    "settings in use are saved back. Tap again to format."
+    "A quick format to FAT32: it erases the file system and every file on it, wifi.txt and the sleep screen files "    \
+    "included, and saves the Wi-Fi in use back. Old data stays readable to recovery tools until it's overwritten. "    \
+    "Tap again to format."
+_Static_assert(sizeof(FORMAT_WARNING) <= MSG_TEXT_MAX, "the warning fits the message");
 
 static const char *TAG = "tab_storage";
 
@@ -394,12 +396,13 @@ static void show_formatting(void)
              (unsigned)cardformat_seconds());
 }
 
-static void format_ended(void)
+// The result of a format that ended, shown once (also when the tab is built after it ended unseen). It restarts the
+// settings idle time, so the result stays up for the full 60 s.
+static void show_format_result(const cardformat_result_t *rp)
 {
-    s_formatting = false;
+    const cardformat_result_t r = *rp;
     forget_card(true); // the files and the free space are new
-    cardformat_result_t r;
-    cardformat_result(&r);
+    lv_display_trigger_activity(NULL);
     if (r.err == ESP_OK) {
         set_msgf(r.wifi == WIFI_SAVE_OK || r.wifi == WIFI_SAVE_NONE ? MSG_GOOD : MSG_BAD,
                  "Formatted as FAT32 (%u KiB clusters) in %u s. %s", (unsigned)(r.cluster_bytes / 1024),
@@ -407,16 +410,22 @@ static void format_ended(void)
                  r.wifi == WIFI_SAVE_OK     ? "The Wi-Fi settings in use were saved to wifi.txt."
                  : r.wifi == WIFI_SAVE_NONE ? "No Wi-Fi network is set, so there is no wifi.txt."
                                             : "Saving wifi.txt failed; save the network again on the Wi-Fi tab.");
-    } else if (r.err == ESP_ERR_NOT_FOUND) {
-        set_msg(MSG_BAD, "Format failed: no card. Put one in and restart the board.");
-    } else if (r.err == ESP_ERR_INVALID_STATE && sdcard_owner() == SDCARD_SHARED) {
-        set_msg(MSG_BAD, "Format failed: the card is shared over USB. Nothing was written.");
-    } else if (r.err == ESP_ERR_INVALID_SIZE) {
-        set_msg(MSG_BAD, "Format failed: the card is smaller than 512 MB. Nothing was written.");
-    } else if (r.err == ESP_ERR_NO_MEM) {
-        set_msg(MSG_BAD, "Format failed: not enough memory. Nothing was written.");
+    } else if (r.reached == SDCARD_FORMAT_REFUSED) { // INVALID_STATE also when a share went ahead of the queued job
+        set_msg(MSG_BAD, r.err == ESP_ERR_NOT_FOUND       ? "Format failed: no card. Put one in and restart the board."
+                         : r.err == ESP_ERR_INVALID_STATE ? "Format failed: the card is shared over USB. Nothing was "
+                                                            "written."
+                         : r.err == ESP_ERR_INVALID_SIZE  ? "Format failed: the card is smaller than 512 MB. Nothing "
+                                                            "was written."
+                         : r.err == ESP_ERR_NO_MEM        ? "Format failed: not enough memory. Nothing was written."
+                                                          : "Format failed. Nothing was written.");
+    } else if (r.reached == SDCARD_FORMAT_UNTOUCHED) {
+        set_msgf(MSG_BAD, "Format failed while %s (%s), before anything was written. The card is as it was.",
+                 r.step ? r.step : "starting", esp_err_to_name(r.err));
+    } else if (r.reached == SDCARD_FORMAT_WRITTEN) {
+        set_msgf(MSG_BAD, "The card was formatted, but mounting it failed (%s). Restart the board; it may mount then.",
+                 esp_err_to_name(r.err));
     } else {
-        set_msgf(MSG_BAD, "Format failed while %s (%s). The card can't be used until a format finishes.",
+        set_msgf(MSG_BAD, "Format failed while %s (%s). The card has no file system now; format it again.",
                  r.step ? r.step : "formatting", esp_err_to_name(r.err));
     }
 }
@@ -426,8 +435,12 @@ void tab_storage_tick(void)
     if (!s_content) {
         return;
     }
+    cardformat_result_t r;
     if (s_formatting && !cardformat_busy()) {
-        format_ended();
+        s_formatting = false;
+        if (cardformat_take_result(&r)) {
+            show_format_result(&r);
+        }
     } else if (s_formatting) {
         show_formatting();
     }
@@ -593,8 +606,11 @@ void tab_storage_build(lv_obj_t *parent)
     if (!usb_ready()) {
         set_msgf(MSG_BAD, "USB didn't start (%s), so the card can't be shared.", esp_err_to_name(usb_error()));
     }
+    cardformat_result_t r;
     if (s_formatting) {
         show_formatting();
+    } else if (cardformat_take_result(&r)) { // a format ended while the tab was away, or settings was closed
+        show_format_result(&r);
     }
 
     // A probe that finished while the tab was away is older than this build; throw it away and read again.
