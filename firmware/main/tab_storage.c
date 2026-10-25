@@ -1,10 +1,12 @@
 // The Storage tab: the TF card (what it is, who has it), what the board keeps on it (wifi.txt and the sleep files), a
-// free-space count, and the share over USB. The card reads and the count run on the svc task (svc.h); this file starts
-// a job and polls for its result from the tab's once-a-second tick, so nothing here waits and a job that outlives the
-// tab only writes to statics nobody is looking at. Everything else runs in the LVGL task or under the LVGL lock.
+// free-space count, the share over USB and Format card. The card reads and the count run on the svc task (svc.h); this
+// file starts a job and polls for its result from the tab's once-a-second tick, so nothing here waits and a job that
+// outlives the tab only writes to statics nobody is looking at. Everything else runs in the LVGL task or under the LVGL
+// lock.
 //
-// The tab never writes to the card. The share is usb.c's (it unmounts the card and maps the raw disk to USB), and
-// Stop sharing restarts the board. Text from the card (the SSID, file names) goes to labels with recolor off.
+// The tab never writes to the card itself. The share is usb.c's (it unmounts the card and maps the raw disk to USB),
+// Stop sharing restarts the board, and the format is cardformat.c's. Share and Format each take two taps, and arming
+// one disarms the other. Text from the card (the SSID, file names) goes to labels with recolor off.
 
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -12,6 +14,7 @@
 #include <string.h>
 #include <strings.h>
 
+#include "cardformat.h"
 #include "cardfs.h"
 #include "esp_log.h"
 #include "sdcard.h"
@@ -25,18 +28,24 @@
 #define BTN_H 56
 #define SHARE_W 360
 #define FREE_W 300
+#define FORMAT_W 300
 #define PROBE_TICKS 5    // wifi.txt and the sleep files are read every 5th tick, and when the owner changes
 #define BACKOFF_TICKS 30 // after a probe that failed, the next waits this many ticks
 #define WIFI_READ_MAX 256
-#define ARMED_TICKS 10   // a first tap on Share or Stop sharing is forgotten after this many seconds
+#define ARMED_TICKS 10   // a first tap on Share, Stop sharing or Format is forgotten after this many seconds
 #define ARM_GUARD_MS 600 // a second tap sooner than this after the first is a double tap, not a confirmation
-#define MSG_TEXT_MAX 192
+#define MSG_TEXT_MAX 256
 
 #define SHARE_WARNING                                                                                                  \
     "The device can't save the sleep screen or Wi-Fi while the card is shared. To take it back, the board restarts."
 #define EJECT_WARNING                                                                                                  \
     "Eject the drive on your computer first. The board restarts to take the card back (about 8 s); the pairing stays."
 #define FREE_RUNNING "Counting free space... this can take 10 s on a large card."
+#define FORMAT_WARNING                                                                                                 \
+    "A quick format to FAT32: it erases the file system and every file on it, wifi.txt and the sleep screen files "    \
+    "included, and saves the Wi-Fi in use back. Old data stays readable to recovery tools until it's overwritten. "    \
+    "Tap again to format."
+_Static_assert(sizeof(FORMAT_WARNING) <= MSG_TEXT_MAX, "the warning fits the message");
 
 static const char *TAG = "tab_storage";
 
@@ -54,6 +63,12 @@ typedef enum {
     MSG_GOOD,
     MSG_BAD,
 } msg_level_t;
+
+typedef enum {
+    ARM_NONE,
+    ARM_SHARE, // Share or Stop sharing was tapped once
+    ARM_FORMAT,
+} arm_t;
 
 /* ---- The jobs ---- */
 
@@ -195,20 +210,22 @@ static bool take_job(_Atomic int *state, void *out, const void *result, size_t s
 
 static lv_obj_t *s_content; // the tab's content object, NULL while the tab isn't shown
 static lv_obj_t *s_rows[ROW_COUNT];
-static lv_obj_t *s_main_btn, *s_main_label, *s_free_btn, *s_msg;
+static lv_obj_t *s_main_btn, *s_main_label, *s_free_btn, *s_format_btn, *s_format_label, *s_msg;
 static char s_row_text[ROW_COUNT][ROW_TEXT_MAX];
 static char s_msg_text[MSG_TEXT_MAX];
-static const char *s_main_text; // what the main button's label shows now; the literals below, compared by address
+// What the main and format buttons' labels show now; the literals below, compared by address.
+static const char *s_main_text, *s_format_text;
 
 static probe_t s_seen;       // the last probe taken; wifi_access and sleep_access say whether it has been
 static space_t s_space_seen; // the last free-space count, with s_space_known
 static bool s_space_known;
 static sdcard_owner_t s_owner; // the owner at the last tick, to catch a change
 static unsigned s_probe_wait;  // ticks until the next probe; 0 starts one as soon as none is out
-static bool s_armed;           // Share or Stop sharing was tapped once and asks to be tapped again
+static arm_t s_armed;          // the button tapped once that asks to be tapped again
 static unsigned s_armed_ticks;
 static uint32_t s_armed_at; // lv_tick_get() of that first tap
 static bool s_sharing;      // a share was queued from here and has not ended
+static bool s_formatting;   // a format was queued (from here, or before the tab was built) and has not ended
 
 static void set_row(row_t r, const char *text)
 {
@@ -254,33 +271,66 @@ static void set_enabled(lv_obj_t *obj, bool enabled)
 
 static void disarm(void)
 {
-    if (s_armed) {
-        s_armed = false;
+    if (s_armed != ARM_NONE) {
+        s_armed = ARM_NONE;
         set_msg(MSG_INFO, "");
     }
 }
 
-// What the main button says and whether it can be tapped, from the owner, a share under way and the first tap.
+static bool formatting(void)
+{
+    return s_formatting || cardformat_busy();
+}
+
+// Drops what the tab knows about the card's files and space, so the next tick reads them again. A format also drops a
+// result that finished before it and wasn't taken yet: it describes the card as it was.
+static void forget_card(bool formatted)
+{
+    s_probe_wait = 0;
+    memset(&s_seen, 0, sizeof(s_seen));
+    s_space_known = false;
+    if (formatted) {
+        int done = JOB_DONE;
+        atomic_compare_exchange_strong(&s_probe_state, &done, JOB_IDLE);
+        done = JOB_DONE;
+        atomic_compare_exchange_strong(&s_space_state, &done, JOB_IDLE);
+    }
+}
+
+static void set_button_text(lv_obj_t *label, const char **shown, const char *text)
+{
+    if (text != *shown) { // literals, so equal text is the same pointer
+        *shown = text;
+        lv_label_set_text_static(label, text);
+    }
+}
+
+// What the buttons say and whether they can be tapped, from the owner, a share or format under way and the first tap.
 static void refresh_buttons(void)
 {
     const sdcard_owner_t owner = sdcard_owner();
+    const bool sharing = s_sharing || usb_share_busy();
+    const bool busy_formatting = formatting();
     const char *text = "Share over USB";
-    bool enabled = owner == SDCARD_DEVICE && usb_ready();
-    if (s_sharing || usb_share_busy()) {
+    bool enabled = owner == SDCARD_DEVICE && usb_ready() && !busy_formatting;
+    if (sharing) {
         text = "Sharing...";
         enabled = false;
     } else if (owner == SDCARD_SHARED) {
-        text = s_armed ? "I ejected it, restart" : "Stop sharing";
+        text = s_armed == ARM_SHARE ? "I ejected it, restart" : "Stop sharing";
         enabled = true;
-    } else if (s_armed) {
+    } else if (s_armed == ARM_SHARE) {
         text = "Tap again to share";
     }
-    if (text != s_main_text) { // literals, so equal text is the same pointer
-        s_main_text = text;
-        lv_label_set_text_static(s_main_label, text);
-    }
+    set_button_text(s_main_label, &s_main_text, text);
     set_enabled(s_main_btn, enabled);
-    set_enabled(s_free_btn, owner == SDCARD_DEVICE && atomic_load(&s_space_state) == JOB_IDLE);
+
+    set_button_text(s_format_label, &s_format_text,
+                    busy_formatting         ? "Formatting..."
+                    : s_armed == ARM_FORMAT ? "Tap again to format"
+                                            : "Format card");
+    set_enabled(s_format_btn, sdcard_card() && owner != SDCARD_SHARED && !sharing && !busy_formatting);
+    set_enabled(s_free_btn, owner == SDCARD_DEVICE && !busy_formatting && atomic_load(&s_space_state) == JOB_IDLE);
 }
 
 static void render(void)
@@ -291,7 +341,7 @@ static void render(void)
     char text[ROW_TEXT_MAX];
 
     storagefmt_card(text, sizeof(text), info.present, info.name, info.bytes, info.fs,
-                    owner == SDCARD_DEVICE && !cardfs_writable());
+                    owner == SDCARD_DEVICE && !cardfs_writable() && !formatting());
     set_row(ROW_CARD, text);
     storagefmt_owner(text, sizeof(text),
                      owner == SDCARD_DEVICE   ? STORAGEFMT_OWNER_DEVICE
@@ -340,20 +390,67 @@ static void space_taken(void)
     }
 }
 
+static void show_formatting(void)
+{
+    set_msgf(MSG_INFO, "Formatting the card... %u s. Leave the card in and the power on.",
+             (unsigned)cardformat_seconds());
+}
+
+// The result of a format that ended, shown once (also when the tab is built after it ended unseen). It restarts the
+// settings idle time, so the result stays up for the full 60 s.
+static void show_format_result(const cardformat_result_t *rp)
+{
+    const cardformat_result_t r = *rp;
+    forget_card(true); // the files and the free space are new
+    lv_display_trigger_activity(NULL);
+    if (r.err == ESP_OK) {
+        set_msgf(r.wifi == WIFI_SAVE_OK || r.wifi == WIFI_SAVE_NONE ? MSG_GOOD : MSG_BAD,
+                 "Formatted as FAT32 (%u KiB clusters) in %u s. %s", (unsigned)(r.cluster_bytes / 1024),
+                 (unsigned)r.seconds,
+                 r.wifi == WIFI_SAVE_OK     ? "The Wi-Fi settings in use were saved to wifi.txt."
+                 : r.wifi == WIFI_SAVE_NONE ? "No Wi-Fi network is set, so there is no wifi.txt."
+                                            : "Saving wifi.txt failed; save the network again on the Wi-Fi tab.");
+    } else if (r.reached == SDCARD_FORMAT_REFUSED) { // INVALID_STATE also when a share went ahead of the queued job
+        set_msg(MSG_BAD, r.err == ESP_ERR_NOT_FOUND       ? "Format failed: no card. Put one in and restart the board."
+                         : r.err == ESP_ERR_INVALID_STATE ? "Format failed: the card is shared over USB. Nothing was "
+                                                            "written."
+                         : r.err == ESP_ERR_INVALID_SIZE  ? "Format failed: the card is smaller than 512 MB. Nothing "
+                                                            "was written."
+                         : r.err == ESP_ERR_NO_MEM        ? "Format failed: not enough memory. Nothing was written."
+                                                          : "Format failed. Nothing was written.");
+    } else if (r.reached == SDCARD_FORMAT_UNTOUCHED) {
+        set_msgf(MSG_BAD, "Format failed while %s (%s), before anything was written. The card is as it was.",
+                 r.step ? r.step : "starting", esp_err_to_name(r.err));
+    } else if (r.reached == SDCARD_FORMAT_WRITTEN) {
+        set_msgf(MSG_BAD, "The card was formatted, but mounting it failed (%s). Restart the board; it may mount then.",
+                 esp_err_to_name(r.err));
+    } else {
+        set_msgf(MSG_BAD, "Format failed while %s (%s). The card has no file system now; format it again.",
+                 r.step ? r.step : "formatting", esp_err_to_name(r.err));
+    }
+}
+
 void tab_storage_tick(void)
 {
     if (!s_content) {
         return;
     }
+    cardformat_result_t r;
+    if (s_formatting && !cardformat_busy()) {
+        s_formatting = false;
+        if (cardformat_take_result(&r)) {
+            show_format_result(&r);
+        }
+    } else if (s_formatting) {
+        show_formatting();
+    }
     const sdcard_owner_t owner = sdcard_owner();
     if (owner != s_owner) { // the card changed hands: look again at once, and drop what was known
         s_owner = owner;
-        s_probe_wait = 0;
-        memset(&s_seen, 0, sizeof(s_seen));
-        s_space_known = false;
+        forget_card(false);
         disarm();
     }
-    if (owner == SDCARD_DEVICE) {
+    if (owner == SDCARD_DEVICE && !s_formatting) {
         if (s_probe_wait > 0) {
             s_probe_wait--;
         }
@@ -370,38 +467,39 @@ void tab_storage_tick(void)
     if (s_sharing && !usb_share_busy()) {
         share_ended();
     }
-    if (s_armed && ++s_armed_ticks >= ARMED_TICKS) {
+    if (s_armed != ARM_NONE && ++s_armed_ticks >= ARMED_TICKS) {
         disarm();
     }
     render();
 }
 
+// The first tap on a button arms it (disarming the other) and shows what the second will do; true on the second.
+static bool confirmed(arm_t which, const char *warning)
+{
+    if (s_armed == which && lv_tick_elaps(s_armed_at) < ARM_GUARD_MS) {
+        return false; // a double tap isn't a confirmation: the person hasn't had time to read
+    }
+    if (s_armed != which) {
+        s_armed = which;
+        s_armed_ticks = 0;
+        s_armed_at = lv_tick_get();
+        set_msg(MSG_INFO, warning);
+        refresh_buttons();
+        return false;
+    }
+    s_armed = ARM_NONE;
+    return true;
+}
+
 static void main_clicked(lv_event_t *e)
 {
     (void)e;
-    if (s_armed && lv_tick_elaps(s_armed_at) < ARM_GUARD_MS) {
-        return; // a double tap isn't a confirmation: the person hasn't had time to read
-    }
-    if (!s_armed) { // the first tap says what will happen, the second does it
-        s_armed = true;
-        s_armed_ticks = 0;
-        s_armed_at = lv_tick_get();
-        switch (sdcard_owner()) {
-        case SDCARD_DEVICE:
-            set_msg(MSG_INFO, SHARE_WARNING);
-            break;
-        case SDCARD_SHARED:
-            set_msg(MSG_INFO, EJECT_WARNING);
-            break;
-        default:
-            s_armed = false;
-            break;
-        }
-        refresh_buttons();
+    const sdcard_owner_t owner = sdcard_owner();
+    if ((owner != SDCARD_DEVICE && owner != SDCARD_SHARED) ||
+        !confirmed(ARM_SHARE, owner == SDCARD_SHARED ? EJECT_WARNING : SHARE_WARNING)) {
         return;
     }
-    s_armed = false;
-    if (sdcard_owner() == SDCARD_SHARED) {
+    if (owner == SDCARD_SHARED) {
         usb_stop_sharing(); // restarts the board
         return;
     }
@@ -413,6 +511,27 @@ static void main_clicked(lv_event_t *e)
         set_msg(MSG_BAD, "Busy. Try again in a moment.");
     } else {
         set_msgf(MSG_BAD, "The card can't be shared now (%s).", ui_status_text(STATUS_USB));
+    }
+    refresh_buttons();
+}
+
+static void format_clicked(lv_event_t *e)
+{
+    (void)e;
+    if (!confirmed(ARM_FORMAT, FORMAT_WARNING)) {
+        return;
+    }
+    const esp_err_t err = cardformat_start();
+    if (err == ESP_OK) {
+        s_formatting = true;
+        forget_card(true);
+        show_formatting();
+    } else if (err == ESP_ERR_NO_MEM) {
+        set_msg(MSG_BAD, "Busy. Try again in a moment.");
+    } else if (err == ESP_ERR_NOT_FOUND) {
+        set_msg(MSG_BAD, "No card. Put one in and restart the board.");
+    } else {
+        set_msg(MSG_BAD, "The card can't be formatted while it's shared over USB.");
     }
     refresh_buttons();
 }
@@ -451,11 +570,12 @@ void tab_storage_build(lv_obj_t *parent)
     memset(&s_seen, 0, sizeof(s_seen));
     memset(&s_space_seen, 0, sizeof(s_space_seen));
     s_space_known = false;
-    s_armed = s_sharing = false;
-    s_main_text = NULL;
+    s_armed = ARM_NONE;
+    s_main_text = s_format_text = NULL;
     s_owner = (sdcard_owner_t)-1; // the first tick sees a change and reads the card
     s_probe_wait = 0;
-    s_sharing = usb_share_busy(); // a share started before the tab was left and is still under way
+    s_sharing = usb_share_busy();     // a share started before the tab was left and is still under way
+    s_formatting = cardformat_busy(); // likewise a format
 
     int y = SETTINGS_PAD;
     for (row_t r = 0; r < ROW_COUNT; r++, y += LINE) {
@@ -470,7 +590,11 @@ void tab_storage_build(lv_obj_t *parent)
     }
     y += SETTINGS_PAD;
     s_main_btn = add_button("Share over USB", SETTINGS_PAD, y, SHARE_W, main_clicked, &s_main_label);
-    s_free_btn = add_button("Check free space", SETTINGS_PAD + SHARE_W + SETTINGS_PAD, y, FREE_W, free_clicked, NULL);
+    int x = SETTINGS_PAD + SHARE_W + SETTINGS_PAD;
+    s_free_btn = add_button("Check free space", x, y, FREE_W, free_clicked, NULL);
+    x += FREE_W + SETTINGS_PAD;
+    _Static_assert(SHARE_W + FREE_W + FORMAT_W + 4 * SETTINGS_PAD <= SETTINGS_CONTENT_W, "the three buttons fit a row");
+    s_format_btn = add_button("Format card", x, y, FORMAT_W, format_clicked, &s_format_label);
     y += BTN_H + SETTINGS_PAD;
 
     s_msg = lv_label_create(parent);
@@ -481,6 +605,12 @@ void tab_storage_build(lv_obj_t *parent)
     set_msg(MSG_INFO, atomic_load(&s_space_state) == JOB_RUNNING ? FREE_RUNNING : "");
     if (!usb_ready()) {
         set_msgf(MSG_BAD, "USB didn't start (%s), so the card can't be shared.", esp_err_to_name(usb_error()));
+    }
+    cardformat_result_t r;
+    if (s_formatting) {
+        show_formatting();
+    } else if (cardformat_take_result(&r)) { // a format ended while the tab was away, or settings was closed
+        show_format_result(&r);
     }
 
     // A probe that finished while the tab was away is older than this build; throw it away and read again.
@@ -493,10 +623,10 @@ void tab_storage_build(lv_obj_t *parent)
 void tab_storage_leave(void)
 {
     memset(s_rows, 0, sizeof(s_rows));
-    s_main_btn = s_main_label = s_free_btn = s_msg = NULL;
+    s_main_btn = s_main_label = s_free_btn = s_format_btn = s_format_label = s_msg = NULL;
     s_content = NULL;
-    if (s_armed) {
-        ESP_LOGI(TAG, "left with a share not confirmed");
+    if (s_armed != ARM_NONE) {
+        ESP_LOGI(TAG, "left with a %s not confirmed", s_armed == ARM_FORMAT ? "format" : "share");
     }
-    s_armed = false;
+    s_armed = ARM_NONE;
 }

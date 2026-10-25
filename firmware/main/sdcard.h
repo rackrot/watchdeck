@@ -23,7 +23,8 @@ typedef enum {
 typedef void (*sdcard_owner_cb_t)(sdcard_owner_t owner, const char *sd_text);
 
 /**
- * At boot, before anything reads the card: init the card, mount its first GPT partition read-write (never formats),
+ * At boot, before anything reads the card: init the card, mount its first GPT partition (or, with no GPT, the first
+ * FAT partition FatFs finds in the MBR) read-write (never formats; only sdcard_format does),
  * then cardfs_init, cardfs_set_writable(true) and cardfs_recover. A recovery that fails is logged, counted and left
  * for the next mount; one that taints cardfs gets one remount at once. A card cardfs can't write (not FAT32) stays
  * mounted read-only. Writes "SD: <size>", "SD: <size>, read-only (<why>)" or "SD: not mounted (<err>)" into msg.
@@ -74,6 +75,27 @@ esp_err_t sdcard_release_fs(void);
 
 /** The card is mapped to USB: SHARED until the next reboot. */
 void sdcard_set_shared(void);
+
+/**
+ * Format card: erase the whole card and make it one FAT32 partition (cardmkfs.h has the layout and the order), then
+ * mount it as at boot: cardfs_init (or cardfs_attach when it ran before), writes on, recovery. Works on a DEVICE card
+ * (cardfs is detached and the card unmounted first) and on a NO_CARD one that answered the init but didn't mount
+ * (no file system FatFs reads, such as exFAT, or a refused GPT). Blocks for the whole format, tens of seconds on a
+ * large card. On a failure *step names what failed and *reached how far it got:
+ *   REFUSED: nothing was touched. ESP_ERR_NOT_FOUND: no card answered at boot. ESP_ERR_INVALID_STATE: shared over USB.
+ *            ESP_ERR_INVALID_SIZE: under 512 MiB, or not 512-byte sectors. ESP_ERR_NO_MEM: no work buffer.
+ *   UNTOUCHED: unmounted, then nothing was written (no free FatFs drive, or the first write failed), so the card was
+ *            mounted again as at boot.
+ *   PARTIAL: the old tables are gone and no new MBR was written: NO_CARD, cardfs detached; format again.
+ *   WRITTEN: the format finished but the card didn't mount: NO_CARD, cardfs detached; a restart may mount it.
+ */
+typedef enum {
+    SDCARD_FORMAT_REFUSED,
+    SDCARD_FORMAT_UNTOUCHED,
+    SDCARD_FORMAT_PARTIAL,
+    SDCARD_FORMAT_WRITTEN,
+} sdcard_format_reached_t;
+esp_err_t sdcard_format(sdcard_format_reached_t *reached, const char **step);
 
 /**
  * Totals since boot of the read-back that checks every multi-block write (IDF 6.1 can report a failed one as

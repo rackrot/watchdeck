@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "cardformat.h"
 #include "display.h"
 #include "esp_log.h"
 #include "link.h"
@@ -116,19 +117,19 @@ static void page_gesture(lv_event_t *e)
 // viewer, and the Wi-Fi editor, which holds a half-typed password and may wait on a trial connect.
 static bool idle_blocked(void)
 {
-    return ui_licenses_open() || tab_wifi_editing();
+    return ui_licenses_open() || tab_wifi_editing() || cardformat_busy(); // a format's result must stay to be seen
 }
 
 static void page_tick(lv_timer_t *timer)
 {
     (void)timer;
+    // The tab's tick first, so a result it shows (a format's end restarts the idle time) counts before the close.
+    if (TABS[s_tab].tick) {
+        TABS[s_tab].tick();
+    }
     if (!idle_blocked() && lv_display_get_inactive_time(NULL) >= SETTINGS_IDLE_MS) {
         ESP_LOGI(TAG, "settings idle for %d s, closing", SETTINGS_IDLE_MS / 1000);
         ui_settings_close();
-        return;
-    }
-    if (TABS[s_tab].tick) {
-        TABS[s_tab].tick();
     }
 }
 

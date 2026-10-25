@@ -27,7 +27,7 @@ my-password
 You can edit the file without removing the card:
 
 1. Plug a USB-C cable into the board's **USB 2.0** port, which is not the serial port. Until you share the card, the computer sees an empty card reader, because the board keeps the card for itself.
-2. On the board, open Settings > Storage and tap Share over USB, then tap it again to confirm. The card shows up as a USB drive with a `tf-data` partition. While it's shared, the board can't save anything to the card.
+2. On the board, open Settings > Storage and tap Share over USB, then tap it again to confirm. The card shows up as a USB drive: a `tf-data` partition as the card ships, or one with no name after the board has formatted it. While it's shared, the board can't save anything to the card.
 3. Edit `wifi.txt`, then eject the drive on the computer.
 4. Tap Stop sharing, then I ejected it, restart, or press reset. The board restarts (about 8 seconds, and it stays paired), takes the card back and reads the new file.
 
@@ -35,12 +35,13 @@ Always eject before unplugging or stopping. The board acknowledges a USB write b
 
 ## The card
 
-The board writes to the card only to save `wifi.txt` and the files in its own `watchdeck` folder. It never formats the card. Each save is recoverable: if the power goes off in the middle, the board finishes or undoes the save the next time it starts, so `wifi.txt` holds either the old or the new settings.
+The board writes to the card only to save `wifi.txt` and the files in its own `watchdeck` folder, and formats it only when you ask. Each save is recoverable: if the power goes off in the middle, the board finishes or undoes the save the next time it starts, so `wifi.txt` holds either the old or the new settings.
 
 - If the power went off while the board was saving `wifi.txt`, let it start once with the card in before you edit the file on a computer. Otherwise the save it finishes at that start replaces your edit.
 - The board never makes a folder bigger. On about 1 card in 16, creating the `watchdeck` folder needs room the card's top level doesn't have yet, and the board reports the card folder as full. Create a `watchdeck` folder at the top of the card on a computer, or add or delete one file there.
 - FAT32 has no journal, so a power cut at the wrong moment can, rarely, damage the file system. If the board reports a card error, check the card on a computer (`fsck.vfat` on Linux, `chkdsk` on Windows). Keep nothing on the card you can't replace.
-- A card that isn't FAT32 works read-only: the board reads `wifi.txt` but can't save to it.
+- A card that isn't FAT32 works read-only: the board reads `wifi.txt` but can't save to it. An exFAT card, as most cards of 64 GB and more ship, doesn't mount at all.
+- Settings > Storage > Format card is a quick format: it replaces the partition table, erases the file system and every file on it, and makes the card one FAT32 partition the board can write (cards of 512 MB to 2 TB). It doesn't overwrite the old data, so recovery tools can still read it until new files overwrite it. Don't rely on it to wipe a card you give away. Tap it, read the warning, and tap it again. A large card can take a minute or so; the tab counts the seconds. The board then saves the Wi-Fi network it's using back to `wifi.txt`; the sleep screen files are erased. Copy anything you want to keep off the card first. If the power goes off during a format, the card may be left unreadable: format it again.
 
 ## Option 2: compiled-in credentials
 

@@ -1,5 +1,6 @@
 #include "wifi.h"
 
+#include <assert.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -602,6 +603,31 @@ static void save_current_job(void *arg)
         s_file_state = WIFI_FILE_FOUND;
     }
     job_done(true, WF_NONE, save, ESP_OK);
+}
+
+wifi_save_t wifi_save_current(void)
+{
+    assert(svc_on_task());
+    if (!s_ready) {
+        return WIFI_SAVE_NONE;
+    }
+    char ssid[WIFI_SSID_LEN], pass[WIFITXT_PASS_MAX + 1];
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    memcpy(ssid, s_cur_ssid, sizeof(ssid));
+    memcpy(pass, s_cur_pass, sizeof(pass));
+    xSemaphoreGive(s_lock);
+    wifi_save_t save = WIFI_SAVE_NONE;
+    if (ssid[0] != '\0') {
+        save = write_wifi_txt(ssid, pass);
+    }
+    memset(pass, 0, sizeof(pass));
+    if (save == WIFI_SAVE_OK) {
+        snapshot_network(ssid, "sd");
+        s_file_state = WIFI_FILE_FOUND;
+    } else if (save == WIFI_SAVE_NONE) {
+        s_file_state = WIFI_FILE_ABSENT; // the format erased it
+    }
+    return save;
 }
 
 static void save_only_job(void *arg)

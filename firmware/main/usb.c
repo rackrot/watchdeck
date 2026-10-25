@@ -3,6 +3,7 @@
 #include <stdatomic.h>
 #include <stdio.h>
 
+#include "cardformat.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -158,7 +159,7 @@ esp_err_t usb_share(void)
 {
     // Without the driver usb_start installed, the storage call would install esp_tinyusb's default one, with its
     // mounting on.
-    if (!s_ready || sdcard_owner() != SDCARD_DEVICE || usb_share_busy()) {
+    if (!s_ready || sdcard_owner() != SDCARD_DEVICE || usb_share_busy() || cardformat_busy()) {
         return ESP_ERR_INVALID_STATE;
     }
     atomic_store_explicit(&s_share_queued, true, memory_order_relaxed);

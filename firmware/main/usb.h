@@ -16,10 +16,10 @@ esp_err_t usb_start(usb_status_cb_t status_cb);
 
 /**
  * Queue the share on svc: it waits for any card write to finish, turns cardfs writes off, unmounts the card and maps
- * the whole raw card (GPT disk) to USB, never formatting it. If mapping fails the card is mounted again.
- * ESP_ERR_INVALID_STATE: USB isn't up, the card isn't the device's, or a share is already queued. ESP_ERR_NO_MEM:
- * svc is busy. Caveat (upstream esp_tinyusb): host writes are acked before they reach the card, and a failed card
- * write is only logged, so the host never sees it. The host ejects before unplugging.
+ * the whole raw card (its GPT or MBR included) to USB, never formatting it. If mapping fails the card is mounted again.
+ * ESP_ERR_INVALID_STATE: USB isn't up, the card isn't the device's, or a share or a format is already queued.
+ * ESP_ERR_NO_MEM: svc is busy. Caveat (upstream esp_tinyusb): host writes are acked before they reach the card, and a
+ * failed card write is only logged, so the host never sees it. The host ejects before unplugging.
  */
 esp_err_t usb_share(void);
 
