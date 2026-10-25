@@ -14,16 +14,29 @@ FAT32 only: IDF hardcodes `FF_FS_EXFAT 0` and cardfs is FAT32-only, so exFAT is 
 - Write order: zero the GPTs, run `f_mkfs`, check the latched write error and the backup sectors, then write the MBR last.
 - After a good format the board writes `wifi.txt` back from the network in use.
 - Reviewed; all six minor findings fixed apart from the hook below. Main passes: `fw:build`, 286 unit tests, 35 FatFs tests (fsck clean on 128 GiB, 8 GiB and GPT images, cut at every write), lint.
-- **Open: the hook tightening** (review finding 6). The permission system blocked the agent's edit to `.pre-commit-config.yaml`, so it needs the user's OK:
-  - change `no-card-format`'s entry to `'\bf_mkfs\b'`, keeping the `cardmkfs.c` exclude;
-  - add a pygrep `'\bcardmkfs_run\b'` hook excluding `^firmware/main/(sdcard\.c|cardmkfs\.[ch])$`;
-  - add a pygrep `'\bsdcard_format\b'` hook excluding `^firmware/main/(cardformat\.c|sdcard\.[ch])$`;
-  - both new hooks with `files: ^firmware/main/.*\.(c|h)$`.
-- On the board (each flash needs the user's yes):
-  1. Format the real card.
-  2. Share it, then on the PC run `lsblk -o NAME,FSTYPE,SIZE,PARTTYPE` and `fsck.vfat -n /dev/sdX1`.
-  3. Stop sharing, then check that the board remounts read-write and Wi-Fi comes back.
-  4. Record the format time and the `stack bytes free` svc figure.
+- The hook tightening is applied (`87cfcaf`) and proven on a planted file.
+- **On the board (2026-10-24, main at `87cfcaf` flashed):**
+  - The user formatted the real 128 GB card from Settings > Storage: FAT32, 32 KiB clusters, 29 s.
+  - After a reboot: `FAT32 volume at card lba 8192`, mounted read-write, Wi-Fi joined from `wifi.txt` (source: sd).
+  - The serial log of the format itself was lost (the capture script buffered; it's fixed now). Its step timings may still be on Settings > Logs.
+  - Not done yet: the PC-side `lsblk` and `fsck.vfat -n` check, blocked by the bug below.
+
+## Blocker: Share over USB doesn't enumerate (first run of Share on hardware)
+
+- The board logs `card shared over USB` and `USB: sharing the card (no computer)`. TinyUSB installed on port 1 at boot (HS config, `CONFIG_TINYUSB_MODE_DMA=y`, esp_tinyusb ^2.0.0).
+- The PC kernel (J16 on usb 3-2) sees a **high-speed** device, then:
+  - 22:21: `Device not responding to setup address`, `device not accepting address N, error -71`
+  - 22:22: `device descriptor read/64, error -110`
+- So the wiring and PHY are fine, and the device stack doesn't answer control transfers.
+- Suspects, untested:
+  - DMA mode with buffers the OTG DMA can't reach (PSRAM or cache alignment); try `CONFIG_TINYUSB_MODE_SLAVE`.
+  - The TinyUSB task starved or not running.
+  - Something about installing with no storage mapped.
+  - A full-speed-only test.
+- Next session: the user brings a second data cable, so both the CH340 (log) and J16 (MSC) plug into the PC.
+  1. Capture the log with `scratchpad/bootlog.py` (now streams and reopens), or rewrite it. Raise `CONFIG_TINYUSB_DEBUG_LEVEL`.
+  2. Read `journalctl -k`.
+  3. Then the PC check above, and Stop sharing.
 
 ## Waiting on the user
 
