@@ -1331,6 +1331,8 @@ void app_main(void)
     RUN_TEST(test_format_128_gib_exfat_card);
     RUN_TEST(test_format_8_gib_blank_card);
     RUN_TEST(test_format_gpt_card);
+    RUN_TEST(test_format_fsinfo_write_error_fails_with_no_mbr);
+    RUN_TEST(test_format_first_write_error_writes_nothing);
     RUN_TEST(test_format_cut_at_every_write);
     // Returning from app_main does not end a linux-target process, so the failure count becomes the exit status.
     exit(UNITY_END());

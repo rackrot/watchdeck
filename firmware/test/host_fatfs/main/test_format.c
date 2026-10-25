@@ -138,12 +138,40 @@ static DRESULT win_read(unsigned char pdrv, unsigned char *buf, uint32_t sector,
     return s_back->read(0, buf, s_win_first + sector, count);
 }
 
+// What the format may write: LBA 0 to 33, the last 33 sectors and the partition window. Every write cardmkfs_run makes
+// goes through win_write or io_write, which count any other one in s_stray while s_guard is set.
+static bool s_guard;
+static uint32_t s_stray;
+static esp_err_t s_win_err;                               // the first error win_write returned since io_window
+static uint32_t s_fail_win[2] = {UINT32_MAX, UINT32_MAX}; // window sectors whose writes fail
+static bool s_fail_lba0;                                  // io_write fails at LBA 0
+
+static void note_write(uint32_t lba, UINT count)
+{
+    if (s_guard && lba < CARDMKFS_PART_LBA && lba + count > CARDMKFS_HEAD_SECTORS) {
+        s_stray++;
+    }
+}
+
 static DRESULT win_write(unsigned char pdrv, const unsigned char *buf, uint32_t sector, UINT count)
 {
     if (sector >= s_win_sectors || count > s_win_sectors - sector) {
         return RES_PARERR; // never outside the window
     }
-    return s_back->write(0, buf, s_win_first + sector, count);
+    note_write(s_win_first + sector, count);
+    DRESULT res = RES_OK;
+    for (size_t i = 0; i < 2; i++) {
+        if (s_fail_win[i] >= sector && s_fail_win[i] - sector < count) {
+            res = RES_ERROR; // as a card write error: nothing lands
+        }
+    }
+    if (res == RES_OK) {
+        res = s_back->write(0, buf, s_win_first + sector, count);
+    }
+    if (res != RES_OK && s_win_err == ESP_OK) {
+        s_win_err = ESP_FAIL; // as sdcard.c's part_disk_write latches it
+    }
+    return res;
 }
 
 // As sdcard.c's part_disk_ioctl: no GET_BLOCK_SIZE and no CTRL_TRIM.
@@ -169,6 +197,10 @@ static const ff_diskio_impl_t s_win_impl = {
 static esp_err_t io_write(uint32_t lba, const uint8_t *buf, void *ctx)
 {
     TEST_ASSERT_TRUE(lba < s_back_sectors);
+    if (s_fail_lba0 && lba == 0) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    note_write(lba, 1);
     return s_back->write(0, buf, lba, 1) == RES_OK ? ESP_OK : ESP_FAIL;
 }
 
@@ -182,9 +214,16 @@ static void io_window(uint32_t first, uint32_t sectors, void *ctx)
 {
     s_win_first = first;
     s_win_sectors = sectors;
+    s_win_err = ESP_OK;
 }
 
-static const cardmkfs_io_t s_io = {.write = io_write, .read = io_read, .set_window = io_window};
+static esp_err_t io_write_error(void *ctx)
+{
+    return s_win_err;
+}
+
+static const cardmkfs_io_t s_io = {
+    .write = io_write, .read = io_read, .set_window = io_window, .write_error = io_write_error};
 
 // The second FatFs drive and its VFS path, once.
 static void use_disk(const ff_diskio_impl_t *back, uint32_t sectors)
@@ -361,16 +400,50 @@ static void check_with_tools(const char *name)
     TEST_ASSERT_EQUAL_MESSAGE(0, run_tool(cmd), "fsck.vfat found a problem");
 }
 
+// A hash of the gap between the head tables and the partition, LBA 34 to 8191, which the format must not write.
+static uint64_t gap_hash(void)
+{
+    uint64_t h = 1469598103934665603ull;
+    uint8_t s[SS];
+    for (uint32_t lba = CARDMKFS_HEAD_SECTORS; lba < CARDMKFS_PART_LBA; lba++) {
+        read_sector(lba, s);
+        for (size_t i = 0; i < SS; i++) {
+            h = (h ^ s[i]) * 1099511628211ull;
+        }
+    }
+    return h;
+}
+
+// Fills LBA 34 to end - 1 with a pattern, so a stray zeroing write there would show in the gap's hash.
+static void poison_gap(uint32_t end)
+{
+    uint8_t s[SS];
+    for (uint32_t lba = CARDMKFS_HEAD_SECTORS; lba < end; lba++) {
+        memset(s, 0xA5, sizeof(s));
+        put_le32(s, lba);
+        write_sector(lba, s);
+    }
+}
+
 // The format as the board runs it, then the checks every image gets: the tables, the volume where the next boot finds
-// it, the pinned FAT32 geometry, and cardfs writing to it.
-static void format_and_check(uint32_t cluster_bytes, uint32_t n_fatent)
+// it, the pinned FAT32 geometry, and cardfs writing to it. The only sectors the format may change are LBA 0 to 33, the
+// last 33 and the partition from LBA 8192; the gap from 34 to 8191 (poisoned up to poison_end, and on the GPT image
+// holding the old volume from 2048) must read the same after it, and no write may be aimed there.
+static void format_and_check(uint32_t cluster_bytes, uint32_t n_fatent, uint32_t poison_end)
 {
     const uint32_t cap = s_back_sectors;
     cardmkfs_step_t step;
     int fresult;
-    TEST_ASSERT_EQUAL_HEX(ESP_OK,
-                          cardmkfs_run(&s_io, s_drive, cap, 0x77617463, s_work, sizeof(s_work), &step, &fresult));
+    poison_gap(poison_end);
+    const uint64_t gap_before = gap_hash();
+    s_guard = true;
+    s_stray = 0;
+    const esp_err_t err = cardmkfs_run(&s_io, s_drive, cap, 0x77617463, s_work, sizeof(s_work), &step, &fresult);
+    s_guard = false;
+    TEST_ASSERT_EQUAL_HEX(ESP_OK, err);
     TEST_ASSERT_EQUAL(CARDMKFS_STEP_DONE, step);
+    TEST_ASSERT_EQUAL_UINT32(0, s_stray);
+    TEST_ASSERT_TRUE_MESSAGE(gap_before == gap_hash(), "the format changed a sector between LBA 34 and the partition");
 
     uint8_t s[SS], want[SS];
     cardmkfs_layout_t layout;
@@ -474,7 +547,7 @@ void test_format_layout_by_card_size(void)
     int fresult;
     TEST_ASSERT_EQUAL_HEX(ESP_ERR_INVALID_SIZE, cardmkfs_run(&s_io, s_drive, CARDMKFS_MIN_SECTORS - 1, 0, s_work,
                                                              sizeof(s_work), &step, &fresult));
-    TEST_ASSERT_EQUAL(CARDMKFS_STEP_LAYOUT, step);
+    TEST_ASSERT_EQUAL(CARDMKFS_STEP_START, step);
     TEST_ASSERT_EQUAL(0, ramdisk_writes());
 }
 
@@ -506,7 +579,7 @@ void test_format_128_gib_exfat_card(void)
 
     // n_fatent from f_mkfs's FAT32 arithmetic (ff.c 6401-6443) worked by hand: 4193024 clusters, 2 FATs of 32768
     // sectors, 8192 reserved.
-    format_and_check(32768, 4193026);
+    format_and_check(32768, 4193026, CARDMKFS_PART_LBA);
     img_close();
     check_with_tools("128g");
     img_remove("128g");
@@ -517,7 +590,7 @@ void test_format_8_gib_blank_card(void)
     const uint32_t cap = 8 * GIB_SECTORS;
     img_open("8g", cap);
     use_disk(&s_img_impl, cap);
-    format_and_check(4096, 2091010); // FATs of 16377 sectors, 8206 reserved
+    format_and_check(4096, 2091010, CARDMKFS_PART_LBA); // FATs of 16377 sectors, 8206 reserved
     img_close();
     check_with_tools("8g");
     img_remove("8g");
@@ -531,10 +604,74 @@ void test_format_gpt_card(void)
     img_open("16g-gpt", cap);
     use_disk(&s_img_impl, cap);
     old_gpt_volume(SHIPPED_PART_LBA);
-    format_and_check(8192, 2094082); // FATs of 16381 sectors, 8198 reserved
+    format_and_check(8192, 2094082, SHIPPED_PART_LBA); // FATs of 16381 sectors, 8198 reserved; the old volume kept
     img_close();
     check_with_tools("16g-gpt");
     img_remove("16g-gpt");
+}
+
+// f_mkfs ignores the results of its backup boot sector and FSINFO writes (window sectors 6, 7 and 1). One failed FSINFO
+// write must fail the format before the MBR. So must both: over an old FAT32 volume in the same place, whose two FSINFO
+// copies match, the sector compare alone can't tell, and only the write error the window diskio latched does.
+void test_format_fsinfo_write_error_fails_with_no_mbr(void)
+{
+    const uint32_t cap = CARDMKFS_MIN_SECTORS;
+    static const uint32_t FAILS[][2] = {{1, UINT32_MAX}, {1, 7}};
+    for (size_t t = 0; t < 2; t++) {
+        ramdisk_create(cap, 0xbad);
+        use_disk(&ramdisk_impl, cap);
+        io_window(CARDMKFS_PART_LBA, cap - CARDMKFS_PART_LBA, NULL);
+        const MKFS_PARM old = {.fmt = FM_FAT32 | FM_SFD, .n_fat = 2, .au_size = 4096};
+        TEST_ASSERT_EQUAL(FR_OK, f_mkfs(s_drive, &old, s_work, sizeof(s_work))); // FSINFO at 8193 and 8199 alike
+        uint8_t a[SS], b[SS];
+        read_sector(CARDMKFS_PART_LBA + 1, a);
+        read_sector(CARDMKFS_PART_LBA + 7, b);
+        TEST_ASSERT_EQUAL_HEX8_ARRAY(a, b, SS);
+
+        s_fail_win[0] = FAILS[t][0];
+        s_fail_win[1] = FAILS[t][1];
+        cardmkfs_step_t step;
+        int fresult;
+        const esp_err_t err = cardmkfs_run(&s_io, s_drive, cap, 1, s_work, sizeof(s_work), &step, &fresult);
+        s_fail_win[0] = s_fail_win[1] = UINT32_MAX;
+        TEST_ASSERT_NOT_EQUAL(ESP_OK, err);
+        TEST_ASSERT_EQUAL(CARDMKFS_STEP_CHECK, step);
+        TEST_ASSERT_EQUAL(FR_OK, fresult); // f_mkfs itself said it worked
+        static const uint8_t ZERO[SS];
+        read_sector(0, a);
+        TEST_ASSERT_EQUAL_HEX8_ARRAY(ZERO, a, SS); // no MBR
+        if (t == 1) {
+            read_sector(CARDMKFS_PART_LBA + 1, a);
+            read_sector(CARDMKFS_PART_LBA + 7, b);
+            TEST_ASSERT_EQUAL_HEX8_ARRAY(a, b, SS); // the old copies, still alike: the compare would have passed
+        }
+        TEST_ASSERT_FALSE(boot_window());
+        TEST_ASSERT_EQUAL(FR_NO_FILESYSTEM, mount_fmt());
+        unmount_fmt();
+    }
+}
+
+// A failed first write (LBA 0) leaves the card as it was, and cardmkfs_run says so (CARDMKFS_STEP_START), so the
+// board mounts the old volume again instead of leaving NO_CARD.
+void test_format_first_write_error_writes_nothing(void)
+{
+    const uint32_t cap = CARDMKFS_MIN_SECTORS;
+    ramdisk_create(cap, 0xfee1);
+    use_disk(&ramdisk_impl, cap);
+    old_gpt_volume(SHIPPED_PART_LBA);
+    ramdisk_reset_count();
+    s_fail_lba0 = true;
+    cardmkfs_step_t step;
+    int fresult;
+    const esp_err_t err = cardmkfs_run(&s_io, s_drive, cap, 1, s_work, sizeof(s_work), &step, &fresult);
+    s_fail_lba0 = false;
+    TEST_ASSERT_EQUAL_HEX(ESP_ERR_INVALID_RESPONSE, err);
+    TEST_ASSERT_EQUAL(CARDMKFS_STEP_START, step);
+    TEST_ASSERT_EQUAL(0, ramdisk_writes());
+    TEST_ASSERT_TRUE(boot_window());
+    TEST_ASSERT_EQUAL(FR_OK, mount_fmt());
+    TEST_ASSERT_TRUE(file_is("old.txt", "the card's old contents"));
+    unmount_fmt();
 }
 
 // A cut at any write of the format: the next boot finds the old volume whole (the format hadn't reached the GPT
