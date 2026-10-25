@@ -68,9 +68,25 @@ repos:
       - id: no-card-format
         name: f_mkfs only in cardmkfs.c
         language: pygrep
-        entry: '\bf_mkfs\s*\('
+        # The bare name, so a function pointer or alias counts too.
+        entry: '\bf_mkfs\b'
         files: ^firmware/main/.*\.(c|h)$
         exclude: ^firmware/main/cardmkfs\.c$
+
+      # The format runs only from the Format card job: cardformat.c calls sdcard_format, which calls cardmkfs_run.
+      - id: format-callers-cardmkfs-run
+        name: cardmkfs_run only from sdcard.c
+        language: pygrep
+        entry: '\bcardmkfs_run\b'
+        files: ^firmware/main/.*\.(c|h)$
+        exclude: ^firmware/main/(sdcard\.c|cardmkfs\.[ch])$
+
+      - id: format-callers-sdcard-format
+        name: sdcard_format only from cardformat.c
+        language: pygrep
+        entry: '\bsdcard_format\b'
+        files: ^firmware/main/.*\.(c|h)$
+        exclude: ^firmware/main/(cardformat\.c|sdcard\.[ch])$
 
       - id: no-tinyusb-app-mount
         name: no esp_tinyusb app mount or VFS format
