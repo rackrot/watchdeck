@@ -1,6 +1,6 @@
 # Battery level: the bar, Settings > Status, and the app
 
-Status: built 2026-11-01 (slices B0 to B8) on `main`; planned against `a1cd882`. C1, C5 and C6 passed on the board; C2, C3 and C4/C4b are still open (see [Results](#results)). Open question Q2 waits on C2. One second-opinion pass is folded in (see the [Critique log](#critique-log)).
+Status: built 2026-11-01 (slices B0 to B8) on `main`; planned against `a1cd882`. C1, C5 and C6 passed on the board; C4 passed; C2 was skipped by choice; C3 is running and C4b was not run (see [Results](#results)). One second-opinion pass is folded in (see the [Critique log](#critique-log)).
 
 The user put a LiPo in the CrowPanel. The ESP32-P4 has no battery line. An STC8H1K08 helper MCU reads VBAT and the TP4059 charger's CHRG and STDBY pins, and answers as an I2C slave at 0x2F on the touch bus. `site/src/device-spec.md` "Battery monitoring" has the probe results. After this plan:
 
@@ -372,7 +372,7 @@ A failure is diagnosed before anything is rerun. It may be a firmware defect, th
 Decided by the user on 2026-11-01:
 
 - **Q1. Bar spacing with five groups.** Decided: the clock drops to `HH:MM`, 24 h, with no weekday and no date. B4 changes the clock format and its worst-case measurement in `bar_create`; C5 still judges the spacing on the panel.
-- **Q2. No battery attached, on USB.** Open until C2. If the registers can't be told from a full battery, the bar shows full and the docs say so.
+- **Q2. No battery attached, on USB.** Decided without C2 (the user chose not to test it): no `BAT_NONE` rule; the board shows what the STC8 reports, which may look like a charging or full battery.
 - **Q3. The percent while charging.** Decided: shown as the STC8 reports it.
 - **Q4. Low-battery behavior.** Decided: display only.
 - **Q5. B0.** Decided: included.
@@ -386,9 +386,10 @@ Built as planned. Recorded by B8 from the code and the user's board checks.
 - **C1 passed.** The boot read took about 1.9 ms. Unplugging and replugging USB logged `charging -> discharging` and back, with no reset.
 - **C5 and C6 passed.** The user saw the bar slot with the `HH:MM` clock and judged the spacing fine. The Devices tab shows the percent, the voltage and the charge state, and switches to discharging on unplug.
 - **Still open.**
-  - **C2:** no battery on USB power. A4 and Q2 wait on it; until then the firmware never reports `none`.
+  - **C2:** not run, and the user chose not to run it (2026-11-01). What the STC8 reports with no battery on USB is unknown; the board shows whatever it reports, and `batfmt_decode` never gives `BAT_NONE`.
   - **C3:** charge to full overnight. The status byte at full (A3's 0x02) is untested, and so is the soak.
-  - **C4 and C4b:** an absent or lost STC8. The code paths exist (`battery_start`, the 3-failure backoff) but were not run on the board.
+  - **C4 (2026-11-01), passed:** a local build at 0x2E logged one info line, `battery: no monitor at 0x2E (ESP_ERR_INVALID_RESPONSE)`, added no E lines, laid the bar out as four groups (`net 663/216 clock 952/60, gap 73`), sent no `battery` frame, and connected normally.
+  - **C4b:** the lost path (an STC8 that stops answering mid-run) wasn't run; the backoff is checked by code review only.
 
 ### Measured on the board
 
