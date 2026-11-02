@@ -1,8 +1,9 @@
 #pragma once
 
 /*
- * The sleep screen's configuration and layout math, pure so the host tests cover it. The screen is a 1024 x 512 image
- * area with the elements in a column at an anchor, and an 88 px strip below it for the spinner and the link status.
+ * The sleep screen's configuration and layout math, pure so the host tests cover it. The screen is 1024 x 600. The
+ * 1024 x 512 image area at the top holds the picture (today the mark); the link status (a spinner over its text) sits
+ * under the mark, and the elements are a column at an anchor, the bottom anchors measured from the screen's bottom.
  */
 
 #include <stdbool.h>
@@ -10,8 +11,8 @@
 
 #define SLEEP_AREA_W 1024
 #define SLEEP_AREA_H 512
-#define SLEEP_STRIP_H 88
-#define SLEEP_MARGIN 32 // from the area's edges to the element column
+#define SLEEP_SCREEN_H 600
+#define SLEEP_MARGIN 32 // from the screen's edges to the element column
 #define SLEEP_TEXT_MAX 65
 
 typedef enum {
@@ -59,16 +60,40 @@ typedef struct {
 
 typedef struct {
     bool shown;
-    int x, y, w, h; // inside the image area
+    int x, y, w, h; // on the screen
 } sleep_el_pos_t;
 
 /**
- * Where each element goes. `heights` are the fonts' line heights. The column is SLEEP_MARGIN from the area's edges
- * (centered vertically for the center anchor), every element is as wide as the column, and the elements stack with no
- * gap. An element whose data is missing, or that `cfg` hides, is not shown and takes no room.
+ * Where each element goes. `heights` are the fonts' line heights. The column is SLEEP_MARGIN from the screen's edges
+ * (the bottom anchors from SLEEP_SCREEN_H; the center anchor is centered in the image area), every element is as wide
+ * as the column, and the elements stack with no gap. An element whose data is missing, or that `cfg` hides, is not
+ * shown and takes no room.
  */
 void sleepcfg_layout(const sleep_cfg_t *cfg, sleep_have_t have, const int heights[SLEEP_EL_COUNT],
                      sleep_el_pos_t out[SLEEP_EL_COUNT]);
+
+/*
+ * The link status stack: a spinner slot, then the status text, centered under the mark. The slot is the same height
+ * for every spinner kind (including none) so the text never moves when the kind changes.
+ */
+#define SLEEP_STACK_GAP 16    // from the mark's bottom to the spinner slot
+#define SLEEP_SPINNER_SLOT 48 // the slot's height; the spinner is centered in it
+#define SLEEP_STATUS_GAP 8    // from the slot to the status text
+/*
+ * The status text's width, centered on the screen and ending in dots. The bottom corners hold the clock and the date
+ * (a date in Montserrat 32 is about 190 px), and a bottom-right column ends 32 px from the edge; (1024 - 480) / 2 = 272
+ * leaves each corner 240 px beyond its margin, so a status text can't run into either column.
+ */
+#define SLEEP_STATUS_W 480
+
+typedef struct {
+    int logo_x, logo_y;               // the mark, centered in the image area
+    int spinner_y;                    // top of the spinner slot
+    int status_x, status_y, status_w; // the status text's box
+} sleep_stack_t;
+
+/** Where the mark and the link status go, from the mark's size. The text is centered, so its x is the box's. */
+sleep_stack_t sleepcfg_stack(int logo_w, int logo_h);
 
 /** How the text sits in its element: -1 left, 0 centered, 1 right. */
 int sleepcfg_text_align(sleep_anchor_t anchor);

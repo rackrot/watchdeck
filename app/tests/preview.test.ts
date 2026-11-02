@@ -18,9 +18,15 @@ import {
   SLEEP_AREA_H,
   SLEEP_AREA_W,
   SLEEP_HEIGHTS,
+  SLEEP_LOGO_PX,
   SLEEP_MARGIN,
-  SLEEP_STRIP_H,
+  SLEEP_SCREEN_H,
+  SLEEP_SPINNER_SLOT,
+  SLEEP_STACK_GAP,
+  SLEEP_STATUS_GAP,
+  SLEEP_STATUS_W,
   sleepLayout,
+  sleepStack,
   sleepTextAlign,
 } from "../src/preview.ts";
 
@@ -32,8 +38,8 @@ test("the sleep preview's positions match test_sleepcfg.c for each anchor", () =
   const cases: [string, number][] = [
     ["top_left", SLEEP_MARGIN],
     ["top_right", SLEEP_MARGIN],
-    ["bottom_left", SLEEP_AREA_H - SLEEP_MARGIN - colH],
-    ["bottom_right", SLEEP_AREA_H - SLEEP_MARGIN - colH],
+    ["bottom_left", SLEEP_SCREEN_H - SLEEP_MARGIN - colH],
+    ["bottom_right", SLEEP_SCREEN_H - SLEEP_MARGIN - colH],
     ["center", (SLEEP_AREA_H - colH) / 2],
   ];
   for (const [anchor, firstY] of cases) {
@@ -52,7 +58,7 @@ test("the sleep preview's positions match test_sleepcfg.c for each anchor", () =
       );
       y += heights[i];
     });
-    assert.ok(y <= SLEEP_AREA_H - SLEEP_MARGIN, anchor);
+    assert.ok(y <= SLEEP_SCREEN_H - SLEEP_MARGIN, anchor);
   }
 });
 
@@ -65,10 +71,29 @@ test("the sleep preview's constants are the firmware's", () => {
     Number(header.match(new RegExp(`#define ${name} (\\d+)`))?.[1]);
   assert.equal(define("SLEEP_AREA_W"), SLEEP_AREA_W);
   assert.equal(define("SLEEP_AREA_H"), SLEEP_AREA_H);
-  assert.equal(define("SLEEP_STRIP_H"), SLEEP_STRIP_H);
+  assert.equal(define("SLEEP_SCREEN_H"), SLEEP_SCREEN_H);
+  assert.equal(define("SLEEP_STACK_GAP"), SLEEP_STACK_GAP);
+  assert.equal(define("SLEEP_SPINNER_SLOT"), SLEEP_SPINNER_SLOT);
+  assert.equal(define("SLEEP_STATUS_GAP"), SLEEP_STATUS_GAP);
+  assert.equal(define("SLEEP_STATUS_W"), SLEEP_STATUS_W);
   assert.equal(define("SLEEP_MARGIN"), SLEEP_MARGIN);
   // montserrat.ts has no 48 table, so only the 32 line height can be compared.
   assert.equal(SLEEP_HEIGHTS[1], MONTSERRAT_32.lineHeight);
+});
+
+// test_sleepcfg_stack_* in test_sleepcfg.c, same numbers for the 240 px mark.
+test("the status stack hangs under the mark and clears the corner columns", () => {
+  const st = sleepStack(SLEEP_LOGO_PX);
+  assert.deepEqual(st, {
+    logoX: 392,
+    logoY: 136,
+    spinnerY: 392,
+    statusX: 272,
+    statusY: 448,
+    statusW: 480,
+  });
+  // A corner column's text can be as wide as 240 px before it reaches the status box.
+  assert.ok(st.statusX - SLEEP_MARGIN >= 240);
 });
 
 test("the sleep preview hides what is not shown and gives it no room, and aligns text by anchor", () => {
@@ -80,8 +105,8 @@ test("the sleep preview hides what is not shown and gives it no room, and aligns
   );
   assert.equal(boxes[0], null);
   assert.equal(boxes[2], null);
-  assert.equal(boxes[3]?.y, SLEEP_AREA_H - SLEEP_MARGIN - 37);
-  assert.equal(boxes[1]?.y, SLEEP_AREA_H - SLEEP_MARGIN - 2 * 37);
+  assert.equal(boxes[3]?.y, SLEEP_SCREEN_H - SLEEP_MARGIN - 37);
+  assert.equal(boxes[1]?.y, SLEEP_SCREEN_H - SLEEP_MARGIN - 2 * 37);
   assert.deepEqual(
     ["top_left", "bottom_left", "top_right", "bottom_right", "center"].map(
       sleepTextAlign,

@@ -10,9 +10,12 @@ import {
   SLEEP_AREA_H,
   SLEEP_AREA_W,
   SLEEP_ELEMENTS,
-  SLEEP_STRIP_H,
+  SLEEP_LOGO_PX,
+  SLEEP_SCREEN_H,
+  SLEEP_SPINNER_SLOT,
   type SleepElement,
   sleepLayout,
+  sleepStack,
   sleepTextAlign,
 } from "./preview";
 
@@ -49,8 +52,7 @@ const PAD: (string | null)[] = [
   "bottom_right",
 ];
 
-/** The mark's size on the board (`wd_logo`, 240 px), and the spinner's (the bar is twice as wide). */
-const LOGO_PX = 240;
+/** The spinner's size on the board (the bar is twice as wide). */
 const SPINNER_PX = 48;
 
 const SPINNERS = ["arc", "dots", "bar", "pulse", "none"] as const;
@@ -140,7 +142,7 @@ function Spinner({
   );
 }
 
-/** The whole screen at the panel's pixels, scaled to fit, with the strip marked "while offline". */
+/** The whole screen at the panel's pixels, scaled to fit, with the status stack marked "while offline". */
 function SleepPreview({
   sleep,
   imageUrl,
@@ -165,19 +167,20 @@ function SleepPreview({
     (el) => show.includes(el) && (el !== "text" || text !== ""),
   );
   const boxes = sleepLayout(shown, anchor);
+  const stack = sleepStack();
   const family = fontInfo(undefined).family;
 
   return (
     <div
       className="stage"
       ref={stage}
-      style={{ height: (SLEEP_AREA_H + SLEEP_STRIP_H) * scale }}
+      style={{ height: SLEEP_SCREEN_H * scale }}
     >
       <div
         className="screen sleep-screen"
         style={{
           width: SLEEP_AREA_W,
-          height: SLEEP_AREA_H + SLEEP_STRIP_H,
+          height: SLEEP_SCREEN_H,
           transform: `scale(${scale})`,
           background: bg,
         }}
@@ -202,7 +205,11 @@ function SleepPreview({
             className="sleep-logo"
             src={logo}
             alt=""
-            style={{ left: (SLEEP_AREA_W - LOGO_PX) / 2 }}
+            style={{
+              left: stack.logoX,
+              top: stack.logoY,
+              width: SLEEP_LOGO_PX,
+            }}
           />
         )}
         {SLEEP_ELEMENTS.map((el, i) => {
@@ -230,14 +237,23 @@ function SleepPreview({
             </div>
           );
         })}
+        {/* sleep.c: the spinner in a slot under the mark, the status text under the slot. */}
         <div
-          className="sleep-strip"
-          style={{ top: SLEEP_AREA_H, height: SLEEP_STRIP_H }}
+          className="sleep-stack"
+          style={{
+            top: stack.spinnerY,
+            left: stack.statusX,
+            width: stack.statusW,
+          }}
         >
           <span className="sleep-offline">while offline</span>
-          {/* sleep.c: the spinner STRIP_PAD from the left, the status text STRIP_GAP after it. */}
-          <Spinner kind={spinner} color={spinnerColor} size={SPINNER_PX} />
-          <span style={{ color: fg, fontFamily: family, fontSize: 32 }}>
+          <div className="sleep-slot" style={{ height: SLEEP_SPINNER_SLOT }}>
+            <Spinner kind={spinner} color={spinnerColor} size={SPINNER_PX} />
+          </div>
+          <span
+            className="sleep-status"
+            style={{ color: fg, fontFamily: family, fontSize: 32 }}
+          >
             searching for devbox
           </span>
         </div>

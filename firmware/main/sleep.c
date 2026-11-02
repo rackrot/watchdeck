@@ -9,14 +9,12 @@
 #define REFRESH_MS 1000
 #define SPINNER_PX 48
 #define BAR_SPIN_W 96
-#define STRIP_PAD 32 // from the screen's left edge to the spinner
-#define STRIP_GAP 16 // spinner to status text
 
 static sleep_cfg_t s_cfg;
 
 static lv_obj_t *s_root;
 static lv_obj_t *s_els[SLEEP_EL_COUNT];
-static lv_obj_t *s_strip;
+static lv_obj_t *s_stack; // the spinner and the status text, shown while the link is down
 static lv_obj_t *s_status;
 static lv_timer_t *s_timer;
 static void (*s_on_touch)(void);
@@ -139,7 +137,8 @@ static lv_obj_t *spinner_create(lv_obj_t *parent, sleep_spinner_t kind, lv_color
     }
 }
 
-// Start or stop the spinner's animations. They run only while the strip shows, so a link that is up costs no frames.
+// Start or stop the spinner's animations. They run only while the status stack shows, so a link that is up costs no
+// frames.
 static void spinner_run(bool on)
 {
     if (!s_spinner || s_spinning == on) {
@@ -185,13 +184,15 @@ static void spinner_run(bool on)
 
 /* ---- The screen ---- */
 
-// The image area's content, centered in the 1024 x 512 area. Today the mark, whose two-color palette is fixed (not
+// The image area's content, centered in the 1024 x 512 area (the status stack hangs from sleepcfg_stack's numbers, so
+// they and this stay in step). Today the mark, whose two-color palette is fixed (not
 // recolored to fg); P3 replaces this body with the configured picture, and falls back to the mark when none is set.
 static lv_obj_t *image_create(lv_obj_t *parent)
 {
     lv_obj_t *img = passive(lv_image_create(parent));
     lv_image_set_src(img, &wd_logo);
-    lv_obj_set_pos(img, (SLEEP_AREA_W - wd_logo.header.w) / 2, (SLEEP_AREA_H - wd_logo.header.h) / 2);
+    const sleep_stack_t st = sleepcfg_stack(wd_logo.header.w, wd_logo.header.h);
+    lv_obj_set_pos(img, st.logo_x, st.logo_y);
     return img;
 }
 
@@ -251,22 +252,23 @@ static void build(void)
         lv_obj_set_hidden(label, true);
     }
 
-    s_strip = passive(lv_obj_create(s_root));
-    lv_obj_remove_style_all(s_strip);
-    lv_obj_set_size(s_strip, DISPLAY_H_RES, SLEEP_STRIP_H);
-    lv_obj_set_pos(s_strip, 0, SLEEP_AREA_H);
-    s_spinner = spinner_create(s_strip, s_cfg.spinner, lv_color_hex(s_cfg.spinner_color));
-    int text_x = STRIP_PAD;
+    // The status stack: the spinner over the status text, both centered under the mark.
+    const sleep_stack_t st = sleepcfg_stack(wd_logo.header.w, wd_logo.header.h);
+    s_stack = passive(lv_obj_create(s_root));
+    lv_obj_remove_style_all(s_stack);
+    lv_obj_set_size(s_stack, DISPLAY_H_RES, DISPLAY_V_RES);
+    s_spinner = spinner_create(s_stack, s_cfg.spinner, lv_color_hex(s_cfg.spinner_color));
     if (s_spinner) {
-        lv_obj_set_pos(s_spinner, STRIP_PAD, (SLEEP_STRIP_H - lv_obj_get_height(s_spinner)) / 2);
-        text_x += lv_obj_get_width(s_spinner) + STRIP_GAP;
+        lv_obj_set_pos(s_spinner, (SLEEP_AREA_W - lv_obj_get_width(s_spinner)) / 2,
+                       st.spinner_y + (SLEEP_SPINNER_SLOT - lv_obj_get_height(s_spinner)) / 2);
     }
-    s_status = lv_label_create(s_strip);
+    s_status = lv_label_create(s_stack);
     lv_obj_set_style_text_font(s_status, &lv_font_montserrat_32, 0);
     lv_obj_set_style_text_color(s_status, fg, 0);
-    lv_obj_set_width(s_status, DISPLAY_H_RES - text_x - STRIP_PAD);
+    lv_obj_set_style_text_align(s_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(s_status, st.status_w);
     lv_label_set_long_mode(s_status, LV_LABEL_LONG_DOT);
-    lv_obj_set_pos(s_status, text_x, (SLEEP_STRIP_H - lv_font_get_line_height(&lv_font_montserrat_32)) / 2);
+    lv_obj_set_pos(s_status, st.status_x, st.status_y);
 
     s_timer = lv_timer_create(timer_cb, REFRESH_MS, NULL);
     sleep_refresh();
@@ -277,7 +279,7 @@ static void destroy(void)
     lv_timer_delete(s_timer);
     s_timer = NULL;
     lv_obj_delete(s_root); // its animations go with their objects
-    s_root = s_strip = s_status = s_image_area = s_spinner = NULL;
+    s_root = s_stack = s_status = s_image_area = s_spinner = NULL;
     s_spinning = false;
     memset(s_els, 0, sizeof(s_els));
 }
@@ -345,7 +347,7 @@ void sleep_refresh(void)
 
     // The spinner and the link status show while the link is down, for either reason the screen is up.
     const bool online = ui_online();
-    lv_obj_set_hidden(s_strip, online);
+    lv_obj_set_hidden(s_stack, online);
     spinner_run(!online);
     set_text(s_status, ui_status_text(STATUS_DAEMON));
 }

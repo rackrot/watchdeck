@@ -2,7 +2,7 @@
 
 /*
  * The sleep screen's widgets: a full-screen object with the image area (the logo placeholder until L4 and P3 bring
- * art), the elements of sleepcfg.h, and the strip with the spinner and the link status. ui.c owns the mode, the reason
+ * art), the elements of sleepcfg.h, and the status stack (spinner over the link status). ui.c owns the mode, the reason
  * and the wake; this file only draws. Everything runs in the LVGL task or under the LVGL lock.
  */
 
@@ -37,5 +37,6 @@ void sleep_hide(void);
 
 bool sleep_is_shown(void);
 
-/** Bring the clock, host, strip and spinner up to date with the UI's state. Also runs once a second while shown. */
+/** Bring the clock, host, status stack and spinner up to date with the UI's state. Also runs once a second while shown.
+ */
 void sleep_refresh(void);

@@ -36,7 +36,7 @@ void sleepcfg_layout(const sleep_cfg_t *cfg, sleep_have_t have, const int height
     }
     int y = SLEEP_MARGIN;
     if (cfg->anchor == SLEEP_ANCHOR_BOTTOM_LEFT || cfg->anchor == SLEEP_ANCHOR_BOTTOM_RIGHT) {
-        y = SLEEP_AREA_H - SLEEP_MARGIN - column_h;
+        y = SLEEP_SCREEN_H - SLEEP_MARGIN - column_h;
     } else if (cfg->anchor == SLEEP_ANCHOR_CENTER) {
         y = (SLEEP_AREA_H - column_h) / 2;
     }
@@ -47,6 +47,18 @@ void sleepcfg_layout(const sleep_cfg_t *cfg, sleep_have_t have, const int height
             y += heights[i];
         }
     }
+}
+
+sleep_stack_t sleepcfg_stack(int logo_w, int logo_h)
+{
+    sleep_stack_t st;
+    st.logo_x = (SLEEP_AREA_W - logo_w) / 2;
+    st.logo_y = (SLEEP_AREA_H - logo_h) / 2;
+    st.spinner_y = st.logo_y + logo_h + SLEEP_STACK_GAP;
+    st.status_y = st.spinner_y + SLEEP_SPINNER_SLOT + SLEEP_STATUS_GAP;
+    st.status_w = SLEEP_STATUS_W;
+    st.status_x = (SLEEP_AREA_W - SLEEP_STATUS_W) / 2;
+    return st;
 }
 
 int sleepcfg_text_align(sleep_anchor_t anchor)

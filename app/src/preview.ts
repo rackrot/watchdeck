@@ -99,11 +99,32 @@ export function iconBox(cols: number, rows: number, paged = false): number {
 }
 
 // The sleep screen, mirroring firmware/main/sleepcfg.c (`sleepcfg_layout`, `sleepcfg_text_align`) and
-// sleep.c: a 1024 x 512 image area with a column of elements, and an 88 px strip below it.
+// sleep.c: a 1024 x 600 screen whose top 1024 x 512 is the image area, with the link status stack
+// under the mark and a column of elements, the bottom anchors measured from the screen's bottom.
 export const SLEEP_AREA_W = 1024;
 export const SLEEP_AREA_H = 512;
-export const SLEEP_STRIP_H = 88;
+export const SLEEP_SCREEN_H = 600;
 export const SLEEP_MARGIN = 32;
+export const SLEEP_STACK_GAP = 16;
+export const SLEEP_SPINNER_SLOT = 48;
+export const SLEEP_STATUS_GAP = 8;
+export const SLEEP_STATUS_W = 480;
+/** The mark's size on the board (`wd_logo`). */
+export const SLEEP_LOGO_PX = 240;
+
+/** Where the mark and the link status go (`sleepcfg_stack`). The text is centered in its box. */
+export function sleepStack(logoPx: number = SLEEP_LOGO_PX) {
+  const logoY = (SLEEP_AREA_H - logoPx) / 2;
+  const spinnerY = logoY + logoPx + SLEEP_STACK_GAP;
+  return {
+    logoX: (SLEEP_AREA_W - logoPx) / 2,
+    logoY,
+    spinnerY,
+    statusX: (SLEEP_AREA_W - SLEEP_STATUS_W) / 2,
+    statusY: spinnerY + SLEEP_SPINNER_SLOT + SLEEP_STATUS_GAP,
+    statusW: SLEEP_STATUS_W,
+  };
+}
 
 /** The elements, top to bottom (`sleep_el_t`). */
 export const SLEEP_ELEMENTS = ["clock", "date", "host", "text"] as const;
@@ -127,7 +148,7 @@ export function sleepLayout(
   const columnH = heights.reduce((sum, h, i) => sum + (shown[i] ? h : 0), 0);
   let y = SLEEP_MARGIN;
   if (anchor === "bottom_left" || anchor === "bottom_right") {
-    y = SLEEP_AREA_H - SLEEP_MARGIN - columnH;
+    y = SLEEP_SCREEN_H - SLEEP_MARGIN - columnH;
   } else if (anchor === "center") {
     y = Math.trunc((SLEEP_AREA_H - columnH) / 2);
   }

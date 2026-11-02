@@ -1,4 +1,5 @@
-// sleepcfg.c: the sleep screen's defaults, its element layout in the 1024 x 512 image area, and the offline rule.
+// sleepcfg.c: the sleep screen's defaults, its element layout on the 1024 x 600 screen, the status stack, and the
+// offline rule.
 
 #include <string.h>
 
@@ -31,7 +32,8 @@ void test_sleepcfg_defaults(void)
     TEST_ASSERT_EQUAL_UINT8(100, cfg.backlight);
 }
 
-// Each anchor: a column 32 px from the area's edges, the clock on top, no gaps, nothing outside the area.
+// Each anchor: a column 32 px from the screen's edges (the center one centered in the image area), the clock on top,
+// no gaps, nothing past the margins.
 void test_sleepcfg_layout_every_anchor_stays_inside_the_margins(void)
 {
     const int col_h = 55 + 37 + 37 + 37;
@@ -41,8 +43,8 @@ void test_sleepcfg_layout_every_anchor_stays_inside_the_margins(void)
     } cases[] = {
         {SLEEP_ANCHOR_TOP_LEFT, SLEEP_MARGIN},
         {SLEEP_ANCHOR_TOP_RIGHT, SLEEP_MARGIN},
-        {SLEEP_ANCHOR_BOTTOM_LEFT, SLEEP_AREA_H - SLEEP_MARGIN - col_h},
-        {SLEEP_ANCHOR_BOTTOM_RIGHT, SLEEP_AREA_H - SLEEP_MARGIN - col_h},
+        {SLEEP_ANCHOR_BOTTOM_LEFT, SLEEP_SCREEN_H - SLEEP_MARGIN - col_h},
+        {SLEEP_ANCHOR_BOTTOM_RIGHT, SLEEP_SCREEN_H - SLEEP_MARGIN - col_h},
         {SLEEP_ANCHOR_CENTER, (SLEEP_AREA_H - col_h) / 2},
     };
     for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
@@ -63,7 +65,7 @@ void test_sleepcfg_layout_every_anchor_stays_inside_the_margins(void)
             y += HEIGHTS[i];
         }
         TEST_ASSERT_GREATER_OR_EQUAL_INT(SLEEP_MARGIN, pos[0].y);
-        TEST_ASSERT_LESS_OR_EQUAL_INT(SLEEP_AREA_H - SLEEP_MARGIN, y);
+        TEST_ASSERT_LESS_OR_EQUAL_INT(SLEEP_SCREEN_H - SLEEP_MARGIN, y);
     }
 }
 
@@ -79,7 +81,7 @@ void test_sleepcfg_layout_hides_what_has_no_data(void)
     TEST_ASSERT_FALSE(pos[SLEEP_EL_DATE].shown);
     TEST_ASSERT_FALSE(pos[SLEEP_EL_HOST].shown);
     TEST_ASSERT_TRUE(pos[SLEEP_EL_TEXT].shown);
-    TEST_ASSERT_EQUAL_INT(SLEEP_AREA_H - SLEEP_MARGIN - 37, pos[SLEEP_EL_TEXT].y);
+    TEST_ASSERT_EQUAL_INT(SLEEP_SCREEN_H - SLEEP_MARGIN - 37, pos[SLEEP_EL_TEXT].y);
 
     // The time is known, the host is not.
     sleepcfg_layout(&cfg, (sleep_have_t){.time = true}, HEIGHTS, pos);
@@ -92,8 +94,22 @@ void test_sleepcfg_layout_hides_what_has_no_data(void)
     sleepcfg_layout(&cfg, ALL, HEIGHTS, pos);
     TEST_ASSERT_FALSE(pos[SLEEP_EL_CLOCK].shown);
     TEST_ASSERT_FALSE(pos[SLEEP_EL_TEXT].shown);
-    TEST_ASSERT_EQUAL_INT(SLEEP_AREA_H - SLEEP_MARGIN - 2 * 37, pos[SLEEP_EL_DATE].y);
+    TEST_ASSERT_EQUAL_INT(SLEEP_SCREEN_H - SLEEP_MARGIN - 2 * 37, pos[SLEEP_EL_DATE].y);
     TEST_ASSERT_EQUAL_INT(pos[SLEEP_EL_DATE].y + 37, pos[SLEEP_EL_HOST].y);
+}
+
+// The 240 px mark: the spinner slot 16 px under it, the status text 8 px under the slot, centered in a box that leaves
+// a corner column 240 px (past its margin) on each side.
+void test_sleepcfg_stack_hangs_under_the_mark_and_clears_the_corners(void)
+{
+    const sleep_stack_t st = sleepcfg_stack(240, 240);
+    TEST_ASSERT_EQUAL_INT(392, st.logo_x);
+    TEST_ASSERT_EQUAL_INT(136, st.logo_y);
+    TEST_ASSERT_EQUAL_INT(136 + 240 + SLEEP_STACK_GAP, st.spinner_y);
+    TEST_ASSERT_EQUAL_INT(st.spinner_y + SLEEP_SPINNER_SLOT + SLEEP_STATUS_GAP, st.status_y);
+    TEST_ASSERT_EQUAL_INT(272, st.status_x);
+    TEST_ASSERT_EQUAL_INT(SLEEP_AREA_W, 2 * st.status_x + st.status_w);
+    TEST_ASSERT_GREATER_OR_EQUAL_INT(240, st.status_x - SLEEP_MARGIN);
 }
 
 void test_sleepcfg_text_align_follows_the_anchor(void)
@@ -126,6 +142,7 @@ void test_sleepcfg_run(void)
     RUN_TEST(test_sleepcfg_defaults);
     RUN_TEST(test_sleepcfg_layout_every_anchor_stays_inside_the_margins);
     RUN_TEST(test_sleepcfg_layout_hides_what_has_no_data);
+    RUN_TEST(test_sleepcfg_stack_hangs_under_the_mark_and_clears_the_corners);
     RUN_TEST(test_sleepcfg_text_align_follows_the_anchor);
     RUN_TEST(test_sleepcfg_offline_due_needs_link_loss_and_no_touch_for_the_delay);
     RUN_TEST(test_sleepcfg_offline_after_0_never_triggers);
