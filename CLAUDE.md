@@ -16,6 +16,7 @@ A Stream Deck-style homelab controller: an Elecrow CrowPanel Advanced 10.1" ESP3
 - The repo lives on Forgejo at `https://git.voidrot.dev/rackrot/watchdeck` (remote `origin`). Issues, pull requests, releases and CI all happen there, and `#N` means a Forgejo issue or PR.
 - Use `fj`, the Forgejo MCP tools and the `forgejo-*` skills and agents (`forgejo-issues`, `forgejo-pr`, `forgejo-actions`, `forgejo-ship`, `forgejo-readme`, `renovate`). Never use `gh` or the GitHub skills (`gh-issues`, `gh-pr`, `gh-actions`, `ship`, `dependabot`, `gh-readme`) for this repo.
 - The `github` remote (`github.com/rackrot/watchdeck`) is the old home. Don't push to it or open issues or PRs there unless the user asks.
+- Outline docs live in the Projects collection under the "WatchDeck" page (`https://outline.homelab.monster/doc/watchdeck-PeSgkPuhHQ`); add new pages as its children.
 
 ## Tooling
 
