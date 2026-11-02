@@ -21,12 +21,20 @@
 #define BATTERY_BACKOFF_FAILS 3  // failed reads in a row that move the poll to BATTERY_BACKOFF_MS
 #define BATTERY_ERR_IMPLAUSIBLE ESP_ERR_INVALID_CRC // the bytes arrived but batfmt_decode refused them
 
+/*
+ * Consumers key on `present` first: false means no monitor (no bar slot, "Battery --", no frames), and `have` is then
+ * false too. When present, the reading is shown while batfmt_fresh(have, age_us), and `--` after.
+ *
+ * `last_err` is the latest read: ESP_OK, BATTERY_ERR_IMPLAUSIBLE, or an I2C error. The IDF reports a NACK and a stuck
+ * or timed-out transfer alike as ESP_ERR_INVALID_RESPONSE; only a timed-out wait for the bus mutex gives
+ * ESP_ERR_TIMEOUT. ESP_ERR_INVALID_STATE: battery_start hasn't read yet.
+ */
 typedef struct {
-    bool present;          // the STC8 answered with a plausible reading at boot; fixed after battery_start
+    bool present;          // answered plausibly at boot and is polled; fixed after battery_start
     bool have;             // a reading has been decoded since boot (pass it and age_us to batfmt_fresh)
     bat_reading_t reading; // the latest decoded reading, valid when `have`
     int64_t age_us;        // since `reading` was taken
-    esp_err_t last_err;    // the latest read: ESP_OK, an I2C error, BATTERY_ERR_IMPLAUSIBLE; INVALID_STATE before start
+    esp_err_t last_err;    // the latest read's result, see above
 } bat_snapshot_t;
 
 /**

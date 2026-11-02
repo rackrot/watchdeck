@@ -182,10 +182,12 @@ esp_err_t battery_start(void)
     ESP_LOGI(TAG, "first reading in %" PRId64 " us (try %d of %d): %s", took_us, tries, BATTERY_BOOT_TRIES, text);
     s_last_charge = r.charge;
     s_period_us = BATTERY_POLL_MS * 1000ULL;
-    ESP_RETURN_ON_ERROR(esp_timer_start_periodic(s_timer, s_period_us), TAG, "timer start");
+    const esp_err_t start_err = esp_timer_start_periodic(s_timer, s_period_us);
     taskENTER_CRITICAL(&s_snap_mux);
-    s_snap.present = true;
+    s_snap.present = start_err == ESP_OK;
+    s_snap.have = s_snap.present; // never a reading from a monitor that isn't polled
     taskEXIT_CRITICAL(&s_snap_mux);
+    ESP_RETURN_ON_ERROR(start_err, TAG, "timer start");
     return ESP_OK;
 }
 

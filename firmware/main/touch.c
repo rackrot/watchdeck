@@ -20,6 +20,10 @@
 #define TOUCH_INT_GPIO 42 // no pull-up fitted, so the GT911 is polled
 #define TOUCH_I2C_HZ 400000
 #define TOUCH_READ_MS 10 // a GT911 read is about 3 short I2C transfers at 400 kHz, roughly 1 to 2 ms
+// Per GT911 transfer, applied by the IDF to the bus mutex wait and to the transfer separately. Unset it is forever,
+// so a battery transfer on the shared bus, or a held bus, could stall the LVGL task with no deadline. 20 ms is 2 ticks
+// and far above a healthy transfer (about 1 ms); a timeout becomes a counted miss in touch_read.
+#define TOUCH_XFER_TIMEOUT_MS 20
 #define TOUCH_H_RES 1024
 #define TOUCH_V_RES 600
 
@@ -133,6 +137,7 @@ esp_err_t touch_init(lv_display_t *disp)
     esp_lcd_panel_io_i2c_config_t io_cfg = ESP_LCD_TOUCH_IO_I2C_GT911_CONFIG();
     io_cfg.dev_addr = addr;
     io_cfg.scl_speed_hz = TOUCH_I2C_HZ;
+    io_cfg.transaction_timeout_ms = TOUCH_XFER_TIMEOUT_MS;
     ESP_GOTO_ON_ERROR(esp_lcd_new_panel_io_i2c(bus, &io_cfg, &io), err, TAG, "panel io");
 
     // RST and INT are NC here: the address was latched above, and an INT pin makes
