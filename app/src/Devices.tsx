@@ -1,7 +1,23 @@
 import { useEffect, useState } from "react";
-import { forgetDevice, pairingState } from "./api";
+import { type Battery, forgetDevice, pairingState } from "./api";
 import { useDevices } from "./hooks";
 import PairDialog from "./PairDialog";
+
+/** The reading as one line, or `null` when it has no numbers to show. */
+function batteryText(battery: Battery | null): string | null {
+  if (!battery || (battery.mv === undefined && battery.percent === undefined)) {
+    return null;
+  }
+  const parts: string[] = [];
+  if (battery.percent !== undefined) {
+    parts.push(`${battery.percent}%`);
+  }
+  if (battery.mv !== undefined) {
+    parts.push(`${(battery.mv / 1000).toFixed(2)} V`);
+  }
+  parts.push(battery.charge);
+  return parts.join(" · ");
+}
 
 export default function Devices({
   active,
@@ -52,26 +68,30 @@ export default function Devices({
           <p className="muted">No paired devices.</p>
         ) : (
           <ul className="name-list">
-            {devices.map((d) => (
-              <li key={d.id}>
-                <span
-                  className={d.connected ? "dot ok" : "dot offline"}
-                  aria-hidden="true"
-                />
-                <span className="mono grow">{d.id}</span>
-                <span className="muted">
-                  {d.connected ? "connected" : "offline"}
-                </span>
-                <button
-                  type="button"
-                  className="quiet"
-                  aria-label={`Forget ${d.id}`}
-                  onClick={() => forget(d.id)}
-                >
-                  Forget
-                </button>
-              </li>
-            ))}
+            {devices.map((d) => {
+              const battery = batteryText(d.battery);
+              return (
+                <li key={d.id}>
+                  <span
+                    className={d.connected ? "dot ok" : "dot offline"}
+                    aria-hidden="true"
+                  />
+                  <span className="mono grow">{d.id}</span>
+                  <span className="muted">
+                    {d.connected ? "connected" : "offline"}
+                  </span>
+                  {battery && <span className="muted">{battery}</span>}
+                  <button
+                    type="button"
+                    className="quiet"
+                    aria-label={`Forget ${d.id}`}
+                    onClick={() => forget(d.id)}
+                  >
+                    Forget
+                  </button>
+                </li>
+              );
+            })}
           </ul>
         )}
         {devices

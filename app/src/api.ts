@@ -8,8 +8,23 @@ import type {
   TileConfig,
 } from "./config";
 
-/** `caps` are what the live session's device supports, such as "fonts". Empty while offline. */
-export type DeviceInfo = { id: string; connected: boolean; caps: string[] };
+/** A device's latest battery reading. `mv` and `percent` are omitted when the device sent none. */
+export type Battery = {
+  mv?: number;
+  percent?: number;
+  charge: "charging" | "full" | "discharging" | "none" | "unknown";
+};
+
+/**
+ * `caps` are what the live session's device supports, such as "fonts". Empty while offline.
+ * `battery` is the live session's latest reading, `null` while offline or before one arrives.
+ */
+export type DeviceInfo = {
+  id: string;
+  connected: boolean;
+  caps: string[];
+  battery: Battery | null;
+};
 
 /** Mirrors `PairingState` in `src-tauri/src/daemon/pairing.rs`, sent as the `pairing` event. */
 export type PairingState =
