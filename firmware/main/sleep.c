@@ -90,6 +90,15 @@ static lv_obj_t *circle(lv_obj_t *parent, int px, lv_color_t color)
     return c;
 }
 
+// The size spinner_create gives each kind. Read from here, not from the object: LVGL applies set_size at the next
+// layout pass, so lv_obj_get_width/height on a new object return 0 and the spinner lands half its size down and to the
+// right.
+static void spinner_size(sleep_spinner_t kind, int *w, int *h)
+{
+    *w = kind == SLEEP_SPIN_BAR ? BAR_SPIN_W : SPINNER_PX;
+    *h = kind == SLEEP_SPIN_BAR ? 10 : SPINNER_PX;
+}
+
 static lv_obj_t *spinner_create(lv_obj_t *parent, sleep_spinner_t kind, lv_color_t color)
 {
     switch (kind) {
@@ -119,7 +128,9 @@ static lv_obj_t *spinner_create(lv_obj_t *parent, sleep_spinner_t kind, lv_color
     case SLEEP_SPIN_BAR: {
         // Indeterminate: the value sweeps back and forth.
         lv_obj_t *bar = passive(lv_bar_create(parent));
-        lv_obj_set_size(bar, BAR_SPIN_W, 10);
+        int bw, bh;
+        spinner_size(SLEEP_SPIN_BAR, &bw, &bh);
+        lv_obj_set_size(bar, bw, bh);
         lv_bar_set_range(bar, 0, 100);
         lv_obj_set_style_bg_color(bar, color, LV_PART_MAIN);
         lv_obj_set_style_bg_opa(bar, LV_OPA_20, LV_PART_MAIN);
@@ -259,8 +270,9 @@ static void build(void)
     lv_obj_set_size(s_stack, DISPLAY_H_RES, DISPLAY_V_RES);
     s_spinner = spinner_create(s_stack, s_cfg.spinner, lv_color_hex(s_cfg.spinner_color));
     if (s_spinner) {
-        lv_obj_set_pos(s_spinner, (SLEEP_AREA_W - lv_obj_get_width(s_spinner)) / 2,
-                       st.spinner_y + (SLEEP_SPINNER_SLOT - lv_obj_get_height(s_spinner)) / 2);
+        int sw, sh;
+        spinner_size(s_cfg.spinner, &sw, &sh);
+        lv_obj_set_pos(s_spinner, (SLEEP_AREA_W - sw) / 2, st.spinner_y + (SLEEP_SPINNER_SLOT - sh) / 2);
     }
     s_status = lv_label_create(s_stack);
     lv_obj_set_style_text_font(s_status, &lv_font_montserrat_32, 0);

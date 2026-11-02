@@ -33,14 +33,14 @@ import {
 // test_sleepcfg_layout_every_anchor_stays_inside_the_margins in
 // firmware/test/host_proto/main/test_sleepcfg.c, case for case: the same heights and first y.
 test("the sleep preview's positions match test_sleepcfg.c for each anchor", () => {
-  const heights = [55, 37, 37, 37];
-  const colH = 55 + 37 + 37 + 37;
+  const heights = [52, 35, 35, 35];
+  const colH = 52 + 35 + 35 + 35;
   const cases: [string, number][] = [
     ["top_left", SLEEP_MARGIN],
     ["top_right", SLEEP_MARGIN],
     ["bottom_left", SLEEP_SCREEN_H - SLEEP_MARGIN - colH],
     ["bottom_right", SLEEP_SCREEN_H - SLEEP_MARGIN - colH],
-    ["center", (SLEEP_AREA_H - colH) / 2],
+    ["center", Math.trunc((SLEEP_AREA_H - colH) / 2)],
   ];
   for (const [anchor, firstY] of cases) {
     let y = firstY;
@@ -101,12 +101,12 @@ test("the sleep preview hides what is not shown and gives it no room, and aligns
   const boxes = sleepLayout(
     [false, true, false, true],
     "bottom_left",
-    [55, 37, 37, 37],
+    [52, 35, 35, 35],
   );
   assert.equal(boxes[0], null);
   assert.equal(boxes[2], null);
-  assert.equal(boxes[3]?.y, SLEEP_SCREEN_H - SLEEP_MARGIN - 37);
-  assert.equal(boxes[1]?.y, SLEEP_SCREEN_H - SLEEP_MARGIN - 2 * 37);
+  assert.equal(boxes[3]?.y, SLEEP_SCREEN_H - SLEEP_MARGIN - 35);
+  assert.equal(boxes[1]?.y, SLEEP_SCREEN_H - SLEEP_MARGIN - 2 * 35);
   assert.deepEqual(
     ["top_left", "bottom_left", "top_right", "bottom_right", "center"].map(
       sleepTextAlign,

@@ -7,7 +7,7 @@
 
 #include "sleepcfg.h"
 
-static const int HEIGHTS[SLEEP_EL_COUNT] = {55, 37, 37, 37}; // Montserrat 48 and 32 line heights, or near enough
+static const int HEIGHTS[SLEEP_EL_COUNT] = {52, 35, 35, 35}; // Montserrat 48 and 32 line heights
 #define ALL ((sleep_have_t){.time = true, .host = true})
 
 static void all_shown_cfg(sleep_cfg_t *cfg)
@@ -36,7 +36,7 @@ void test_sleepcfg_defaults(void)
 // no gaps, nothing past the margins.
 void test_sleepcfg_layout_every_anchor_stays_inside_the_margins(void)
 {
-    const int col_h = 55 + 37 + 37 + 37;
+    const int col_h = 52 + 35 + 35 + 35;
     const struct {
         sleep_anchor_t anchor;
         int first_y;
@@ -81,7 +81,7 @@ void test_sleepcfg_layout_hides_what_has_no_data(void)
     TEST_ASSERT_FALSE(pos[SLEEP_EL_DATE].shown);
     TEST_ASSERT_FALSE(pos[SLEEP_EL_HOST].shown);
     TEST_ASSERT_TRUE(pos[SLEEP_EL_TEXT].shown);
-    TEST_ASSERT_EQUAL_INT(SLEEP_SCREEN_H - SLEEP_MARGIN - 37, pos[SLEEP_EL_TEXT].y);
+    TEST_ASSERT_EQUAL_INT(SLEEP_SCREEN_H - SLEEP_MARGIN - 35, pos[SLEEP_EL_TEXT].y);
 
     // The time is known, the host is not.
     sleepcfg_layout(&cfg, (sleep_have_t){.time = true}, HEIGHTS, pos);
@@ -94,8 +94,8 @@ void test_sleepcfg_layout_hides_what_has_no_data(void)
     sleepcfg_layout(&cfg, ALL, HEIGHTS, pos);
     TEST_ASSERT_FALSE(pos[SLEEP_EL_CLOCK].shown);
     TEST_ASSERT_FALSE(pos[SLEEP_EL_TEXT].shown);
-    TEST_ASSERT_EQUAL_INT(SLEEP_SCREEN_H - SLEEP_MARGIN - 2 * 37, pos[SLEEP_EL_DATE].y);
-    TEST_ASSERT_EQUAL_INT(pos[SLEEP_EL_DATE].y + 37, pos[SLEEP_EL_HOST].y);
+    TEST_ASSERT_EQUAL_INT(SLEEP_SCREEN_H - SLEEP_MARGIN - 2 * 35, pos[SLEEP_EL_DATE].y);
+    TEST_ASSERT_EQUAL_INT(pos[SLEEP_EL_DATE].y + 35, pos[SLEEP_EL_HOST].y);
 }
 
 // The 240 px mark: the spinner slot 16 px under it, the status text 8 px under the slot, centered in a box that leaves

@@ -252,7 +252,12 @@ function SleepPreview({
           </div>
           <span
             className="sleep-status"
-            style={{ color: fg, fontFamily: family, fontSize: 32 }}
+            style={{
+              color: fg,
+              fontFamily: family,
+              fontSize: 32,
+              marginTop: stack.statusY - stack.spinnerY - SLEEP_SPINNER_SLOT,
+            }}
           >
             searching for devbox
           </span>

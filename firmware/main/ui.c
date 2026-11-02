@@ -1628,7 +1628,7 @@ void ui_link_down(void)
         lv_obj_set_style_opa(s_grid, LV_OPA_30, 0);
     }
     bar_refresh();
-    sleep_refresh(); // the strip shows the spinner while the link is down
+    sleep_refresh(); // the status stack shows the spinner while the link is down
     lvgl_port_unlock();
 }
 
@@ -1905,7 +1905,7 @@ static void set_text(status_t i, const char *text)
     show_status(i);
     if (i == STATUS_DAEMON) {
         bar_refresh();   // the bar's left slot shows it while the link is down
-        sleep_refresh(); // and so does the sleep screen's strip
+        sleep_refresh(); // and so does the sleep screen's status stack
     }
     lvgl_port_unlock();
 }

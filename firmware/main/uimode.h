@@ -6,7 +6,7 @@
  * mode.
  *
  * Entry points that act the same in every mode are not in the table: ui_set_stats keeps the frame (the bar and the
- * sleep screen's clock read it), ui_link_down greys the grid and updates the bar or the sleep strip,
+ * sleep screen's clock read it), ui_link_down greys the grid and updates the bar or the sleep status stack,
  * ui_set_paired(false) ends whatever mode is up and shows status mode.
  */
 
