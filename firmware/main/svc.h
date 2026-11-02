@@ -1,7 +1,7 @@
 #pragma once
 
 // The worker task for slow device jobs: card I/O, the Wi-Fi scan and the steps of a trial connect, the RSSI read,
-// the USB share and image loads. Never the link task or the LVGL task.
+// the battery read, the USB share and image loads. Never the link task or the LVGL task.
 //
 // A job runs to completion and never waits on a network event; a trial connect is a state machine driven by
 // Wi-Fi events, and svc runs only its short steps. A job does its I/O holding no lock, then takes the LVGL lock

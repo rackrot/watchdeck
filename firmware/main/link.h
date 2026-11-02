@@ -57,6 +57,13 @@ esp_err_t link_press(const char *btn, uint32_t seq);
  */
 esp_err_t link_feed_dismiss(const char *id);
 
+/**
+ * Tell the link a battery poll ran, good or failed; the link reads battery_snapshot() and decides what to send. Call
+ * from the battery poll only. At most one is queued at a time, a refused one is dropped (the next poll retries), and
+ * it does nothing before link_start.
+ */
+void link_battery_poll(void);
+
 /** Pair with `daemon`. Ignored unless unpaired and idle. Safe from any task. */
 esp_err_t link_pair(const link_daemon_t *daemon);
 

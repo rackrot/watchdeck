@@ -79,6 +79,7 @@ typedef enum {
     EV_WS_BAD_CERT, // the daemon's cert is not the pinned one
     EV_PRESS,
     EV_FEED_DISMISS, // a note id in press.btn
+    EV_BATTERY,      // a battery poll ran
     EV_PAIR,         // the user picked a daemon to pair with
     EV_PAIR_CANCEL,  // the user abandoned the attempt, or said No to its question
     EV_PAIR_CONFIRM, // the user said Yes, the desktop shows the pairing
@@ -152,6 +153,8 @@ static struct {
 
 // Read by other tasks. The id is written once, before the first hello, and never changes.
 static char s_device_id[PROTO_DEVICE_ID_LEN];
+// An EV_BATTERY is queued: set by the battery poll before its post, cleared by the link task when it takes it.
+static volatile bool s_battery_pending;
 
 // Reassembly state and connect measurements, touched only by the websocket event handler, which
 // the client runs under its lock.
@@ -1356,6 +1359,9 @@ static void handle_event(link_ev_t *ev)
             ESP_LOGW(TAG, "link down, feed dismiss dropped");
         }
         break;
+    case EV_BATTERY:
+        s_battery_pending = false; // nothing goes on the wire yet, and while the link is down it drops silently
+        break;
     case EV_PAIR:
         if (!s.paired && s.state == ST_BROWSE) {
             start_pairing(&ev->daemon);
@@ -1517,6 +1523,19 @@ esp_err_t link_feed_dismiss(const char *id)
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
+}
+
+void link_battery_poll(void)
+{
+    // Silent before link_start, and one pending at most, so a wedged link task can't fill its queue with these.
+    if (!s.queue || s_battery_pending) {
+        return;
+    }
+    s_battery_pending = true; // before the post, so the link task's clear can't land first
+    const link_ev_t ev = {.type = EV_BATTERY};
+    if (!post(&ev)) {
+        s_battery_pending = false;
+    }
 }
 
 esp_err_t link_pair(const link_daemon_t *daemon)

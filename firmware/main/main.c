@@ -7,6 +7,7 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 
+#include "battery.h"
 #include "cardtest.h"
 #include "crash.h"
 #include "display.h"
@@ -98,6 +99,11 @@ void app_main(void)
         ESP_LOGE(TAG, "touch_init: %s", esp_err_to_name(err));
     }
     ui_set_touch_text(err == ESP_OK ? "Touch: ready" : "Touch: FAILED");
+
+    // The battery monitor shares touch's bus, so it starts only when touch did. Absent or failed, boot goes on.
+    if (err == ESP_OK && (err = battery_start()) != ESP_OK) {
+        ESP_LOGE(TAG, "battery_start: %s", esp_err_to_name(err));
+    }
 
     // Wi-Fi comes up with or without credentials, so Settings > Wi-Fi can scan and join from a board that has none.
     err = wifi_init(ui_set_wifi_text);
