@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "battery.h"
 #include "esp_app_desc.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
@@ -32,6 +33,7 @@ typedef enum {
     ROW_PSRAM,
     ROW_LVGL,
     ROW_ICONS,
+    ROW_BATTERY,
     ROW_LEFT_COUNT,
     ROW_WIFI = ROW_LEFT_COUNT,
     ROW_SSID,
@@ -52,6 +54,26 @@ static char s_row_text[ROW_COUNT][ROW_TEXT_MAX]; // what each row was last given
 static void set_row(row_t r, const char *text)
 {
     ui_set_label(s_rows[r], s_row_text[r], ROW_TEXT_MAX, text);
+}
+
+// The battery row: the reading while the STC8 is there and the reading is fresh, else "Battery --". The longest form
+// ("Battery 4.12 V, 100%, discharging") may pass the column, so then the state word is shortened. It reads only the
+// snapshot, never the bus.
+static void battery_row(char *text, size_t size)
+{
+    bat_snapshot_t snap;
+    battery_snapshot(&snap);
+    const bat_reading_t *r = snap.present && batfmt_fresh(snap.have, snap.age_us) ? &snap.reading : NULL;
+    if (!batfmt_row(text, size, r)) {
+        strlcpy(text, "Battery --", size);
+        return;
+    }
+    lv_point_t extent;
+    lv_text_get_size(&extent, text, &lv_font_montserrat_24, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    if (r && r->charge == BAT_DISCHARGING && extent.x > LEFT_W) {
+        snprintf(text, size, "Battery %u.%02u V, %u%%, draining", (unsigned)(r->mv / 1000 % 100),
+                 (unsigned)(r->mv % 1000 / 10), (unsigned)r->percent % 1000);
+    }
 }
 
 // Fill every row. Takes the model lock after the LVGL lock, and nothing here blocks: the RSSI is the link task's cached
@@ -93,6 +115,8 @@ void tab_status_tick(void)
     model_unlock();
     snprintf(text, sizeof(text), "Icons %u, %u KiB", (unsigned)icons, (unsigned)(icon_bytes / 1024));
     set_row(ROW_ICONS, text);
+    battery_row(text, sizeof(text));
+    set_row(ROW_BATTERY, text);
     if (pages > 0) {
         snprintf(text, sizeof(text), "Layout rev %u, page %u of %u", (unsigned)rev, shown + 1u, (unsigned)pages);
     } else {
