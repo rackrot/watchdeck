@@ -1,11 +1,15 @@
 #include "touch.h"
 
+#include <inttypes.h>
+#include <string.h>
+
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_check.h"
 #include "esp_lcd_io_i2c.h"
 #include "esp_lcd_touch_gt911.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_lvgl_port.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -26,6 +30,44 @@
 #define TOUCH_MIRROR_Y 0
 
 static const char *TAG = "touch";
+
+#define TOUCH_FAIL_LOG_US (60 * 1000000LL)
+
+static esp_err_t (*s_gt911_read)(esp_lcd_touch_handle_t tp);
+static uint32_t s_read_failures;
+static int64_t s_last_fail_log_us; // 0 until the first line; touch_read runs on the LVGL task only
+
+// esp_lvgl_port wraps the read in ESP_ERROR_CHECK, so a failed I2C read would reboot the board. Count it, put back
+// the points the driver may have cleared (it zeroes them before its second read, so a failure there would read as a
+// release), and report success. The finger stays where it was for one more read.
+static esp_err_t touch_read(esp_lcd_touch_handle_t tp)
+{
+    uint8_t points;
+    esp_lcd_touch_point_data_t coords[CONFIG_ESP_LCD_TOUCH_MAX_POINTS];
+
+    portENTER_CRITICAL(&tp->data.lock);
+    points = tp->data.points;
+    memcpy(coords, tp->data.coords, sizeof(coords));
+    portEXIT_CRITICAL(&tp->data.lock);
+
+    esp_err_t err = s_gt911_read(tp);
+    if (err == ESP_OK) {
+        return ESP_OK;
+    }
+
+    portENTER_CRITICAL(&tp->data.lock);
+    tp->data.points = points;
+    memcpy(tp->data.coords, coords, sizeof(coords));
+    portEXIT_CRITICAL(&tp->data.lock);
+
+    s_read_failures++;
+    int64_t now = esp_timer_get_time();
+    if (s_last_fail_log_us == 0 || now - s_last_fail_log_us >= TOUCH_FAIL_LOG_US) {
+        s_last_fail_log_us = now;
+        ESP_LOGW(TAG, "touch read failed %" PRIu32 " times: %s", s_read_failures, esp_err_to_name(err));
+    }
+    return ESP_OK;
+}
 
 // The GT911 latches its I2C address from the INT level at the rising edge of RST:
 // INT low selects 0x5D, INT high selects 0x14. Afterwards INT is released as an input.
@@ -93,6 +135,9 @@ esp_err_t touch_init(lv_display_t *disp)
         .flags = {.swap_xy = TOUCH_SWAP_XY, .mirror_x = TOUCH_MIRROR_X, .mirror_y = TOUCH_MIRROR_Y},
     };
     ESP_GOTO_ON_ERROR(esp_lcd_touch_new_i2c_gt911(io, &tp_cfg, &tp), err, TAG, "gt911");
+
+    s_gt911_read = tp->read_data;
+    tp->read_data = touch_read;
 
     const lvgl_port_touch_cfg_t lv_cfg = {.disp = disp, .handle = tp};
     lv_indev_t *indev = lvgl_port_add_touch(&lv_cfg);
