@@ -776,6 +776,7 @@ static void send_hello(void)
     // reads `stats` frames, and "feed" that ui.c shows the -1 page from `feed` frames and dismisses with feed_dismiss,
     // and "battery" that this build found the STC8 at boot and sends `battery` frames (named only then).
     // The hello must stay under 256 bytes: test_proto.c pins its size for this list, and for the list with "sleep".
+    // "battery" must stay last: without a monitor it is dropped by shortening the list.
     const char *const caps[] = {"fonts", "pages", "status_bar", "feed", "battery"};
     const size_t n_caps = sizeof(caps) / sizeof(caps[0]) - (battery_present() ? 0 : 1);
     char buf[256];
