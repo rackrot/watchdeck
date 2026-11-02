@@ -3947,6 +3947,8 @@ async fn a_battery_frame_is_listed_and_an_equal_one_emits_no_event() {
         charge: Charge::Unknown,
     };
     wait_for_battery(&daemon, DEVICE, Some(unavailable)).await;
+    // It came within the gap of the first event, so its event trails.
+    tokio::time::sleep(Duration::from_millis(1300)).await;
     assert_eq!(battery_events(&mut daemon), 1);
 }
 
@@ -4032,5 +4034,39 @@ async fn disconnecting_clears_the_battery() {
         battery_of(&daemon, DEVICE),
         None,
         "a new session starts empty"
+    );
+}
+
+#[tokio::test]
+async fn a_flipping_battery_emits_a_bounded_number_of_events_and_ends_on_the_last() {
+    let mut daemon = start().await;
+    let mut c = device_session(daemon.addr, DEVICE, &TOKEN, &["battery"]).await;
+    let _ = battery_events(&mut daemon);
+    let started = Instant::now();
+    for i in 0..200 {
+        c.send(Ws::text(if i % 2 == 0 { BATTERY_A } else { BATTERY_B }))
+            .await
+            .unwrap();
+    }
+    // 200 frames, the last one B.
+    press_and_wait(&mut c, 1).await;
+    let burst = started.elapsed();
+    let expected = Some(Battery {
+        mv: Some(4120),
+        percent: Some(91),
+        charge: Charge::Charging,
+    });
+    assert_eq!(
+        battery_of(&daemon, DEVICE),
+        expected,
+        "every reading is kept"
+    );
+    // The trailing event arrives within the gap.
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    let events = battery_events(&mut daemon);
+    let most = 2 + burst.as_secs() as usize + 1;
+    assert!(
+        (2..=most).contains(&events),
+        "{events} events for 200 frames in {burst:?}"
     );
 }

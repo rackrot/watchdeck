@@ -51,6 +51,9 @@ const MAX_BUTTON_ID_BYTES: usize = 64;
 /// A session sends the feed at most this often, so a busy source costs the board two frames a
 /// second at most.
 const FEED_GAP: Duration = Duration::from_millis(500);
+/// The least time between two `BatteryChanged` events of one session, so a device that flips
+/// its reading can't flood the event channel.
+const BATTERY_EVENT_GAP: Duration = Duration::from_secs(1);
 /// Ids in one `icon_get`: one page never names more icons than it has cells, and a device asks
 /// for the icons of a set of pages in several requests.
 const MAX_ICON_IDS: usize = (MAX_COLS * MAX_ROWS) as usize;
@@ -422,6 +425,19 @@ impl Registry {
         }
     }
 
+    /// Keeps `battery` as session `id` of `device`'s latest reading, and says whether that
+    /// changed it. A session that has been replaced or ended finds its slot taken or gone and
+    /// changes nothing.
+    fn set_battery(&mut self, device: &str, id: u64, battery: Battery) -> bool {
+        match self.sessions.get_mut(device) {
+            Some(entry) if entry.id == id && entry.battery != Some(battery) => {
+                entry.battery = Some(battery);
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn publish_count(&self) {
         self.connected.send_replace(self.sessions.len());
     }
@@ -479,25 +495,6 @@ impl Shared {
             drop(registry);
             self.emit(DaemonEvent::DeviceDisconnected(device.to_string()));
         }
-    }
-
-    /// Keeps `battery` as session `id` of `device`'s latest reading. A session that has been
-    /// replaced or ended finds its slot taken or gone and changes nothing.
-    fn set_battery(&self, device: &str, id: u64, battery: Battery) {
-        let mut registry = self.registry();
-        let Some(entry) = registry
-            .sessions
-            .get_mut(device)
-            .filter(|current| current.id == id)
-        else {
-            return;
-        };
-        if entry.battery == Some(battery) {
-            return;
-        }
-        entry.battery = Some(battery);
-        drop(registry);
-        self.emit(DaemonEvent::BatteryChanged(device.to_string()));
     }
 
     fn emit(&self, event: DaemonEvent) {
@@ -933,6 +930,9 @@ where
     let feed_on = caps.iter().any(|cap| cap == CAP_FEED);
     let battery_on = caps.iter().any(|cap| cap == CAP_BATTERY);
     let mut battery_refused = false;
+    // When the last event went out, and whether a change since then still needs one.
+    let mut battery_emitted = Instant::now() - BATTERY_EVENT_GAP;
+    let mut battery_pending = false;
     let mut feed_rx = feed.subscribe();
     // The first snapshot goes out with the session, even an empty one, which tells the board
     // there is no -1 page. Later ones wait for the gap.
@@ -1004,6 +1004,13 @@ where
             }, if feed_on => {
                 send_feed(tx, &mut feed_rx).await?;
                 feed_ready = Instant::now() + FEED_GAP;
+                continue;
+            }
+            // The trailing event, so the window ends on the latest reading.
+            () = sleep_until(battery_emitted + BATTERY_EVENT_GAP), if battery_pending => {
+                battery_pending = false;
+                battery_emitted = Instant::now();
+                shared.emit(DaemonEvent::BatteryChanged(device.to_string()));
                 continue;
             }
             Ok(()) = stats.changed(), if status_bar => {
@@ -1146,7 +1153,16 @@ where
                 }
             }
             Incoming::Msg(Message::Battery(battery)) if battery_on => match battery.check() {
-                Ok(()) => shared.set_battery(device, session_id, battery),
+                Ok(()) => {
+                    // Every valid reading is kept; only the event is throttled.
+                    let changed = shared.registry().set_battery(device, session_id, battery);
+                    if changed && battery_emitted.elapsed() >= BATTERY_EVENT_GAP {
+                        battery_emitted = Instant::now();
+                        shared.emit(DaemonEvent::BatteryChanged(device.to_string()));
+                    } else if changed {
+                        battery_pending = true;
+                    }
+                }
                 // The board resends at every welcome, so a close would only loop it through
                 // reconnects over a status nicety. One line a session is enough.
                 Err(why) if !battery_refused => {
@@ -1296,6 +1312,36 @@ mod tests {
     use super::super::protocol::{NetUnit, TempUnit};
     use super::super::units::Units;
     use super::*;
+
+    #[test]
+    fn a_stale_session_cannot_set_the_battery() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = Registry {
+            store: Store::load(dir.path()).unwrap(),
+            sessions: HashMap::new(),
+            connected: watch::channel(0).0,
+        };
+        let session = |id| SessionEntry {
+            id,
+            kick: oneshot::channel().0,
+            caps: Vec::new(),
+            battery: None,
+        };
+        let reading = |percent| Battery {
+            mv: Some(3800),
+            percent: Some(percent),
+            charge: super::super::protocol::Charge::Discharging,
+        };
+        registry.sessions.insert("d".into(), session(2));
+
+        assert!(!registry.set_battery("d", 1, reading(10)), "stale id");
+        assert_eq!(registry.sessions["d"].battery, None);
+        assert!(!registry.set_battery("other", 2, reading(10)), "no session");
+        assert!(registry.set_battery("d", 2, reading(10)));
+        assert!(!registry.set_battery("d", 2, reading(10)), "unchanged");
+        assert!(!registry.set_battery("d", 1, reading(20)), "stale again");
+        assert_eq!(registry.sessions["d"].battery, Some(reading(10)));
+    }
 
     fn cpu_of(msg: Message) -> Option<u32> {
         let Message::Stats { cpu, .. } = msg else {

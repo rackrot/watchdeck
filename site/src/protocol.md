@@ -574,8 +574,9 @@ Sent only by a device whose `hello` names `battery`: after each `welcome`, when 
 - `charging`, `full` and `discharging` need both.
 - `none` (no battery fitted) and `unknown` may leave both out. `unknown` with no numbers means the reading is unavailable.
 - A `charge` the daemon doesn't know reads as `unknown` and keeps its numbers.
+- `"mv":null` and `"percent":null` read as absent.
 
-The daemon keeps the latest valid frame of the live session and shows it in the desktop app. It drops the reading when the session ends, and a frame from a replaced session changes nothing. A frame that is refused, from a session that doesn't name `battery` or whose fields are mistyped, negative, out of range, missing `charge` or breaking the rules above, is logged and ignored. It never ends the session, so there is no `error` reply. A text frame that isn't JSON still gets `bad_request`, like any other.
+The daemon keeps the latest valid frame of the live session and shows it in the desktop app. It drops the reading when the session ends, and a frame from a replaced session changes nothing. A frame that is refused, from a session that doesn't name `battery` or whose fields are mistyped, negative, out of range, missing `charge` or breaking the rules above, is ignored. It never ends the session, so there is no `error` reply. A refused frame from a session that names `battery` is logged once per session. One from a session that doesn't is ignored under the daemon's generic unexpected-message log, as `feed_dismiss` is. A text frame that isn't JSON still gets `bad_request`, like any other.
 
 ### `report` (device → daemon)
 
