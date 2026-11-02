@@ -1,6 +1,6 @@
 # Battery level: the bar, Settings > Status, and the app
 
-Status: planned 2026-11-01 against `main` at `a1cd882`, with the battery section of `site/src/device-spec.md` still uncommitted in the working tree. Nothing is built yet. One second-opinion pass is folded in (see the [Critique log](#critique-log)). Open questions Q1 to Q5 are at the end; Q1 and Q3 to Q5 are decided, Q2 waits on C2.
+Status: built 2026-11-01 (slices B0 to B8) on `main`; planned against `a1cd882`. C1, C5 and C6 passed on the board; C2, C3 and C4/C4b are still open (see [Results](#results)). Open question Q2 waits on C2. One second-opinion pass is folded in (see the [Critique log](#critique-log)).
 
 The user put a LiPo in the CrowPanel. The ESP32-P4 has no battery line. An STC8H1K08 helper MCU reads VBAT and the TP4059 charger's CHRG and STDBY pins, and answers as an I2C slave at 0x2F on the touch bus. `site/src/device-spec.md` "Battery monitoring" has the probe results. After this plan:
 
@@ -379,7 +379,33 @@ Decided by the user on 2026-11-01:
 
 ## Results
 
-Filled in by C1 to C6 and B8.
+Built as planned. Recorded by B8 from the code and the user's board checks.
+
+### On-board checks
+
+- **C1 passed.** The boot read took about 1.9 ms. Unplugging and replugging USB logged `charging -> discharging` and back, with no reset.
+- **C5 and C6 passed.** The user saw the bar slot with the `HH:MM` clock and judged the spacing fine. The Devices tab shows the percent, the voltage and the charge state, and switches to discharging on unplug.
+- **Still open.**
+  - **C2:** no battery on USB power. A4 and Q2 wait on it; until then the firmware never reports `none`.
+  - **C3:** charge to full overnight. The status byte at full (A3's 0x02) is untested, and so is the soak.
+  - **C4 and C4b:** an absent or lost STC8. The code paths exist (`battery_start`, the 3-failure backoff) but were not run on the board.
+
+### Measured on the board
+
+- svc stack: 4968 bytes free (the `stack bytes free:` line).
+- B0's touch failure counter was 0 in the boot logs.
+
+### Risks to record
+
+- **Log flood on a stuck bus.** The 10 ms touch reads can produce unthrottled IDF `I2C transaction timeout` E lines. B0's W line is limited to one a minute, but the IDF's lines are not.
+- **Late unavailable frame.** The daemon's view goes stale only when a poll arrives. A long svc block (Format card) or the 60 s backoff delays the `unknown` frame.
+- **Status row fallback.** The row falls back to "draining" when the "discharging" text is wider than the column. That fallback is unverified on the panel.
+- **A NACK and a stuck bus look alike.** Both come back from the IDF as `ESP_ERR_INVALID_RESPONSE`, so `last_err` can't tell them apart.
+- **Daemon event throttle.** Battery events reach the app at most once a second per session (`BATTERY_EVENT_GAP`), added after the plan.
+
+### Note
+
+A panic report pending on the board came from a temporary probe build (ELF `7985206...`), not from shipped code.
 
 ## Critique log
 

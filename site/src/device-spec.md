@@ -86,6 +86,8 @@ Not from the vendor page. From Elecrow's V1.2 schematic and probing the board on
 | 0x08 | Charge, percent | 85 | 53 |
 | 0x09, 0x0A | Charger status; likely bit 0 = STDBY, bit 1 = CHRG, both active low (a full battery's value is untested) | 0x01 | 0x03 |
 
+The firmware (`battery.c`, `batfmt.c`) reads registers 0x00 to 0x0A in one transfer, which confirms the pointer auto-increments, and checks that the battery mV is the pin mV × 139/100 within 2 % + 20 mV. It maps 0x09 as 0x01 charging, 0x03 discharging, 0x02 full and 0x00 unknown; 0x0A is only logged. Still untested on the board: the status byte at full charge (0x02 is a guess from the bit order), and the registers with no battery attached on USB, which may look like a full battery. The firmware never reports "no battery". On a plug or unplug the percent jumps, since the STC8's own voltage lookup reads high under charge current.
+
 Registers from 0x0B up read differently on each pass and look unused. The meanings come from these two states only. Nothing here was written to the STC8 except a register-pointer byte.
 
 ## Board Connectors

@@ -562,7 +562,7 @@ Every string is printable ASCII. A device refuses a `sleep` or `feed` frame with
 {"t":"battery","mv":3873,"percent":53,"charge":"discharging"}
 ```
 
-Sent only by a device whose `hello` names `battery`: after each `welcome`, when the charge state changes, and when the percent moves. A device with no way to read a battery sends none.
+Sent only by a device whose `hello` names `battery`, and a device names it only when it found a battery monitor at boot. A frame goes after each `welcome`, when the charge state changes, when the percent moves 2 points or more from the last frame sent (not from the last reading seen), when the reading goes stale (no fresh reading for 15 s, sent as `unknown` with no numbers), and when a reading comes back. The device checks on each of its polls, every 5 s (once a minute after repeated failed reads), so a stale or restored reading can reach the daemon later than that. A device with no way to read a battery sends none.
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -576,7 +576,7 @@ Sent only by a device whose `hello` names `battery`: after each `welcome`, when 
 - A `charge` the daemon doesn't know reads as `unknown` and keeps its numbers.
 - `"mv":null` and `"percent":null` read as absent.
 
-The daemon keeps the latest valid frame of the live session and shows it in the desktop app. It drops the reading when the session ends, and a frame from a replaced session changes nothing. A frame that is refused, from a session that doesn't name `battery` or whose fields are mistyped, negative, out of range, missing `charge` or breaking the rules above, is ignored. It never ends the session, so there is no `error` reply. A refused frame from a session that names `battery` is logged once per session. One from a session that doesn't is ignored under the daemon's generic unexpected-message log, as `feed_dismiss` is. A text frame that isn't JSON still gets `bad_request`, like any other.
+The daemon keeps the latest valid frame of the live session and shows it in the desktop app. It tells the app of a changed value at most once a second per session, but the value it keeps is always the latest. It drops the reading when the session ends, and a frame from a replaced session changes nothing. A frame that is refused, from a session that doesn't name `battery` or whose fields are mistyped, negative, out of range, missing `charge` or breaking the rules above, is ignored. It never ends the session, so there is no `error` reply. A refused frame from a session that names `battery` is logged once per session. One from a session that doesn't is ignored under the daemon's generic unexpected-message log, as `feed_dismiss` is. A text frame that isn't JSON still gets `bad_request`, like any other.
 
 ### `report` (device → daemon)
 
