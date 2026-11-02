@@ -112,6 +112,7 @@ mod tests {
             id: id.to_string(),
             connected,
             caps: Vec::new(),
+            battery: None,
         }
     }
 

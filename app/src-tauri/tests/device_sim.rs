@@ -37,9 +37,10 @@ use watchdeck_lib::daemon::gpu::GpuReading;
 use watchdeck_lib::daemon::hoststats::HostSources;
 use watchdeck_lib::daemon::pairing::{Pairing, PairingState};
 use watchdeck_lib::daemon::protocol::{
-    decode_hex, encode_hex, pairing_code, Button, CardState, Colors, ErrorCode, Feed, FeedCard,
-    FeedDismiss, IconFrame, Message, NetUnit, NoteLevel, Report, Sleep, SleepAnchor, SleepShow,
-    SleepSpinner, TempUnit, TileState, Token, ASSET_CHUNK_BYTES, ASSET_HEADER_BYTES,
+    decode_hex, encode_hex, pairing_code, Battery, Button, CardState, Charge, Colors, ErrorCode,
+    Feed, FeedCard, FeedDismiss, IconFrame, Message, NetUnit, NoteLevel, Report, Sleep,
+    SleepAnchor, SleepShow, SleepSpinner, TempUnit, TileState, Token, ASSET_CHUNK_BYTES,
+    ASSET_HEADER_BYTES,
 };
 use watchdeck_lib::daemon::screens::{self, Fit};
 use watchdeck_lib::daemon::secrets::Secrets;
@@ -804,6 +805,7 @@ async fn an_impostor_with_a_stolen_device_id_cannot_kick_the_paired_session() {
             id: DEVICE.into(),
             connected: true,
             caps: Vec::new(),
+            battery: None,
         }]
     );
 }
@@ -2125,6 +2127,7 @@ async fn the_fonts_cap_gets_font_fields_and_a_font_only_edit_pushes_a_new_rev_wi
             id: DEVICE.into(),
             connected: true,
             caps: vec!["fonts".into()],
+            battery: None,
         }],
         "the unknown cap is not kept"
     );
@@ -3646,6 +3649,7 @@ async fn a_sleep_device_gets_the_frame_after_the_first_layout_and_others_get_non
             id: DEVICE.into(),
             connected: true,
             caps: vec!["sleep".into()],
+            battery: None,
         }]
     );
     assert_only_a_result_follows(&mut c, 1).await;
@@ -3866,4 +3870,167 @@ async fn a_paged_set_comes_first_then_the_known_tile_then_sleep() {
     assert_eq!(recv_tile(&mut c, 5).await.0, "up");
     let sleep = next_sleep(&mut c).await;
     assert_eq!(sleep.check(), Ok(()));
+}
+
+const BATTERY_A: &str = r#"{"t":"battery","mv":3873,"percent":53,"charge":"discharging"}"#;
+const BATTERY_B: &str = r#"{"t":"battery","mv":4120,"percent":91,"charge":"charging"}"#;
+
+fn battery_of(daemon: &Daemon, device: &str) -> Option<Battery> {
+    let list = daemon.devices.list();
+    list.iter()
+        .find(|d| d.id == device)
+        .expect("paired")
+        .battery
+}
+
+/// Waits until `device`'s listed battery is `want`.
+async fn wait_for_battery(daemon: &Daemon, device: &str, want: Option<Battery>) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while battery_of(daemon, device) != want {
+        assert!(
+            Instant::now() < deadline,
+            "the battery never became {want:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Presses `hello` and waits for its result, which proves every earlier frame was handled.
+async fn press_and_wait(c: &mut Client, seq: u64) {
+    c.send(press("hello", seq)).await.unwrap();
+    loop {
+        if let Message::Result { seq: got, ok, .. } = recv_within(c, 5).await {
+            if got == seq {
+                assert!(ok);
+                return;
+            }
+        }
+    }
+}
+
+fn battery_a() -> Battery {
+    Battery {
+        mv: Some(3873),
+        percent: Some(53),
+        charge: Charge::Discharging,
+    }
+}
+
+fn battery_events(daemon: &mut Daemon) -> usize {
+    let mut n = 0;
+    while let Ok(event) = daemon.events.try_recv() {
+        n += usize::from(matches!(event, DaemonEvent::BatteryChanged(_)));
+    }
+    n
+}
+
+#[tokio::test]
+async fn a_battery_frame_is_listed_and_an_equal_one_emits_no_event() {
+    let mut daemon = start().await;
+    let mut c = device_session(daemon.addr, DEVICE, &TOKEN, &["battery"]).await;
+    assert_eq!(caps_of(&daemon, DEVICE), ["battery"]);
+    assert_eq!(battery_of(&daemon, DEVICE), None);
+
+    c.send(Ws::text(BATTERY_A)).await.unwrap();
+    wait_for_battery(&daemon, DEVICE, Some(battery_a())).await;
+    c.send(Ws::text(BATTERY_A)).await.unwrap();
+    press_and_wait(&mut c, 1).await;
+    assert_eq!(battery_events(&mut daemon), 1, "the repeat is no change");
+
+    // The unavailable form replaces the reading and is a change.
+    c.send(Ws::text(r#"{"t":"battery","charge":"unknown"}"#))
+        .await
+        .unwrap();
+    let unavailable = Battery {
+        mv: None,
+        percent: None,
+        charge: Charge::Unknown,
+    };
+    wait_for_battery(&daemon, DEVICE, Some(unavailable)).await;
+    assert_eq!(battery_events(&mut daemon), 1);
+}
+
+#[tokio::test]
+async fn a_battery_frame_without_the_cap_is_ignored() {
+    let daemon = start().await;
+    let mut c = device_session(daemon.addr, DEVICE, &TOKEN, &["pages"]).await;
+    c.send(Ws::text(BATTERY_A)).await.unwrap();
+    press_and_wait(&mut c, 1).await;
+    assert_eq!(battery_of(&daemon, DEVICE), None);
+}
+
+#[tokio::test]
+async fn a_bad_battery_frame_is_ignored_and_the_session_goes_on() {
+    let daemon = start().await;
+    let mut c = device_session(daemon.addr, DEVICE, &TOKEN, &["battery"]).await;
+    for (i, frame) in [
+        r#"{"t":"battery","mv":3873,"percent":101,"charge":"discharging"}"#,
+        r#"{"t":"battery","mv":3873,"percent":"53","charge":"discharging"}"#,
+        r#"{"t":"battery","mv":-1,"percent":53,"charge":"discharging"}"#,
+        r#"{"t":"battery","mv":1e30,"percent":53,"charge":"discharging"}"#,
+        r#"{"t":"battery","mv":3873,"percent":53}"#,
+        r#"{"t":"battery","mv":10001,"percent":53,"charge":"full"}"#,
+        r#"{"t":"battery","mv":3873,"charge":"discharging"}"#,
+        r#"{"t":"battery","charge":"charging"}"#,
+        r#"{"t":"battery","charge":"full"}"#,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        c.send(Ws::text(frame)).await.unwrap();
+        press_and_wait(&mut c, i as u64 + 1).await;
+        assert_eq!(battery_of(&daemon, DEVICE), None, "{frame}");
+    }
+    // A good one after the bad ones still lands.
+    c.send(Ws::text(BATTERY_A)).await.unwrap();
+    wait_for_battery(&daemon, DEVICE, Some(battery_a())).await;
+}
+
+#[tokio::test]
+async fn a_replaced_session_cannot_change_the_battery_of_its_replacement() {
+    let daemon = start().await;
+    let mut old = device_session(daemon.addr, DEVICE, &TOKEN, &["battery"]).await;
+    old.send(Ws::text(BATTERY_A)).await.unwrap();
+    wait_for_battery(&daemon, DEVICE, Some(battery_a())).await;
+
+    let mut new = device_session(daemon.addr, DEVICE, &TOKEN, &["battery"]).await;
+    assert_eq!(
+        battery_of(&daemon, DEVICE),
+        None,
+        "the replacement starts without one"
+    );
+    // The old session is kicked, so its late frame goes nowhere.
+    let _ = old.send(Ws::text(BATTERY_B)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(battery_of(&daemon, DEVICE), None);
+
+    new.send(Ws::text(BATTERY_B)).await.unwrap();
+    wait_for_battery(
+        &daemon,
+        DEVICE,
+        Some(Battery {
+            mv: Some(4120),
+            percent: Some(91),
+            charge: Charge::Charging,
+        }),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn disconnecting_clears_the_battery() {
+    let daemon = start().await;
+    let mut c = device_session(daemon.addr, DEVICE, &TOKEN, &["battery"]).await;
+    c.send(Ws::text(BATTERY_A)).await.unwrap();
+    wait_for_battery(&daemon, DEVICE, Some(battery_a())).await;
+    drop(c);
+    wait_until_disconnected(&daemon.devices).await;
+    assert_eq!(battery_of(&daemon, DEVICE), None);
+
+    let _c = device_session(daemon.addr, DEVICE, &TOKEN, &["battery"]).await;
+    assert_eq!(
+        battery_of(&daemon, DEVICE),
+        None,
+        "a new session starts empty"
+    );
 }

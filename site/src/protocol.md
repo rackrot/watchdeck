@@ -167,6 +167,7 @@ device                      daemon
   |<-- asset frame (binary) ---|   one per asset_get
   |<-- feed ------------------|   with feed, a snapshot that replaces the last
   |--- feed_dismiss --------->|   when a note is dismissed
+  |--- battery -------------->|   with battery, after welcome and when the reading changes
   |--- press ---------------->|
   |<-- result ----------------|   exactly one per press
   |--- report --------------->|   a crash or reset from an earlier boot, if the device has one
@@ -209,6 +210,7 @@ device                      daemon
 | `status_bar` | Reads `stats` and shows the host's CPU and GPU busy share and temperatures, memory, network rates and the clock in a bar, in the units and colors the frame gives. See [`stats`](#stats-daemon--device) |
 | `sleep` | Shows a sleep screen when the link is lost or the user asks for one. Reads `sleep`, fetches its image with `asset_get` and reads the [asset frames](#asset-frames). See [`sleep`](#sleep-daemon--device) |
 | `feed` | Shows the -1 feed page, of notifications and stat cards. Reads `feed` and sends `feed_dismiss`. See [`feed`](#feed-daemon--device) |
+| `battery` | Reads its battery and sends [`battery`](#battery-device--daemon) |
 
 The daemon hashes `token` and compares the result in constant time with the hash it stored for `device`. A missing, malformed or wrong token and an unknown device all get the same `error`, then a close:
 
@@ -553,6 +555,27 @@ Every string is printable ASCII. A device refuses a `sleep` or `feed` frame with
 ```
 
 `id` is the `id` of a note the device showed, 1 to 63 printable ASCII characters. The daemon removes that note from the feed it sends to every session. An unknown `id` is ignored.
+
+### `battery` (device → daemon)
+
+```json
+{"t":"battery","mv":3873,"percent":53,"charge":"discharging"}
+```
+
+Sent only by a device whose `hello` names `battery`: after each `welcome`, when the charge state changes, and when the percent moves. A device with no way to read a battery sends none.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `mv` | integer | Battery voltage in millivolts, 0 to 10000 |
+| `percent` | integer | Charge, 0 to 100 |
+| `charge` | string | `charging`, `full`, `discharging`, `none` or `unknown`. Required |
+
+- `mv` and `percent` come together or not at all.
+- `charging`, `full` and `discharging` need both.
+- `none` (no battery fitted) and `unknown` may leave both out. `unknown` with no numbers means the reading is unavailable.
+- A `charge` the daemon doesn't know reads as `unknown` and keeps its numbers.
+
+The daemon keeps the latest valid frame of the live session and shows it in the desktop app. It drops the reading when the session ends, and a frame from a replaced session changes nothing. A frame that is refused, from a session that doesn't name `battery` or whose fields are mistyped, negative, out of range, missing `charge` or breaking the rules above, is logged and ignored. It never ends the session, so there is no `error` reply. A text frame that isn't JSON still gets `bad_request`, like any other.
 
 ### `report` (device → daemon)
 

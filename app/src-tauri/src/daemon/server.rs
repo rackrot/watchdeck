@@ -30,10 +30,10 @@ use super::hoststats::{self, HostSources, HostStats};
 use super::integrations::{self, FeedHandle, FeedSlots, Integrations};
 use super::protocol::TileState;
 use super::protocol::{
-    decode_hex, encode_asset_frame, encode_hex, valid_device_id, CardState, Colors, ErrorCode,
-    Feed, Message, Report, Token, ASSET_ID_BYTES, CAPS, CAP_FEED, CAP_FONTS, CAP_PAGES, CAP_SLEEP,
-    CAP_STATUS_BAR, ICON_ID_BYTES, MAX_MESSAGE_BYTES, MAX_REPORTS_PER_SESSION, TOKEN_BYTES,
-    VERSION,
+    decode_hex, encode_asset_frame, encode_hex, valid_device_id, Battery, CardState, Colors,
+    ErrorCode, Feed, Message, Report, Token, ASSET_ID_BYTES, CAPS, CAP_BATTERY, CAP_FEED,
+    CAP_FONTS, CAP_PAGES, CAP_SLEEP, CAP_STATUS_BAR, ICON_ID_BYTES, MAX_MESSAGE_BYTES,
+    MAX_REPORTS_PER_SESSION, TOKEN_BYTES, VERSION,
 };
 
 use super::screens::IMAGE_BYTES;
@@ -75,6 +75,8 @@ pub enum DaemonEvent {
     /// The device built the grid of layout `rev`. Only a newer board sends the ack, and the first
     /// layout's is announced too.
     LayoutApplied(String, u32),
+    /// A live session's battery reading changed. The window refetches the device list.
+    BatteryChanged(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -83,6 +85,9 @@ pub struct DeviceInfo {
     pub connected: bool,
     /// The capabilities of the live session (see [`CAPS`]), empty while disconnected.
     pub caps: Vec<String>,
+    /// The latest checked `battery` frame of the live session, `None` while disconnected or
+    /// before one arrives.
+    pub battery: Option<Battery>,
 }
 
 /// Why a live session is told to end.
@@ -126,6 +131,7 @@ struct SessionEntry {
     /// Closes the session.
     kick: oneshot::Sender<Kick>,
     caps: Vec<String>,
+    battery: Option<Battery>,
 }
 
 struct Registry {
@@ -246,6 +252,7 @@ impl Devices {
                     id: id.to_string(),
                     connected: session.is_some(),
                     caps: session.map(|s| s.caps.clone()).unwrap_or_default(),
+                    battery: session.and_then(|s| s.battery),
                 }
             })
             .collect()
@@ -444,6 +451,7 @@ impl Shared {
             id,
             kick: kick_tx,
             caps,
+            battery: None,
         };
         let old = registry.sessions.insert(device.to_string(), entry);
         registry.publish_count();
@@ -471,6 +479,25 @@ impl Shared {
             drop(registry);
             self.emit(DaemonEvent::DeviceDisconnected(device.to_string()));
         }
+    }
+
+    /// Keeps `battery` as session `id` of `device`'s latest reading. A session that has been
+    /// replaced or ended finds its slot taken or gone and changes nothing.
+    fn set_battery(&self, device: &str, id: u64, battery: Battery) {
+        let mut registry = self.registry();
+        let Some(entry) = registry
+            .sessions
+            .get_mut(device)
+            .filter(|current| current.id == id)
+        else {
+            return;
+        };
+        if entry.battery == Some(battery) {
+            return;
+        }
+        entry.battery = Some(battery);
+        drop(registry);
+        self.emit(DaemonEvent::BatteryChanged(device.to_string()));
     }
 
     fn emit(&self, event: DaemonEvent) {
@@ -532,6 +559,11 @@ fn incoming(frame: WsMessage) -> Option<Incoming> {
             Ok(msg) => Incoming::Msg(msg),
             Err(e) => match hello_version_mismatch(text.as_str()) {
                 Some(reason) => Incoming::BadVersion(reason),
+                None if is_battery(text.as_str()) => {
+                    // A mistyped battery frame is rejected by `check` like any other bad one,
+                    // instead of ending the session.
+                    Incoming::Msg(Message::Battery(Battery::malformed()))
+                }
                 None => match unparsable_report_id(text.as_str()) {
                     // A report with mistyped fields is rejected by `check` like any other bad
                     // one (its kind is empty), instead of ending the session.
@@ -593,6 +625,11 @@ where
         Ok(Err(e)) => log::debug!("close: {e}"),
         Err(_) => log::warn!("close timed out after {WRITE_TIMEOUT:?}"),
     }
+}
+
+/// Whether `text` is JSON whose `t` is `battery`, however wrong the rest of it is.
+fn is_battery(text: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(text).is_ok_and(|value| value["t"] == "battery")
 }
 
 /// For a `report` that failed to parse, its `id` if that is a valid one and empty if not.
@@ -741,7 +778,7 @@ where
         screen[0],
         screen[1]
     );
-    let outcome = serve(tx, rx, kick, shared, &device, &session_caps).await;
+    let outcome = serve(tx, rx, kick, shared, &device, id, &session_caps).await;
     shared.unregister(&device, id);
     outcome
 }
@@ -835,6 +872,7 @@ async fn serve<S>(
     mut kick: oneshot::Receiver<Kick>,
     shared: &Shared,
     device: &str,
+    session_id: u64,
     caps: &[String],
 ) -> Result<(), WsError>
 where
@@ -893,6 +931,8 @@ where
 
     let feed = shared.integrations.handle();
     let feed_on = caps.iter().any(|cap| cap == CAP_FEED);
+    let battery_on = caps.iter().any(|cap| cap == CAP_BATTERY);
+    let mut battery_refused = false;
     let mut feed_rx = feed.subscribe();
     // The first snapshot goes out with the session, even an empty one, which tells the board
     // there is no -1 page. Later ones wait for the gap.
@@ -1105,6 +1145,16 @@ where
                     None => log::info!("{device}: asset {} is not the current image", get.id),
                 }
             }
+            Incoming::Msg(Message::Battery(battery)) if battery_on => match battery.check() {
+                Ok(()) => shared.set_battery(device, session_id, battery),
+                // The board resends at every welcome, so a close would only loop it through
+                // reconnects over a status nicety. One line a session is enough.
+                Err(why) if !battery_refused => {
+                    battery_refused = true;
+                    log::warn!("{device}: ignoring a bad battery frame: {why}");
+                }
+                Err(_) => {}
+            },
             Incoming::Msg(Message::Report(report)) => {
                 reports += 1;
                 // The device resends an unacked report on every session, so a bad or surplus one

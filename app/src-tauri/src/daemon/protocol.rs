@@ -12,7 +12,14 @@ pub use super::units::{NetUnit, TempUnit};
 pub const VERSION: u32 = 1;
 
 /// The capabilities a session keeps from `hello.caps`; any other name is dropped.
-pub const CAPS: [&str; 5] = [CAP_FONTS, CAP_PAGES, CAP_STATUS_BAR, CAP_SLEEP, CAP_FEED];
+pub const CAPS: [&str; 6] = [
+    CAP_FONTS,
+    CAP_PAGES,
+    CAP_STATUS_BAR,
+    CAP_SLEEP,
+    CAP_FEED,
+    CAP_BATTERY,
+];
 /// The device draws every font in `fonts_gen::FONT_IDS` and reads the layout's font fields.
 pub const CAP_FONTS: &str = "fonts";
 /// The device assembles a set of up to 4 `layout` pages and lays out the shorter grid for 2 or
@@ -24,6 +31,8 @@ pub const CAP_STATUS_BAR: &str = "status_bar";
 pub const CAP_SLEEP: &str = "sleep";
 /// The device shows the -1 feed page, reads `feed`, and sends `feed_dismiss`.
 pub const CAP_FEED: &str = "feed";
+/// The device reads its battery and sends `battery`.
+pub const CAP_BATTERY: &str = "battery";
 
 /// Largest message, and largest frame, in either direction.
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
@@ -277,6 +286,9 @@ pub enum Message {
     /// The device dismissed a note, which the daemon removes from every board. Checked with
     /// [`FeedDismiss::check`].
     FeedDismiss(FeedDismiss),
+    /// The device's battery, from a session whose `hello` names [`CAP_BATTERY`]. Unchecked until
+    /// [`Battery::check`] passes.
+    Battery(Battery),
     /// A crash or abnormal reset from an earlier boot. Unchecked until [`Report::check`] passes.
     Report(Report),
     ReportAck {
@@ -653,6 +665,72 @@ impl FeedDismiss {
             return Err(format!(
                 "id is not 1 to {MAX_FEED_ID_CHARS} printable ASCII characters"
             ));
+        }
+        Ok(())
+    }
+}
+
+/// The most millivolts a battery frame may carry.
+pub const MAX_BATTERY_MV: u32 = 10_000;
+
+/// What the battery is doing. An unknown future name reads as `Unknown` and keeps the numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Charge {
+    Charging,
+    Full,
+    Discharging,
+    /// No battery is fitted.
+    None,
+    #[serde(other)]
+    Unknown,
+}
+
+/// A device's battery reading as it arrives. A wrong value is caught by [`Battery::check`], and a
+/// frame serde can't read at all becomes [`Battery::malformed`], so a bad frame is dropped
+/// without ending the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Battery {
+    /// Battery voltage, with `percent`: both or neither.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mv: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent: Option<u32>,
+    pub charge: Charge,
+}
+
+impl Battery {
+    /// Stands for a battery frame that failed to parse. `check` always rejects it.
+    pub fn malformed() -> Self {
+        Self {
+            mv: Some(0),
+            percent: None,
+            charge: Charge::Unknown,
+        }
+    }
+
+    /// Why this reading is unacceptable.
+    pub fn check(&self) -> Result<(), String> {
+        match (self.mv, self.percent) {
+            (None, None) => {
+                if matches!(
+                    self.charge,
+                    Charge::Charging | Charge::Full | Charge::Discharging
+                ) {
+                    return Err(
+                        "a charging, full or discharging reading needs mv and percent".into(),
+                    );
+                }
+            }
+            (Some(mv), Some(percent)) => {
+                if mv > MAX_BATTERY_MV {
+                    return Err(format!("mv is over {MAX_BATTERY_MV}"));
+                }
+                if percent > 100 {
+                    return Err("percent is over 100".into());
+                }
+            }
+            _ => return Err("mv and percent come together or not at all".into()),
         }
         Ok(())
     }
@@ -1557,5 +1635,78 @@ mod tests {
         );
         assert_eq!(encode_asset_frame(&id, u64::from(u32::MAX) + 1, &[1]), None);
         assert!(encode_asset_frame(&id, u64::from(u32::MAX), &[1]).is_some());
+    }
+
+    #[test]
+    fn battery_frames_parse_and_the_combination_rules_hold() {
+        let Message::Battery(full) = parse(include_str!("../../tests/fixtures/battery.json"))
+        else {
+            panic!("not a battery")
+        };
+        assert_eq!(
+            full,
+            Battery {
+                mv: Some(3873),
+                percent: Some(53),
+                charge: Charge::Discharging
+            }
+        );
+        assert_eq!(full.check(), Ok(()));
+
+        let reading = |mv, percent, charge| Battery {
+            mv,
+            percent,
+            charge,
+        };
+        for charge in [Charge::Charging, Charge::Full, Charge::Discharging] {
+            assert!(reading(None, None, charge).check().is_err(), "{charge:?}");
+            assert!(reading(Some(3800), None, charge).check().is_err());
+            assert!(reading(None, Some(50), charge).check().is_err());
+            assert_eq!(reading(Some(3800), Some(50), charge).check(), Ok(()));
+        }
+        for charge in [Charge::None, Charge::Unknown] {
+            assert_eq!(reading(None, None, charge).check(), Ok(()), "{charge:?}");
+            assert_eq!(reading(Some(0), Some(0), charge).check(), Ok(()));
+            assert!(reading(Some(3800), None, charge).check().is_err());
+            assert!(reading(None, Some(50), charge).check().is_err());
+        }
+        let ok = |mv, percent| reading(Some(mv), Some(percent), Charge::Charging).check();
+        assert_eq!(ok(MAX_BATTERY_MV, 100), Ok(()));
+        assert!(ok(MAX_BATTERY_MV + 1, 100).unwrap_err().starts_with("mv "));
+        assert!(ok(4000, 101).unwrap_err().starts_with("percent "));
+        assert!(Battery::malformed().check().is_err());
+    }
+
+    #[test]
+    fn an_unknown_charge_name_reads_as_unknown_and_keeps_its_numbers() {
+        let Message::Battery(b) =
+            parse(r#"{"t":"battery","mv":3900,"percent":60,"charge":"trickle"}"#)
+        else {
+            panic!("not a battery")
+        };
+        assert_eq!(b.charge, Charge::Unknown);
+        assert_eq!((b.mv, b.percent), (Some(3900), Some(60)));
+        assert_eq!(b.check(), Ok(()));
+    }
+
+    #[test]
+    fn a_battery_serializes_with_lowercase_charge_and_no_absent_numbers() {
+        let json = |b: Battery| serde_json::to_string(&b).unwrap();
+        assert_eq!(
+            json(Battery {
+                mv: Some(4100),
+                percent: Some(90),
+                charge: Charge::Charging
+            }),
+            r#"{"mv":4100,"percent":90,"charge":"charging"}"#
+        );
+        assert_eq!(
+            json(Battery {
+                mv: None,
+                percent: None,
+                charge: Charge::Unknown
+            }),
+            r#"{"charge":"unknown"}"#
+        );
     }
 }

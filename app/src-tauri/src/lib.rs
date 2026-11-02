@@ -220,6 +220,13 @@ pub fn run() {
                             }
                             continue;
                         }
+                        // Once a reading changes, with no log line and no tray rewrite.
+                        Ok(DaemonEvent::BatteryChanged(_)) => {
+                            if let Err(e) = handle.emit("devices-changed", ()) {
+                                log::error!("emitting devices-changed: {e}");
+                            }
+                            continue;
+                        }
                         Ok(event) => log::info!("{event:?}"),
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             log::warn!("missed {n} daemon events")
