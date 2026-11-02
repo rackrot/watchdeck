@@ -9,6 +9,7 @@
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
 #include "esp_timer.h"
+#include "battery.h"
 #include "display.h"
 #include "feedpage.h"
 #include "font_licenses.h"
@@ -63,9 +64,9 @@ _Static_assert(GRID_SCREEN_W == DISPLAY_H_RES && GRID_SCREEN_H == DISPLAY_V_RES,
 #define OPEN_SETTINGS_X (DISPLAY_H_RES - 20 - FORGET_W - 12 - OPEN_SETTINGS_W) // 12 px left of Forget pairing
 
 // The status bar, 1024 px wide, in Roboto Mono Regular 20 so that every text of a group has a fixed width. Left to
-// right: CPU, RAM, GPU, NET, then the date and time. CPU starts BAR_MARGIN from the left edge and the clock ends
-// BAR_MARGIN from the right one. The gaps between CPU, RAM, GPU, NET and the clock's area are equal. bar_create
-// measures each group's worst case over every unit form and computes them.
+// right: CPU, RAM, GPU, NET, the battery (only when battery_present()), then the time as HH:MM. CPU starts BAR_MARGIN
+// from the left edge and the clock ends BAR_MARGIN from the right one. The gaps between the groups and the clock's
+// area are equal. bar_create measures each group's worst case over every unit form and computes them.
 #define BAR_MARGIN 12 // px between the first group and the left edge, and between the clock and the right edge
 #define BAR_REFRESH_MS 1000
 #define SLEEP_WATCH_MS 1000 // how often the offline watchdog looks at the link and the touch idle time
@@ -106,6 +107,7 @@ typedef enum {
     BAR_RAM,
     BAR_GPU,
     BAR_NET, // "▼  1.2M ▲ 340.0k"
+    BAR_BAT, // battery glyph, charge mark and percent; no label at all without a battery monitor
     BAR_COUNT,
 } bar_slot_t;
 static lv_obj_t *s_bar;
@@ -1209,8 +1211,25 @@ static void bar_group_text(bar_slot_t slot, const proto_stats_t *stats, bool fre
     }
 }
 
-// Show the latest stats in the slots. While the link is down the status text takes the four host slots' place and the
-// clock stays. The host values show "--" once the latest frame is stale (hoststat_fresh), or when it lacked them.
+// The battery slot: a glyph for the level, a charge mark while charging, then the percent in 4 cells. "--" when the
+// reading isn't fresh, which the caller says with NULL.
+static void bar_battery_text(const bat_reading_t *r, char *buf, size_t size)
+{
+    static const char *const glyphs[BAT_LEVELS] = {LV_SYMBOL_BATTERY_EMPTY, LV_SYMBOL_BATTERY_1, LV_SYMBOL_BATTERY_2,
+                                                   LV_SYMBOL_BATTERY_3, LV_SYMBOL_BATTERY_FULL};
+    char percent[BATFMT_PERCENT_MAX];
+    batfmt_percent(percent, sizeof(percent), r);
+    if (r == NULL) {
+        snprintf(buf, size, "%s", percent);
+        return;
+    }
+    snprintf(buf, size, "%s%s%s", glyphs[batfmt_level(r->percent)], r->charge == BAT_CHARGING ? LV_SYMBOL_CHARGE : "",
+             percent);
+}
+
+// Show the latest stats in the slots. While the link is down the status text takes the host slots' place and the
+// clock and battery stay (they are local values). The host values show "--" once the latest frame is stale
+// (hoststat_fresh), or when it lacked them.
 static void bar_refresh(void)
 {
     if (!s_bar) {
@@ -1226,18 +1245,27 @@ static void bar_refresh(void)
     } else {
         strlcpy(text, "--:--", sizeof(text));
     }
-    bar_set(BAR_CLOCK, text);
+    // hoststat_clock gives "Wed 22 Oct 14:32"; the bar shows only the HH:MM.
+    bar_set(BAR_CLOCK, strlen(text) == 16 ? text + 11 : "--:--");
+
+    if (s_bar_labels[BAR_BAT]) {
+        bat_snapshot_t snap;
+        battery_snapshot(&snap); // a copy under a spinlock, no I2C
+        const bool shown = snap.present && batfmt_fresh(snap.have, snap.age_us);
+        bar_battery_text(shown ? &snap.reading : NULL, text, sizeof(text));
+        bar_set(BAR_BAT, text);
+    }
 
     if (!s_online) {
         bar_set(BAR_STATUS, s_texts[STATUS_DAEMON]);
-        for (bar_slot_t slot = BAR_CPU; slot < BAR_COUNT; slot++) {
+        for (bar_slot_t slot = BAR_CPU; slot < BAR_BAT; slot++) {
             bar_set(slot, "");
         }
         return;
     }
     bar_set(BAR_STATUS, "");
     const bool fresh = hoststat_fresh(s_have_stats, now - s_stats_at_us);
-    for (bar_slot_t slot = BAR_CPU; slot < BAR_COUNT; slot++) {
+    for (bar_slot_t slot = BAR_CPU; slot < BAR_BAT; slot++) {
         bar_group_text(slot, &s_stats, fresh, text, sizeof(text));
         bar_set(slot, text);
     }
@@ -1255,6 +1283,21 @@ static int bar_text_w(const char *text)
     // The recolor flag makes a "#rrggbb text#" measure as just its text, the way the labels draw it.
     lv_text_get_size(&size, text, &s_bar_font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_RECOLOR);
     return size.x;
+}
+
+// The widest the battery slot gets: every percent, which covers every glyph, with and without the charge mark, or "--".
+static int bar_battery_w(void)
+{
+    int widest = bar_text_w("--");
+    char text[HOSTSTAT_GROUP_MAX];
+    for (unsigned percent = 0; percent <= 100; percent++) {
+        for (int charging = 0; charging <= 1; charging++) {
+            const bat_reading_t r = {.percent = percent, .charge = charging ? BAT_CHARGING : BAT_DISCHARGING};
+            bar_battery_text(&r, text, sizeof(text));
+            widest = LV_MAX(widest, bar_text_w(text));
+        }
+    }
+    return widest;
 }
 
 // The widest a host group gets: every value at its longest, in every unit form, and with a color on every value. The
@@ -1318,34 +1361,49 @@ static void bar_create(void)
     }
     // Each group's worst case over every unit form ("CPU 100% 302°F", "▼999.9Mi ▲999.9Mi").
     int w[BAR_COUNT] = {0};
-    w[BAR_CLOCK] = bar_text_w("Wed 24 May 04:44");
-    for (bar_slot_t slot = BAR_CPU; slot < BAR_COUNT; slot++) {
+    w[BAR_CLOCK] = bar_text_w("00:00");
+    for (bar_slot_t slot = BAR_CPU; slot < BAR_BAT; slot++) {
         w[slot] = bar_group_w(slot);
     }
-    // CPU starts at BAR_MARGIN and the clock ends BAR_MARGIN from the right edge. The four gaps between CPU, RAM, GPU,
-    // NET and the clock's area are equal, within 1 px: the remainder goes one px each to the first gaps.
+    // The battery slot exists only with a monitor; without one the bar is the four groups and the clock.
+    const bool has_battery = battery_present();
+    const bar_slot_t last = has_battery ? BAR_BAT : BAR_NET;
+    if (has_battery) {
+        w[BAR_BAT] = bar_battery_w();
+    }
+    // CPU starts at BAR_MARGIN and the clock ends BAR_MARGIN from the right edge. The gaps between the groups and the
+    // clock's area are equal, within 1 px: the remainder goes one px each to the first gaps.
+    const int groups = last - BAR_CPU + 1;
     const int clock_x = DISPLAY_H_RES - BAR_MARGIN - w[BAR_CLOCK];
-    const int free_px = clock_x - BAR_MARGIN - w[BAR_CPU] - w[BAR_RAM] - w[BAR_GPU] - w[BAR_NET];
+    int free_px = clock_x - BAR_MARGIN;
+    for (bar_slot_t slot = BAR_CPU; slot <= last; slot++) {
+        free_px -= w[slot];
+    }
     if (free_px < 0) {
         ESP_LOGW(TAG, "bar slot overflow: the groups need %d px more than the bar has", -free_px);
     }
-    const int gap = free_px > 0 ? free_px / 4 : 0;
-    const int spare = free_px > 0 ? free_px % 4 : 0;
+    const int gap = free_px > 0 ? free_px / groups : 0;
+    const int spare = free_px > 0 ? free_px % groups : 0;
     int x[BAR_COUNT] = {0};
     x[BAR_STATUS] = BAR_MARGIN;
     x[BAR_CLOCK] = clock_x;
     x[BAR_CPU] = BAR_MARGIN;
-    x[BAR_RAM] = x[BAR_CPU] + w[BAR_CPU] + gap + (0 < spare);
-    x[BAR_GPU] = x[BAR_RAM] + w[BAR_RAM] + gap + (1 < spare);
-    x[BAR_NET] = x[BAR_GPU] + w[BAR_GPU] + gap + (2 < spare);
-    w[BAR_STATUS] = clock_x - 2 * BAR_MARGIN; // the link status text spans the group area
+    for (bar_slot_t slot = BAR_RAM; slot <= last; slot++) {
+        x[slot] = x[slot - 1] + w[slot - 1] + gap + ((int)(slot - BAR_RAM) < spare);
+    }
+    // The link status text spans the host group area and stops short of the battery, which stays visible.
+    w[BAR_STATUS] = (has_battery ? x[BAR_BAT] : clock_x) - 2 * BAR_MARGIN;
+    char batt_log[32] = "";
+    if (has_battery) {
+        snprintf(batt_log, sizeof(batt_log), " batt %d/%d", x[BAR_BAT], w[BAR_BAT]);
+    }
     // The text is as tall as the bar font's line, centered in the bar.
     const int text_h = s_bar_font.line_height;
     const int text_y = (BAR_H - text_h) / 2;
     ESP_LOGI(TAG,
-             "bar groups (x/width): cpu %d/%d ram %d/%d gpu %d/%d net %d/%d clock %d/%d, gap %d (+%d spare), margins "
+             "bar groups (x/width): cpu %d/%d ram %d/%d gpu %d/%d net %d/%d%s clock %d/%d, gap %d (+%d spare), margins "
              "%d left %d right, text y %d h %d",
-             x[BAR_CPU], w[BAR_CPU], x[BAR_RAM], w[BAR_RAM], x[BAR_GPU], w[BAR_GPU], x[BAR_NET], w[BAR_NET],
+             x[BAR_CPU], w[BAR_CPU], x[BAR_RAM], w[BAR_RAM], x[BAR_GPU], w[BAR_GPU], x[BAR_NET], w[BAR_NET], batt_log,
              x[BAR_CLOCK], w[BAR_CLOCK], gap, spare, x[BAR_CPU], DISPLAY_H_RES - x[BAR_CLOCK] - w[BAR_CLOCK], text_y,
              text_h);
 
@@ -1360,12 +1418,15 @@ static void bar_create(void)
     lv_obj_set_style_text_color(s_bar, lv_palette_lighten(LV_PALETTE_GREY, 2), 0);
     memset(s_bar_text, 0, sizeof(s_bar_text)); // every label starts as ""
     for (bar_slot_t slot = 0; slot < BAR_COUNT; slot++) {
+        if (slot == BAR_BAT && !has_battery) {
+            continue; // s_bar_labels[BAR_BAT] stays NULL
+        }
         lv_obj_t *label = lv_label_create(s_bar);
         s_bar_labels[slot] = label;
         lv_obj_set_size(label, w[slot], text_h);
         lv_obj_set_pos(label, x[slot], text_y);
         lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
-        if (slot == BAR_CLOCK) {
+        if (slot == BAR_CLOCK || slot == BAR_BAT) {
             lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_RIGHT, 0);
         } else if (slot >= BAR_CPU) {
             lv_label_set_recolor(label, true);
