@@ -34,12 +34,16 @@ static const char *TAG = "touch";
 #define TOUCH_FAIL_LOG_US (60 * 1000000LL)
 
 static esp_err_t (*s_gt911_read)(esp_lcd_touch_handle_t tp);
+#define TOUCH_HOLD_FAILS 5 // consecutive failures (about 50 ms) that keep the last points before a release
+
 static uint32_t s_read_failures;
+static uint32_t s_consecutive_failures;
 static int64_t s_last_fail_log_us; // 0 until the first line; touch_read runs on the LVGL task only
 
 // esp_lvgl_port wraps the read in ESP_ERROR_CHECK, so a failed I2C read would reboot the board. Count it, put back
 // the points the driver may have cleared (it zeroes them before its second read, so a failure there would read as a
-// release), and report success. The finger stays where it was for one more read.
+// release), and report success. The finger stays where it was for TOUCH_HOLD_FAILS failed reads in a row; after that
+// the points are cleared, so a bus that stays down doesn't hold a phantom press that clicks when it recovers.
 static esp_err_t touch_read(esp_lcd_touch_handle_t tp)
 {
     uint8_t points;
@@ -52,12 +56,18 @@ static esp_err_t touch_read(esp_lcd_touch_handle_t tp)
 
     esp_err_t err = s_gt911_read(tp);
     if (err == ESP_OK) {
+        s_consecutive_failures = 0;
         return ESP_OK;
     }
 
+    s_consecutive_failures++;
     portENTER_CRITICAL(&tp->data.lock);
-    tp->data.points = points;
-    memcpy(tp->data.coords, coords, sizeof(coords));
+    if (s_consecutive_failures <= TOUCH_HOLD_FAILS) {
+        tp->data.points = points;
+        memcpy(tp->data.coords, coords, sizeof(coords));
+    } else {
+        tp->data.points = 0;
+    }
     portEXIT_CRITICAL(&tp->data.lock);
 
     s_read_failures++;
