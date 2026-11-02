@@ -1040,7 +1040,7 @@ void test_stats_color_for_a_gpu_with_no_gpu_field_is_accepted_and_kept(void)
     TEST_ASSERT_EQUAL_UINT8(1u << PROTO_COLOR_GPU, msg.stats.colors_mask);
 }
 
-// The caps link.c sends today. When it gains "sleep", the five-cap test below is the one to match.
+// The caps link.c sends on a board without the STC8. With "battery" the 236-byte test below pins that.
 void test_hello_with_the_four_real_caps_and_a_32_character_fw_is_226_bytes(void)
 {
     char buf[256];
@@ -1056,6 +1056,47 @@ void test_hello_with_five_caps_and_a_32_character_fw_is_234_bytes(void)
     size_t len = proto_build_hello(buf, sizeof(buf), "wd-e8f60ae276ab", TOKEN, run_of('v', 32), 1024, 600, caps, 5);
     TEST_ASSERT_EQUAL_size_t(234, len);
     TEST_ASSERT_NOT_NULL(strstr(buf, "\"caps\":[\"fonts\",\"pages\",\"status_bar\",\"sleep\",\"feed\"]"));
+}
+
+void test_hello_with_the_five_real_caps_and_a_32_character_fw_is_236_bytes(void)
+{
+    char buf[256];
+    const char *const caps[] = {"fonts", "pages", "status_bar", "feed", "battery"};
+    size_t len = proto_build_hello(buf, sizeof(buf), "wd-e8f60ae276ab", TOKEN, run_of('v', 32), 1024, 600, caps, 5);
+    TEST_ASSERT_EQUAL_size_t(236, len);
+}
+
+// ---- Battery frame ----
+
+void test_battery_frame_carries_the_reading_and_the_charge_name(void)
+{
+    char buf[96];
+    const bat_reading_t r = {.mv = 3873, .percent = 53, .charge = BAT_DISCHARGING};
+    size_t len = proto_build_battery(buf, sizeof(buf), &r);
+    TEST_ASSERT_EQUAL_STRING("{\"t\":\"battery\",\"mv\":3873,\"percent\":53,\"charge\":\"discharging\"}", buf);
+    TEST_ASSERT_EQUAL_size_t(strlen(buf), len);
+    const bat_reading_t full = {.mv = 4180, .percent = 100, .charge = BAT_FULL};
+    TEST_ASSERT_GREATER_THAN(0, proto_build_battery(buf, sizeof(buf), &full));
+    TEST_ASSERT_EQUAL_STRING("{\"t\":\"battery\",\"mv\":4180,\"percent\":100,\"charge\":\"full\"}", buf);
+}
+
+void test_battery_frame_for_none_and_unavailable(void)
+{
+    char buf[96];
+    const bat_reading_t none = {.mv = 0, .percent = 0, .charge = BAT_NONE};
+    TEST_ASSERT_GREATER_THAN(0, proto_build_battery(buf, sizeof(buf), &none));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"charge\":\"none\""));
+    // No reading: unknown, and neither mv nor percent, since they are present together or not at all.
+    size_t len = proto_build_battery(buf, sizeof(buf), NULL);
+    TEST_ASSERT_EQUAL_STRING("{\"t\":\"battery\",\"charge\":\"unknown\"}", buf);
+    TEST_ASSERT_EQUAL_size_t(strlen(buf), len);
+}
+
+void test_battery_frame_that_does_not_fit_is_zero(void)
+{
+    char buf[20];
+    const bat_reading_t r = {.mv = 3873, .percent = 53, .charge = BAT_CHARGING};
+    TEST_ASSERT_EQUAL_size_t(0, proto_build_battery(buf, sizeof(buf), &r));
 }
 
 // ---- Sleep, feed and asset frames ----
@@ -1530,6 +1571,10 @@ void app_main(void)
     RUN_TEST(test_stats_color_for_a_gpu_with_no_gpu_field_is_accepted_and_kept);
     RUN_TEST(test_hello_with_the_four_real_caps_and_a_32_character_fw_is_226_bytes);
     RUN_TEST(test_hello_with_five_caps_and_a_32_character_fw_is_234_bytes);
+    RUN_TEST(test_hello_with_the_five_real_caps_and_a_32_character_fw_is_236_bytes);
+    RUN_TEST(test_battery_frame_carries_the_reading_and_the_charge_name);
+    RUN_TEST(test_battery_frame_for_none_and_unavailable);
+    RUN_TEST(test_battery_frame_that_does_not_fit_is_zero);
     RUN_TEST(test_sleep_fixture_has_every_field);
     RUN_TEST(test_sleep_minimal_fixture_has_no_image_or_text);
     RUN_TEST(test_sleep_image_must_be_32_lowercase_hex);

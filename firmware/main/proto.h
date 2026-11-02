@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "batfmt.h"
 #include "esp_err.h"
 #include "font_ids.h"
 
@@ -334,6 +335,12 @@ size_t proto_build_asset_get(char *buf, size_t buf_len, const uint8_t id[PROTO_A
  * JSON does not fit in `buf`.
  */
 size_t proto_build_feed_dismiss(char *buf, size_t buf_len, const char *id);
+
+/**
+ * Build a battery frame from `r`, or the unavailable form (`charge` "unknown", no `mv` or `percent`) when `r` is NULL.
+ * Returns the JSON length, or 0 if it does not fit in `buf`.
+ */
+size_t proto_build_battery(char *buf, size_t buf_len, const bat_reading_t *r);
 
 /** Build a press message. Returns the JSON length, or 0 if it does not fit in `buf`. */
 size_t proto_build_press(char *buf, size_t buf_len, const char *btn, uint32_t seq);

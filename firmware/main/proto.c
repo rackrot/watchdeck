@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "batfmt.h"
 #include "cJSON.h"
 #include "esp_log.h"
 #include "psa/crypto.h"
@@ -216,6 +217,21 @@ size_t proto_build_press(char *buf, size_t buf_len, const char *btn, uint32_t se
     cJSON_AddStringToObject(root, "t", "press");
     cJSON_AddStringToObject(root, "btn", btn);
     cJSON_AddNumberToObject(root, "seq", seq);
+    return print_into(root, buf, buf_len);
+}
+
+size_t proto_build_battery(char *buf, size_t buf_len, const bat_reading_t *r)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return 0;
+    }
+    cJSON_AddStringToObject(root, "t", "battery");
+    if (r) {
+        cJSON_AddNumberToObject(root, "mv", r->mv);
+        cJSON_AddNumberToObject(root, "percent", r->percent);
+    }
+    cJSON_AddStringToObject(root, "charge", batfmt_charge_name(r ? r->charge : BAT_UNKNOWN));
     return print_into(root, buf, buf_len);
 }
 

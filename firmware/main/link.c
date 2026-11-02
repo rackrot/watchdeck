@@ -4,6 +4,8 @@
 #include <string.h>
 #include <strings.h>
 
+#include "battery.h"
+#include "batfmt.h"
 #include "crash.h"
 #include "diag.h"
 #include "display.h"
@@ -122,6 +124,9 @@ static struct {
     esp_websocket_client_handle_t client;
     uint32_t gen;
     bool welcomed;
+    bool bat_have_sent;  // this session has sent a battery frame
+    bool bat_sent_avail; // and it carried a reading, not the unavailable form
+    bat_reading_t bat_sent;
     size_t backoff_idx;
     int64_t retry_at_ms;
     int64_t connect_deadline_ms;
@@ -732,6 +737,33 @@ static void send_text(const char *json, size_t len, const char *what)
     }
 }
 
+// Send a battery frame when the daemon should hear of one: the first of the session, or when batfmt_should_send says
+// so. No frame without the monitor, and a reading that isn't fresh goes as the unavailable form.
+static void send_battery(void)
+{
+    if (!battery_present() || s.state != ST_UP || !s.welcomed) {
+        return;
+    }
+    bat_snapshot_t snap;
+    battery_snapshot(&snap);
+    const bat_reading_t *now = batfmt_fresh(snap.have, snap.age_us) ? &snap.reading : NULL;
+    if (!batfmt_should_send(s.bat_have_sent, s.bat_sent_avail ? &s.bat_sent : NULL, now)) {
+        return;
+    }
+    char buf[96];
+    size_t len = proto_build_battery(buf, sizeof(buf), now);
+    if (len == 0) {
+        ESP_LOGW(TAG, "battery frame not built, dropped");
+        return;
+    }
+    s.bat_have_sent = true;
+    s.bat_sent_avail = now != NULL;
+    if (now) {
+        s.bat_sent = *now;
+    }
+    send_text(buf, len, NULL);
+}
+
 static void send_hello(void)
 {
     char device[PROTO_DEVICE_ID_LEN];
@@ -741,12 +773,14 @@ static void send_hello(void)
     }
     // Only names this build fully supports: "fonts" means ui.c draws every font id in font_list.h, and "pages" that
     // pageset.c assembles sets of up to PROTO_MAX_PAGES and ui.c lays out the paged grid, and "status_bar" that ui.c
-    // reads `stats` frames, and "feed" that ui.c shows the -1 page from `feed` frames and dismisses with feed_dismiss.
+    // reads `stats` frames, and "feed" that ui.c shows the -1 page from `feed` frames and dismisses with feed_dismiss,
+    // and "battery" that this build found the STC8 at boot and sends `battery` frames (named only then).
     // The hello must stay under 256 bytes: test_proto.c pins its size for this list, and for the list with "sleep".
-    static const char *const caps[] = {"fonts", "pages", "status_bar", "feed"};
+    const char *const caps[] = {"fonts", "pages", "status_bar", "feed", "battery"};
+    const size_t n_caps = sizeof(caps) / sizeof(caps[0]) - (battery_present() ? 0 : 1);
     char buf[256];
     size_t len = proto_build_hello(buf, sizeof(buf), device, s.pairing->token, esp_app_get_description()->version,
-                                   DISPLAY_H_RES, DISPLAY_V_RES, caps, sizeof(caps) / sizeof(caps[0]));
+                                   DISPLAY_H_RES, DISPLAY_V_RES, caps, n_caps);
     if (len == 0) {
         lost("hello does not fit");
         return;
@@ -1173,6 +1207,8 @@ static void handle_msg(const char *json, size_t len)
         }
         set_status("connected to %s", m->welcome_name);
         send_report();
+        s.bat_have_sent = false; // the first frame of a session always goes
+        send_battery();
         crash_test_arm();
         break;
     case PROTO_MSG_REPORT_ACK:
@@ -1360,7 +1396,8 @@ static void handle_event(link_ev_t *ev)
         }
         break;
     case EV_BATTERY:
-        s_battery_pending = false; // nothing goes on the wire yet, and while the link is down it drops silently
+        s_battery_pending = false;
+        send_battery(); // silent while the link is down: a W line per poll would fill the Errors tab
         break;
     case EV_PAIR:
         if (!s.paired && s.state == ST_BROWSE) {
