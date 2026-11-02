@@ -25,6 +25,7 @@ void test_svc_run(void);        // test_svc.c
 void test_kbmap_run(void);      // test_kbmap.c
 void test_wifistate_run(void);  // test_wifistate.c
 void test_storagefmt_run(void); // test_storagefmt.c
+void test_batfmt_run(void);     // test_batfmt.c
 
 static uint8_t frame[PROTO_MAX_ICON_FRAME];
 static char json[8192];
@@ -1566,6 +1567,7 @@ void app_main(void)
     test_kbmap_run();
     test_wifistate_run();
     test_storagefmt_run();
+    test_batfmt_run();
 
     // Returning from app_main does not end a linux-target process, so the failure count becomes the exit status.
     exit(UNITY_END());
