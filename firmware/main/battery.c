@@ -2,6 +2,7 @@
 
 #include <inttypes.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "driver/i2c_master.h"
 #include "esp_check.h"
@@ -55,13 +56,21 @@ static void reading_text(char *out, size_t size, const bat_reading_t *r, const u
              batfmt_charge_name(r->charge), raw);
 }
 
-// One write of the register pointer, then BATFMT_REGS bytes from 0x00 (the pointer auto-increments, plan A1).
+// Three short pointer-then-read transfers, one per field. Once the battery is full the STC8 can't keep up with one
+// 11-byte burst: the first 4 bytes arrive and the rest read 00, ff or a repeated byte, and the GT911 read after it
+// fails (plan C3: 1119 of 2086 polls overnight). Split this way it read 179 of 179 at full, with no touch failures.
 static esp_err_t read_regs(uint8_t regs[BATFMT_REGS], bat_reading_t *out)
 {
-    const uint8_t reg = 0x00;
-    const esp_err_t err = i2c_master_transmit_receive(s_dev, &reg, 1, regs, BATFMT_REGS, BATTERY_XFER_MS);
-    if (err != ESP_OK) {
-        return err;
+    static const struct {
+        uint8_t reg, len;
+    } parts[] = {{0x00, 4}, {0x04, 4}, {0x08, 3}};
+    memset(regs, 0, BATFMT_REGS);
+    for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
+        const esp_err_t err =
+            i2c_master_transmit_receive(s_dev, &parts[i].reg, 1, regs + parts[i].reg, parts[i].len, BATTERY_XFER_MS);
+        if (err != ESP_OK) {
+            return err;
+        }
     }
     return batfmt_decode(regs, out) ? ESP_OK : BATTERY_ERR_IMPLAUSIBLE;
 }

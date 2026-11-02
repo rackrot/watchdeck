@@ -10,7 +10,7 @@
  * site/src/device-spec.md "Battery monitoring".
  */
 
-#define BATFMT_REGS 11                    // registers 0x00 to 0x0A, read in one transfer
+#define BATFMT_REGS 11                    // registers 0x00 to 0x0A, read in three transfers
 #define BAT_STALE_US (15 * 1000 * 1000LL) // three polls
 #define BAT_MV_MAX 6000
 #define BAT_SEND_PERCENT_STEP 2

@@ -1,6 +1,6 @@
 # Battery level: the bar, Settings > Status, and the app
 
-Status: built 2026-11-01 (slices B0 to B8) on `main`; planned against `a1cd882`. C1, C5 and C6 passed on the board; C4 passed; C2 was skipped by choice; C3 is running and C4b was not run (see [Results](#results)). One second-opinion pass is folded in (see the [Critique log](#critique-log)).
+Status: built 2026-11-01 (slices B0 to B8) on `main`; planned against `a1cd882`. C1, C5 and C6 passed on the board; C4 passed; C2 was skipped by choice; C3 confirmed 0x02 at full and found failing reads once full, fixed by splitting the read (C3b passed); C4b was not run (see [Results](#results)). One second-opinion pass is folded in (see the [Critique log](#critique-log)).
 
 The user put a LiPo in the CrowPanel. The ESP32-P4 has no battery line. An STC8H1K08 helper MCU reads VBAT and the TP4059 charger's CHRG and STDBY pins, and answers as an I2C slave at 0x2F on the touch bus. `site/src/device-spec.md` "Battery monitoring" has the probe results. After this plan:
 
@@ -32,7 +32,7 @@ The user put a LiPo in the CrowPanel. The ESP32-P4 has no battery line. An STC8H
 |---|---|---|---|
 | A1 | One `i2c_master_transmit_receive` of register 0x00 and 11 bytes returns 0x00 to 0x0A in order, so the register pointer auto-increments. The u32 values in the probe suggest it does | B2's first step compares the 11-byte read with single-byte reads of each register | If they differ, read each field with its own transfer (0x00, 0x04, 0x08, 0x09). `batfmt_decode` still takes the same 11-byte buffer |
 | A2 | The battery mV is exactly the pin mV × 139 / 100, truncated. Both probe rows match: 2948 → 4097 and 2787 → 3873. A junk read won't match | C1 readings | A real reading that fails the check is investigated (byte order, a different register, a different STC8 firmware) before anything changes. The tolerance isn't widened just to let it through |
-| A3 | Status 0x09: bit 0 is STDBY and bit 1 is CHRG, both active low. 0x01 means charging, 0x03 discharging, 0x02 full (untested), and 0x00 (both low) unknown. 0x0A repeats 0x09 and is only logged | C3 (full charge) | If a full battery reads something other than 0x02, change the table in `batfmt.c` and its test |
+| A3 | Status 0x09: bit 0 is STDBY and bit 1 is CHRG, both active low. 0x01 means charging, 0x03 discharging, 0x02 full (confirmed in C3), and 0x00 (both low) unknown. 0x0A repeats 0x09 and is only logged | C3 (full charge) | If a full battery reads something other than 0x02, change the table in `batfmt.c` and its test |
 | A4 | With no battery on USB power, the TP4059's BAT pin floats near 4.2 V and STDBY may assert, so the registers may look like "full" or toggle (Q2) | C2, with every sample logged | If the reading can be told apart, a `BAT_NONE` rule goes in: a single-sample rule in `batfmt_decode`, or a rule over the last few samples in `battery.c`, with its test. Otherwise the board shows what the STC8 says, and the docs say so |
 | A5 | The STC8 is fine at 100 kHz beside the GT911's 400 kHz device. `i2c_master` sets the speed per device, and the user's probe ran at 100 kHz | C1, the soak in C3, and the touch feel | If touch reads start failing (B0's counter), poll less often first, then look at the bus |
 | A6 | The `i2c_master` driver serializes transfers from several tasks with its bus mutex (IDF 6.1 `i2c.rst` "Thread Safety"). `i2c_master_bus_add_device` inserts under that mutex. A NACK returns `ESP_ERR_INVALID_RESPONSE` and logs only at debug level (`i2c_master.c:157, 726`). Timeouts and bus-clear failures log E lines from several paths (`:93`, `:544`, `:553`, `:596`). The transfer timeout applies to the mutex wait and the transfer separately, so it isn't a strict end-to-end deadline | Read of the installed IDF (done) | None. This is verified. The failure latency is measured in C4b |
@@ -385,16 +385,17 @@ Built as planned. Recorded by B8 from the code and the user's board checks.
 
 - **C1 passed.** The boot read took about 1.9 ms. Unplugging and replugging USB logged `charging -> discharging` and back, with no reset.
 - **C5 and C6 passed.** The user saw the bar slot with the `HH:MM` clock and judged the spacing fine. The Devices tab shows the percent, the voltage and the charge state, and switches to discharging on unplug.
+- **C4 passed** (2026-11-01): a local build at 0x2E logged one info line, `battery: no monitor at 0x2E (ESP_ERR_INVALID_RESPONSE)`, added no E lines, laid the bar out as four groups (`net 663/216 clock 952/60, gap 73`), sent no `battery` frame, and connected normally.
+- **C3 passed, with a defect found** (2026-11-01 to 02, 12 h on USB, every-poll logging): `charging -> full` at 1327 s, 4107 mV, 86 %, raw `8b 0b 00 00 0b 10 00 00 56 02 02`, so A3's 0x02 is confirmed (0x0A repeats it). No reset, panic or crash report; svc had 4928 bytes of stack free. It also found a defect. About 10 min after full (first at 1947 s), the 11-byte read started failing: 1119 of 2086 polls overnight, 150 backoff episodes, so the bar and Status row showed `--` and the daemon got `unknown` several times an hour. Every failed read had the first 4 bytes (pin mV) right and the rest all `00`, all `ff`, or byte 4 repeated (`7e 0b 00 00 f9 f9 f9 ...`). Zero failures in the 22 min of charging. All 180 touch read failures came 0 to 40 ms after a failed battery read; B0 absorbed them (at most 6 between log lines a minute apart), with no phantom press or reset. Cause, by the signature: the STC8 can't keep up with a long burst in its full state.
+- **C3b passed** (2026-11-02, battery still full, 15 min): `read_regs` split into three pointer-then-read transfers (0x00 4 bytes, 0x04 4, 0x08 3). 179 of 179 polls read, 0 touch failures, a poll about 2.3 ms. This is the shipped read; A1's single burst is retired.
 - **Still open.**
   - **C2:** not run, and the user chose not to run it (2026-11-01). What the STC8 reports with no battery on USB is unknown; the board shows whatever it reports, and `batfmt_decode` never gives `BAT_NONE`.
-  - **C3:** charge to full overnight. The status byte at full (A3's 0x02) is untested, and so is the soak.
-  - **C4 (2026-11-01), passed:** a local build at 0x2E logged one info line, `battery: no monitor at 0x2E (ESP_ERR_INVALID_RESPONSE)`, added no E lines, laid the bar out as four groups (`net 663/216 clock 952/60, gap 73`), sent no `battery` frame, and connected normally.
   - **C4b:** the lost path (an STC8 that stops answering mid-run) wasn't run; the backoff is checked by code review only.
 
 ### Measured on the board
 
 - svc stack: 4968 bytes free (the `stack bytes free:` line).
-- B0's touch failure counter was 0 in the boot logs.
+- B0's touch failure counter was 0 in the boot logs and in C3b; 180 overnight in C3, all from the 11-byte read (see C3).
 
 ### Risks to record
 
