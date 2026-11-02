@@ -92,15 +92,12 @@ void test_batfmt_refuses_junk_and_leaves_out_alone(void)
     TEST_ASSERT_EQUAL_MEMORY(&before, &r, sizeof(r));
 }
 
-void test_batfmt_check_does_not_overflow_on_a_huge_pin(void)
+void test_batfmt_check_does_not_overflow_in_32_bits(void)
 {
     uint8_t regs[BATFMT_REGS];
     bat_reading_t r;
-    // 0xFFFFFFFF * 139 wraps in 32 bits; the check must still see a huge expected value and refuse.
-    const uint32_t wrapped = (uint32_t)(0xFFFFFFFFu * 139u) / 100;
-    regs_of(regs, 0xFFFFFFFFu, wrapped, 50, 0x03);
-    TEST_ASSERT_FALSE(batfmt_decode(regs, &r));
-    regs_of(regs, 0xFFFFFFFFu, 4000, 50, 0x03);
+    // 30899046 * 139 = 2^32 + 98: a 32-bit check expects 0 mV and would accept a battery of 0 mV.
+    regs_of(regs, 30899046u, 0, 50, 0x03);
     TEST_ASSERT_FALSE(batfmt_decode(regs, &r));
 }
 
@@ -195,19 +192,21 @@ void test_batfmt_sends_when_a_reading_comes_and_goes(void)
     TEST_ASSERT_TRUE(batfmt_should_send(true, NULL, &same));
 }
 
-void test_batfmt_text_fits_its_buffers(void)
+void test_batfmt_text_fits_the_buffers_and_reports_a_cut(void)
 {
-    // Not the wording: only that the worst case stays NUL-terminated inside the buffers.
+    // Not the wording: the worst cases fit their buffers, and a too-small buffer is reported.
     const bat_reading_t r = {.pin_mv = 2948, .mv = 4100, .percent = 100, .charge = BAT_DISCHARGING};
+    const bat_reading_t none = {.mv = 10000, .percent = 100, .charge = BAT_NONE};
     char pct[BATFMT_PERCENT_MAX];
     char row[BATFMT_ROW_MAX];
-    batfmt_percent(pct, &r);
-    TEST_ASSERT_LESS_THAN(BATFMT_PERCENT_MAX, strlen(pct));
-    batfmt_row(row, sizeof(row), &r);
-    TEST_ASSERT_LESS_THAN(BATFMT_ROW_MAX, strlen(row));
-    batfmt_percent(pct, NULL);
-    batfmt_row(row, sizeof(row), NULL);
-    TEST_ASSERT_TRUE(strlen(pct) > 0 && strlen(row) > 0);
+    char tiny[3];
+    TEST_ASSERT_TRUE(batfmt_percent(pct, sizeof(pct), &r));
+    TEST_ASSERT_TRUE(batfmt_percent(pct, sizeof(pct), NULL));
+    TEST_ASSERT_TRUE(batfmt_row(row, sizeof(row), &r));
+    TEST_ASSERT_TRUE(batfmt_row(row, sizeof(row), &none));
+    TEST_ASSERT_TRUE(batfmt_row(row, sizeof(row), NULL));
+    TEST_ASSERT_FALSE(batfmt_percent(tiny, sizeof(tiny), &r));
+    TEST_ASSERT_FALSE(batfmt_row(tiny, sizeof(tiny), &r));
 }
 
 void test_batfmt_run(void)
@@ -216,7 +215,7 @@ void test_batfmt_run(void)
     RUN_TEST(test_batfmt_decodes_little_endian_from_the_raw_bytes);
     RUN_TEST(test_batfmt_maps_each_status_byte);
     RUN_TEST(test_batfmt_refuses_junk_and_leaves_out_alone);
-    RUN_TEST(test_batfmt_check_does_not_overflow_on_a_huge_pin);
+    RUN_TEST(test_batfmt_check_does_not_overflow_in_32_bits);
     RUN_TEST(test_batfmt_cap_and_tolerance_edges);
     RUN_TEST(test_batfmt_fresh_until_exactly_fifteen_seconds);
     RUN_TEST(test_batfmt_level_is_monotonic_and_spans_the_range);
@@ -225,5 +224,5 @@ void test_batfmt_run(void)
     RUN_TEST(test_batfmt_ignores_a_one_point_move);
     RUN_TEST(test_batfmt_measures_a_two_point_move_from_the_last_sent);
     RUN_TEST(test_batfmt_sends_when_a_reading_comes_and_goes);
-    RUN_TEST(test_batfmt_text_fits_its_buffers);
+    RUN_TEST(test_batfmt_text_fits_the_buffers_and_reports_a_cut);
 }

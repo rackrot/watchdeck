@@ -56,11 +56,11 @@ int batfmt_level(unsigned percent);
  */
 bool batfmt_should_send(bool have_sent, const bat_reading_t *sent, const bat_reading_t *now);
 
-/** The bar's percent text, right-aligned in 4 cells, or "--" when `r` is NULL. */
-void batfmt_percent(char out[BATFMT_PERCENT_MAX], const bat_reading_t *r);
+/** The bar's percent text, right-aligned in 4 cells, or "--" when `r` is NULL. False if it was cut to fit `size`. */
+bool batfmt_percent(char *out, size_t size, const bat_reading_t *r);
 
-/** The Settings > Status row: voltage, percent and state, or "Battery --" when `r` is NULL. */
-void batfmt_row(char *out, size_t size, const bat_reading_t *r);
+/** The Settings > Status row: voltage, percent and state, or "Battery --" when `r` is NULL. False if cut to `size`. */
+bool batfmt_row(char *out, size_t size, const bat_reading_t *r);
 
 /** The wire name of a charge state, as in the `battery` frame's `charge`. */
 const char *batfmt_charge_name(bat_charge_t charge);

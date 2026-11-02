@@ -86,23 +86,22 @@ const char *batfmt_charge_name(bat_charge_t charge)
     }
 }
 
-void batfmt_percent(char out[BATFMT_PERCENT_MAX], const bat_reading_t *r)
+bool batfmt_percent(char *out, size_t size, const bat_reading_t *r)
 {
-    if (r == NULL) {
-        snprintf(out, BATFMT_PERCENT_MAX, "--");
-    } else {
-        snprintf(out, BATFMT_PERCENT_MAX, "%3u%%", (unsigned)r->percent % 1000);
-    }
+    const int n = r == NULL ? snprintf(out, size, "--") : snprintf(out, size, "%3u%%", (unsigned)r->percent % 1000);
+    return n >= 0 && (size_t)n < size;
 }
 
-void batfmt_row(char *out, size_t size, const bat_reading_t *r)
+bool batfmt_row(char *out, size_t size, const bat_reading_t *r)
 {
+    int n;
     if (r == NULL) {
-        snprintf(out, size, "Battery --");
+        n = snprintf(out, size, "Battery --");
     } else if (r->charge == BAT_NONE) {
-        snprintf(out, size, "Battery no battery");
+        n = snprintf(out, size, "Battery no battery");
     } else {
-        snprintf(out, size, "Battery %u.%02u V, %u%%, %s", (unsigned)(r->mv / 1000 % 100),
-                 (unsigned)(r->mv % 1000 / 10), (unsigned)r->percent % 1000, batfmt_charge_name(r->charge));
+        n = snprintf(out, size, "Battery %u.%02u V, %u%%, %s", (unsigned)(r->mv / 1000 % 100),
+                     (unsigned)(r->mv % 1000 / 10), (unsigned)r->percent % 1000, batfmt_charge_name(r->charge));
     }
+    return n >= 0 && (size_t)n < size;
 }
