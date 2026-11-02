@@ -71,6 +71,23 @@ Source: [Elecrow product page](https://www.elecrow.com/crowpanel-advanced-10-1in
 | Power input | 5 V / 2 A, via USB or UART terminal |
 | Dimensions | 248 × 147 mm |
 
+### Battery monitoring
+
+Not from the vendor page. From Elecrow's V1.2 schematic and probing the board on 2026-11-01.
+
+- A TP4059 charges the battery. The ESP32-P4 has no battery or charger line of its own.
+- An STC8H1K08 helper MCU (U5, "Charge indicator control") reads VBAT through a 39k/100k divider on P3.2/ADC10, reads the TP4059's CHRG and STDBY outputs, and drives the CHG LED. Its own UART is on header J8.
+- The STC8 is an I2C slave at **0x2F** on the touch bus (I2C0, SDA 45, SCL 46), alongside the GT911 at 0x5D. Elecrow documents no protocol for it. A plain read returns junk; write a register byte, then read.
+
+| Register | Meaning (inferred) | USB, charging | Battery only |
+|---|---|---|---|
+| 0x00–0x03 | ADC pin voltage, mV, u32 little-endian | 2948 | 2787 |
+| 0x04–0x07 | Battery voltage, mV, u32 little-endian (pin mV × 139/100) | 4097 | 3873 |
+| 0x08 | Charge, percent | 85 | 53 |
+| 0x09, 0x0A | Charger status; likely bit 0 = STDBY, bit 1 = CHRG, both active low (a full battery's value is untested) | 0x01 | 0x03 |
+
+Registers from 0x0B up read differently on each pass and look unused. The meanings come from these two states only. Nothing here was written to the STC8 except a register-pointer byte.
+
 ## Board Connectors
 
 | Pin | Description | Connector |
