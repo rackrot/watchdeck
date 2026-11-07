@@ -64,7 +64,7 @@ tauri-plugin-autostart = "2.7"
 tauri-plugin-single-instance = "2.5"
 tauri-plugin-dialog = "2.8"
 # SVG icons are untrusted. No default features, so no text, fonts or embedded raster images.
-resvg = { version = "0.48.1", default-features = false }
+resvg = { version = "0.49.0", default-features = false }
 roxmltree = "0.21.1"
 # The CSS tokenizer usvg 0.48 uses, so a style attribute is checked as usvg reads it.
 simplecss = "0.2.2"
